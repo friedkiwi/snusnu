@@ -15,6 +15,9 @@ const LLC_HEADER: usize = 3;
 
 pub const DEFAULT_BASE_SAP: u8 = 0x04;
 pub const DEFAULT_HPR_SAP: u8 = 0xc8;
+const XID3_FIXED_BYTES: usize = 29;
+const HPR_CAPABILITIES_KEY: u8 = 0x61;
+const LLC_SAP_SUBFIELD_KEY: u8 = 0x80;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Saps {
@@ -45,8 +48,6 @@ impl Saps {
         if [local_base, remote_base, local_hpr, remote_hpr]
             .iter()
             .any(|sap| *sap == 0 || sap & 1 != 0)
-            || local_base == local_hpr
-            || remote_base == remote_hpr
         {
             return Err(FrameError::InvalidSapPair);
         }
@@ -56,6 +57,156 @@ impl Saps {
             local_hpr,
             remote_hpr,
         })
+    }
+}
+
+/// The LAN default is permitted by IBM *SNA Formats*, whereas RFC 2353
+/// requires an explicit LLC SAP subfield on an EE IP link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HprMedium {
+    Lan,
+    EnterpriseExtender,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NegotiationError {
+    InvalidXid3,
+    WrongExchangeState,
+    MissingHprCapabilities,
+    DuplicateHprCapabilities,
+    InvalidCapabilities,
+    MissingSap,
+    DuplicateSap,
+    InvalidSap,
+    Incomplete,
+}
+
+/// SAP advertised by one node in a negotiation-proceeding XID3. This only
+/// extracts the DLC SAP; it does not decide whether the HPR TG can activate.
+pub fn advertised_hpr_sap(xid: &[u8], medium: HprMedium) -> Result<u8, NegotiationError> {
+    if xid.len() < XID3_FIXED_BYTES
+        || xid.len() > u8::MAX as usize
+        || xid[0] != 0x32
+        || xid[1] as usize != xid.len()
+    {
+        return Err(NegotiationError::InvalidXid3);
+    }
+    if xid[9] & 0x0c != 0x04 {
+        return Err(NegotiationError::WrongExchangeState);
+    }
+    let mut cursor = XID3_FIXED_BYTES;
+    let mut capabilities = None;
+    while cursor < xid.len() {
+        let header = xid
+            .get(cursor..cursor + 2)
+            .ok_or(NegotiationError::InvalidXid3)?;
+        let end = cursor
+            .checked_add(2 + header[1] as usize)
+            .filter(|end| *end <= xid.len())
+            .ok_or(NegotiationError::InvalidXid3)?;
+        if header[0] == HPR_CAPABILITIES_KEY {
+            if capabilities.replace(&xid[cursor + 2..end]).is_some() {
+                return Err(NegotiationError::DuplicateHprCapabilities);
+            }
+        }
+        cursor = end;
+    }
+    let data = capabilities.ok_or(NegotiationError::MissingHprCapabilities)?;
+    // The original IBM HPR architecture has a two-byte CV61 fixed prefix.
+    // The observed V5R4 EE XID3 has a five-byte prefix ending in 02 80 02.
+    // Select only that explicit observed extension; guessing a subfield
+    // boundary could accept a false SAP from arbitrary capability bytes.
+    if data.len() < 2 {
+        return Err(NegotiationError::InvalidCapabilities);
+    }
+    let prefix = if data.len() >= 5 && data[2..5] == [0x02, 0x80, 0x02] {
+        5
+    } else {
+        2
+    };
+    let sap = parse_sap_subfields(&data[prefix..])?;
+    match (sap, medium) {
+        (Some(sap), _) => Ok(sap),
+        (None, HprMedium::Lan) => Ok(DEFAULT_HPR_SAP),
+        (None, HprMedium::EnterpriseExtender) => Err(NegotiationError::MissingSap),
+    }
+}
+
+fn parse_sap_subfields(data: &[u8]) -> Result<Option<u8>, NegotiationError> {
+    let mut cursor = 0;
+    let mut sap = None;
+    while cursor < data.len() {
+        let header = data
+            .get(cursor..cursor + 2)
+            .ok_or(NegotiationError::InvalidCapabilities)?;
+        let length = header[0] as usize;
+        if length < 2 {
+            return Err(NegotiationError::InvalidCapabilities);
+        }
+        let end = cursor
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .ok_or(NegotiationError::InvalidCapabilities)?;
+        if header[1] == LLC_SAP_SUBFIELD_KEY {
+            if length != 3 {
+                return Err(NegotiationError::InvalidCapabilities);
+            }
+            let value = data[cursor + 2];
+            if value == 0 || value & 1 != 0 {
+                return Err(NegotiationError::InvalidSap);
+            }
+            if sap.replace(value).is_some() {
+                return Err(NegotiationError::DuplicateSap);
+            }
+        }
+        cursor = end;
+    }
+    Ok(sap)
+}
+
+/// The directional pair becomes usable only after both XID3 advertisements
+/// have been observed. A new exchange should start with a fresh value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HprSapNegotiation {
+    local_base: u8,
+    remote_base: u8,
+    local_hpr: Option<u8>,
+    remote_hpr: Option<u8>,
+}
+
+impl HprSapNegotiation {
+    pub fn new(local_base: u8, remote_base: u8) -> Result<Self, NegotiationError> {
+        if local_base == 0 || remote_base == 0 || local_base & 1 != 0 || remote_base & 1 != 0 {
+            return Err(NegotiationError::InvalidSap);
+        }
+        Ok(Self {
+            local_base,
+            remote_base,
+            local_hpr: None,
+            remote_hpr: None,
+        })
+    }
+
+    pub fn observe_sent(&mut self, xid: &[u8], medium: HprMedium) -> Result<(), NegotiationError> {
+        self.local_hpr = Some(advertised_hpr_sap(xid, medium)?);
+        Ok(())
+    }
+
+    pub fn observe_received(
+        &mut self,
+        xid: &[u8],
+        medium: HprMedium,
+    ) -> Result<(), NegotiationError> {
+        self.remote_hpr = Some(advertised_hpr_sap(xid, medium)?);
+        Ok(())
+    }
+
+    pub fn saps(self) -> Result<Saps, NegotiationError> {
+        let (Some(local_hpr), Some(remote_hpr)) = (self.local_hpr, self.remote_hpr) else {
+            return Err(NegotiationError::Incomplete);
+        };
+        Saps::new(self.local_base, self.remote_base, local_hpr, remote_hpr)
+            .map_err(|_| NegotiationError::InvalidSap)
     }
 }
 
@@ -238,6 +389,16 @@ mod tests {
         Saps::default()
     }
 
+    fn xid3_with_capabilities(data: &[u8]) -> Vec<u8> {
+        let mut xid = vec![0; XID3_FIXED_BYTES];
+        xid[0] = 0x32;
+        xid[9] = 0x04;
+        xid.extend_from_slice(&[HPR_CAPABILITIES_KEY, data.len() as u8]);
+        xid.extend_from_slice(data);
+        xid[1] = xid.len() as u8;
+        xid
+    }
+
     #[test]
     fn parses_negotiated_hpr_ui_and_ignores_ethernet_padding() {
         let mut bytes = vec![
@@ -299,8 +460,77 @@ mod tests {
     }
 
     #[test]
+    fn v5r4_ee_cv61_advertises_sap_and_keeps_directional_state() {
+        // CV61 from a V5R4 EE negotiation-proceeding XID3 control capture.
+        // Only the capability vector is retained; no application data is used.
+        let captured = xid3_with_capabilities(&[
+            0xf8, 0x00, 0x02, 0x80, 0x02, 0x03, 0x80, 0x04, 0x17, 0x81, 0x05, 0xb5, 0x00, 0x00,
+            0xea, 0x60, 0x10, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x02, 0xa4, 0x00,
+            0x02, 0xa4, 0x00,
+        ]);
+        assert_eq!(
+            advertised_hpr_sap(&captured, HprMedium::EnterpriseExtender),
+            Ok(4)
+        );
+        let mut state = HprSapNegotiation::new(4, 4).unwrap();
+        assert_eq!(state.saps(), Err(NegotiationError::Incomplete));
+        state
+            .observe_sent(&captured, HprMedium::EnterpriseExtender)
+            .unwrap();
+        assert_eq!(state.saps(), Err(NegotiationError::Incomplete));
+        let remote = xid3_with_capabilities(&[0x80, 0x00, 0x03, 0x80, 0xca]);
+        state.observe_received(&remote, HprMedium::Lan).unwrap();
+        assert_eq!(state.saps().unwrap().local_hpr, 4);
+        assert_eq!(state.saps().unwrap().remote_hpr, 0xca);
+    }
+
+    #[test]
+    fn cv61_requires_complete_unique_sap_and_correct_exchange_phase() {
+        let absent = xid3_with_capabilities(&[0x80, 0x00]);
+        assert_eq!(advertised_hpr_sap(&absent, HprMedium::Lan), Ok(0xc8));
+        assert_eq!(
+            advertised_hpr_sap(&absent, HprMedium::EnterpriseExtender),
+            Err(NegotiationError::MissingSap)
+        );
+        let malformed = xid3_with_capabilities(&[0xf8, 0, 2, 0x80, 2, 4, 0x80, 4]);
+        assert_eq!(
+            advertised_hpr_sap(&malformed, HprMedium::EnterpriseExtender),
+            Err(NegotiationError::InvalidCapabilities)
+        );
+        let repeated_sap = xid3_with_capabilities(&[0x80, 0, 3, 0x80, 0xc8, 3, 0x80, 0xca]);
+        assert_eq!(
+            advertised_hpr_sap(&repeated_sap, HprMedium::Lan),
+            Err(NegotiationError::DuplicateSap)
+        );
+        let odd_sap = xid3_with_capabilities(&[0x80, 0, 3, 0x80, 0xc9]);
+        assert_eq!(
+            advertised_hpr_sap(&odd_sap, HprMedium::Lan),
+            Err(NegotiationError::InvalidSap)
+        );
+        let mut wrong_state = absent.clone();
+        wrong_state[9] = 0x08;
+        assert_eq!(
+            advertised_hpr_sap(&wrong_state, HprMedium::Lan),
+            Err(NegotiationError::WrongExchangeState)
+        );
+        let mut wrong_length = absent.clone();
+        wrong_length[1] += 1;
+        assert_eq!(
+            advertised_hpr_sap(&wrong_length, HprMedium::Lan),
+            Err(NegotiationError::InvalidXid3)
+        );
+        let mut duplicate = absent.clone();
+        duplicate.extend_from_slice(&[HPR_CAPABILITIES_KEY, 2, 0x80, 0]);
+        duplicate[1] = duplicate.len() as u8;
+        assert_eq!(
+            advertised_hpr_sap(&duplicate, HprMedium::Lan),
+            Err(NegotiationError::DuplicateHprCapabilities)
+        );
+    }
+
+    #[test]
     fn rejects_llc2_and_invalid_ldlc_frames() {
-        assert_eq!(Saps::new(4, 4, 4, 0xc8), Err(FrameError::InvalidSapPair));
+        assert_eq!(Saps::new(4, 4, 5, 0xc8), Err(FrameError::InvalidSapPair));
         assert!(parse_frame(&[0; 13], saps()).is_err());
         let mut ui = encode_frame(B, A, Kind::UiNlp, false, false, &[1], saps()).unwrap();
         ui[16] = 0x13;
