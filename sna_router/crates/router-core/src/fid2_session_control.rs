@@ -22,6 +22,16 @@ const V4R4_MANAGEMENT_RESPONSE_FIXED: [u8; 27] = [
 ];
 const SNASVCMG: [u8; 8] = [0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
 
+/// Session-level pacing selected by the local SLU for +RSP(BIND).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagementPacing {
+    /// Both sides use adaptive session-level pacing; requires IPM handling.
+    Adaptive,
+    /// One-stage fixed pacing. `local_receive_window` limits normal-flow
+    /// requests arriving from the PLU and requires IPR/window accounting.
+    FixedOneStage { local_receive_window: u8 },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionControlError {
     InvalidRequest(BindError),
@@ -142,13 +152,15 @@ impl ManagementBind {
     /// negotiation: other fixed parameter sets, cryptography, and unrecognized
     /// control vectors are rejected. Structured user subfield X'13' is ignored
     /// as required for an unrecognized subfield. The caller must implement
-    /// the advertised adaptive pacing, CNOS, and parallel-session behavior
-    /// before transmitting. Unlike the captured OS/400 response, byte 23 is
+    /// the selected adaptive IPM or fixed IPR pacing, CNOS, and parallel-
+    /// session behavior before transmitting. Unlike the captured OS/400
+    /// response, byte 23 is
     /// zero: this peer does not provide conversation security or password
     /// substitution.
     pub fn build_v4r4_positive_response(
         &self,
         request_piu: &[u8],
+        pacing: ManagementPacing,
     ) -> Result<Vec<u8>, SessionControlError> {
         if ManagementBind::from_request(request_piu, &self.plu, &self.slu)? != *self {
             return Err(SessionControlError::WrongSession);
@@ -183,7 +195,25 @@ impl ManagementBind {
             0x80,
             0,
         ];
-        response.extend_from_slice(&V4R4_MANAGEMENT_RESPONSE_FIXED);
+        let mut fixed = V4R4_MANAGEMENT_RESPONSE_FIXED;
+        if let ManagementPacing::FixedOneStage {
+            local_receive_window,
+        } = pacing
+        {
+            if !(1..=7).contains(&local_receive_window) {
+                return Err(SessionControlError::UnsupportedResponse);
+            }
+            // GA27-3136-19 §6-29 permits the SLU to clear the adaptive bit.
+            // SC31-6808-0 §4-25: with one-stage pacing, secondary send is
+            // taken from primary receive (7); secondary receive is bounded
+            // by the local installation limit; primary send equals that
+            // negotiated secondary receive; primary receive stays 7.
+            fixed[8] = 7;
+            fixed[9] = local_receive_window;
+            fixed[12] = 0x80 | local_receive_window;
+            fixed[13] = 7;
+        }
+        response.extend_from_slice(&fixed);
         response.extend_from_slice(&[0, user.len() as u8]); // No outer PLU name.
         response.extend_from_slice(&user);
         response.extend_from_slice(&[0, 0]); // No URC or outer SLU name.
@@ -397,7 +427,9 @@ mod tests {
         ));
         assert_eq!(request.len(), 141);
         let bind = ManagementBind::from_request(&request, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
-        let response = bind.build_v4r4_positive_response(&request).unwrap();
+        let response = bind
+            .build_v4r4_positive_response(&request, ManagementPacing::Adaptive)
+            .unwrap();
         // SC31-6808-0 permits the unrecognized X'13' user subfield to be
         // discarded. The 89-byte expectation negotiates adaptive pacing,
         // advertises no security features, and carries our SLU name/FQPCID.
@@ -409,16 +441,37 @@ mod tests {
         assert_eq!(response, expected);
         assert_eq!(bind.correlate_positive_response(&response), Ok(()));
 
+        let fixed = bind
+            .build_v4r4_positive_response(
+                &request,
+                ManagementPacing::FixedOneStage {
+                    local_receive_window: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(&fixed[9 + 8..9 + 14], &[7, 1, 0x86, 0x86, 0x81, 7]);
+        assert_eq!(fixed[9 + 23], 0); // No local conversation security.
+        assert_eq!(bind.correlate_positive_response(&fixed), Ok(()));
+        assert_eq!(
+            bind.build_v4r4_positive_response(
+                &request,
+                ManagementPacing::FixedOneStage {
+                    local_receive_window: 0,
+                },
+            ),
+            Err(SessionControlError::UnsupportedResponse)
+        );
+
         let mut unsupported = request.clone();
         unsupported[9 + 9] &= !0x80; // No adaptive pacing in request.
         assert_eq!(
-            bind.build_v4r4_positive_response(&unsupported),
+            bind.build_v4r4_positive_response(&unsupported, ManagementPacing::Adaptive),
             Err(SessionControlError::UnsupportedRequest)
         );
         unsupported = request.clone();
         unsupported[7] = 0x84;
         assert_eq!(
-            bind.build_v4r4_positive_response(&unsupported),
+            bind.build_v4r4_positive_response(&unsupported, ManagementPacing::Adaptive),
             Err(SessionControlError::UnsupportedRequest)
         );
     }
