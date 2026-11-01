@@ -12,6 +12,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+socket2 = "0.5"
 
 [dev-dependencies]
 prost = "0.14"

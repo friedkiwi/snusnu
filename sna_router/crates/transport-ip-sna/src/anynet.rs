@@ -168,6 +168,31 @@ impl TcpSession {
         self.stream.peer_addr()
     }
 
+    /// Read at most one bounded socket chunk. A router poll must not drain an
+    /// unlimited number of records from a busy peer before serving others.
+    pub fn receive_once(&mut self) -> io::Result<Option<Vec<TcpRecord>>> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MPTN TCP closed",
+            ));
+        }
+        let mut scratch = [0; 8192];
+        match self.stream.read(&mut scratch) {
+            Ok(0) => {
+                self.closed = true;
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MPTN TCP closed",
+                ))
+            }
+            Ok(n) => self.decoder.push(&scratch[..n]).map(Some),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(Some(Vec::new())),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn receive(&mut self) -> io::Result<Vec<TcpRecord>> {
         if self.closed {
             return Err(io::Error::new(
