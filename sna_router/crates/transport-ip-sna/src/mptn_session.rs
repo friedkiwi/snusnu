@@ -493,7 +493,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         assert!(session.complete_tcp_delivery(MAX_RECORD + 1).is_err());
-        let expedited = TcpRecord::decode(vec![0, 0, 0, 5, 1]).unwrap();
+        let expedited = TcpRecord::decode(vec![0, 0, 0, 6, 1, 0xaa]).unwrap();
         assert!(session.mptn_normal(&expedited).is_err());
     }
 }

@@ -68,8 +68,20 @@ impl TcpRecord {
                 TcpKind::Connect
             }
             0x00 => TcpKind::Normal,
-            0x01 => TcpKind::Expedited,
-            0x03 => TcpKind::ExpeditedAck,
+            0x01 => {
+                if bytes.len() == 5 {
+                    return Err(invalid("MPTN expedited record has no data"));
+                }
+                TcpKind::Expedited
+            }
+            0x03 => {
+                // TCP62 section 3.2.2.1: the acknowledgement is only the
+                // record length and one-byte compensation header.
+                if bytes.len() != 5 {
+                    return Err(invalid("MPTN expedited acknowledgement has data"));
+                }
+                TcpKind::ExpeditedAck
+            }
             0x10 => TcpKind::Abort,
             0x20 => TcpKind::Segmented,
             _ => return Err(invalid("unsupported MPTN TCP compensation")),
@@ -297,6 +309,31 @@ mod tests {
         assert!(TcpRecord::decode(vec![0, 0, 0, 5, 0xff]).is_err());
         assert!(UdpDatagram::decode(vec![0, 0, 0, 5, 0x84]).is_err());
         assert!(Decoder::default().push(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn expedited_records_require_data_and_acknowledgements_are_empty() {
+        // The V5R4 AnyNet capture has TCP 0x01 data records and an exact
+        // five-byte 0x03 acknowledgement. An abortive 0x10 record can carry
+        // termination data; its payload is deliberately not interpreted here.
+        assert_eq!(
+            TcpRecord::decode(vec![0, 0, 0, 6, 0x01, 0xaa])
+                .unwrap()
+                .kind,
+            TcpKind::Expedited
+        );
+        assert_eq!(
+            TcpRecord::decode(vec![0, 0, 0, 5, 0x03]).unwrap().kind,
+            TcpKind::ExpeditedAck
+        );
+        assert_eq!(
+            TcpRecord::decode(vec![0, 0, 0, 6, 0x10, 0xaa])
+                .unwrap()
+                .kind,
+            TcpKind::Abort
+        );
+        assert!(TcpRecord::decode(vec![0, 0, 0, 5, 0x01]).is_err());
+        assert!(TcpRecord::decode(vec![0, 0, 0, 6, 0x03, 0xaa]).is_err());
     }
 
     #[test]
