@@ -1,9 +1,8 @@
 //! One bounded TCP62/AnyNet session attachment.
 //!
 //! This relays complete TCP62 records between equivalent AnyNet peers. It
-//! deliberately closes a session if UDP/397 traffic appears: node-pair
-//! keepalives and expedited commands can carry provider IP addresses and
-//! require a separate session-aware translation before proxying is safe.
+//! translates IPv4 UDP/397 node-pair keepalives across router-facing IP
+//! adjacencies. Unsupported expedited UDP commands fail closed.
 
 use crate::routing::{RoutePort, RoutedUnit, RouterEvent};
 use router_core::packet_log::hex_dump;
@@ -38,6 +37,7 @@ pub(crate) struct AnyNetPort {
     session: Option<TcpSession>,
     connecting: Option<TcpStream>,
     incoming: VecDeque<TcpRecord>,
+    incoming_udp: VecDeque<Vec<u8>>,
     pending: VecDeque<TcpRecord>,
     pending_bytes: usize,
     pending_udp: VecDeque<Keepalive>,
@@ -95,6 +95,7 @@ impl AnyNetPort {
             session: None,
             connecting: None,
             incoming: VecDeque::new(),
+            incoming_udp: VecDeque::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
             pending_udp: VecDeque::new(),
@@ -190,7 +191,14 @@ impl AnyNetPort {
         session.flush()
     }
 
-    fn check_udp(&mut self) -> io::Result<Option<Vec<RouterEvent>>> {
+    fn check_udp(&mut self, can_forward: bool) -> io::Result<Option<Vec<RouterEvent>>> {
+        if can_forward {
+            if let Some(bytes) = self.incoming_udp.pop_front() {
+                return Ok(Some(vec![RouterEvent::Unit(
+                    RoutedUnit::AnyNetUdpDatagram(bytes),
+                )]));
+            }
+        }
         let mut bytes = [0; anynet::MAX_RECORD];
         match self.udp.recv_from(&mut bytes) {
             Ok((size, source)) => {
@@ -206,9 +214,21 @@ impl AnyNetPort {
                 match decoded {
                     Ok(keepalive) => {
                         tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, kind = ?keepalive.kind, bytes = size, hex = %hex_dump(&bytes[..size]), "AnyNet node-pair keepalive received");
-                        Ok(Some(vec![RouterEvent::Unit(
-                            RoutedUnit::AnyNetUdpDatagram(bytes[..size].to_vec()),
-                        )]))
+                        if self.incoming_udp.len() >= UDP_QUEUE_LIMIT {
+                            tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, "AnyNet keepalive ingress queue full; node pair closed");
+                            self.disconnect()?;
+                            return Ok(Some(vec![RouterEvent::Closed]));
+                        }
+                        self.incoming_udp.push_back(bytes[..size].to_vec());
+                        if can_forward {
+                            Ok(Some(vec![RouterEvent::Unit(
+                                RoutedUnit::AnyNetUdpDatagram(
+                                    self.incoming_udp.pop_front().unwrap(),
+                                ),
+                            )]))
+                        } else {
+                            Ok(Some(Vec::new()))
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, source_port = source.port(), error = %error, "unsupported AnyNet UDP/397 traffic; session closed");
@@ -362,10 +382,8 @@ fn encode_lu(name: &str) -> io::Result<Vec<u8>> {
 
 impl RoutePort for AnyNetPort {
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
-        if can_accept_information {
-            if let Some(events) = self.check_udp()? {
-                return Ok(Some(events));
-            }
+        if let Some(events) = self.check_udp(can_accept_information)? {
+            return Ok(Some(events));
         }
         if self.accept_once()? {
             return Ok(Some(Vec::new()));
@@ -482,6 +500,7 @@ impl RoutePort for AnyNetPort {
         self.session = None;
         self.connecting = None;
         self.incoming.clear();
+        self.incoming_udp.clear();
         self.pending.clear();
         self.pending_bytes = 0;
         self.pending_udp.clear();
@@ -690,6 +709,8 @@ mod tests {
         guest_a
             .send_to(&request, SocketAddr::new(a_ip, port))
             .unwrap();
+        wait_until(|| a.poll(false).unwrap().is_some());
+        assert_eq!(a.incoming_udp.len(), 1);
         assert!(b
             .send(RoutedUnit::AnyNetUdpDatagram(next_udp_unit(&mut a)))
             .unwrap());
