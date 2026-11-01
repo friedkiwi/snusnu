@@ -10,6 +10,7 @@ use crate::{
     routing::{PortId, RouteAddress, RoutePort, RoutedUnit, Router, RouterEvent},
 };
 use router_core::llc2::State;
+use router_core::xid3::Xid3;
 use std::{
     cell::RefCell,
     io,
@@ -31,6 +32,47 @@ pub(crate) struct LlcPeer<'a> {
 pub(crate) struct LlcPort {
     endpoint: Endpoint,
     registry: Option<Rc<RefCell<EndpointRegistry>>>,
+    cp_gate: Option<CpGate>,
+    peer_ready: bool,
+    interface: String,
+    guest_mac: [u8; 6],
+}
+
+struct CpGate {
+    expected: String,
+    verified: bool,
+}
+
+impl CpGate {
+    fn observe(&mut self, pdu: &[u8]) -> io::Result<bool> {
+        if pdu.get(2).is_none_or(|control| control & !0x10 != 0xaf) || pdu.get(3) != Some(&0x32) {
+            return Ok(false);
+        }
+        let xid = Xid3::decode(&pdu[3..]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid guest XID3: {error}"),
+            )
+        })?;
+        let observed = xid.cp_name().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("guest XID3 lacks CP identity: {error}"),
+            )
+        })?;
+        if observed != self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "guest XID3 CP {observed} differs from configured {}",
+                    self.expected
+                ),
+            ));
+        }
+        let newly_verified = !self.verified;
+        self.verified = true;
+        Ok(newly_verified)
+    }
 }
 
 impl LlcPort {
@@ -38,17 +80,69 @@ impl LlcPort {
         Ok(Self {
             endpoint: Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?,
             registry: None,
+            cp_gate: None,
+            peer_ready: false,
+            interface: peer.interface.to_owned(),
+            guest_mac: peer.guest_mac,
         })
     }
 
     fn open_registered(
         peer: LlcPeer<'_>,
         registry: Rc<RefCell<EndpointRegistry>>,
+        expected_cp: Option<&str>,
     ) -> io::Result<Self> {
+        let mut endpoint = Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?;
+        if expected_cp.is_some() {
+            endpoint.set_connect_allowed(false)?;
+        }
         Ok(Self {
-            endpoint: Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?,
+            endpoint,
             registry: Some(registry),
+            cp_gate: expected_cp.map(|expected| CpGate {
+                expected: expected.to_owned(),
+                verified: false,
+            }),
+            peer_ready: false,
+            interface: peer.interface.to_owned(),
+            guest_mac: peer.guest_mac,
         })
+    }
+
+    fn map_events(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
+        let mut routed = Vec::with_capacity(events.len());
+        for event in events {
+            match &event {
+                Event::Type1(pdu) => {
+                    if let Some(gate) = &mut self.cp_gate {
+                        let newly_verified = match gate.observe(pdu) {
+                            Ok(verified) => verified,
+                            Err(error) => {
+                                tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), expected_cp = %gate.expected, error = %error, "guest XID3 CP identity rejected");
+                                return Err(error);
+                            }
+                        };
+                        if newly_verified {
+                            tracing::info!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), cp = %gate.expected, "guest XID3 CP identity verified");
+                            self.endpoint.set_connect_allowed(true)?;
+                            if self.peer_ready && self.endpoint.state() == State::Disconnected {
+                                self.endpoint.begin_connect_after(CONNECT_BARRIER);
+                            }
+                        }
+                    }
+                }
+                Event::Disconnected | Event::TimedOut => {
+                    if let Some(gate) = &mut self.cp_gate {
+                        gate.verified = false;
+                        self.endpoint.set_connect_allowed(false)?;
+                    }
+                    self.peer_ready = false;
+                }
+                _ => {}
+            }
+            routed.push(map_event(event));
+        }
+        Ok(routed)
     }
 }
 
@@ -64,15 +158,15 @@ fn map_event(event: Event) -> RouterEvent {
 
 impl RoutePort for LlcPort {
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
-        self.endpoint
-            .poll(can_accept_information)
-            .map(|events| events.map(|events| events.into_iter().map(map_event).collect()))
+        let Some(events) = self.endpoint.poll(can_accept_information)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.map_events(events)?))
     }
 
     fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
-        self.endpoint
-            .tick()
-            .map(|events| events.into_iter().map(map_event).collect())
+        let events = self.endpoint.tick()?;
+        self.map_events(events)
     }
 
     fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> {
@@ -108,7 +202,10 @@ impl RoutePort for LlcPort {
     }
 
     fn on_peer_ready(&mut self) -> io::Result<()> {
-        if self.endpoint.state() == State::Disconnected {
+        self.peer_ready = true;
+        if self.endpoint.state() == State::Disconnected
+            && self.cp_gate.as_ref().is_none_or(|gate| gate.verified)
+        {
             self.endpoint.begin_connect_after(CONNECT_BARRIER);
         }
         Ok(())
@@ -125,7 +222,13 @@ impl RoutePort for LlcPort {
     }
 
     fn disconnect(&mut self) -> io::Result<()> {
-        self.endpoint.disconnect()
+        self.endpoint.disconnect()?;
+        self.peer_ready = false;
+        if let Some(gate) = &mut self.cp_gate {
+            gate.verified = false;
+            self.endpoint.set_connect_allowed(false)?;
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -163,6 +266,7 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                         proxy_mac: config::parse_mac(&peer.proxy_mac)?,
                     },
                     registry.clone(),
+                    peer.local_cp.as_deref(),
                 )?),
             )?;
         }
@@ -440,5 +544,42 @@ to = "upstream"
         let error = run_config(&config).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("not owned"));
+    }
+
+    #[test]
+    fn guest_xid3_cp_must_match_before_llc_activation() {
+        // Sanitized V4R4 XID3 with SOLNET.SNAB in CV0E/F4.
+        let xid = [
+            0x32, 0x2f, 0xff, 0xf1, 0x23, 0x45, 0x00, 0x00, 0x00, 0xb4, 0xc0, 0x00, 0x00, 0x00,
+            0x00, 0x80, 0x01, 0x01, 0x0b, 0x50, 0x00, 0x05, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x07,
+            0x00, 0x0e, 0x0c, 0xf4, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b, 0xe2, 0xd5, 0xc1,
+            0xc2, 0x10, 0x02, 0x11, 0x01,
+        ];
+        let mut pdu = vec![0x04, 0x04, 0xaf];
+        pdu.extend_from_slice(&xid);
+        let mut matching = CpGate {
+            expected: "SOLNET.SNAB".into(),
+            verified: false,
+        };
+        assert!(!matching.observe(&[0x04, 0x04, 0xaf]).unwrap());
+        assert!(!matching.verified);
+        assert!(matching.observe(&pdu).unwrap());
+        assert!(matching.verified);
+        assert!(!matching.observe(&pdu).unwrap());
+        let mut wrong = CpGate {
+            expected: "SOLNET.SNAA".into(),
+            verified: false,
+        };
+        assert_eq!(
+            wrong.observe(&pdu).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!wrong.verified);
+        let mut malformed = pdu;
+        malformed[4] = 0x2e; // Declared XID length no longer matches.
+        assert_eq!(
+            matching.observe(&malformed).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

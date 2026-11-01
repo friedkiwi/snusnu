@@ -52,6 +52,8 @@ Set `SNUSNU_ROUTER_TOKEN` in the environment for a remote route. Do not put bear
 
 Configured `[[remote]]` entries share one authenticated connection and publish one snapshot containing all listed CPs and LUs. Each remote circuit must have one local LLC association. Declare the CP and LUs owned by that guest on its `[[llc]]` entry; `[[remote]] local_cp` must match, and its exported `lus` must be a subset of the peer's declared LUs. Standalone LLC routes can omit those identity fields. A configured remote route with no matching local identity is rejected before connecting or publishing. The configured proxy MAC must be in the `02:53:4e` managed namespace and is updated to the server-assigned virtual MAC while its LLC association is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
 
+When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the remote route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
+
 An EE link can also be attached without any LLC peers. Each `[[ee]]` entry binds UDP ports 12000–12004 on its `local_ip`, accepts datagrams only from `peer_ip`, and preserves the EE priority port. To relay two EE links, configure two distinct local addresses and route the two IDs together:
 
 ```toml
