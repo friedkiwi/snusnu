@@ -1,13 +1,17 @@
 //! LLC adapter and local route configuration.
 
 use crate::{
-    endpoint::{format_mac, Endpoint, Event},
+    config::{self, RouterConfig},
+    endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
+    ip_ports::EePort,
     remote::{Config as RemoteConfig, WsRoutePort},
-    routing::{PortId, RoutePort, RoutedUnit, Router, RouterEvent},
+    routing::{PortId, RouteAddress, RoutePort, RoutedUnit, Router, RouterEvent},
 };
 use router_core::llc2::State;
 use std::{
+    cell::RefCell,
     io,
+    rc::Rc,
     sync::atomic::Ordering,
     thread,
     time::{Duration, Instant},
@@ -24,12 +28,24 @@ pub(crate) struct LlcPeer<'a> {
 
 pub(crate) struct LlcPort {
     endpoint: Endpoint,
+    registry: Option<Rc<RefCell<EndpointRegistry>>>,
 }
 
 impl LlcPort {
     pub(crate) fn open(peer: LlcPeer<'_>) -> io::Result<Self> {
         Ok(Self {
             endpoint: Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?,
+            registry: None,
+        })
+    }
+
+    fn open_registered(
+        peer: LlcPeer<'_>,
+        registry: Rc<RefCell<EndpointRegistry>>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            endpoint: Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?,
+            registry: Some(registry),
         })
     }
 }
@@ -64,6 +80,12 @@ impl RoutePort for LlcPort {
                 Ok(true)
             }
             RoutedUnit::SnaInformation(data) => self.endpoint.queue_information(data),
+            RoutedUnit::AnyNetTcpRecord(_)
+            | RoutedUnit::AnyNetUdpDatagram(_)
+            | RoutedUnit::EeDatagram { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IP SNA encapsulation cannot be sent on an LLC2 port without a converter",
+            )),
         }
     }
 
@@ -90,12 +112,164 @@ impl RoutePort for LlcPort {
         Ok(())
     }
 
+    fn on_managed_mac(&mut self, mac: [u8; 6]) -> io::Result<()> {
+        if let Some(registry) = &self.registry {
+            registry
+                .borrow_mut()
+                .apply_managed_proxy_mac(&mut self.endpoint, mac)
+        } else {
+            self.endpoint.set_managed_proxy_mac(mac)
+        }
+    }
+
     fn disconnect(&mut self) -> io::Result<()> {
         self.endpoint.disconnect()
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.endpoint.flush()
+    }
+}
+
+/// Start all configured local associations and the optional remote hop. The
+/// route table is checked before any raw socket is opened, so a typo cannot
+/// leave a partially attached router running.
+pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
+    config.validate()?;
+    const FIRST_RETRY: Duration = Duration::from_millis(500);
+    const MAX_RETRY: Duration = Duration::from_secs(30);
+    let mut delay = FIRST_RETRY;
+    while !crate::STOP.load(Ordering::Relaxed) {
+        let remote_ports = if let Some(remote) = config.remote.first() {
+            let bearer = std::env::var("SNUSNU_ROUTER_TOKEN").map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SNUSNU_ROUTER_TOKEN is required",
+                )
+            })?;
+            let options = config
+                .remote
+                .iter()
+                .map(|entry| {
+                    Ok(RemoteConfig {
+                        url: entry.url.clone(),
+                        bearer: bearer.clone(),
+                        local_cp: config::parse_cp(&entry.local_cp)?,
+                        target_cp: config::parse_cp(&entry.target_cp)?,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let logical_units = config
+                .remote
+                .iter()
+                .flat_map(|entry| {
+                    entry.lus.iter().map(|name| {
+                        Ok(transport_ws::wire::LuReachability {
+                            lu: Some(config::parse_cp(name)?),
+                            hosting_cp: Some(config::parse_cp(&entry.local_cp)?),
+                        })
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            match WsRoutePort::connect_many(options, logical_units) {
+                Ok(ports) => Some(ports),
+                Err(error) if retryable_remote_error(&error) => {
+                    tracing::warn!(upstream = upstream_authority(&remote.url), error = %error, retry_ms = delay.as_millis(), "concentrator connection failed");
+                    wait_or_stop(delay);
+                    delay = delay.saturating_mul(2).min(MAX_RETRY);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let connected_at = Instant::now();
+        let mut registry = EndpointRegistry::default();
+        for peer in &config.llc {
+            registry.register(
+                &peer.interface,
+                config::parse_mac(&peer.guest_mac)?,
+                config::parse_mac(&peer.proxy_mac)?,
+            )?;
+        }
+        let registry = Rc::new(RefCell::new(registry));
+        let mut router = Router::new();
+        for peer in &config.llc {
+            let id = PortId::new(&peer.id);
+            router.register_port(
+                id,
+                Box::new(LlcPort::open_registered(
+                    LlcPeer {
+                        interface: &peer.interface,
+                        guest_mac: config::parse_mac(&peer.guest_mac)?,
+                        proxy_mac: config::parse_mac(&peer.proxy_mac)?,
+                    },
+                    registry.clone(),
+                )?),
+            )?;
+        }
+        for peer in &config.ee {
+            router.register_port(
+                PortId::new(&peer.id),
+                Box::new(EePort::open(peer.local_ip, peer.peer_ip)?),
+            )?;
+        }
+        if let Some(remote_ports) = remote_ports {
+            for (remote, port) in config.remote.iter().zip(remote_ports) {
+                router.register_port(PortId::new(&remote.id), Box::new(port))?;
+            }
+        }
+        for route in &config.route {
+            let source = PortId::new(&route.from);
+            let target = PortId::new(&route.to);
+            install_config_route(&mut router, config, &source, &target)?;
+            if route.bidirectional {
+                install_config_route(&mut router, config, &target, &source)?;
+            }
+        }
+        match router.run() {
+            Ok(()) => return Ok(()),
+            Err(error) if !config.remote.is_empty() && retryable_remote_error(&error) => {
+                for peer in &config.llc {
+                    router.disconnect_port(&PortId::new(&peer.id))?;
+                }
+                if connected_at.elapsed() >= MAX_RETRY {
+                    delay = FIRST_RETRY;
+                }
+                let url = &config.remote.first().expect("checked").url;
+                tracing::warn!(upstream = upstream_authority(url), error = %error, retry_ms = delay.as_millis(), "concentrator link lost");
+                wait_or_stop(delay);
+                delay = delay.saturating_mul(2).min(MAX_RETRY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn install_config_route(
+    router: &mut Router,
+    config: &RouterConfig,
+    source: &PortId,
+    target: &PortId,
+) -> io::Result<()> {
+    let address = if let Some(peer) = config.llc.iter().find(|peer| peer.id == source.0) {
+        Some(RouteAddress::Mac(config::parse_mac(&peer.proxy_mac)?))
+    } else if let Some(remote) = config.remote.iter().find(|remote| remote.id == source.0) {
+        let cp = config::parse_cp(&remote.local_cp)?;
+        Some(RouteAddress::ControlPoint {
+            netid: cp.netid,
+            name: cp.name,
+        })
+    } else {
+        None
+    };
+    if let Some(address) = address {
+        router.add_address_route(source, address.clone(), target)?;
+        router.bind_destination(source, address)
+    } else {
+        router.add_route(source, target)
     }
 }
 

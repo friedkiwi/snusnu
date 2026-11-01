@@ -7,5 +7,12 @@ edition = "2021"
 router-core = { path = "../router-core" }
 link-linux = { path = "../link-linux" }
 transport-ws = { path = "../transport-ws" }
+transport-ip-sna = { path = "../transport-ip-sna" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+prost = "0.14"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

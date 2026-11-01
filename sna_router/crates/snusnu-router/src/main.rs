@@ -7,7 +7,11 @@ use std::{
 use tracing_subscriber::{fmt::time::UtcTime, EnvFilter};
 
 #[cfg(target_os = "linux")]
+mod config;
+#[cfg(target_os = "linux")]
 mod endpoint;
+#[cfg(target_os = "linux")]
+mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
 #[cfg(target_os = "linux")]
@@ -68,6 +72,16 @@ fn init_logging() -> io::Result<()> {
 fn run() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let first = args.next();
+    #[cfg(target_os = "linux")]
+    if first.as_deref() == Some("--config") {
+        let path = args.next().ok_or_else(usage_error)?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        let config = config::load(std::path::Path::new(&path))?;
+        install_signals();
+        return runtime::run_config(&config);
+    }
     #[cfg(target_os = "linux")]
     if first.as_deref() == Some("--lab-link") {
         let interface_a = args.next().ok_or_else(usage_error)?;
@@ -145,7 +159,7 @@ fn run() -> io::Result<()> {
         None => "local-dev".to_owned(),
         Some("--help") if args.next().is_none() => {
             println!(
-                "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
+                "usage: snusnu-router --config FILE | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
             );
             return Ok(());
         }
@@ -175,7 +189,7 @@ fn run() -> io::Result<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
+        "usage: snusnu-router --config FILE | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
     )
 }
 
