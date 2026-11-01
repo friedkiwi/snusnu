@@ -112,3 +112,22 @@ sudo ip rule add pref 1009 from 10.99.4.11/32 lookup 109
 `ip route get 10.99.4.3 from 10.99.4.11` selected `sol9`, while the
 unchanged `.10` source selected `sol7`; two source-pinned pings to Bob's
 guest succeeded. The TAPs remain outside any bridge.
+
+## First Bob-initiated management probe
+
+An opt-in Rust TCP62 listener on `10.99.4.11:397` accepted only the Bob
+guest's `10.99.4.3` source. An unqualified
+`STRPASTHR RMTLOCNAME(SNAA)` returned `Route to specified location not
+found` before any TCP/397 packet. Both `SNAA` devices were active and no
+`QAPPNLCL` list shadowed the target. With the same guest configuration,
+
+```text
+STRPASTHR RMTLOCNAME(SNAA) RMTNETID(QAALICE) LCLLOCNAME(SNAB)
+```
+
+sent a 228-byte SNASVCMG TCP62 Connect to `10.99.4.11:397`. The opt-in
+listener rejected a previously unobserved guarded token flag before its
+positive response, so the guest reported APPC failure
+`0009000000000000`. This probe proves that explicit remote NETID selection
+reaches the router from the prepared V5 clone; it does not prove a completed
+management session. Captures remain private outside the repository.
