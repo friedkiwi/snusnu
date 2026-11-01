@@ -67,8 +67,14 @@ impl RoutePort for EePort {
         if !can_accept_information {
             return Ok(None);
         }
-        let Some((source, datagram)) = self.sockets.receive()? else {
-            return Ok(None);
+        let (source, datagram) = match self.sockets.receive() {
+            Ok(Some(received)) => received,
+            Ok(None) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                tracing::warn!(local_ip = %self.local_ip, error = %error, "malformed EE datagram discarded");
+                return Ok(Some(Vec::new()));
+            }
+            Err(error) => return Err(error),
         };
         if source.ip() != self.peer_ip {
             tracing::warn!(
@@ -206,10 +212,7 @@ mod tests {
         ));
 
         peer.send_to(&[4, 4, 0x00], target).unwrap();
-        assert_eq!(
-            wait_event(&mut port).err().unwrap().kind(),
-            io::ErrorKind::InvalidData
-        );
+        assert!(wait_event(&mut port).unwrap().is_empty());
 
         let capture = UdpSocket::bind(SocketAddr::new(peer_ip, CONTROL_PORT + 2)).unwrap();
         capture
