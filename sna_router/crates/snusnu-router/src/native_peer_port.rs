@@ -50,6 +50,7 @@ pub(crate) struct NativePeerPort {
     converter_expected_cp: Option<String>,
     converter_events: VecDeque<NativeLlcEvent>,
     converter_offer: Option<UserBindOffer>,
+    converter_bind_waits_for_bis_ack: bool,
     converter_bind_response_pending: bool,
     converter_bind_response_acked: bool,
     converter_first_attach_seen: bool,
@@ -108,6 +109,7 @@ impl NativePeerPort {
             converter_expected_cp: None,
             converter_events: VecDeque::new(),
             converter_offer: None,
+            converter_bind_waits_for_bis_ack: false,
             converter_bind_response_pending: false,
             converter_bind_response_acked: false,
             converter_first_attach_seen: false,
@@ -288,6 +290,12 @@ impl NativePeerPort {
                     _ => {}
                 }
             }
+            publish_pending_converter_bind(
+                management.phase(),
+                &self.converter_offer,
+                &mut self.converter_bind_waits_for_bis_ack,
+                &mut self.converter_events,
+            )?;
             if let Some(attach) = management.take_early_attach() {
                 if let Err(error) = self.process_management_piu(attach) {
                     self.endpoint.disconnect()?;
@@ -579,18 +587,41 @@ impl NativePeerPort {
                     "native bilateral BIS exchange queued; awaiting LLC acknowledgement"
                 );
             }
+            ManagementPhase::AwaitBisAck if self.converter_policy.is_some() => {
+                let bind = management.bind().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
+                })?;
+                let (plu, slu) = self.converter_policy.as_ref().unwrap();
+                queue_converter_bind(
+                    management.phase(),
+                    &piu,
+                    bind,
+                    plu,
+                    slu,
+                    &mut self.converter_offer,
+                    &mut self.converter_bind_waits_for_bis_ack,
+                    &mut self.converter_events,
+                )?;
+            }
             ManagementPhase::BisComplete => {
                 if matches!(classify_bind(&piu), Ok(Some(_))) {
                     let bind = management.bind().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
                     })?;
-                    let offer = if let Some((plu, slu)) = &self.converter_policy {
-                        UserBindOffer::from_request_with_policy(
+                    if let Some((plu, slu)) = &self.converter_policy {
+                        queue_converter_bind(
+                            management.phase(),
                             &piu,
                             bind,
-                            UserBindPolicy { plu, slu, mode: "" },
-                        )
-                    } else if let Some(policy) = &self.pacing_probe {
+                            plu,
+                            slu,
+                            &mut self.converter_offer,
+                            &mut self.converter_bind_waits_for_bis_ack,
+                            &mut self.converter_events,
+                        )?;
+                        return Ok(());
+                    }
+                    let offer = if let Some(policy) = &self.pacing_probe {
                         UserBindOffer::from_request_with_policy(
                             &piu,
                             bind,
@@ -600,22 +631,10 @@ impl NativePeerPort {
                                 mode: "",
                             },
                         )
+                        .map_err(management_error)?
                     } else {
-                        UserBindOffer::from_request(&piu, bind, "")
-                    }
-                    .map_err(management_error)?;
-                    if self.converter_policy.is_some() {
-                        if self.converter_offer.is_some() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "duplicate converter user BIND",
-                            ));
-                        }
-                        self.converter_offer = Some(offer);
-                        self.converter_events
-                            .push_back(NativeLlcEvent::UserBind(piu));
-                        return Ok(());
-                    }
+                        UserBindOffer::from_request(&piu, bind, "").map_err(management_error)?
+                    };
                     tracing::warn!(plu = %offer.plu, slu = %offer.slu, daf = offer.daf, oaf = offer.oaf, mode = %offer.mode, bytes = offer.request().len(), experimental_response = self.user_probe == UserProbeState::AwaitBind, "native user BIND offer validated; user gateway unavailable");
                     if self.user_probe == UserProbeState::AwaitBind {
                         let mut pacing = if self.pacing_probe.is_some() {
@@ -683,6 +702,92 @@ fn management_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+fn validate_converter_bind(
+    piu: &[u8],
+    management: &router_core::fid2_session_control::ManagementBind,
+    plu: &str,
+    slu: &str,
+) -> io::Result<UserBindOffer> {
+    // A complete supported FID2 BIND is at most a 256-byte RU plus TH/RH.
+    // Bound the one deferred offer before copying it into session state.
+    if piu.len() > 265 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "converter user BIND exceeds bounded PIU",
+        ));
+    }
+    let offer = UserBindOffer::from_request_with_policy(
+        piu,
+        management,
+        UserBindPolicy { plu, slu, mode: "" },
+    )
+    .map_err(management_error)?;
+    offer.build_fixed_response(1).map_err(management_error)?;
+    Ok(offer)
+}
+
+fn queue_converter_bind(
+    phase: ManagementPhase,
+    piu: &[u8],
+    management: &router_core::fid2_session_control::ManagementBind,
+    plu: &str,
+    slu: &str,
+    offer: &mut Option<UserBindOffer>,
+    waiting_for_bis_ack: &mut bool,
+    events: &mut VecDeque<NativeLlcEvent>,
+) -> io::Result<()> {
+    if !matches!(
+        phase,
+        ManagementPhase::AwaitBisAck | ManagementPhase::BisComplete
+    ) || !matches!(classify_bind(piu), Ok(Some(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "converter user PIU is not a BIND at the BIS boundary",
+        ));
+    }
+    if offer.is_some() || *waiting_for_bis_ack {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate converter user BIND",
+        ));
+    }
+    let validated = validate_converter_bind(piu, management, plu, slu)?;
+    tracing::info!(
+        daf = validated.daf,
+        oaf = validated.oaf,
+        bytes = piu.len(),
+        pending_bis_ack = phase == ManagementPhase::AwaitBisAck,
+        "native converter user BIND validated"
+    );
+    *offer = Some(validated);
+    if phase == ManagementPhase::AwaitBisAck {
+        *waiting_for_bis_ack = true;
+    } else {
+        events.push_back(NativeLlcEvent::UserBind(piu.to_vec()));
+    }
+    Ok(())
+}
+
+fn publish_pending_converter_bind(
+    phase: ManagementPhase,
+    offer: &Option<UserBindOffer>,
+    waiting_for_bis_ack: &mut bool,
+    events: &mut VecDeque<NativeLlcEvent>,
+) -> io::Result<()> {
+    if phase != ManagementPhase::BisComplete || !*waiting_for_bis_ack {
+        return Ok(());
+    }
+    let piu = offer
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pending user BIND missing"))?
+        .request()
+        .to_vec();
+    *waiting_for_bis_ack = false;
+    events.push_back(NativeLlcEvent::UserBind(piu));
+    Ok(())
+}
+
 impl RoutePort for NativePeerPort {
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
         self.endpoint
@@ -727,7 +832,122 @@ impl RoutePort for NativePeerPort {
 
 #[cfg(test)]
 mod completion_tests {
-    use super::exclusive_bind_ack;
+    use super::{
+        exclusive_bind_ack, publish_pending_converter_bind, queue_converter_bind, NativeLlcEvent,
+    };
+    use router_core::{fid2_session_control::ManagementBind, native_management::Phase};
+    use std::collections::VecDeque;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn bind_pair() -> (ManagementBind, Vec<u8>) {
+        let management_piu = hex(concat!(
+            "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
+            "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
+            "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
+            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "2c0a00000000000000000000"
+        ));
+        let user_piu = hex(concat!(
+            "2d00020200006b800031001307b0b051330383c7c7830306020000000000000094434000",
+            "0be2d6d3d5c5e34be2d5c1c12d000902404040404040404009030100000000000000",
+            "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
+            "0be2d6d3d5c5e34be2d5c1c260142222222222222222222222222222222222222222",
+            "2c0a01087bc3d6d5d5c5c3e3"
+        ));
+        (
+            ManagementBind::from_request(&management_piu, "SOLNET.SNAA", "SOLNET.SNAB").unwrap(),
+            user_piu,
+        )
+    }
+
+    #[test]
+    fn user_bind_before_bis_ack_is_validated_once_and_published_after_both_acks() {
+        let (management, piu) = bind_pair();
+        let mut offer = None;
+        let mut pending = false;
+        let mut events = VecDeque::new();
+        let mut wrong_session = piu.clone();
+        wrong_session[2] = 1;
+        assert!(queue_converter_bind(
+            Phase::AwaitBisAck,
+            &wrong_session,
+            &management,
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &mut offer,
+            &mut pending,
+            &mut events,
+        )
+        .is_err());
+        assert!(offer.is_none());
+        assert!(!pending);
+        assert!(events.is_empty());
+        queue_converter_bind(
+            Phase::AwaitBisAck,
+            &piu,
+            &management,
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &mut offer,
+            &mut pending,
+            &mut events,
+        )
+        .unwrap();
+        assert!(pending);
+        assert_eq!(offer.as_ref().unwrap().request(), piu);
+        publish_pending_converter_bind(Phase::AwaitBisAck, &offer, &mut pending, &mut events)
+            .unwrap(); // first BIS completion only
+        assert!(events.is_empty());
+        assert!(queue_converter_bind(
+            Phase::AwaitBisAck,
+            &piu,
+            &management,
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &mut offer,
+            &mut pending,
+            &mut events,
+        )
+        .is_err());
+        publish_pending_converter_bind(Phase::BisComplete, &offer, &mut pending, &mut events)
+            .unwrap();
+        assert!(!pending);
+        assert!(matches!(events.pop_front(), Some(NativeLlcEvent::UserBind(sent)) if sent == piu));
+        publish_pending_converter_bind(Phase::BisComplete, &offer, &mut pending, &mut events)
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn bis_ack_coalesced_with_user_bind_publishes_immediately() {
+        // NativePeerPort processes LLC completion counts before I-frame
+        // events from the same poll. This is the resulting phase at dispatch.
+        let (management, piu) = bind_pair();
+        let mut offer = None;
+        let mut pending = false;
+        let mut events = VecDeque::new();
+        queue_converter_bind(
+            Phase::BisComplete,
+            &piu,
+            &management,
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &mut offer,
+            &mut pending,
+            &mut events,
+        )
+        .unwrap();
+        assert!(!pending);
+        assert!(matches!(events.pop_front(), Some(NativeLlcEvent::UserBind(sent)) if sent == piu));
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn converter_bind_ack_cannot_claim_another_frame_completion() {
