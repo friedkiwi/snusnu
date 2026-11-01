@@ -29,7 +29,7 @@ use transport_ip_sna::{
     mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
     mptn_gateway_edge::GatewayEdge,
     mptn_management_initiator::ManagementInitiator,
-    mptn_native_bridge::Bridge,
+    mptn_native_bridge::{Bridge, Phase as BridgePhase},
     mptn_session::BindPolicy,
 };
 
@@ -562,6 +562,181 @@ pub(crate) fn run_v5(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) -> io
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FlowSnapshot {
+    phase: BridgePhase,
+    pending_tcp: usize,
+    pending_native: usize,
+    ipr_ack_outstanding: bool,
+}
+
+fn flow_snapshot(edge: &GatewayEdge<NativeLlcPort>) -> FlowSnapshot {
+    let (pending_tcp, pending_native) = edge.pending_gateway_bytes();
+    FlowSnapshot {
+        phase: edge.phase(),
+        pending_tcp,
+        pending_native,
+        ipr_ack_outstanding: edge.ipr_ack_outstanding(),
+    }
+}
+
+fn log_flow_change(
+    edge: &GatewayEdge<NativeLlcPort>,
+    before: FlowSnapshot,
+    leg: &'static str,
+    remote_ip: Ipv4Addr,
+) {
+    let after = flow_snapshot(edge);
+    if after != before {
+        tracing::debug!(
+            leg,
+            remote_ip = %remote_ip,
+            phase = ?after.phase,
+            pending_tcp = after.pending_tcp,
+            pending_native = after.pending_native,
+            ipr_ack_outstanding = after.ipr_ack_outstanding,
+            "experimental V5 flow advanced"
+        );
+    }
+}
+
+fn flow_poll_tcp(first_attach_seen: bool, ipr_ack_outstanding: bool) -> bool {
+    first_attach_seen || !ipr_ack_outstanding
+}
+
+/// Continue the isolated V5R4 experiment after the first Attach. The native
+/// and TCP62 legs retain GatewayEdge's bounded credit; any UDP/397 traffic or
+/// reverse Connect remains unsupported and ends this explicit lab run.
+pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) -> io::Result<()> {
+    if local_ip.is_unspecified()
+        || local_ip.is_loopback()
+        || local_ip.is_multicast()
+        || remote_ip.is_unspecified()
+        || remote_ip.is_loopback()
+        || remote_ip.is_multicast()
+        || local_ip == remote_ip
+    {
+        return Err(invalid(
+            "isolated V5 lab needs two distinct unicast IPv4 addresses",
+        ));
+    }
+    let mut reverse = ReverseConnectProbe::bind(SocketAddr::new(local_ip.into(), 397), remote_ip)?;
+    let udp = UdpSocket::bind(SocketAddr::new(local_ip.into(), 397))?;
+    udp.set_nonblocking(true)?;
+    let probe = ProbeConfig::load(path)?;
+    let local_lu = probe
+        .user_plu
+        .as_deref()
+        .ok_or_else(|| invalid("user_plu required for V5 management"))?;
+    let remote_lu = probe
+        .user_slu
+        .as_deref()
+        .ok_or_else(|| invalid("user_slu required for V5 management"))?;
+    establish_v5_management(local_ip, remote_ip, local_lu, remote_lu, &udp)?;
+    let (config, native, user_plu, user_slu, tp, deadline) = open_native(path)?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind(&SocketAddr::new(local_ip.into(), 0).into())?;
+    let remote = SocketAddr::new(remote_ip.into(), 397);
+    socket.connect_timeout(&remote.into(), Duration::from_secs(5))?;
+    let stream: TcpStream = socket.into();
+    let bridge = bridge(&native, &user_plu, &user_slu, tp)?;
+    let mut edge = GatewayEdge::new(
+        native,
+        TcpSession::new(stream)?,
+        bridge,
+        v5_template(&user_plu, &user_slu)?,
+    );
+    tracing::warn!(
+        interface = %config.interface,
+        guest_mac = %config.guest_mac,
+        proxy_mac = %config.proxy_mac,
+        local_ip = %local_ip,
+        remote_ip = %remote_ip,
+        local_lu = %local_lu,
+        remote_lu = %remote_lu,
+        "experimental V5 flow lab opened; X83 unavailable; no production route advertised"
+    );
+    let mut first_attach_seen = false;
+    let outcome = (|| -> io::Result<&'static str> {
+        loop {
+            if STOP.load(Ordering::Relaxed) {
+                return Ok("stop signal");
+            }
+            if Instant::now() >= deadline {
+                return Ok("configured timeout");
+            }
+            if let Some(connect) = reverse.poll()? {
+                tracing::warn!(
+                    source_lu = ?connect.source.node,
+                    destination_lu = ?connect.destination.node,
+                    remote_ip = %remote_ip,
+                    "unsupported reverse V5 Connect in flow lab"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "reverse V5 management Connect requires a responder",
+                ));
+            }
+            observe_udp(&udp)?;
+            let before = flow_snapshot(&edge);
+            edge.poll_native_once()?;
+            log_flow_change(&edge, before, "native", remote_ip);
+            if edge.is_closed() {
+                return Ok("native peer closed");
+            }
+            let before = flow_snapshot(&edge);
+            edge.flush_tcp()?;
+            log_flow_change(&edge, before, "tcp write", remote_ip);
+            if edge.first_attach_delivery_complete() && !first_attach_seen {
+                first_attach_seen = true;
+                tracing::info!(
+                    interface = %config.interface,
+                    local_ip = %local_ip,
+                    remote_ip = %remote_ip,
+                    "first native Attach delivered; continuing V5 application flow"
+                );
+            }
+            if flow_poll_tcp(first_attach_seen, edge.ipr_ack_outstanding()) {
+                let before = flow_snapshot(&edge);
+                match edge.poll_tcp_once() {
+                    Ok(()) => log_flow_change(&edge, before, "tcp receive", remote_ip),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::UnexpectedEof && first_attach_seen =>
+                    {
+                        return Ok("remote TCP peer closed");
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            observe_udp(&udp)?;
+            thread::sleep(Duration::from_micros(200));
+        }
+    })();
+    let close_result = edge.close();
+    match outcome {
+        Ok(reason) => {
+            tracing::info!(reason, first_attach_seen, remote_ip = %remote_ip, "experimental V5 flow lab stopped");
+            close_result?;
+            if !first_attach_seen && reason != "stop signal" {
+                return Err(io::Error::new(
+                    if reason == "configured timeout" {
+                        io::ErrorKind::TimedOut
+                    } else {
+                        io::ErrorKind::ConnectionAborted
+                    },
+                    format!("V5 flow lab ended before first Attach delivery: {reason}"),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(reason = %error, first_attach_seen, remote_ip = %remote_ip, "experimental V5 flow lab failed");
+            let _ = close_result;
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +794,17 @@ mod tests {
             observe_udp(&receiver).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+    }
+
+    #[test]
+    fn flow_lab_continues_tcp_polling_after_first_attach_even_with_ipr_pending() {
+        // The one-shot diagnostic holds TCP reads while the first native IPR
+        // is outstanding. Once that Attach has completed, the flow lab must
+        // keep reading so remote application data or Abort can make progress.
+        assert!(!flow_poll_tcp(false, true));
+        assert!(flow_poll_tcp(false, false));
+        assert!(flow_poll_tcp(true, false));
+        assert!(flow_poll_tcp(true, true));
     }
 
     #[test]
