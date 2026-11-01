@@ -6,12 +6,14 @@
 //! when it considers role and TG negotiation complete. This tracker enforces
 //! only those observable facts and peer identity continuity. An agreed result
 //! is not sufficient to arm SETMODE: LDLC, all CV61 capability bits, and APPN
-//! topology remain outside this module.
+//! topology remain outside this module. The router currently lacks RTP,
+//! control flows over RTP, and APPN network-control-layer behavior, so it
+//! cannot truthfully emit an EE CV61 sender profile or activate this route.
 
 use crate::{
     hpr_lan::HprMedium,
     hpr_xid_evidence::{EvidenceError, HprXidEvidence},
-    xid3::{ExchangeState, Role, Xid3, XidError},
+    xid3::{ControlVector, ExchangeState, Role, Xid3, XidError},
 };
 
 const FIXED_BYTES: usize = 29;
@@ -19,6 +21,18 @@ const TG_DESCRIPTOR: u8 = 0x46;
 const TG_IDENTIFIER: u8 = 0x80;
 const ENHANCED_SUPPORTED: u8 = 0x80;
 const NEGOTIATION_COMPLETE: u8 = 0x40;
+
+/// Encode the CV46/CV80 TG Identifier for a locally configured regular EE
+/// TG. GA27-3136 defines zero-length partner CP name and cleared link flags;
+/// the direct V5R4 EE prenegotiation capture uses exactly this five-byte
+/// subfield. The caller must insert this in its *own* prenegotiation XID3.
+/// This does not claim HPR, RTP, control-flow, or LDLC support.
+pub fn local_ee_tg_descriptor(tg_number: u8) -> ControlVector {
+    ControlVector {
+        key: TG_DESCRIPTOR,
+        data: vec![5, TG_IDENTIFIER, tg_number, 0, 0],
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -255,10 +269,7 @@ mod tests {
             data: name,
         }];
         if medium == HprMedium::EnterpriseExtender {
-            vectors.push(ControlVector {
-                key: TG_DESCRIPTOR,
-                data: vec![5, 0x80, 1, 0, 0],
-            });
+            vectors.push(local_ee_tg_descriptor(1));
         }
         if np {
             vectors.push(ControlVector {
@@ -322,5 +333,13 @@ mod tests {
             leg.observe_prenegotiation(Side::Local, &mismatch),
             Err(LegError::TgMismatch)
         );
+    }
+
+    #[test]
+    fn own_ee_tg_descriptor_matches_captured_regular_tg_encoding() {
+        assert_eq!(local_ee_tg_descriptor(1).key, 0x46);
+        assert_eq!(local_ee_tg_descriptor(1).data, [5, 0x80, 1, 0, 0]);
+        let fixture = fixture(HprMedium::EnterpriseExtender, Side::Local, false, false);
+        assert_eq!(tg_identifier(&fixture), Ok(Some(1)));
     }
 }
