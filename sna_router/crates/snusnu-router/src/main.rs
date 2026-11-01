@@ -36,6 +36,7 @@ mod remote;
 mod routing;
 #[cfg(target_os = "linux")]
 mod runtime;
+mod virtual_native_cp;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
