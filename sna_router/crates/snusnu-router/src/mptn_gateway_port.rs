@@ -113,6 +113,12 @@ impl MptnGatewayPort {
         self.management_ready
     }
 
+    pub(crate) fn user_active(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|association| matches!(association.state, SessionState::UserActive(_)))
+    }
+
     /// One UDP receive, one TCP accept/read, one record and at most two queued
     /// writes per call. The virtual WebSocket leg supplies downstream credit.
     pub(crate) fn poll_once(

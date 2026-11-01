@@ -203,11 +203,6 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
                 tracing::info!("native user BIND accepted; TCP62 positive queued");
             }
         }
-        if let Some(record) = virtual_port.tcp_user_record().cloned() {
-            if tcp.queue_user_record(&record)? {
-                virtual_port.mark_tcp_user_record_enqueued(&record)?;
-            }
-        }
         if let Some(event) = tcp.poll_once(pending_user_input.is_none())? {
             match event {
                 GatewayEvent::ManagementReady => tracing::info!("TCP62 management ready"),
@@ -242,6 +237,13 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
                 }
                 GatewayEvent::Rejected(reason) => {
                     return Err(invalid(format!("TCP62 peer rejected: {reason}")))
+                }
+            }
+        }
+        if tcp.user_active() {
+            if let Some(record) = virtual_port.tcp_user_record().cloned() {
+                if tcp.queue_user_record(&record)? {
+                    virtual_port.mark_tcp_user_record_enqueued(&record)?;
                 }
             }
         }
