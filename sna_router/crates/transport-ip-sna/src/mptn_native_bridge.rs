@@ -340,4 +340,17 @@ impl Bridge {
         self.phase = Phase::Active;
         Ok(())
     }
+
+    /// Consume a correlated native user pacing response locally. It grants
+    /// the next native send window and must never cross the TCP62 boundary.
+    pub fn observe_native_ipr(&mut self, piu: &[u8]) -> io::Result<()> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        self.pacing
+            .as_mut()
+            .unwrap()
+            .observe_ipr(piu)
+            .map_err(|_| invalid("native user IPR violates session pacing"))
+    }
 }

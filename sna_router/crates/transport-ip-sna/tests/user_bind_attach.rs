@@ -371,6 +371,12 @@ fn tcp62_application_record_waits_for_exact_native_llc_ack() {
     bridge.acknowledge_native_normal(1).unwrap();
     assert_eq!(bridge.pending_bytes(), (0, 0));
     assert_eq!(bridge.phase(), BridgePhase::Active);
+    assert!(bridge
+        .observe_native_ipr(&hex("2d0001020000830100"))
+        .is_ok());
+    assert!(bridge
+        .observe_native_ipr(&hex("2d0001020000830100"))
+        .is_err());
 }
 
 #[test]
@@ -563,6 +569,13 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
         .push_back(NativeEvent::EgressAck(1));
     edge.poll_native_once().unwrap();
     assert_eq!(edge.pending_gateway_bytes(), (0, 0));
+
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::UserInformation(hex("2d0001020000830100")));
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.pending_gateway_bytes(), (0, 0));
+    assert_eq!(edge.native_mut().sent.len(), 4); // User IPR stays on LLC leg.
 
     edge.native_mut()
         .events

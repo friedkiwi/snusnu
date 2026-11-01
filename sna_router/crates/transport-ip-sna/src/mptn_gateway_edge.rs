@@ -154,8 +154,12 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     if !can_accept_information || !self.first_attach_delivery_complete() {
                         return Err(invalid("native user data before gateway credit"));
                     }
-                    let (record, _) = self.bridge.next_native_normal(&piu)?;
-                    self.normal = Some((record, false));
+                    if piu.len() == 9 && piu[6] == 0x83 {
+                        self.bridge.observe_native_ipr(&piu)?;
+                    } else {
+                        let (record, _) = self.bridge.next_native_normal(&piu)?;
+                        self.normal = Some((record, false));
+                    }
                 }
                 NativeEvent::EgressAck(n) => {
                     if n != 1 {
