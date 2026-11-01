@@ -637,7 +637,10 @@ impl WsRoutePort {
                 && self.local_route_ids.contains(&r.route_id)
                 && r.route_generation == 1
         });
-        let accept = target_ok && self.circuit.is_none() && !self.opening;
+        let accept = target_ok
+            && self.circuit.is_none()
+            && !self.opening
+            && (!self.require_managed_binding || self.managed_mac.is_some());
         let reason = if accept {
             wire::OpenFailure::Unspecified
         } else if target_ok {
