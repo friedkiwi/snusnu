@@ -1,9 +1,19 @@
 //! Transport-neutral SNA routing between registered ports.
 
 use crate::STOP;
-use std::{collections::HashMap, fmt, io, sync::atomic::Ordering, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, io,
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, Instant},
+};
 
 const IDLE_POLL: Duration = Duration::from_micros(200);
+const FIRST_RETRY: Duration = Duration::from_millis(500);
+const MAX_RETRY: Duration = Duration::from_secs(30);
+const QUARANTINED_POLL: Duration = Duration::from_millis(10);
+const MAX_POLL_BATCHES: usize = 64;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PortId(pub(crate) String);
@@ -66,6 +76,15 @@ pub(crate) enum RouterEvent {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureScope {
+    /// Reset and retry only the connected route component.
+    Route,
+    /// A shared transport is gone; the runtime must reconstruct its ports.
+    /// The current runtime rebuilds all ports, including unrelated local pairs.
+    SharedTransport,
+}
+
 /// One attachment to the router. Adapters translate their own protocol into
 /// router events and accept routed units. `poll` must be nonblocking and
 /// apply `can_accept_information` before acknowledging incoming information.
@@ -99,6 +118,9 @@ pub(crate) trait RoutePort {
             "route port does not accept a managed MAC",
         ))
     }
+    fn failure_scope(&self, _error: &io::Error) -> FailureScope {
+        FailureScope::Route
+    }
     fn disconnect(&mut self) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
 }
@@ -109,6 +131,13 @@ pub(crate) struct Router {
     routes: HashMap<PortId, PortId>,
     address_routes: HashMap<(PortId, RouteAddress), PortId>,
     destinations: HashMap<PortId, RouteAddress>,
+    failures: HashMap<PortId, RouteFailure>,
+}
+
+#[derive(Clone, Copy)]
+struct RouteFailure {
+    failures: u32,
+    retry_at: Instant,
 }
 
 impl Router {
@@ -119,6 +148,7 @@ impl Router {
             routes: HashMap::new(),
             address_routes: HashMap::new(),
             destinations: HashMap::new(),
+            failures: HashMap::new(),
         }
     }
 
@@ -211,29 +241,127 @@ impl Router {
     pub(crate) fn run(&mut self) -> io::Result<()> {
         self.validate_routes()?;
         while !STOP.load(Ordering::Relaxed) {
-            let mut received = false;
-            for source in self.order.clone() {
-                let target = self.target(&source)?.clone();
-                self.release_completed(&source, &target)?;
-                loop {
-                    let capacity = self.port(&target)?.has_capacity();
-                    let slots = self.port(&target)?.available_receive_slots();
-                    let ingress = self.port_mut(&source)?;
-                    ingress.on_downstream_capacity(slots)?;
-                    ingress.set_ingress_busy(!capacity)?;
-                    let Some(events) = ingress.poll(capacity)? else {
-                        break;
-                    };
-                    received = true;
-                    self.dispatch(&source, events)?;
+            if !self.poll_once()? {
+                thread::sleep(self.idle_delay());
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_once(&mut self) -> io::Result<bool> {
+        let mut received = false;
+        let mut polled = HashSet::new();
+        for source in self.order.clone() {
+            if self.is_quarantined(&source) {
+                continue;
+            }
+            match self.poll_source(&source) {
+                Ok(got_data) => {
+                    received |= got_data;
+                    polled.insert(source);
                 }
+                Err(error) => self.handle_route_error(&source, error)?,
             }
-            for source in self.order.clone() {
-                let events = self.port_mut(&source)?.tick()?;
-                self.dispatch(&source, events)?;
+        }
+        for source in self.order.clone() {
+            if self.is_quarantined(&source) {
+                continue;
             }
-            if !received {
-                thread::sleep(IDLE_POLL);
+            match self.tick_source(&source) {
+                Ok(()) => {
+                    if polled.contains(&source) {
+                        self.failures.remove(&source);
+                    }
+                }
+                Err(error) => self.handle_route_error(&source, error)?,
+            }
+        }
+        Ok(received)
+    }
+
+    fn poll_source(&mut self, source: &PortId) -> io::Result<bool> {
+        let target = self.target(source)?.clone();
+        self.release_completed(source, &target)?;
+        let mut received = false;
+        for _ in 0..MAX_POLL_BATCHES {
+            let capacity = self.port(&target)?.has_capacity();
+            let slots = self.port(&target)?.available_receive_slots();
+            let ingress = self.port_mut(source)?;
+            ingress.on_downstream_capacity(slots)?;
+            ingress.set_ingress_busy(!capacity)?;
+            let Some(events) = ingress.poll(capacity)? else {
+                break;
+            };
+            received = true;
+            self.dispatch(source, events)?;
+        }
+        Ok(received)
+    }
+
+    fn tick_source(&mut self, source: &PortId) -> io::Result<()> {
+        let events = self.port_mut(source)?.tick()?;
+        self.dispatch(source, events)
+    }
+
+    fn is_quarantined(&self, source: &PortId) -> bool {
+        self.failures
+            .get(source)
+            .is_some_and(|state| state.retry_at > Instant::now())
+    }
+
+    fn idle_delay(&self) -> Duration {
+        if self.order.iter().all(|source| self.is_quarantined(source)) {
+            let now = Instant::now();
+            self.failures
+                .values()
+                .filter_map(|state| state.retry_at.checked_duration_since(now))
+                .min()
+                .unwrap_or(IDLE_POLL)
+                .min(QUARANTINED_POLL)
+        } else {
+            IDLE_POLL
+        }
+    }
+
+    fn route_component(&self, source: &PortId) -> io::Result<Vec<PortId>> {
+        let mut component = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = source.clone();
+        while seen.insert(current.clone()) {
+            component.push(current.clone());
+            current = self.target(&current)?.clone();
+        }
+        Ok(component)
+    }
+
+    fn handle_route_error(&mut self, source: &PortId, error: io::Error) -> io::Result<()> {
+        let component = self.route_component(source)?;
+        if component.iter().any(|id| {
+            self.port(id)
+                .is_ok_and(|port| port.failure_scope(&error) == FailureScope::SharedTransport)
+        }) {
+            return Err(error);
+        }
+        let failures = component
+            .iter()
+            .filter_map(|id| self.failures.get(id).map(|state| state.failures))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let delay = FIRST_RETRY
+            .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+            .min(MAX_RETRY);
+        let retry_at = Instant::now() + delay;
+        tracing::warn!(source_port = %source.0, component = ?component.iter().map(|id| id.0.as_str()).collect::<Vec<_>>(), error = %error, retry_ms = delay.as_millis(), "route component quarantined");
+        for id in component {
+            self.failures
+                .insert(id.clone(), RouteFailure { failures, retry_at });
+            if let Err(disconnect_error) = self.port_mut(&id)?.disconnect() {
+                if self.port(&id)?.failure_scope(&disconnect_error) == FailureScope::SharedTransport
+                {
+                    return Err(disconnect_error);
+                }
+                tracing::warn!(port = %id.0, error = %disconnect_error, "route port disconnect failed during quarantine");
             }
         }
         Ok(())
@@ -426,18 +554,43 @@ mod tests {
         free_slots: usize,
         managed_macs: Vec<[u8; 6]>,
         reject_managed_mac: bool,
+        poll_count: usize,
+        poll_failures_remaining: usize,
+        tick_count: usize,
+        tick_failures_remaining: usize,
+        disconnect_count: usize,
+        next_event: Option<RouterEvent>,
+        send_failures_remaining: usize,
+        shared_failure: bool,
     }
 
     struct FakePort(Rc<RefCell<State>>);
 
     impl RoutePort for FakePort {
         fn poll(&mut self, _: bool) -> io::Result<Option<Vec<RouterEvent>>> {
-            Ok(None)
+            let mut state = self.0.borrow_mut();
+            state.poll_count += 1;
+            if state.poll_failures_remaining > 0 {
+                state.poll_failures_remaining -= 1;
+                return Err(io::Error::other("simulated poll failure"));
+            }
+            Ok(state.next_event.take().map(|event| vec![event]))
         }
         fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
+            let mut state = self.0.borrow_mut();
+            state.tick_count += 1;
+            if state.tick_failures_remaining > 0 {
+                state.tick_failures_remaining -= 1;
+                return Err(io::Error::other("simulated tick failure"));
+            }
             Ok(Vec::new())
         }
         fn send(&mut self, _: RoutedUnit) -> io::Result<bool> {
+            let mut state = self.0.borrow_mut();
+            if state.send_failures_remaining > 0 {
+                state.send_failures_remaining -= 1;
+                return Err(io::Error::other("simulated send failure"));
+            }
             Ok(true)
         }
         fn has_capacity(&self) -> bool {
@@ -467,7 +620,15 @@ mod tests {
             Ok(())
         }
         fn disconnect(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().disconnect_count += 1;
             Ok(())
+        }
+        fn failure_scope(&self, _error: &io::Error) -> FailureScope {
+            if self.0.borrow().shared_failure {
+                FailureScope::SharedTransport
+            } else {
+                FailureScope::Route
+            }
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -751,5 +912,113 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(router.destinations.get(&target), Some(&initial));
         assert_eq!(router.target(&target).unwrap(), &remote);
+    }
+
+    fn paired_fake_routes(
+        a: Rc<RefCell<State>>,
+        b: Rc<RefCell<State>>,
+        c: Rc<RefCell<State>>,
+        d: Rc<RefCell<State>>,
+    ) -> Router {
+        let mut router = Router::new();
+        for (name, state) in [("a", a), ("b", b), ("c", c), ("d", d)] {
+            router
+                .register_port(PortId::new(name), Box::new(FakePort(state)))
+                .unwrap();
+        }
+        for (source, target) in [("a", "b"), ("b", "a"), ("c", "d"), ("d", "c")] {
+            router
+                .add_route(&PortId::new(source), &PortId::new(target))
+                .unwrap();
+        }
+        router.validate_routes().unwrap();
+        router
+    }
+
+    #[test]
+    fn failed_pair_is_quarantined_while_other_pair_stays_active() {
+        let a = Rc::new(RefCell::new(State {
+            poll_failures_remaining: 1,
+            ..State::default()
+        }));
+        let b = Rc::new(RefCell::new(State::default()));
+        let c = Rc::new(RefCell::new(State::default()));
+        let d = Rc::new(RefCell::new(State::default()));
+        let mut router = paired_fake_routes(a.clone(), b.clone(), c.clone(), d.clone());
+        router.poll_once().unwrap();
+        assert_eq!(a.borrow().disconnect_count, 1);
+        assert_eq!(b.borrow().disconnect_count, 1);
+        assert_eq!(b.borrow().poll_count, 0);
+        assert_eq!(c.borrow().poll_count, 1);
+        assert_eq!(d.borrow().tick_count, 1);
+        assert!(router.is_quarantined(&PortId::new("a")));
+        assert!(router.is_quarantined(&PortId::new("b")));
+        for name in ["a", "b"] {
+            router
+                .failures
+                .get_mut(&PortId::new(name))
+                .unwrap()
+                .retry_at = Instant::now();
+        }
+        router.poll_once().unwrap();
+        assert_eq!(a.borrow().poll_count, 2);
+        assert_eq!(b.borrow().poll_count, 1);
+        assert!(!router.failures.contains_key(&PortId::new("a")));
+        assert!(!router.failures.contains_key(&PortId::new("b")));
+    }
+
+    #[test]
+    fn target_send_failure_is_isolated_to_its_pair() {
+        let a = Rc::new(RefCell::new(State {
+            next_event: Some(RouterEvent::Unit(RoutedUnit::SnaInformation(vec![1]))),
+            ..State::default()
+        }));
+        let b = Rc::new(RefCell::new(State {
+            send_failures_remaining: 1,
+            ..State::default()
+        }));
+        let c = Rc::new(RefCell::new(State::default()));
+        let d = Rc::new(RefCell::new(State::default()));
+        let mut router = paired_fake_routes(a, b.clone(), c.clone(), d);
+        router.poll_once().unwrap();
+        assert_eq!(b.borrow().disconnect_count, 1);
+        assert_eq!(c.borrow().poll_count, 1);
+    }
+
+    #[test]
+    fn tick_failure_is_isolated_to_its_pair() {
+        let a = Rc::new(RefCell::new(State {
+            tick_failures_remaining: 1,
+            ..State::default()
+        }));
+        let b = Rc::new(RefCell::new(State::default()));
+        let c = Rc::new(RefCell::new(State::default()));
+        let d = Rc::new(RefCell::new(State::default()));
+        let mut router = paired_fake_routes(a.clone(), b.clone(), c.clone(), d.clone());
+        router.poll_once().unwrap();
+        assert_eq!(a.borrow().disconnect_count, 1);
+        assert_eq!(b.borrow().tick_count, 0);
+        assert_eq!(c.borrow().tick_count, 1);
+        assert_eq!(d.borrow().tick_count, 1);
+    }
+
+    #[test]
+    fn shared_transport_failure_still_restarts_router() {
+        let a = Rc::new(RefCell::new(State {
+            poll_failures_remaining: 1,
+            ..State::default()
+        }));
+        let b = Rc::new(RefCell::new(State {
+            shared_failure: true,
+            ..State::default()
+        }));
+        let c = Rc::new(RefCell::new(State::default()));
+        let d = Rc::new(RefCell::new(State::default()));
+        let mut router = paired_fake_routes(a.clone(), b.clone(), c, d);
+        let error = router.poll_once().unwrap_err();
+        assert_eq!(error.to_string(), "simulated poll failure");
+        assert!(router.failures.is_empty());
+        assert_eq!(a.borrow().disconnect_count, 0);
+        assert_eq!(b.borrow().disconnect_count, 0);
     }
 }
