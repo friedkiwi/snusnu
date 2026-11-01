@@ -58,6 +58,8 @@ An isolated direct V5R4 run captured both TAPs during `STRPASTHR`, B sign-on, an
 
 Neither case emitted UDP/397 `0x83` out-of-band data. The active-session failure produced one 59-byte TCP `0x10` compensation record from B and then a TCP reset from A. Both session starts had TCP `0x01` expedited records of 15 and 11 bytes and a five-byte `0x03` acknowledgement. This trace supports strict TCP expedited acknowledgement framing; it does not establish the V5R4 UDP `0x83` wire shape or justify enabling that path in the router.
 
+A later isolated test delayed B-to-A frames for 15 seconds during both startup and `ENDPASTHR`; a separate test dropped one exact five-byte TCP `0x03` acknowledgement. Both completed without any UDP/397 `0x83` datagram. IBM's [TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00), section 3.2.2.1, says an OOB datagram does not need a four-byte length field for its data portion, while section 5.3.3 explicitly includes a four-byte Record Length in the `0x83` command format. The bounded parser follows the detailed section 5.3.3 command format. With no captured `0x83` packet, that choice remains unverified against V5R4 and must not enable the X19 compensation gate.
+
 ## Focused expedited and out-of-band capture
 
 A further direct run on the isolated `sol6`/`sol7` bridge captured two A-to-B pass-through starts, remote sign-on, and normal `ENDPASTHR` returns. Each start sent a 15-byte TCP62 `0x01` expedited record B→A, an 11-byte `0x01` record A→B, and a five-byte `0x03` acknowledgement B→A. The unfiltered captures contain 143 frames on `sol6` and 142 on `sol7`. Neither contains any UDP datagram. Private captures are at `/tmp/snusnu-v5r4-ip-lab/direct-anynet-oob-sol6.pcap` and `direct-anynet-oob-sol7.pcap`.
