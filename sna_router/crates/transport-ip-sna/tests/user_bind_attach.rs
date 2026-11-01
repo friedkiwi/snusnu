@@ -402,6 +402,72 @@ fn tcp62_application_record_waits_for_exact_native_llc_ack() {
 }
 
 #[test]
+fn v4r4_implied_bracket_positive_response_crosses_tcp62_without_pacing_credit() {
+    use transport_ip_sna::mptn_gateway::native_normal_to_mptn;
+
+    let mut bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let connect_record = bridge.begin_native_bind(&user_bind(), template()).unwrap();
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    let bind_response = bridge
+        .accept_connect_response(&positive_response(&connect))
+        .unwrap();
+    bridge.mark_native_bind_enqueued(&bind_response).unwrap();
+    bridge.acknowledge_native_bind(1).unwrap();
+    let (attach, _) = bridge.first_attach(&first_user_attach()).unwrap();
+    let ipr = bridge.mark_attach_enqueued(&attach, 1).unwrap();
+    bridge.mark_ipr_enqueued(&ipr).unwrap();
+    bridge.complete_tcp_delivery(attach.bytes.len()).unwrap();
+
+    // The V4R4 response followed a remote FM request with DR1 and DR2.
+    let response_piu = hex("2c000102800083a000");
+    assert!(bridge.next_native_positive_response(&response_piu).is_err());
+    let reply = first_application_reply();
+    let tcp = TcpRecord::decode(native_normal_to_mptn(&reply).unwrap().bytes).unwrap();
+    let native_reply = bridge.next_mptn_normal(&tcp).unwrap().unwrap();
+    assert_eq!(native_reply[7] & 0xa0, 0xa0);
+    bridge.mark_native_normal_enqueued(&native_reply).unwrap();
+    bridge.acknowledge_native_normal(1).unwrap();
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+    assert!(bridge.next_mptn_normal(&tcp).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+
+    let mut wrong = response_piu.clone();
+    wrong[5] = 1;
+    assert!(bridge.next_native_positive_response(&wrong).is_err());
+    wrong = response_piu.clone();
+    wrong[7] = 1; // Canonical IPR is not a definite response.
+    assert!(bridge.next_native_positive_response(&wrong).is_err());
+    wrong = response_piu.clone();
+    wrong[2] = 3;
+    assert!(bridge.next_native_positive_response(&wrong).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+
+    let record = bridge.next_native_positive_response(&response_piu).unwrap();
+    assert_eq!(record.bytes, hex("0000000a00800083a000"));
+    assert_eq!(bridge.phase(), BridgePhase::PositiveResponsePrepared);
+    assert_eq!(bridge.pending_bytes(), (10, 0));
+    let mut wrong_record = record.clone();
+    wrong_record.bytes[8] = 0;
+    assert!(bridge
+        .mark_native_positive_response_enqueued(&wrong_record)
+        .is_err());
+    bridge
+        .mark_native_positive_response_enqueued(&record)
+        .unwrap();
+    assert_eq!(bridge.pending_bytes(), (10, 0));
+    bridge.complete_tcp_delivery(record.bytes.len()).unwrap();
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+    assert!(bridge.next_native_positive_response(&response_piu).is_err());
+}
+
+#[test]
 fn gateway_tcp_credit_releases_after_complete_socket_write() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -560,6 +626,7 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
     let first = first_application_reply();
     let mut second = first.clone();
     second[5] = 2;
+    second[7] &= !0xa0; // The bounded implied-bracket DR is still outstanding.
     let first_record = native_normal_to_mptn(&first).unwrap().bytes;
     let second_record = native_normal_to_mptn(&second).unwrap().bytes;
     peer.write_all(&first_record).unwrap();

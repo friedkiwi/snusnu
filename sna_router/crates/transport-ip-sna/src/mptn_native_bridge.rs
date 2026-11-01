@@ -22,6 +22,7 @@ pub enum Phase {
     Active,
     AttachPrepared,
     NormalPrepared,
+    PositiveResponsePrepared,
     NativeNormalPrepared,
     AwaitNativeNormalAck,
     IprPrepared,
@@ -38,7 +39,11 @@ pub struct Bridge {
     pacing: Option<UserPacingSession>,
     attach: Option<TcpRecord>,
     normal: Option<(TcpRecord, bool)>,
+    positive_response: Option<TcpRecord>,
     native_normal: Option<(Vec<u8>, usize)>,
+    // The admitted first LU6.2 bracket is implied by BIND. A definite
+    // response to its FM data uses SNF 0x8000, not the request's own SNF.
+    outstanding_implied_bracket_dr: bool,
     first_attach_complete: bool,
     phase: Phase,
 }
@@ -78,7 +83,9 @@ impl Bridge {
             pacing: None,
             attach: None,
             normal: None,
+            positive_response: None,
             native_normal: None,
+            outstanding_implied_bracket_dr: false,
             first_attach_complete: false,
             phase: Phase::Idle,
         })
@@ -310,6 +317,44 @@ impl Bridge {
         self.gateway.complete_tcp_delivery(bytes)
     }
 
+    /// Forward the observed V4R4 positive FM response to TCP62. IBM SNA
+    /// Formats specifies SNF 0x8000 for a response to an implied first LU6.2
+    /// bracket, even though the FM request itself has a different SNF. This
+    /// response is independent of the hop-local IPR and grants no pacing.
+    pub fn next_native_positive_response(&mut self, piu: &[u8]) -> io::Result<TcpRecord> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        if !self.outstanding_implied_bracket_dr
+            || piu.len() != 9
+            || piu[4..6] != [0x80, 0x00]
+            || piu[6..9] != [0x83, 0xa0, 0x00]
+        {
+            return Err(invalid(
+                "native positive response has no matching implied-bracket DR",
+            ));
+        }
+        // GatewaySession validates the negotiated FID2 address and ODAI,
+        // strips only the native TH address, and reserves bounded TCP credit.
+        let record = self.gateway.native_normal(piu)?;
+        self.positive_response = Some(record.clone());
+        self.phase = Phase::PositiveResponsePrepared;
+        Ok(record)
+    }
+
+    /// Commit only after the exact TCP62 response enters the socket queue.
+    pub fn mark_native_positive_response_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.phase != Phase::PositiveResponsePrepared
+            || self.positive_response.as_ref() != Some(record)
+        {
+            return Err(wrong_phase());
+        }
+        self.positive_response = None;
+        self.outstanding_implied_bracket_dr = false;
+        self.phase = Phase::Active;
+        Ok(())
+    }
+
     /// Convert one TCP62 normal record (or a final segmented record) to the
     /// established native user session. The native send window supplies PI;
     /// TCP62 pacing bits and SNA session/DFC control remain unsupported.
@@ -324,6 +369,15 @@ impl Bridge {
         if piu.len() < 10 || piu[6] & 0xe0 != 0 {
             self.gateway.complete_native_delivery(piu.len())?;
             return Err(invalid("TCP62 normal data is not an FM request"));
+        }
+        // The first observed V4R4 reply asks for both DR1 and DR2. Admit
+        // only one outstanding response in the implied first bracket, so a
+        // later 0x8000 response has an unambiguous local correspondent.
+        if piu[7] & 0xa0 != 0 && (piu[7] & 0xa0 != 0xa0 || self.outstanding_implied_bracket_dr) {
+            self.gateway.complete_native_delivery(piu.len())?;
+            return Err(invalid(
+                "TCP62 definite response request is unsupported or outstanding",
+            ));
         }
         let prepared = match self.pacing.as_mut().unwrap().prepare_normal_send(&piu) {
             Ok(prepared) => prepared.to_vec(),
@@ -354,6 +408,9 @@ impl Bridge {
             .unwrap()
             .mark_egress_enqueued(piu)
             .map_err(|_| invalid("native normal egress differs from prepared PIU"))?;
+        if piu[7] & 0xa0 == 0xa0 {
+            self.outstanding_implied_bracket_dr = true;
+        }
         self.phase = Phase::AwaitNativeNormalAck;
         Ok(())
     }
