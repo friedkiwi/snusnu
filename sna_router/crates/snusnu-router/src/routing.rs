@@ -1,7 +1,7 @@
 //! Transport-neutral SNA routing between registered ports.
 
 use crate::STOP;
-use std::{collections::HashMap, io, sync::atomic::Ordering, thread, time::Duration};
+use std::{collections::HashMap, fmt, io, sync::atomic::Ordering, thread, time::Duration};
 
 const IDLE_POLL: Duration = Duration::from_micros(200);
 
@@ -14,15 +14,50 @@ impl PortId {
     }
 }
 
+/// Address used to select a peer association. A route port still represents
+/// one LLC association or one remote circuit so its credit remains isolated.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RouteAddress {
+    Mac([u8; 6]),
+    ControlPoint {
+        netid: String,
+        name: String,
+    },
+    LogicalUnit {
+        netid: String,
+        cp: String,
+        name: String,
+    },
+}
+
+impl fmt::Display for RouteAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mac(mac) => write!(
+                f,
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ),
+            Self::ControlPoint { netid, name } => write!(f, "{netid}.{name}"),
+            Self::LogicalUnit { netid, cp, name } => write!(f, "{netid}.{cp}.{name}"),
+        }
+    }
+}
+
 /// The SNA content passed between encapsulations. A DLC control frame keeps
 /// its original LLC PDU bytes so an LLC egress can reconstruct Ethernet.
 pub(crate) enum RoutedUnit {
     DlcType1(Vec<u8>),
     SnaInformation(Vec<u8>),
+    AnyNetTcpRecord(Vec<u8>),
+    AnyNetUdpDatagram(Vec<u8>),
+    EeDatagram { priority: u8, payload: Vec<u8> },
 }
 
 pub(crate) enum RouterEvent {
     Unit(RoutedUnit),
+    /// The concentrator-assigned virtual MAC for this destination CP.
+    ManagedMac([u8; 6]),
     Ready,
     Closed,
     TimedOut,
@@ -55,6 +90,12 @@ pub(crate) trait RoutePort {
     }
     fn set_ingress_busy(&mut self, busy: bool) -> io::Result<()>;
     fn on_peer_ready(&mut self) -> io::Result<()>;
+    fn on_managed_mac(&mut self, _mac: [u8; 6]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "route port does not accept a managed MAC",
+        ))
+    }
     fn disconnect(&mut self) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
 }
@@ -63,6 +104,8 @@ pub(crate) struct Router {
     ports: HashMap<PortId, Box<dyn RoutePort>>,
     order: Vec<PortId>,
     routes: HashMap<PortId, PortId>,
+    address_routes: HashMap<(PortId, RouteAddress), PortId>,
+    destinations: HashMap<PortId, RouteAddress>,
 }
 
 impl Router {
@@ -71,6 +114,8 @@ impl Router {
             ports: HashMap::new(),
             order: Vec::new(),
             routes: HashMap::new(),
+            address_routes: HashMap::new(),
+            destinations: HashMap::new(),
         }
     }
 
@@ -88,6 +133,53 @@ impl Router {
     }
 
     pub(crate) fn add_route(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
+        self.check_route_ports(source, target)?;
+        Self::insert_route(&mut self.routes, source.clone(), target.clone())?;
+        tracing::info!(source_port = %source.0, target_port = %target.0, "route installed");
+        Ok(())
+    }
+
+    /// Install a route for one destination seen by this source association.
+    /// An address cannot silently switch to another port if configuration is
+    /// applied twice; the caller must explicitly rebuild the route table.
+    pub(crate) fn add_address_route(
+        &mut self,
+        source: &PortId,
+        address: RouteAddress,
+        target: &PortId,
+    ) -> io::Result<()> {
+        self.check_route_ports(source, target)?;
+        Self::insert_route(
+            &mut self.address_routes,
+            (source.clone(), address.clone()),
+            target.clone(),
+        )?;
+        tracing::info!(source_port = %source.0, destination = %address, target_port = %target.0, "address route installed");
+        Ok(())
+    }
+
+    /// Select the addressed route for a source association. A missing exact
+    /// route is an error even when a legacy default route is also configured.
+    pub(crate) fn bind_destination(
+        &mut self,
+        source: &PortId,
+        address: RouteAddress,
+    ) -> io::Result<()> {
+        if !self
+            .address_routes
+            .contains_key(&(source.clone(), address.clone()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no route from {} to {address}", source.0),
+            ));
+        }
+        tracing::info!(source_port = %source.0, destination = %address, "route destination bound");
+        self.destinations.insert(source.clone(), address);
+        Ok(())
+    }
+
+    fn check_route_ports(&self, source: &PortId, target: &PortId) -> io::Result<()> {
         if source == target || !self.ports.contains_key(source) || !self.ports.contains_key(target)
         {
             return Err(io::Error::new(
@@ -95,12 +187,26 @@ impl Router {
                 "invalid router route",
             ));
         }
-        self.routes.insert(source.clone(), target.clone());
-        tracing::info!(source_port = %source.0, target_port = %target.0, "route installed");
+        Ok(())
+    }
+
+    fn insert_route<K: Eq + std::hash::Hash>(
+        routes: &mut HashMap<K, PortId>,
+        key: K,
+        target: PortId,
+    ) -> io::Result<()> {
+        if routes.get(&key).is_some_and(|existing| existing != &target) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "route selector already targets another port",
+            ));
+        }
+        routes.insert(key, target);
         Ok(())
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
+        self.validate_routes()?;
         while !STOP.load(Ordering::Relaxed) {
             let mut received = false;
             for source in self.order.clone() {
@@ -138,12 +244,36 @@ impl Router {
     }
 
     fn target(&self, source: &PortId) -> io::Result<&PortId> {
-        self.routes.get(source).ok_or_else(|| {
+        let target = if let Some(address) = self.destinations.get(source) {
+            self.address_routes.get(&(source.clone(), address.clone()))
+        } else {
+            self.routes.get(source)
+        };
+        target.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no route for {}", source.0),
             )
         })
+    }
+
+    /// Completion counts and credit belong to one source/target association.
+    /// Reject fan-in until the egress adapter exposes separate circuit ports.
+    fn validate_routes(&self) -> io::Result<()> {
+        let mut upstreams = HashMap::<&PortId, &PortId>::new();
+        for source in &self.order {
+            let target = self.target(source)?;
+            if let Some(previous) = upstreams.insert(target, source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "ports {} and {} share egress {}; use one port per circuit",
+                        previous.0, source.0, target.0
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn release_completed(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
@@ -182,6 +312,9 @@ impl Router {
                     let (kind, bytes) = match &unit {
                         RoutedUnit::DlcType1(data) => ("dlc_type1", data.len()),
                         RoutedUnit::SnaInformation(data) => ("sna_information", data.len()),
+                        RoutedUnit::AnyNetTcpRecord(data) => ("anynet_tcp_record", data.len()),
+                        RoutedUnit::AnyNetUdpDatagram(data) => ("anynet_udp_datagram", data.len()),
+                        RoutedUnit::EeDatagram { payload, .. } => ("ee_datagram", payload.len()),
                     };
                     tracing::trace!(source_port = %source.0, target_port = %target.0, kind, bytes, "unit routed");
                     if !self.port_mut(&target)?.send(unit)? {
@@ -191,6 +324,10 @@ impl Router {
                             "route capacity changed during dispatch",
                         ));
                     }
+                }
+                RouterEvent::ManagedMac(mac) => {
+                    tracing::info!(source_port = %source.0, target_port = %target.0, mac = %RouteAddress::Mac(mac), "managed MAC routed");
+                    self.port_mut(&target)?.on_managed_mac(mac)?;
                 }
                 RouterEvent::Ready => {
                     tracing::info!(source_port = %source.0, target_port = %target.0, "route source ready");
@@ -222,6 +359,7 @@ mod tests {
         completions: usize,
         credited: usize,
         free_slots: usize,
+        managed_macs: Vec<[u8; 6]>,
     }
 
     struct FakePort(Rc<RefCell<State>>);
@@ -253,6 +391,10 @@ mod tests {
             Ok(())
         }
         fn on_peer_ready(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn on_managed_mac(&mut self, mac: [u8; 6]) -> io::Result<()> {
+            self.0.borrow_mut().managed_macs.push(mac);
             Ok(())
         }
         fn disconnect(&mut self) -> io::Result<()> {
@@ -289,5 +431,145 @@ mod tests {
         assert_eq!(egress_state.borrow().free_slots, 0);
         router.release_completed(&ingress, &egress).unwrap();
         assert_eq!(ingress_state.borrow().credited, 1);
+    }
+
+    fn fake_port(router: &mut Router, name: &str) -> PortId {
+        let id = PortId::new(name);
+        router
+            .register_port(
+                id.clone(),
+                Box::new(FakePort(Rc::new(RefCell::new(State::default())))),
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn address_routes_select_distinct_targets_for_distinct_peer_ports() {
+        let mut router = Router::new();
+        let a = fake_port(&mut router, "llc-a");
+        let b = fake_port(&mut router, "llc-b");
+        let c = fake_port(&mut router, "remote-circuit-a");
+        let d = fake_port(&mut router, "remote-circuit-b");
+        let cp_a = RouteAddress::ControlPoint {
+            netid: "NET".into(),
+            name: "CPA".into(),
+        };
+        let cp_b = RouteAddress::ControlPoint {
+            netid: "NET".into(),
+            name: "CPB".into(),
+        };
+        router.add_address_route(&a, cp_a.clone(), &c).unwrap();
+        router.add_address_route(&b, cp_b.clone(), &d).unwrap();
+        router.bind_destination(&a, cp_a).unwrap();
+        router.bind_destination(&b, cp_b).unwrap();
+        router.add_route(&c, &a).unwrap();
+        router.add_route(&d, &b).unwrap();
+        assert_eq!(router.target(&a).unwrap(), &c);
+        assert_eq!(router.target(&b).unwrap(), &d);
+        router.validate_routes().unwrap();
+    }
+
+    #[test]
+    fn exact_address_route_cannot_be_reassigned_or_fall_back() {
+        let mut router = Router::new();
+        let a = fake_port(&mut router, "llc-a");
+        let b = fake_port(&mut router, "llc-b");
+        let c = fake_port(&mut router, "llc-c");
+        let mac = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        router.add_route(&a, &b).unwrap();
+        router.add_address_route(&a, mac.clone(), &b).unwrap();
+        assert_eq!(
+            router
+                .add_address_route(&a, mac.clone(), &c)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            router
+                .bind_destination(&a, RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 2]))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        router.bind_destination(&a, mac).unwrap();
+        assert_eq!(router.target(&a).unwrap(), &b);
+    }
+
+    #[test]
+    fn logical_unit_selector_uses_full_cp_and_lu_identity() {
+        let mut router = Router::new();
+        let source = fake_port(&mut router, "source");
+        let first = fake_port(&mut router, "first");
+        let second = fake_port(&mut router, "second");
+        let lu = |name: &str| RouteAddress::LogicalUnit {
+            netid: "NET".into(),
+            cp: "CPA".into(),
+            name: name.into(),
+        };
+        router
+            .add_address_route(&source, lu("LU1"), &first)
+            .unwrap();
+        router
+            .add_address_route(&source, lu("LU2"), &second)
+            .unwrap();
+        router.bind_destination(&source, lu("LU2")).unwrap();
+        assert_eq!(router.target(&source).unwrap(), &second);
+    }
+
+    #[test]
+    fn fan_in_is_rejected_until_egress_exposes_separate_circuit_ports() {
+        let mut router = Router::new();
+        let a = fake_port(&mut router, "llc-a");
+        let b = fake_port(&mut router, "llc-b");
+        let c = fake_port(&mut router, "shared-egress");
+        router.add_route(&a, &c).unwrap();
+        router.add_route(&b, &c).unwrap();
+        router.add_route(&c, &a).unwrap();
+        assert_eq!(
+            router.validate_routes().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn managed_mac_reaches_only_the_addressed_peer() {
+        let mut router = Router::new();
+        let source = fake_port(&mut router, "remote");
+        let a = Rc::new(RefCell::new(State::default()));
+        let b = Rc::new(RefCell::new(State::default()));
+        let a_id = PortId::new("llc-a");
+        let b_id = PortId::new("llc-b");
+        router
+            .register_port(a_id.clone(), Box::new(FakePort(a.clone())))
+            .unwrap();
+        router
+            .register_port(b_id.clone(), Box::new(FakePort(b.clone())))
+            .unwrap();
+        let cp = RouteAddress::ControlPoint {
+            netid: "NET".into(),
+            name: "CPA".into(),
+        };
+        router
+            .add_address_route(&source, cp.clone(), &a_id)
+            .unwrap();
+        router
+            .add_address_route(
+                &source,
+                RouteAddress::ControlPoint {
+                    netid: "NET".into(),
+                    name: "CPB".into(),
+                },
+                &b_id,
+            )
+            .unwrap();
+        router.bind_destination(&source, cp).unwrap();
+        let mac = [0x02, 0x53, 0x4e, 0, 0, 7];
+        router
+            .dispatch(&source, vec![RouterEvent::ManagedMac(mac)])
+            .unwrap();
+        assert_eq!(a.borrow().managed_macs, vec![mac]);
+        assert!(b.borrow().managed_macs.is_empty());
     }
 }
