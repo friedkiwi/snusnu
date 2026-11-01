@@ -130,7 +130,10 @@ pub fn classify_reverse_management_connect(
     if user[..11] != [0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]
         || user[11..14] != [9, 3, 1]
         || user[14] != 0x23
-        || user[19..21] != [0x80, 0]
+        // Both X'80' (earlier reverse capture) and X'00' (QABOB-initiated
+        // cross-NETID capture) occur in this dynamic token flag.
+        || !matches!(user[19], 0 | 0x80)
+        || user[20] != 0
         || user[21] as usize != source.len() + 1
         || user[22] != 4
         || user[23..23 + source.len()] != *source
@@ -283,6 +286,37 @@ mod tests {
         .unwrap();
         assert!(admitted.request().matches_response(&response));
         assert_eq!(response.connection_data().len(), 85);
+    }
+
+    #[test]
+    fn admits_live_bob_initiated_zero_token_flag() {
+        // The first QABOB→router Connect on the isolated clone carried
+        // 23 xx xx xx xx 00 00 in both X'03' and X'13' token subfields.
+        // The earlier same-NETID reverse capture had 80 00 instead.
+        let source = ebcdic_lu("QABOB.SNAB").unwrap();
+        let mut fqpcid = vec![0x60, (9 + source.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(source.len() as u8);
+        fqpcid.extend_from_slice(&source);
+        let initiated = ManagementInitiator::new(
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            fqpcid.clone(),
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let mut request = Connect::decode(initiated.connect_request()).unwrap();
+        let data = &mut request.options[1].value;
+        let user_start = 32 + 1 + source.len() + 1;
+        data[user_start + 19] = 0;
+        data[user_start + 32 + source.len()] = 0;
+        let admitted =
+            classify_reverse_management_connect(request, "QABOB.SNAB", "QAALICE.SNAA", None)
+                .unwrap();
+        assert_eq!(admitted.fqpcid(), fqpcid);
     }
 
     fn captured_shape() -> Connect {
