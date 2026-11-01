@@ -119,6 +119,11 @@ fn first_user_attach() -> Vec<u8> {
     piu
 }
 
+fn next_user_normal() -> Vec<u8> {
+    // Same user-session address/ODAI, next SNF, FM request with hop-local PI.
+    hex("2c0001020002039120c1")
+}
+
 fn management_bind() -> ManagementBind {
     // Independent sanitized management BIND; FID2 address pair is kept
     // distinct from the normalized user session pair.
@@ -244,6 +249,61 @@ fn pure_bridge_rejects_unavailable_oob_before_opening() {
     .unwrap();
     assert!(bridge.begin_native_bind(&user_bind(), template()).is_err());
     assert_eq!(bridge.phase(), BridgePhase::Idle);
+}
+
+#[test]
+fn post_attach_fm_request_preserves_credit_and_requires_native_pacing_grant() {
+    let mut bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    assert!(bridge.next_native_normal(&next_user_normal()).is_err());
+    let connect_record = bridge.begin_native_bind(&user_bind(), template()).unwrap();
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    let response = bridge
+        .accept_connect_response(&positive_response(&connect))
+        .unwrap();
+    bridge.mark_native_bind_enqueued(&response).unwrap();
+    bridge.acknowledge_native_bind(1).unwrap();
+    let (attach, _) = bridge.first_attach(&first_user_attach()).unwrap();
+    let ipr = bridge.mark_attach_enqueued(&attach, 1).unwrap();
+    bridge.mark_ipr_enqueued(&ipr).unwrap();
+    bridge.complete_tcp_delivery(attach.bytes.len()).unwrap();
+
+    let mut wrong_session = next_user_normal();
+    wrong_session[2] = 3;
+    assert!(bridge.next_native_normal(&wrong_session).is_err());
+    let mut dfc = next_user_normal();
+    dfc[6] |= 0x40;
+    assert!(bridge.next_native_normal(&dfc).is_err());
+    let mut missing_pi = next_user_normal();
+    missing_pi[7] &= !0x01;
+    assert!(bridge.next_native_normal(&missing_pi).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+
+    let (record, pacing_requested) = bridge.next_native_normal(&next_user_normal()).unwrap();
+    assert!(pacing_requested);
+    assert_eq!(record.bytes, hex("0000000b000002039020c1"));
+    assert_eq!(bridge.pending_bytes(), (11, 0));
+    let mut wrong_record = record.clone();
+    wrong_record.bytes[10] ^= 1;
+    assert!(bridge.mark_normal_enqueued(&wrong_record, 1).is_err());
+    assert_eq!(bridge.phase(), BridgePhase::NormalPrepared);
+    assert_eq!(
+        bridge.mark_normal_enqueued(&record, 0).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let ipr = bridge.mark_normal_enqueued(&record, 1).unwrap().unwrap();
+    assert_eq!(ipr, hex("2d0002010000830100"));
+    assert!(bridge.mark_ipr_enqueued(&ipr[..8]).is_err());
+    bridge.mark_ipr_enqueued(&ipr).unwrap();
+    bridge.complete_tcp_delivery(record.bytes.len()).unwrap();
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+    assert_eq!(bridge.phase(), BridgePhase::Active);
 }
 
 #[test]

@@ -21,6 +21,7 @@ pub enum Phase {
     AwaitNativeBindAck,
     Active,
     AttachPrepared,
+    NormalPrepared,
     IprPrepared,
     Closed,
 }
@@ -34,6 +35,8 @@ pub struct Bridge {
     offer: Option<UserBindOffer>,
     pacing: Option<UserPacingSession>,
     attach: Option<TcpRecord>,
+    normal: Option<(TcpRecord, bool)>,
+    first_attach_complete: bool,
     phase: Phase,
 }
 
@@ -71,6 +74,8 @@ impl Bridge {
             offer: None,
             pacing: None,
             attach: None,
+            normal: None,
+            first_attach_complete: false,
             phase: Phase::Idle,
         })
     }
@@ -200,9 +205,72 @@ impl Bridge {
             .unwrap()
             .mark_egress_enqueued(piu)
             .map_err(|_| invalid("native IPR differs from prepared egress"))?;
+        if self.attach.is_some() {
+            self.first_attach_complete = true;
+        }
         self.attach = None;
+        self.normal = None;
         self.phase = Phase::Active;
         Ok(())
+    }
+
+    /// Convert one later, complete FM request after the first Attach has
+    /// entered TCP and its native pacing grant has entered LLC egress. The
+    /// application RU stays opaque; DFC, session control, and responses need
+    /// separate handlers. A rejected PIU releases any reserved TCP credit.
+    pub fn next_native_normal(&mut self, piu: &[u8]) -> io::Result<(TcpRecord, bool)> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        if piu.len() < 10 || piu[6] & 0xe0 != 0 {
+            return Err(invalid("later native PIU is not an FM request"));
+        }
+        let (record, pacing_requested) = self.gateway.native_normal_observe_pacing(piu)?;
+        if self
+            .pacing
+            .as_mut()
+            .unwrap()
+            .observe_normal_request(piu)
+            .is_err()
+        {
+            self.gateway.complete_tcp_delivery(record.bytes.len())?;
+            return Err(invalid("later native PIU violates user-session pacing"));
+        }
+        self.normal = Some((record.clone(), pacing_requested));
+        self.phase = Phase::NormalPrepared;
+        Ok((record, pacing_requested))
+    }
+
+    /// Confirm exact TCP queue acceptance. A PI-bearing request needs a
+    /// native IPR, prepared only when the next receive window has storage.
+    /// Queue backpressure leaves this record retryable without double charge.
+    pub fn mark_normal_enqueued(
+        &mut self,
+        record: &TcpRecord,
+        native_slots: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if self.phase != Phase::NormalPrepared
+            || self.normal.as_ref().map(|(pending, _)| pending) != Some(record)
+        {
+            return Err(wrong_phase());
+        }
+        if self.normal.as_ref().unwrap().1 {
+            let ipr = self
+                .pacing
+                .as_mut()
+                .unwrap()
+                .prepare_ipr(native_slots)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "native IPR slot unavailable")
+                })?
+                .to_vec();
+            self.phase = Phase::IprPrepared;
+            Ok(Some(ipr))
+        } else {
+            self.normal = None;
+            self.phase = Phase::Active;
+            Ok(None)
+        }
     }
     pub fn complete_tcp_delivery(&mut self, bytes: usize) -> io::Result<()> {
         self.gateway.complete_tcp_delivery(bytes)
