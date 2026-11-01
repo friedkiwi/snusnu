@@ -3,14 +3,16 @@
 //! TCP62 removes FID2 DAF/OAF/ODAI from Connect's BIND image. Synthetic
 //! nonzero FID2 addresses below exist only to reuse the strict LU 6.2 BIND
 //! parser; they are never returned or used for a native session. This module
-//! does not produce a BIND response or establish a management session.
+//! can construct a response candidate but does not establish a management
+//! session or authorize transmitting that candidate.
 
 use std::io;
 
 use router_core::fid2_session_control::ManagementBind;
 
 use crate::{
-    mptn_compensations::required_from_connect,
+    mptn_bind_negotiation::validate_positive_response,
+    mptn_compensations::{required_from_connect, CompensationSet},
     mptn_connect::{Connect, Direction},
 };
 
@@ -24,8 +26,18 @@ const REDUCED_BIND_BYTES: usize = 137;
 pub struct ReverseManagementConnect {
     /// The complete, validated request is retained for response correlation.
     /// Owning it does not authorize a positive response.
-    pub request: Connect,
-    pub fqpcid: [u8; 22],
+    request: Connect,
+    fqpcid: [u8; 22],
+}
+
+impl ReverseManagementConnect {
+    pub fn request(&self) -> &Connect {
+        &self.request
+    }
+
+    pub fn fqpcid(&self) -> &[u8; 22] {
+        &self.fqpcid
+    }
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -97,6 +109,80 @@ pub fn classify_reverse_management_connect(
         request,
         fqpcid: *bind.fqpcid(),
     })
+}
+
+/// Build a structural positive-response *candidate* for the admitted V5R4
+/// SNASVCMG BIND. The caller must independently implement all six required
+/// TCP62 compensations, fixed one-stage pacing, CONFIRM, and management FM
+/// before this could be sent. Current runtime does not satisfy that contract.
+///
+/// GA27-3136 and SC31-6808 permit the secondary to clear adaptive pacing:
+/// primary receive/send = 7/1 and secondary receive/send = 1/7. Security and
+/// SYNCPT are declined. TCP62 draft §5.3.1.1.3/5 clear unsupported SON and
+/// keepalive options in the response rather than echoing their request values.
+pub fn candidate_positive_management_response(
+    admitted: &ReverseManagementConnect,
+    available: CompensationSet,
+) -> io::Result<Connect> {
+    let request = &admitted.request;
+    let required = required_from_connect(request)
+        .map_err(|_| invalid("reverse management compensations are invalid"))?;
+    if !required.is_complete_tcp62() || !required.missing_from(available).is_empty() {
+        return Err(invalid("required TCP62 compensation is unavailable"));
+    }
+    // The classifier validates the BIND. These option checks additionally
+    // prevent silently accepting a service mode or extension we cannot honor.
+    if request.options.len() != 5
+        || request
+            .options
+            .iter()
+            .map(|field| field.kind)
+            .collect::<Vec<_>>()
+            != [0x05, 0x0a, 0x18, 0x19, 0x1a]
+        || request.options[0].value != [1, 1]
+        || request.options[2].value != [1]
+        || request.options[4].value != [0x84]
+    {
+        return Err(invalid("unsupported reverse management Connect option"));
+    }
+
+    let mut fixed = V5_MANAGEMENT_FIXED;
+    fixed[8] = 7; // primary receive
+    fixed[9] = 1; // primary send
+    fixed[12] = 0x81; // secondary receive, one-stage pacing
+    fixed[13] = 7; // secondary send
+    fixed[23] = 0; // no conversation security or password substitution
+    fixed[24] = 0x23; // CONFIRM, not SYNCPT
+
+    let slu = &request.destination.node;
+    let mut user = vec![0, 9, 2];
+    user.extend_from_slice(&[0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]); // SNASVCMG
+    user.extend_from_slice(&[2, 3, 2]); // FQPCID session-instance selector
+    user.push((slu.len() + 1) as u8);
+    user.push(5);
+    user.extend_from_slice(slu);
+
+    let mut data = vec![0, 0, 0xeb, 0x80, 0]; // reduced SNF/RH, positive RSP(BIND)
+    data.extend_from_slice(&fixed);
+    data.extend_from_slice(&[0, user.len() as u8]); // no outer PLU
+    data.extend_from_slice(&user);
+    data.extend_from_slice(&[0, 0]); // no URC or outer SLU
+    data.extend_from_slice(&admitted.fqpcid);
+
+    let mut response = request.clone();
+    response.direction = Direction::PositiveResponse;
+    response.processing = 0x8a;
+    response.options[1].value = data;
+    response.options[2].value = vec![0]; // no SON
+    response.options[4].value = vec![0]; // no keepalive
+    let response = Connect::decode(&response.encode()?)?;
+    if !request.matches_response(&response)
+        || validate_positive_response(request.connection_data(), response.connection_data())
+            .is_err()
+    {
+        return Err(invalid("reverse management response correlation failed"));
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -250,5 +336,90 @@ mod tests {
             .value
             .pop();
         assert!(classify(request).is_err());
+    }
+
+    #[test]
+    fn candidate_correlates_exactly_and_declines_unsupported_features() {
+        let admitted = classify(captured_shape()).unwrap();
+        let available = required_from_connect(admitted.request()).unwrap();
+        let response = candidate_positive_management_response(&admitted, available).unwrap();
+        let request = admitted.request();
+        assert!(request.matches_response(&response));
+        assert_eq!(response.direction, Direction::PositiveResponse);
+        assert_eq!(response.processing, 0x8a);
+        assert_eq!(response.correlator, request.correlator);
+        assert_eq!(response.destination, request.destination);
+        assert_eq!(response.source, request.source);
+        assert_eq!(response.options[0], request.options[0]);
+        assert_eq!(response.options[3], request.options[3]);
+        assert_eq!(response.options[2].value, [0]);
+        assert_eq!(response.options[4].value, [0]);
+
+        let data = response.connection_data();
+        assert_eq!(&data[..5], &[0, 0, 0xeb, 0x80, 0]);
+        assert_eq!(&data[5..13], &request.connection_data()[5..13]);
+        assert_eq!(&data[13..19], &[7, 1, 0x86, 0x86, 0x81, 7]);
+        assert_eq!(&data[28..32], &[0, 0x23, 0, 0]);
+        assert_eq!(&data[data.len() - 22..], admitted.fqpcid());
+        assert_eq!(
+            validate_positive_response(request.connection_data(), data),
+            Ok(())
+        );
+        assert_ne!(data, request.connection_data());
+    }
+
+    #[test]
+    fn candidate_requires_every_compensation_and_rejects_extra_options() {
+        let admitted = classify(captured_shape()).unwrap();
+        let incomplete = CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20]).unwrap();
+        assert!(candidate_positive_management_response(&admitted, incomplete).is_err());
+
+        let mut request = captured_shape();
+        request.options[0].value = vec![2, 1]; // unhandled MPTN service mode
+        let admitted = classify(request).unwrap();
+        let complete = required_from_connect(admitted.request()).unwrap();
+        assert!(candidate_positive_management_response(&admitted, complete).is_err());
+
+        let mut request = captured_shape();
+        request.options.push(OptionalField {
+            kind: 0x1c,
+            processing: 0,
+            value: vec![1, 2],
+        });
+        let admitted = classify(request).unwrap();
+        assert!(candidate_positive_management_response(&admitted, complete).is_err());
+
+        let mut request = captured_shape();
+        request.options[2].value = vec![1, 1]; // unhandled multiple SON values
+        let admitted = classify(request).unwrap();
+        assert!(candidate_positive_management_response(&admitted, complete).is_err());
+    }
+
+    #[test]
+    fn candidate_uses_the_current_request_session_instance() {
+        let first = classify(captured_shape()).unwrap();
+        let mut second_request = captured_shape();
+        let data = bind_data_mut(&mut second_request);
+        let fqpcid_offset = data
+            .windows(2)
+            .position(|bytes| bytes == [0x60, 0x14])
+            .unwrap();
+        data[fqpcid_offset + 3] ^= 1;
+        second_request.correlator[0] ^= 1;
+        let second = classify(second_request).unwrap();
+        let complete = required_from_connect(first.request()).unwrap();
+        let first_response = candidate_positive_management_response(&first, complete).unwrap();
+        let second_response = candidate_positive_management_response(&second, complete).unwrap();
+        assert_ne!(first.fqpcid(), second.fqpcid());
+        assert_ne!(first_response.correlator, second_response.correlator);
+        assert_ne!(
+            first_response.connection_data(),
+            second_response.connection_data()
+        );
+        assert!(validate_positive_response(
+            first.request().connection_data(),
+            second_response.connection_data()
+        )
+        .is_err());
     }
 }
