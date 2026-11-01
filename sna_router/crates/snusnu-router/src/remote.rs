@@ -69,17 +69,8 @@ impl WsRoutePort {
             target_cp = %format_cp(&config.target_cp),
             "connected to concentrator"
         );
-        let snapshot = wire::RouteSnapshot {
-            epoch: welcome.connection_epoch.clone(),
-            revision: 1,
-            routes: vec![wire::RouteExport {
-                id: 1,
-                generation: 1,
-                resource: Some(wire::route_export::Resource::ControlPoint(
-                    config.local_cp.clone(),
-                )),
-            }],
-        };
+        let snapshot =
+            local_route_snapshot(&welcome.connection_epoch, 1, &config.local_cp, &[], &[])?;
         client
             .send(envelope(wire::ws_envelope::Body::PublishRoutes(snapshot)))
             .map_err(io_error)?;
@@ -660,6 +651,94 @@ fn validate_name(name: &wire::SnaName) -> io::Result<()> {
     }
 }
 
+/// Build a complete local reachability snapshot. The primary CP keeps route
+/// ID 1 for the existing single-peer adapter. Additional CP and LU IDs are
+/// derived from their resource names, so inserting another export does not
+/// silently retarget an existing route ID. The caller must increase the
+/// generation if an export's actual destination changes within an epoch.
+pub(crate) fn local_route_snapshot(
+    epoch: &[u8],
+    revision: u64,
+    primary_cp: &wire::SnaName,
+    additional_cps: &[wire::SnaName],
+    logical_units: &[wire::LuReachability],
+) -> io::Result<wire::RouteSnapshot> {
+    if epoch.len() != 16 || revision == 0 {
+        return Err(protocol("invalid route snapshot epoch or revision"));
+    }
+    validate_name(primary_cp)?;
+    let mut identities = HashSet::new();
+    identities.insert((primary_cp.netid.clone(), primary_cp.name.clone(), false));
+    let mut ids = HashSet::new();
+    ids.insert(1);
+    let mut routes = vec![wire::RouteExport {
+        id: 1,
+        generation: 1,
+        resource: Some(wire::route_export::Resource::ControlPoint(
+            primary_cp.clone(),
+        )),
+    }];
+    for cp in additional_cps {
+        validate_name(cp)?;
+        if !identities.insert((cp.netid.clone(), cp.name.clone(), false)) {
+            return Err(protocol("duplicate local CP export"));
+        }
+        let id = stable_route_id(b'C', cp);
+        if id == 0 || !ids.insert(id) {
+            return Err(protocol("local route ID collision"));
+        }
+        routes.push(wire::RouteExport {
+            id,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::ControlPoint(cp.clone())),
+        });
+    }
+    for lu in logical_units {
+        let name = lu
+            .lu
+            .as_ref()
+            .ok_or_else(|| protocol("LU export missing name"))?;
+        validate_name(name)?;
+        if let Some(host) = &lu.hosting_cp {
+            validate_name(host)?;
+        }
+        if !identities.insert((name.netid.clone(), name.name.clone(), true)) {
+            return Err(protocol("duplicate local LU export"));
+        }
+        let id = stable_route_id(b'L', name);
+        if id == 0 || !ids.insert(id) {
+            return Err(protocol("local route ID collision"));
+        }
+        routes.push(wire::RouteExport {
+            id,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::LogicalUnit(lu.clone())),
+        });
+    }
+    routes[1..].sort_by_key(|route| route.id);
+    Ok(wire::RouteSnapshot {
+        epoch: epoch.to_vec(),
+        revision,
+        routes,
+    })
+}
+
+// FNV-1a with a resource-kind prefix and component separators. A collision
+// is rejected above rather than allowing a circuit to reach another route.
+fn stable_route_id(kind: u8, name: &wire::SnaName) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in [kind]
+        .into_iter()
+        .chain(name.netid.bytes())
+        .chain([0])
+        .chain(name.name.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn validate_managed_bindings(bindings: &[wire::ManagedCpBinding]) -> io::Result<()> {
     let mut addresses = HashSet::new();
     for binding in bindings {
@@ -758,6 +837,83 @@ fn io_error(error: transport_ws::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn name(netid: &str, name: &str) -> wire::SnaName {
+        wire::SnaName {
+            netid: netid.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn local_snapshot_exports_cp_and_lu_with_stable_distinct_ids() {
+        let primary = name("SOLNET", "SNAA");
+        let cp_b = name("SOLNET", "SNAB");
+        let cp_c = name("SOLNET", "SNAC");
+        let lu = wire::LuReachability {
+            lu: Some(name("SOLNET", "USER1")),
+            hosting_cp: Some(cp_b.clone()),
+        };
+        let first = local_route_snapshot(
+            &[7; 16],
+            1,
+            &primary,
+            &[cp_b.clone(), cp_c.clone()],
+            std::slice::from_ref(&lu),
+        )
+        .unwrap();
+        let reordered = local_route_snapshot(
+            &[7; 16],
+            2,
+            &primary,
+            &[cp_c, cp_b],
+            std::slice::from_ref(&lu),
+        )
+        .unwrap();
+        assert_eq!(first.routes, reordered.routes);
+        assert_eq!(first.routes[0].id, 1);
+        assert_eq!(first.routes.len(), 4);
+        assert_eq!(
+            first
+                .routes
+                .iter()
+                .map(|r| r.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        assert!(first.routes.iter().any(|r| matches!(
+            &r.resource,
+            Some(wire::route_export::Resource::LogicalUnit(value)) if value == &lu
+        )));
+    }
+
+    #[test]
+    fn local_snapshot_rejects_duplicate_or_invalid_exports() {
+        let primary = name("SOLNET", "SNAA");
+        let lu = wire::LuReachability {
+            lu: Some(name("SOLNET", "USER1")),
+            hosting_cp: None,
+        };
+        assert!(local_route_snapshot(&[0; 15], 1, &primary, &[], &[]).is_err());
+        assert!(local_route_snapshot(&[0; 16], 0, &primary, &[], &[]).is_err());
+        assert!(
+            local_route_snapshot(&[0; 16], 1, &primary, std::slice::from_ref(&primary), &[])
+                .is_err()
+        );
+        assert!(local_route_snapshot(&[0; 16], 1, &primary, &[], &[lu.clone(), lu]).is_err());
+        assert!(local_route_snapshot(
+            &[0; 16],
+            1,
+            &primary,
+            &[],
+            &[wire::LuReachability {
+                lu: None,
+                hosting_cp: None,
+            }]
+        )
+        .is_err());
+    }
 
     #[test]
     fn type1_roundtrip_preserves_xid3_bytes_and_flags() {
