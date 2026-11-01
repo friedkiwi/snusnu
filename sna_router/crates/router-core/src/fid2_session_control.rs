@@ -312,7 +312,7 @@ fn encode_lu_name(name: &str) -> Result<Vec<u8>, SessionControlError> {
         .collect()
 }
 
-fn request_fqpcid(ru: &[u8]) -> Result<[u8; 22], SessionControlError> {
+pub(crate) fn request_fqpcid(ru: &[u8]) -> Result<[u8; 22], SessionControlError> {
     let mut offset = 27;
     for _ in 0..4 {
         let length = *ru
