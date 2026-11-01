@@ -2,8 +2,8 @@
 //!
 //! The wrapped port owns circuit open, credit and transport retry. This
 //! adapter starts XID without a local Ethernet interface, then waits for the
-//! remote LLC endpoint's LinkReady. User and management PIUs remain disabled
-//! until a session gateway is attached.
+//! remote LLC endpoint's LinkReady. Management follows the native V4 sequence,
+//! then a single admitted TCP62 user BIND may start on the managed link.
 
 use crate::{
     routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent},
@@ -14,6 +14,10 @@ use router_core::{
     xid3::Xid3,
 };
 use std::io;
+use transport_ip_sna::{
+    mptn_ingress::IngressOffer,
+    mptn_reverse_user_bind::{NativeAddress, Phase as UserBindPhase, ReverseUserBind},
+};
 
 pub(crate) struct VirtualWsPort<P: RoutePort> {
     inner: P,
@@ -25,6 +29,10 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     management: Option<NativeManagementInitiator>,
     management_invalidated: bool,
     early_management_information: Option<Vec<u8>>,
+    user_bind: Option<ReverseUserBind>,
+    user_bind_native_completed: bool,
+    early_user_response: Option<Vec<u8>>,
+    tcp_bind_response: Option<Vec<u8>>,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -45,6 +53,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
             management: None,
             management_invalidated: false,
             early_management_information: None,
+            user_bind: None,
+            user_bind_native_completed: false,
+            early_user_response: None,
+            tcp_bind_response: None,
         })
     }
 
@@ -76,10 +88,51 @@ impl<P: RoutePort> VirtualWsPort<P> {
             .is_some_and(|management| management.phase() == ManagementPhase::Complete)
     }
 
+    pub(crate) fn begin_user_bind(
+        &mut self,
+        offer: &IngressOffer,
+        address: NativeAddress,
+    ) -> io::Result<()> {
+        if !self.ready() || !self.management_complete() || self.user_bind.is_some() {
+            return Err(protocol("virtual user BIND needs an idle managed link"));
+        }
+        self.user_bind = Some(ReverseUserBind::after_management(offer, address)?);
+        Ok(())
+    }
+
+    pub(crate) fn user_bind_response_ready(&self) -> bool {
+        self.tcp_bind_response.is_some()
+    }
+
+    pub(crate) fn tcp_bind_response(&self) -> Option<&[u8]> {
+        self.tcp_bind_response.as_deref()
+    }
+
+    pub(crate) fn mark_tcp_bind_response_enqueued(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.tcp_bind_response.as_deref() != Some(bytes) {
+            return Err(protocol(
+                "virtual TCP62 BIND response changed before enqueue",
+            ));
+        }
+        self.user_bind
+            .as_mut()
+            .ok_or_else(|| protocol("virtual user BIND is absent"))?
+            .mark_tcp_response_enqueued(bytes)?;
+        self.tcp_bind_response = None;
+        Ok(())
+    }
+
     fn reset_cp(&mut self) -> io::Result<()> {
         self.cp = VirtualNativeCp::new(self.local_xid.clone(), &self.local_cp, &self.peer_cp)?;
         self.initial_xid_sent = false;
         self.early_management_information = None;
+        if let Some(user_bind) = self.user_bind.as_mut() {
+            user_bind.close();
+        }
+        self.user_bind = None;
+        self.user_bind_native_completed = false;
+        self.early_user_response = None;
+        self.tcp_bind_response = None;
         if self.management.take().is_some() {
             // FQPCID and BIND token must be freshly minted on the next
             // circuit. A caller must construct a new virtual session.
@@ -127,14 +180,41 @@ impl<P: RoutePort> VirtualWsPort<P> {
             .management
             .as_mut()
             .ok_or_else(|| protocol("virtual information completion without management"))?;
-        management
-            .acknowledge(completed)
-            .map_err(|_| protocol("virtual management LLC acknowledgement mismatch"))?;
-        if let Some(piu) = self.early_management_information.take() {
+        if Self::waiting_management_ack(management.phase()) {
             management
-                .observe(&piu)
-                .map_err(|_| protocol("early virtual management PIU is invalid"))?;
+                .acknowledge(completed)
+                .map_err(|_| protocol("virtual management LLC acknowledgement mismatch"))?;
+            if let Some(piu) = self.early_management_information.take() {
+                management
+                    .observe(&piu)
+                    .map_err(|_| protocol("early virtual management PIU is invalid"))?;
+            }
+        } else if completed == 1
+            && self
+                .user_bind
+                .as_ref()
+                .is_some_and(|bind| bind.phase() == UserBindPhase::AwaitNativeBind)
+            && !self.user_bind_native_completed
+        {
+            self.user_bind_native_completed = true;
+            if let Some(piu) = self.early_user_response.take() {
+                self.accept_user_response(&piu)?;
+            }
+        } else {
+            return Err(protocol(
+                "virtual information completion has no outstanding PIU",
+            ));
         }
+        Ok(())
+    }
+
+    fn accept_user_response(&mut self, piu: &[u8]) -> io::Result<()> {
+        let response = self
+            .user_bind
+            .as_mut()
+            .ok_or_else(|| protocol("virtual user BIND is absent"))?
+            .accept_native_response(piu)?;
+        self.tcp_bind_response = Some(response.encode()?);
         Ok(())
     }
 
@@ -146,6 +226,16 @@ impl<P: RoutePort> VirtualWsPort<P> {
             return Ok(());
         };
         let Some(piu) = management.prepared().map(<[u8]>::to_vec) else {
+            if management.phase() == ManagementPhase::Complete {
+                if let Some(user_bind) = self.user_bind.as_mut() {
+                    if user_bind.phase() == UserBindPhase::NativeBindPrepared {
+                        let piu = user_bind.native_bind().to_vec();
+                        if self.inner.send(RoutedUnit::SnaInformation(piu.clone()))? {
+                            user_bind.mark_native_bind_enqueued(&piu)?;
+                        }
+                    }
+                }
+            }
             return Ok(());
         };
         if self.inner.send(RoutedUnit::SnaInformation(piu.clone()))? {
@@ -177,7 +267,20 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     let management = self.management.as_mut().ok_or_else(|| {
                         protocol("virtual native session handler is not installed")
                     })?;
-                    if Self::waiting_management_ack(management.phase()) {
+                    if management.phase() == ManagementPhase::Complete {
+                        if self
+                            .user_bind
+                            .as_ref()
+                            .is_none_or(|bind| bind.phase() != UserBindPhase::AwaitNativeBind)
+                        {
+                            return Err(protocol("virtual user BIND response without request"));
+                        }
+                        if self.user_bind_native_completed {
+                            self.accept_user_response(&piu)?;
+                        } else if self.early_user_response.replace(piu).is_some() {
+                            return Err(protocol("multiple early virtual user BIND responses"));
+                        }
+                    } else if Self::waiting_management_ack(management.phase()) {
                         if self.early_management_information.replace(piu).is_some() {
                             return Err(protocol("multiple early virtual management PIUs"));
                         }
@@ -272,6 +375,11 @@ mod tests {
     use router_core::xid3::{ControlVector, ExchangeState, Role};
     use router_core::xid3_activation::Phase;
     use std::collections::VecDeque;
+    use transport_ip_sna::{
+        mptn_compensations::CompensationSet,
+        mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
+        mptn_ingress::{IngressPolicy, IngressSession},
+    };
 
     struct MockWs {
         incoming: VecDeque<RouterEvent>,
@@ -348,6 +456,68 @@ mod tests {
             .collect()
     }
 
+    fn user_offer() -> IngressOffer {
+        let source = hex("e2d6d3d5c5e34be2d5c1c1");
+        let destination = hex("e2d6d3d5c5e34be2d5c1c2");
+        let connect = Connect {
+            direction: Direction::Request,
+            processing: 0x0a,
+            ttl: 42,
+            source: Address { node: source },
+            destination: Address { node: destination },
+            correlator: vec![0x35; 8],
+            requirements: TransportRequirements {
+                max_record: 0x8005,
+                max_expedited: 0x76,
+                max_termination: 0x76,
+            },
+            options: vec![
+                OptionalField {
+                    kind: 5,
+                    processing: 8,
+                    value: vec![1, 1],
+                },
+                OptionalField {
+                    kind: 10,
+                    processing: 2,
+                    value: hex(concat!(
+                        "00006b800031001307b0b0513303838c8c8303060200000000000000944300000b",
+                        "e2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301238ff2ee27",
+                        "00000c04e2d6d3d5c5e34be2d5c1c10a1300b0238ff2ee270000000be2d6",
+                        "d3d5c5e34be2d5c1c26014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1",
+                        "2c0a01087bc3d6d5d5c5c3e3"
+                    )),
+                },
+                OptionalField {
+                    kind: 0x18,
+                    processing: 0,
+                    value: vec![1],
+                },
+                OptionalField {
+                    kind: 0x19,
+                    processing: 10,
+                    value: vec![0, 0x20, 1, 3, 0x10, 0x83],
+                },
+                OptionalField {
+                    kind: 0x1a,
+                    processing: 0,
+                    value: vec![0x84],
+                },
+            ],
+        };
+        let mut ingress = IngressSession::new(IngressPolicy {
+            source_lu: "SOLNET.SNAA".into(),
+            destination_lu: "SOLNET.SNAB".into(),
+            user_mode: None,
+            allow_blank_user_mode: true,
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            forbidden_fqpcid: None,
+        })
+        .unwrap();
+        ingress.receive(&connect.encode().unwrap()).unwrap().clone()
+    }
+
     #[test]
     fn native_management_starts_after_link_and_waits_for_exact_remote_llc_credit() {
         let inner = MockWs {
@@ -398,6 +568,16 @@ mod tests {
         assert_eq!(port.inner.information.len(), 1);
         assert_eq!(&port.inner.information[0][..9], &hex("2f00010200006b8500"));
         assert!(!port.management_complete());
+        assert!(port
+            .begin_user_bind(
+                &user_offer(),
+                NativeAddress {
+                    daf: 2,
+                    oaf: 1,
+                    odai: false
+                }
+            )
+            .is_err());
 
         // The passive peer may send an adaptive IPR before the BIND's LLC
         // acknowledgement reaches us. Buffer it without advancing session.
@@ -429,6 +609,76 @@ mod tests {
         assert_eq!(port.inner.information.len(), 2);
         assert_eq!(&port.inner.information[1][..9], &hex("2e00010200010b9120"));
         assert!(!port.management_complete());
+
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        for peer_piu in [
+            "2f0002010000830100000001",
+            "2e0002010001039101001912100a0000000000080004000400084040404040404040",
+        ] {
+            port.inner
+                .incoming
+                .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(peer_piu))));
+            port.poll(false).unwrap();
+        }
+        assert_eq!(&port.inner.information[2], &hex("2f0001020000830100000001"));
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        assert_eq!(&port.inner.information[3], &hex("2e00010200024b910070"));
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        for peer_piu in ["2f0002010000830100000001", "2e00020100024bb10070"] {
+            port.inner
+                .incoming
+                .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(peer_piu))));
+            port.poll(false).unwrap();
+        }
+        assert_eq!(&port.inner.information[4], &hex("2f0001020000830100000001"));
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        assert_eq!(&port.inner.information[5][..9], &hex("2f00010200006b8000"));
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        port.inner
+            .incoming
+            .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(
+                "2f0002010000eb800032",
+            ))));
+        port.poll(false).unwrap();
+        assert!(port.management_complete());
+
+        port.begin_user_bind(
+            &user_offer(),
+            NativeAddress {
+                daf: 2,
+                oaf: 1,
+                odai: false,
+            },
+        )
+        .unwrap();
+        port.poll(false).unwrap();
+        assert_eq!(&port.inner.information[6][..9], &hex("2d00020100006b8500"));
+        let mut native_response = hex(concat!(
+            "0000eb800031001307b0b0513303038c8c83030602000000000000009443000000",
+            "2600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b0",
+            "238ff4f5c3000000006014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1"
+        ));
+        native_response[5 + 8..5 + 14].copy_from_slice(&[0, 0x80, 0xc7, 0xc7, 0x80, 0]);
+        native_response[5 + 25] = 0x40;
+        native_response.splice(0..0, [0x2d, 0, 1, 2]);
+        port.inner
+            .incoming
+            .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(
+                native_response,
+            )));
+        port.poll(false).unwrap();
+        assert!(!port.user_bind_response_ready());
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        assert!(port.user_bind_response_ready());
+        let response = port.tcp_bind_response().unwrap().to_vec();
+        port.mark_tcp_bind_response_enqueued(&response).unwrap();
+        assert!(!port.user_bind_response_ready());
     }
 
     #[test]
