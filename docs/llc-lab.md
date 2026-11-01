@@ -171,3 +171,16 @@ Run `snusnu-router --native-probe probe.toml` with `CAP_NET_RAW` and optionally
 `reached SNASVCMG BIND` log means XID3 and LLC2 contact succeeded and the
 first management BIND arrived. Protocol errors and the configured timeout
 exit with status 1. An operator interrupt exits without a success claim.
+
+On 2026-11-01, the one-guest probe reached this milestone against the
+isolated V4R4 SNAA guest on `sol5` with the fixed-secondary SNAB profile
+above. The guest sent a null XID, then prenegotiation and negotiation XID3s.
+It resolved itself to primary and sent SABME; Rust answered UA. The link
+remained in LLC2 contact with RR polls. After `STRPASTHR`, A sent a 141-byte
+SNASVCMG BIND for PLU `SOLNET.SNAA` and SLU `SOLNET.SNAB`. Rust logged the
+BIND, sent DISC, and the one-shot probe exited successfully. The captured
+BIND used FID2 TH `2d0001020000` and RH `6b8000`, whereas the two-OS/400
+baseline used `2f0001020000` and `6b8500`. A management responder must
+validate this variation before it can send a positive BIND response. The
+capture remains outside the repository because it may include application
+data.
