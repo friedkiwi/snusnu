@@ -74,3 +74,26 @@ sudo --preserve-env=SNUSNU_ROUTER_TOKEN target/debug/snusnu-router --remote-link
 
 A second router uses B's TAP and reversed CP/MAC values. The WebSocket path
 awaits the Go `/router/v1/ws` handler before the two-router OS/400 test.
+
+The Rust WebSocket path was also verified with two separate router processes
+and the loopback lab broker, using these same configured V4R4 guests. Start
+the broker with:
+
+```sh
+cargo run -p transport-ws --example lab_broker -- 127.0.0.1:18743
+```
+
+Its test credentials are `lab-a` and `lab-b`. Each router then uses
+`ws://127.0.0.1:18743/router/v1/ws` and its respective credential.
+This broker runs only on loopback and is a test harness for the circuit
+protocol; it does not provide concentrator authentication or policy.
+
+In that run, A's `STRPASTHR` reached B's remote Sign On through the two Rust
+routers, remote QSECOFR sign-on reached B's Main Menu, and `ENDPASTHR`
+returned A to its Main Menu. The broker observed an accepted circuit,
+bidirectional XID/TEST, link-ready events, SNA information, and credit. The
+first attempt after reboot sent no Ethernet frames until both OS/400 APPC
+controllers were varied on again. A complete session then succeeded.
+
+The Go concentrator still needs its `/router/v1/ws` handler before this exact
+test can run through the production service.
