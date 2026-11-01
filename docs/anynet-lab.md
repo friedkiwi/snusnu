@@ -75,10 +75,10 @@ does not establish when other expedited senders choose to retry.
 
 The UDP wire format has an unresolved contradiction in the [IBM-authored TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00): section 3.2.2.1 says an out-of-band UDP datagram omits the four-byte record length because UDP preserves message boundaries, while section 5.3.3 lists that length as the first field of `MPTN_DG_OOB_Data`. No captured `0x83` packet settles which form V5R4 sends. Rust has a bounded section-5.3.3 structural parser and separate TCP/UDP expedited sequence-deduplication state, but `GatewaySession` does not accept or emit `0x83`, send its UDP acknowledgement, or retry it. The `0x83` required compensation must stay unavailable. To complete it, capture an actual V5R4 `0x83` request and response, establish the record-length and alias forms, then verify duplicate suppression when the same expedited message arrives over both TCP and UDP, response correlation, retry limits, and abort handling.
 
-## Proposed V4R4 LLC2 to V5R4 AnyNet lab
+## V4R4 LLC2 to V5R4 AnyNet mixed lab
 
-This topology is a plan for the first media-conversion test; it has not been
-run. Keep V4R4 A on isolated `sol5` and V5R4 B on isolated `sol7`, with no
+This topology was staged for the first media-conversion test. Keep V4R4 A on
+isolated `sol5` and V5R4 B on isolated `sol7`, with no
 Linux bridge between them. Remove `sol7` from the direct V5 bridge and keep
 V5R4 A on `sol6` disconnected or stopped, so its `SOLNET.SNAA` identity cannot
 compete with the Rust router. The V4R4 A guest is `SOLNET.SNAA`, MAC
@@ -96,14 +96,24 @@ sudo ip addr add 10.99.4.10/32 dev sol7
 sudo ip route replace 10.99.4.3/32 dev sol7 src 10.99.4.10
 ```
 
-On B, point the host-table name `SNAA.SOLNET.SNA.IBM.COM` at `.10` instead of
-the direct V5 peer `.2`, checking the existing entry before changing it.
-IBM documents this [AnyNet name form](https://www.ibm.com/docs/en/i/7.5.0?topic=beginning-add-tcpip-host-table-entry)
-and the [host-entry address rename command](https://www.ibm.com/docs/en/i/7.5.0?topic=r-rename-tcpip-host-table-entry).
-If `.2` has a dedicated `SNAA` entry, the planned OS/400 command is
-`RNMTCPHTE INTNETADR('10.99.4.2') NEWINTNETA('10.99.4.10')`; otherwise edit
-only that alias. Vary B `ANYTOA` off before the change and on after Rust is
-listening. Vary A `SNAB` on only after the LLC side is listening.
+The writable B clone's `.2` host-table entry contained both
+`S1054504.SOLSTICE.LOCAL` and `SNAA.SOLNET.SNA.IBM.COM`. To preserve B's
+system hostname, the mixed-lab setup moved only the second name:
+
+```text
+CHGTCPHTE INTNETADR('10.99.4.2') HOSTNAME((*SAME) (*BLANK))
+ADDTCPHTE INTNETADR('10.99.4.10') HOSTNAME(SNAA.SOLNET.SNA.IBM.COM)
+```
+
+The B host-table display then showed `.2` with only the system hostname and
+`.10` with only the SNAA AnyNet alias. The [V5R4 CHGTCPHTE reference](https://public.dhe.ibm.com/systems/power/docs/systemi/v5r4/en_US/SS1-4.pdf)
+defines `*SAME` and `*BLANK` for individual host-name slots. B's `ANYTOA`
+controller remained varied on with its `SNAA00` device varied off, and its
+`QAPPNRMT` entry still mapped remote `SNAA` in `SOLNET` to local `SNAB`.
+The host `.10/32` address and route to B `.3` were staged on isolated `sol7`,
+and two host pings to B succeeded. These are setup checks; the mixed gateway
+has not yet carried a conversation. Vary A `SNAB` on only after the LLC side
+is listening.
 
 The Rust LLC side must present CP `SOLNET.SNAB`, station `SNAB`, and proxy MAC
 `02:00:35:27:23:02` to A. Its AnyNet side must bind `.10`, target B `.3`,
@@ -114,3 +124,14 @@ teardown, FMH-5 Attach and replies, pacing, and session cleanup across the
 two media. The current native probe has reached A's first FMH-5 Attach but
 has not completed an application conversation, so the plan is not yet a
 pass-through acceptance result.
+
+The first opt-in mixed harness run on 1 November 2026 reached native LLC2
+and management exchange. A sent its 141-byte user BIND while Rust's
+management BIS I-frame was awaiting its LLC acknowledgement. A's BIND
+carried N(R)=4; A subsequently sent RR with N(R)=5. The harness rejected
+the early user BIND and sent DISC before opening TCP/397 to B. This exposed
+an overly strict transition in the Rust harness, not an AnyNet Connect
+failure. The private unfiltered captures are
+`/tmp/snusnu-v4r4-regression/native-converter-v5-sol5.pcap` and
+`/tmp/snusnu-v5r4-ip-lab/native-converter-v5-sol7.pcap`. No application
+conversation crossed the media boundary in this run.
