@@ -1,0 +1,7 @@
+[package]
+name = "transport-ws"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+router-core = { path = "../router-core" }

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/router-core", "crates/link-linux", "crates/transport-ws", "crates/snusnu-router"]
+resolver = "2"

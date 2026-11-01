@@ -1,0 +1,24 @@
+name: Go
+on:
+  push:
+    paths: ['concentrator/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
+  pull_request:
+    paths: ['concentrator/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: concentrator
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: concentrator/go.mod
+          cache: false
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test ./...

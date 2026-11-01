@@ -1,0 +1,9 @@
+/concentrator/bin/
+/sna_router/target/
+*.test
+*.out
+.DS_Store
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,20 @@
+name: Protocol contract
+on:
+  push:
+    paths: ['docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/protocol.yml']
+  pull_request:
+    paths: ['docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/protocol.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check draft contract
+        run: |
+          test -f docs/protocol.md
+          test -d docs/test-vectors
+          test -f docs/test-vectors/README.md
+          grep -q 'No byte layout or interoperability claim is frozen yet' docs/protocol.md
+          grep -q 'No vectors are invented before the layout is defined' docs/test-vectors/README.md

@@ -1,0 +1,90 @@
+//! Platform-independent circuit domain foundation.
+
+use std::num::NonZeroU64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct CircuitId(NonZeroU64);
+
+impl CircuitId {
+    pub fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ConnectionGeneration(NonZeroU64);
+
+impl ConnectionGeneration {
+    pub fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CircuitState {
+    Opening,
+    Open,
+    Closed,
+    Reset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidTransition;
+
+impl CircuitState {
+    pub fn transition(self, next: Self) -> Result<Self, InvalidTransition> {
+        match (self, next) {
+            (Self::Opening, Self::Open | Self::Closed | Self::Reset)
+            | (Self::Open, Self::Closed | Self::Reset) => Ok(next),
+            _ => Err(InvalidTransition),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifiers_reject_zero() {
+        assert!(CircuitId::new(0).is_none());
+        assert_eq!(CircuitId::new(42).map(CircuitId::get), Some(42));
+        assert!(ConnectionGeneration::new(0).is_none());
+        assert_eq!(
+            ConnectionGeneration::new(7).map(ConnectionGeneration::get),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejects_reopening_terminal_states() {
+        assert_eq!(
+            CircuitState::Opening.transition(CircuitState::Open),
+            Ok(CircuitState::Open)
+        );
+        assert_eq!(
+            CircuitState::Open.transition(CircuitState::Closed),
+            Ok(CircuitState::Closed)
+        );
+        assert_eq!(
+            CircuitState::Closed.transition(CircuitState::Open),
+            Err(InvalidTransition)
+        );
+        assert_eq!(
+            CircuitState::Reset.transition(CircuitState::Open),
+            Err(InvalidTransition)
+        );
+        assert_eq!(
+            CircuitState::Open.transition(CircuitState::Opening),
+            Err(InvalidTransition)
+        );
+    }
+}
