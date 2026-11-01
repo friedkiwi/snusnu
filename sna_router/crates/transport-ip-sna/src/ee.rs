@@ -146,6 +146,12 @@ mod tests {
         let xid = Datagram::decode(CONTROL_PORT, vec![4, 5, 0xbf, 0x81]).unwrap();
         assert_eq!(xid.kind, LdlcKind::Xid);
         assert_eq!(xid.ssap, 5);
+        // Sanitized three-byte headers observed in a V5R4 EE TEST exchange.
+        let test_command = Datagram::decode(CONTROL_PORT, vec![4, 4, 0xf3]).unwrap();
+        let test_response = Datagram::decode(CONTROL_PORT, vec![4, 5, 0xf3]).unwrap();
+        assert_eq!(test_command.kind, LdlcKind::Test);
+        assert_eq!(test_response.kind, LdlcKind::Test);
+        assert_eq!(test_response.ssap, 5);
         let nlp = Datagram::decode(HIGH_PORT, vec![0x80, 0x80, 3, 0x12]).unwrap();
         assert_eq!(nlp.kind, LdlcKind::UiNlp);
     }
