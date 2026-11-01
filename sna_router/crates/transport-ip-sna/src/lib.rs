@@ -20,5 +20,6 @@ pub mod mptn_oob_sequence;
 pub mod mptn_reverse_management;
 pub mod mptn_reverse_user_bind;
 pub mod mptn_reverse_user_flow;
+pub mod mptn_reverse_user_teardown;
 pub mod mptn_segments;
 pub mod mptn_session;
