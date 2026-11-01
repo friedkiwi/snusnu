@@ -45,3 +45,32 @@ On 2026-11-01, V4R4M0 guests on Solstice 0.4.1 reached B's remote Sign On from A
 The initial relay attempt failed when B received SABME before completing its final XID exchange. A short connection barrier resolved that lab timing race. This is an observed interoperability result for these two guests, not a general LLC2 conformance claim.
 
 The raw captures and emulator disks stay outside this repository because SNA application data can appear in them. The TEST/XID bytes used by the parser's regression tests are in `sna_router/crates/router-core/tests/v4r4_llc.rs`.
+
+## Standalone and remote router modes
+
+After extracting the reusable LLC endpoint, the same two V4R4 guests
+completed `STRPASTHR`, remote sign-on, and `ENDPASTHR` again through both
+`--lab-link` and the standalone route mode:
+
+```sh
+sudo target/debug/snusnu-router --local-link \
+  sol5 02:00:35:27:23:01 02:00:35:27:23:02 \
+  sol4 02:00:35:27:23:02 02:00:35:27:23:01
+```
+
+`--local-link` configures each LLC endpoint independently. The endpoints
+exchange XID/TEST and SNA information through the router's `RoutePort`
+interface. It operates without a concentrator.
+
+For one LLC endpoint routed through a concentrator, use a router credential
+in the environment rather than on the command line:
+
+```sh
+export SNUSNU_ROUTER_TOKEN='the-router-credential'
+sudo --preserve-env=SNUSNU_ROUTER_TOKEN target/debug/snusnu-router --remote-link \
+  sol5 02:00:35:27:23:01 02:00:35:27:23:02 \
+  SOLNET.SNAA SOLNET.SNAB wss://concentrator.example/router/v1/ws
+```
+
+A second router uses B's TAP and reversed CP/MAC values. The WebSocket path
+awaits the Go `/router/v1/ws` handler before the two-router OS/400 test.
