@@ -164,6 +164,7 @@ fn two_authenticated_peers_exchange_routes_and_circuit_traffic() {
                     request_id: 7,
                     target: Some(target.clone()),
                     receive_allowance_bytes: 1500,
+                    source_route: None,
                 })
             );
             send_server(
@@ -173,6 +174,7 @@ fn two_authenticated_peers_exchange_routes_and_circuit_traffic() {
                     source_router_id: a_id,
                     target: Some(target),
                     source_receive_allowance_bytes: 1500,
+                    source_route: None,
                 }),
             );
             assert_eq!(
@@ -245,6 +247,7 @@ fn two_authenticated_peers_exchange_routes_and_circuit_traffic() {
                         route_generation: 1,
                     }),
                     receive_allowance_bytes: 1500,
+                    source_route: None,
                 }),
             );
             assert!(

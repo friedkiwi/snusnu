@@ -28,6 +28,7 @@ type outboundMessage struct {
 type routerSession struct {
 	router                         store.Router
 	token, epoch, ip, allowedNetID string
+	subprotocol                    string
 	conn                           *websocket.Conn
 	out                            chan outboundMessage
 	snapshot                       *wire.RouteSnapshot
@@ -73,9 +74,17 @@ func uuidString(value []byte) (string, bool) {
 	return id.String(), err == nil
 }
 func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Sec-WebSocket-Protocol") != "snusnu.v1" {
-		w.Header().Set("Sec-WebSocket-Protocol", "snusnu.v1")
-		http.Error(w, "snusnu.v1 subprotocol required", http.StatusUpgradeRequired)
+	requested := websocket.Subprotocols(r)
+	subprotocol := ""
+	for _, offered := range requested {
+		if offered == "snusnu.v2" || offered == "snusnu.v1" {
+			subprotocol = offered
+			break
+		}
+	}
+	if subprotocol == "" {
+		w.Header().Set("Sec-WebSocket-Protocol", "snusnu.v2, snusnu.v1")
+		http.Error(w, "snusnu.v2 or snusnu.v1 subprotocol required", http.StatusUpgradeRequired)
 		return
 	}
 	parts := strings.Fields(r.Header.Get("Authorization"))
@@ -98,7 +107,7 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid origin", http.StatusForbidden)
 		return
 	}
-	upgrader := websocket.Upgrader{Subprotocols: []string{"snusnu.v1"}, CheckOrigin: func(*http.Request) bool { return true }, ReadBufferSize: 4096, WriteBufferSize: 4096}
+	upgrader := websocket.Upgrader{Subprotocols: []string{subprotocol}, CheckOrigin: func(*http.Request) bool { return true }, ReadBufferSize: 4096, WriteBufferSize: 4096}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -113,7 +122,7 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}}
+	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}}
 	h := a.hub
 	h.mu.Lock()
 	if previous := h.clients[router.ID]; previous != nil {

@@ -410,6 +410,7 @@ impl WsRoutePort {
             request_id: self.request_id,
             target: Some(target),
             receive_allowance_bytes: INITIAL_ALLOWANCE,
+            source_route: None,
         }))
     }
 
@@ -1354,6 +1355,7 @@ mod tests {
                             route_generation: 1,
                         }),
                         source_receive_allowance_bytes: 1500,
+                        source_route: None,
                     }),
                 );
             }

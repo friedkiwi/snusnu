@@ -101,6 +101,7 @@ impl Broker {
                         source_router_id: ROUTER_IDS[side].to_vec(),
                         target: Some(reference),
                         source_receive_allowance_bytes: request.receive_allowance_bytes,
+                        source_route: None,
                     }),
                 )?;
             }

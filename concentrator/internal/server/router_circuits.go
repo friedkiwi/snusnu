@@ -9,12 +9,14 @@ import (
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
 )
 
 type wsCircuit struct {
 	source, target *routerSession
 	requestID      uint64
 	targetRef      *wire.RouteReference
+	sourceRef      *wire.RouteReference
 	pending        bool
 	allowance      [2]uint64 // data bytes each side may send
 	sent           [2]uint64
@@ -30,18 +32,32 @@ func (h *routerHub) circuitCountLocked(c *routerSession) int {
 	return n
 }
 func (h *routerHub) routeValidLocked(c *wsCircuit) bool {
-	if c.target == nil || c.target.snapshot == nil || c.targetRef == nil {
+	if h.routeForRefLocked(c.target, c.targetRef) == nil {
 		return false
 	}
-	if string(c.targetRef.Epoch) != string(uuidBytes(c.target.epoch)) {
-		return false
+	return c.sourceRef == nil || h.routeForRefLocked(c.source, c.sourceRef) != nil
+}
+
+func (h *routerHub) routeForRefLocked(owner *routerSession, ref *wire.RouteReference) *wire.RouteExport {
+	if owner == nil || owner.snapshot == nil || ref == nil ||
+		string(ref.RouterId) != string(uuidBytes(owner.router.ID)) ||
+		string(ref.Epoch) != string(uuidBytes(owner.epoch)) ||
+		ref.RouteId == 0 || ref.RouteGeneration == 0 {
+		return nil
 	}
-	for _, r := range c.target.snapshot.Routes {
-		if r.Id == c.targetRef.RouteId && r.Generation == c.targetRef.RouteGeneration {
-			return true
+	for _, route := range owner.snapshot.Routes {
+		if route.Id == ref.RouteId && route.Generation == ref.RouteGeneration {
+			return route
 		}
 	}
-	return false
+	return nil
+}
+
+func sourceLUValid(owner *routerSession, route *wire.RouteExport) bool {
+	if owner == nil || route == nil || route.GetLogicalUnit() == nil || route.GetLogicalUnit().Lu == nil {
+		return false
+	}
+	return route.GetLogicalUnit().Lu.Netid == owner.allowedNetID
 }
 func (h *routerHub) openLocked(source *routerSession, req *wire.OpenRequest) error {
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
@@ -53,6 +69,16 @@ func (h *routerHub) openLocked(source *routerSession, req *wire.OpenRequest) err
 		}
 	}
 	ref := req.Target
+	if source.subprotocol == "snusnu.v1" && req.SourceRoute != nil {
+		return errors.New("source route requires snusnu.v2")
+	}
+	if source.subprotocol == "snusnu.v2" && req.SourceRoute == nil {
+		return errors.New("snusnu.v2 open requires source LU route")
+	}
+	if req.SourceRoute != nil && !sourceLUValid(source, h.routeForRefLocked(source, req.SourceRoute)) {
+		h.sendLocked(source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: req.RequestId, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN}}}, "", 0)
+		return nil
+	}
 	targetID, ok := uuidString(ref.RouterId)
 	if !ok || len(ref.Epoch) != 16 || ref.RouteId == 0 || ref.RouteGeneration == 0 {
 		return errors.New("invalid route reference")
@@ -62,17 +88,22 @@ func (h *routerHub) openLocked(source *routerSession, req *wire.OpenRequest) err
 	if target != nil && target != source {
 		if !h.allowedLocked(source, target) {
 			reason = wire.OpenFailure_OPEN_FAILURE_FORBIDDEN
+		} else if req.SourceRoute != nil && (target.subprotocol != "snusnu.v2" || !sourceLUValid(target, h.routeForRefLocked(target, ref))) {
+			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
 		} else if h.circuitCountLocked(source) >= maxWSCircuits || h.circuitCountLocked(target) >= maxWSCircuits {
 			reason = wire.OpenFailure_OPEN_FAILURE_BUSY
 		} else {
-			candidate := &wsCircuit{source: source, target: target, targetRef: ref}
+			candidate := &wsCircuit{source: source, target: target, targetRef: proto.Clone(ref).(*wire.RouteReference)}
+			if req.SourceRoute != nil {
+				candidate.sourceRef = proto.Clone(req.SourceRoute).(*wire.RouteReference)
+			}
 			if h.routeValidLocked(candidate) {
 				id := uuid.NewString()
 				candidate.requestID = req.RequestId
 				candidate.pending = true
 				candidate.allowance[1] = req.ReceiveAllowanceBytes
 				h.circuits[id] = candidate
-				if h.sendLocked(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: ref, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes}}}, "", 0) {
+				if h.sendLocked(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef}}}, "", 0) {
 					return nil
 				}
 				delete(h.circuits, id)

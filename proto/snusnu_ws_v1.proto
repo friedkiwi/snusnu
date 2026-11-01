@@ -36,6 +36,7 @@ message OpenRequest {
   uint64 request_id = 1;
   RouteReference target = 2;
   uint64 receive_allowance_bytes = 3; // Initial total data bytes peer may send.
+  RouteReference source_route = 4; // Required for snusnu.v2; live LU owned by sender.
 }
 
 // Go allocates a 16-byte circuit ID and stamps the authenticated source.
@@ -44,6 +45,7 @@ message IncomingOpen {
   bytes source_router_id = 2;
   RouteReference target = 3;
   uint64 source_receive_allowance_bytes = 4;
+  RouteReference source_route = 5; // Server-validated source LU; snusnu.v2 only.
 }
 
 message OpenDecision {
