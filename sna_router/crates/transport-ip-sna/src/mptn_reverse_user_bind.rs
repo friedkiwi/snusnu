@@ -213,6 +213,7 @@ mod tests {
 
     const REQUEST: &str = "00006b800031001307b0b0513303838c8c8303060200000000000000944300000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301238ff2ee2700000c04e2d6d3d5c5e34be2d5c1c10a1300b0238ff2ee270000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e3";
     const RESPONSE: &str = "0000eb800031001307b0b0513303038c8c830306020000000000000094430000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b0238ff4f5c3000000006014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1";
+    const V4_RESPONSE: &str = "0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1";
 
     fn connect() -> Connect {
         let source = hex("e2d6d3d5c5e34be2d5c1c1");
@@ -334,5 +335,35 @@ mod tests {
             assert!(bridge.accept_native_response(&response).is_err());
             assert_eq!(bridge.phase(), Phase::Closed);
         }
+    }
+
+    #[test]
+    fn captured_v4_response_profile_correlates_after_fqpcid_rebinding() {
+        let offer = offer();
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        let mut bridge = ReverseUserBind::after_management(&offer, address).unwrap();
+        assert_eq!(
+            &bridge.native_bind()[..9],
+            &[0x2f, 0, 2, 2, 0, 0, 0x6b, 0x85, 0]
+        );
+        let bind = bridge.native_bind().to_vec();
+        bridge.mark_native_bind_enqueued(&bind).unwrap();
+        let mut response = hex(V4_RESPONSE);
+        let pos = response
+            .windows(2)
+            .position(|part| part == [0x60, 0x14])
+            .unwrap();
+        response[pos..pos + offer.fqpcid().len()].copy_from_slice(offer.fqpcid());
+        let piu = [vec![0x2f, 0, 2, 2], response].concat();
+        let tcp = bridge.accept_native_response(&piu).unwrap();
+        assert_eq!(tcp.direction, Direction::PositiveResponse);
+        assert_eq!(
+            tcp.connection_data()[5 + 8..5 + 14],
+            [3, 3, 0x8c, 0x8c, 0x83, 3]
+        );
     }
 }
