@@ -1,11 +1,9 @@
-//! Bounded LU 6.2 BIS exchange for the observed V4R4 management session.
+//! One bounded LU 6.2 BIS exchange on the observed V4R4 management session.
 //!
-//! IBM SNA LU 6.2 Reference: Peer Protocols (SC31-6808), chapter 3, describes
-//! BIS as a session shutdown handshake. The receiver returns BIS only after
-//! pending bracket and allocation work is drained. BIS does not complete CNOS;
-//! the successful CNOS bracket ends on the reply chain's CEB (Figure 5.4-4).
-//! The exact request and reply RHs below are verified against the sanitized
-//! V4R4 LLC capture.
+//! IBM SC31-6808, chapter 3, describes bilateral BIS during session shutdown.
+//! Each LU sends its own DFC BIS request after its brackets and pending session
+//! allocations drain. The two requests are independent; either may arrive
+//! first. BIS does not complete CNOS (SC31-6808, Figure 5.4-4).
 
 use std::{error::Error, fmt};
 
@@ -25,94 +23,106 @@ impl fmt::Display for BisError {
 impl Error for BisError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BisPhase {
-    AwaitRequest,
-    WaitingForBracketFree,
-    ReplyPendingTransmit,
-    Complete,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BisAddress {
     pub daf: u8,
     pub oaf: u8,
-    pub request_sequence: u16,
+    pub sequence: u16,
 }
 
-/// Tracks one received BIS request. The owner checks bracket and allocation
-/// state before preparing the reply, and confirms exact egress acceptance.
-pub struct BisResponder {
-    phase: BisPhase,
-    next_send_sequence: u16,
-    address: Option<BisAddress>,
-    pending_reply: Option<[u8; 10]>,
+/// A local BIS and a remote BIS are independent requests. `complete()` means
+/// both have been seen/sent; session deactivation is owned by the caller.
+pub struct BisPeer {
+    th0: u8,
+    local_daf: u8,
+    local_oaf: u8,
+    local_sequence: u16,
+    remote: Option<BisAddress>,
+    pending_local: Option<[u8; 10]>,
+    local_sent: bool,
 }
 
-impl BisResponder {
-    pub fn new(next_send_sequence: u16) -> Result<Self, BisError> {
-        if next_send_sequence == 0 {
-            return Err(BisError::InvalidPiu);
-        }
-        Ok(Self {
-            phase: BisPhase::AwaitRequest,
-            next_send_sequence,
-            address: None,
-            pending_reply: None,
-        })
-    }
-
-    pub fn phase(&self) -> BisPhase {
-        self.phase
-    }
-
-    pub fn address(&self) -> Option<BisAddress> {
-        self.address
-    }
-
-    /// Accept only an unsegmented FID2 DFC BIS request, with no padding.
-    pub fn observe_request(&mut self, piu: &[u8]) -> Result<BisAddress, BisError> {
-        if self.phase != BisPhase::AwaitRequest {
-            return Err(BisError::UnexpectedState);
-        }
-        if piu.len() != 10
-            || piu[..2] != [0x2c, 0]
-            || piu[6..] != [0x4b, 0x91, 0, 0x70]
-            || piu[2] == 0
-            || piu[3] == 0
-            || piu[2] == piu[3]
+impl BisPeer {
+    /// `local_daf` is the remote session address; `local_oaf` is ours.
+    /// TH byte 0 preserves the link's ODAI bit (X'2C' or X'2E').
+    pub fn new(
+        th0: u8,
+        local_daf: u8,
+        local_oaf: u8,
+        local_sequence: u16,
+    ) -> Result<Self, BisError> {
+        if !matches!(th0, 0x2c | 0x2e)
+            || local_daf == 0
+            || local_oaf == 0
+            || local_daf == local_oaf
+            || local_sequence == 0
         {
             return Err(BisError::InvalidPiu);
         }
-        let request_sequence = u16::from_be_bytes([piu[4], piu[5]]);
-        if request_sequence == 0 {
-            return Err(BisError::InvalidPiu);
-        }
-        let address = BisAddress {
-            daf: piu[2],
-            oaf: piu[3],
-            request_sequence,
-        };
-        self.address = Some(address);
-        self.phase = BisPhase::WaitingForBracketFree;
-        Ok(address)
+        Ok(Self {
+            th0,
+            local_daf,
+            local_oaf,
+            local_sequence,
+            remote: None,
+            pending_local: None,
+            local_sent: false,
+        })
     }
 
-    /// `bracket_free` means no bracket is active or in transit and no waiting
-    /// allocation for this session remains, as required by the BIS protocol.
-    pub fn prepare_reply(&mut self, bracket_free: bool) -> Result<&[u8], BisError> {
-        if self.phase != BisPhase::WaitingForBracketFree {
+    pub fn remote(&self) -> Option<BisAddress> {
+        self.remote
+    }
+
+    pub fn local_sent(&self) -> bool {
+        self.local_sent
+    }
+
+    pub fn complete(&self) -> bool {
+        self.local_sent && self.remote.is_some()
+    }
+
+    /// Accept the V4R4 source-side DFC BIS request; it is not an SNA response.
+    pub fn observe_remote_bis(&mut self, piu: &[u8]) -> Result<BisAddress, BisError> {
+        if self.remote.is_some() {
+            return Err(BisError::UnexpectedState);
+        }
+        if piu.len() != 10
+            || piu[0] != self.th0
+            || piu[1] != 0
+            || piu[2] != self.local_oaf
+            || piu[3] != self.local_daf
+            || piu[6..] != [0x4b, 0x91, 0, 0x70]
+        {
+            return Err(BisError::InvalidPiu);
+        }
+        let sequence = u16::from_be_bytes([piu[4], piu[5]]);
+        if sequence == 0 {
+            return Err(BisError::InvalidPiu);
+        }
+        let remote = BisAddress {
+            daf: piu[2],
+            oaf: piu[3],
+            sequence,
+        };
+        self.remote = Some(remote);
+        Ok(remote)
+    }
+
+    /// Build our independent BIS request only once local bracket and waiting
+    /// allocation work has drained. It may precede the remote BIS.
+    pub fn prepare_local_bis(&mut self, bracket_free: bool) -> Result<&[u8], BisError> {
+        if self.local_sent || self.pending_local.is_some() {
             return Err(BisError::UnexpectedState);
         }
         if !bracket_free {
             return Err(BisError::BracketBusy);
         }
-        let address = self.address.ok_or(BisError::UnexpectedState)?;
-        let [high, low] = self.next_send_sequence.to_be_bytes();
-        self.pending_reply = Some([
-            0x2c,
+        let [high, low] = self.local_sequence.to_be_bytes();
+        self.pending_local = Some([
+            self.th0,
             0,
-            address.oaf,
-            address.daf,
+            self.local_daf,
+            self.local_oaf,
             high,
             low,
             0x4b,
@@ -120,18 +130,17 @@ impl BisResponder {
             0,
             0x70,
         ]);
-        self.phase = BisPhase::ReplyPendingTransmit;
-        Ok(self.pending_reply.as_ref().expect("reply just stored"))
+        Ok(self.pending_local.as_ref().expect("local BIS just stored"))
     }
 
-    pub fn mark_reply_transmitted(&mut self, piu: &[u8]) -> Result<(), BisError> {
-        if self.phase != BisPhase::ReplyPendingTransmit
-            || self.pending_reply.as_ref().map(<[u8; 10]>::as_slice) != Some(piu)
-        {
+    /// A successful egress handoff of these exact bytes is required before
+    /// considering our local BIS sent.
+    pub fn mark_local_bis_transmitted(&mut self, piu: &[u8]) -> Result<(), BisError> {
+        if self.pending_local.as_ref().map(<[u8; 10]>::as_slice) != Some(piu) {
             return Err(BisError::UnexpectedState);
         }
-        self.pending_reply = None;
-        self.phase = BisPhase::Complete;
+        self.pending_local = None;
+        self.local_sent = true;
         Ok(())
     }
 }
@@ -140,64 +149,68 @@ impl BisResponder {
 mod tests {
     use super::*;
 
-    // Sanitized V4R4 management session; no application payload.
-    const REQUEST: [u8; 10] = [0x2c, 0, 1, 2, 0, 2, 0x4b, 0x91, 0, 0x70];
-    const REPLY: [u8; 10] = [0x2c, 0, 2, 1, 0, 2, 0x4b, 0xb1, 0, 0x70];
+    // Sanitized V4R4 management session, /tmp/snusnu-sol4-b.pcap p68/p74.
+    const REMOTE: [u8; 10] = [0x2e, 0, 1, 2, 0, 2, 0x4b, 0x91, 0, 0x70];
+    const LOCAL: [u8; 10] = [0x2e, 0, 2, 1, 0, 2, 0x4b, 0xb1, 0, 0x70];
 
-    #[test]
-    fn waits_for_bracket_and_egress_before_completing() {
-        let mut responder = BisResponder::new(2).unwrap();
-        assert_eq!(responder.phase(), BisPhase::AwaitRequest);
-        assert_eq!(
-            responder.prepare_reply(true),
-            Err(BisError::UnexpectedState)
-        );
-        assert_eq!(
-            responder.observe_request(&REQUEST).unwrap(),
-            BisAddress {
-                daf: 1,
-                oaf: 2,
-                request_sequence: 2,
-            }
-        );
-        assert_eq!(responder.prepare_reply(false), Err(BisError::BracketBusy));
-        assert_eq!(responder.phase(), BisPhase::WaitingForBracketFree);
-        assert_eq!(
-            responder.observe_request(&REQUEST),
-            Err(BisError::UnexpectedState)
-        );
-        let reply = responder.prepare_reply(true).unwrap().to_vec();
-        assert_eq!(reply, REPLY);
-        let mut wrong_reply = reply.clone();
-        wrong_reply[7] &= !0x20;
-        assert_eq!(
-            responder.mark_reply_transmitted(&wrong_reply),
-            Err(BisError::UnexpectedState)
-        );
-        assert_eq!(responder.phase(), BisPhase::ReplyPendingTransmit);
-        responder.mark_reply_transmitted(&reply).unwrap();
-        assert_eq!(responder.phase(), BisPhase::Complete);
+    fn peer() -> BisPeer {
+        BisPeer::new(0x2e, 2, 1, 2).unwrap()
     }
 
     #[test]
-    fn rejects_malformed_bis_and_zero_sequence() {
-        assert!(BisResponder::new(0).is_err());
-        for offset in [0, 2, 6, 7, 8, 9] {
-            let mut invalid = REQUEST;
+    fn remote_first_matches_capture_and_requires_local_drain() {
+        let mut peer = peer();
+        assert_eq!(peer.observe_remote_bis(&REMOTE).unwrap().sequence, 2);
+        assert!(!peer.complete());
+        assert_eq!(peer.prepare_local_bis(false), Err(BisError::BracketBusy));
+        let local = peer.prepare_local_bis(true).unwrap().to_vec();
+        assert_eq!(local, LOCAL);
+        let mut wrong = local.clone();
+        wrong[7] ^= 0x20;
+        assert_eq!(
+            peer.mark_local_bis_transmitted(&wrong),
+            Err(BisError::UnexpectedState)
+        );
+        assert!(!peer.complete());
+        peer.mark_local_bis_transmitted(&local).unwrap();
+        assert!(peer.complete());
+        assert_eq!(
+            peer.observe_remote_bis(&REMOTE),
+            Err(BisError::UnexpectedState)
+        );
+    }
+
+    #[test]
+    fn local_first_is_legal_and_odai_is_preserved() {
+        let mut peer = peer();
+        let local = peer.prepare_local_bis(true).unwrap().to_vec();
+        peer.mark_local_bis_transmitted(&local).unwrap();
+        assert!(!peer.complete());
+        peer.observe_remote_bis(&REMOTE).unwrap();
+        assert!(peer.complete());
+
+        let mut no_odai = BisPeer::new(0x2c, 2, 1, 2).unwrap();
+        let mut remote = REMOTE;
+        remote[0] = 0x2c;
+        no_odai.observe_remote_bis(&remote).unwrap();
+        assert_eq!(no_odai.prepare_local_bis(true).unwrap()[0], 0x2c);
+    }
+
+    #[test]
+    fn rejects_wrong_session_and_malformed_bis() {
+        assert!(BisPeer::new(0x2c, 2, 1, 0).is_err());
+        for offset in [0, 2, 3, 6, 7, 8, 9] {
+            let mut invalid = REMOTE;
             invalid[offset] ^= 1;
-            let mut responder = BisResponder::new(2).unwrap();
             assert_eq!(
-                responder.observe_request(&invalid),
+                peer().observe_remote_bis(&invalid),
                 Err(BisError::InvalidPiu)
             );
-            assert_eq!(responder.phase(), BisPhase::AwaitRequest);
         }
-        let mut zero_sequence = REQUEST;
+        let mut zero_sequence = REMOTE;
         zero_sequence[4..6].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(
-            BisResponder::new(2)
-                .unwrap()
-                .observe_request(&zero_sequence),
+            peer().observe_remote_bis(&zero_sequence),
             Err(BisError::InvalidPiu)
         );
     }

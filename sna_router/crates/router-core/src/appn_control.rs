@@ -206,7 +206,8 @@ impl ControlResponder {
             return Err(ControlError::UnexpectedState);
         }
         let attach = CnosAttach::decode(bytes)?;
-        if bytes[..2] != [0x2c, 0x00]
+        if !matches!(bytes[0], 0x2c | 0x2e)
+            || bytes[1] != 0
             || bytes[6..9] != [0x0b, 0x91, 0x20]
             || attach.address.daf == 0
             || attach.address.oaf == 0
@@ -216,7 +217,7 @@ impl ControlResponder {
         }
         let reply_gds = self.cnos.accept_request(&bytes[21..])?;
         let mut reply = Vec::with_capacity(9 + reply_gds.len());
-        reply.extend_from_slice(&[0x2c, 0x00, attach.address.oaf, attach.address.daf]);
+        reply.extend_from_slice(&[bytes[0], 0x00, attach.address.oaf, attach.address.daf]);
         reply.extend_from_slice(&1u16.to_be_bytes());
         reply.extend_from_slice(&[0x03, 0x91, 0x01]);
         reply.extend_from_slice(&reply_gds);
@@ -384,6 +385,16 @@ mod tests {
             responder.mark_reply_transmitted(&reply),
             Err(ControlError::UnexpectedState)
         );
+    }
+
+    #[test]
+    fn preserves_fid2_odai_in_cnos_reply() {
+        let mut attach = ATTACH;
+        attach[0] = 0x2e;
+        let mut responder = ControlResponder::new(String::new(), 8).unwrap();
+        let reply = responder.accept_attach(&attach).unwrap();
+        assert_eq!(reply[0], 0x2e);
+        assert_eq!(&reply[6..9], &[0x03, 0x91, 0x01]);
     }
 
     #[test]
