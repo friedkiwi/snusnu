@@ -302,3 +302,14 @@ conversation completed. The private capture
 `/tmp/snusnu-v4r4-regression/native-userbind2-sol5.pcap` has 50 frames and
 no capture drops. The next native milestone is a valid user FMH-5 reply and
 conversation handling, with the opaque tail treated as application data.
+
+The subsequent opt-in user pacing probe buffered that same 242-byte Attach
+and sent one nine-byte user-session IPR, TH `2d 00 02 02 00 00`, RH
+`83 01 00`. A acknowledged it with LLC RR `N(R)=8`; only periodic LLC RR
+polls followed during a bounded observation interval. The guest display
+remained at “Pass-through initialization in progress,” with no error shown.
+The probe was stopped by the operator; no Attach reply or application
+conversation was attempted. This verifies delivery of the IPR frame, while
+leaving its higher-level acceptance and the necessary Attach reply unproven.
+The private capture `/tmp/snusnu-v4r4-regression/native-attach-ipr-sol5.pcap`
+has 58 frames and no capture drops.
