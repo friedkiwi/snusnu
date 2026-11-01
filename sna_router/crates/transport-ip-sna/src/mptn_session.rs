@@ -298,6 +298,23 @@ impl GatewaySession {
     /// Reserve TCP output capacity and translate complete post-BIND data.
     /// Call `complete_tcp_delivery` only after the transport has written bytes.
     pub fn native_normal(&mut self, piu: &[u8]) -> io::Result<TcpRecord> {
+        self.native_normal_inner(piu, false)
+            .map(|(record, _)| record)
+    }
+
+    /// Translate a native PIU while reporting a hop-local pacing request.
+    /// The caller must use a separate native pacing session to prepare and
+    /// enqueue its IPR after this record enters the bounded TCP queue. This
+    /// method does not itself grant native receive credit.
+    pub fn native_normal_observe_pacing(&mut self, piu: &[u8]) -> io::Result<(TcpRecord, bool)> {
+        self.native_normal_inner(piu, true)
+    }
+
+    fn native_normal_inner(
+        &mut self,
+        piu: &[u8],
+        observe_pacing: bool,
+    ) -> io::Result<(TcpRecord, bool)> {
         let State::Established { native } = self.state else {
             return Err(state_error("gateway session not established"));
         };
@@ -312,16 +329,17 @@ impl GatewaySession {
             return Err(invalid("native PIU session address mismatch"));
         }
         let translated = native_normal_to_mptn(piu)?;
-        if translated.native_pacing_requested {
+        if translated.native_pacing_requested && !observe_pacing {
             return Err(invalid("native pacing response handler is not installed"));
         }
+        let native_pacing_requested = translated.native_pacing_requested;
         let record = TcpRecord::decode(translated.bytes)?;
         reserve(
             &mut self.pending_tcp,
             self.policy.max_pending_bytes,
             record.bytes.len(),
         )?;
-        Ok(record)
+        Ok((record, native_pacing_requested))
     }
 
     /// Reassemble segmented TCP62 normal data and restore the local FID2
