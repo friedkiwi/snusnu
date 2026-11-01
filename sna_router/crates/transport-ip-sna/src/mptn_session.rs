@@ -422,6 +422,17 @@ impl GatewaySession {
         self.expedited.complete_native_delivery(reduced)
     }
 
+    /// Without the UDP out-of-band fallback, an expired expedited ACK
+    /// deadline retires the entire bridged session.
+    pub fn expedited_ack_timed_out(&mut self) -> io::Result<()> {
+        if !matches!(self.state, State::Established { .. }) {
+            return Err(state_error("gateway session not established"));
+        }
+        self.expedited.ack_timed_out()?;
+        self.close();
+        Ok(())
+    }
+
     pub fn complete_tcp_delivery(&mut self, bytes: usize) -> io::Result<()> {
         if bytes > self.pending_tcp {
             return Err(state_error("TCP delivery exceeds reserved credit"));
@@ -647,6 +658,25 @@ mod tests {
             session.mptn_normal(&later).unwrap()[..6],
             [0x2c, 0, 2, 1, 0, 4]
         );
+    }
+
+    #[test]
+    fn expedited_ack_timeout_closes_gateway() {
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let request = session
+            .begin_native_bind(&captured_user_bind(), request_template())
+            .unwrap();
+        let decoded = Connect::decode(&request.bytes).unwrap();
+        session
+            .receive_connect_response(&response_for(&decoded))
+            .unwrap();
+        assert!(session.expedited_ack_timed_out().is_err());
+        session
+            .native_expedited(&[0x2c, 0, 1, 2, 0, 2, 0x4b, 0x80, 0, 0xc9])
+            .unwrap();
+        session.expedited_ack_timed_out().unwrap();
+        assert_eq!(session.phase(), Phase::Closed);
+        assert_eq!(session.pending_bytes(), (0, 0));
     }
 
     #[test]
