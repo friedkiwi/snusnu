@@ -39,6 +39,15 @@ pub struct UserBindOffer {
     request: Vec<u8>,
 }
 
+/// The application LU pair and mode must be selected by configuration.
+/// Empty mode selects only the observed SNA default-mode BIND.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserBindPolicy<'a> {
+    pub plu: &'a str,
+    pub slu: &'a str,
+    pub mode: &'a str,
+}
+
 const V4R4_USER_REQUEST_FIXED: [u8; 27] = [
     0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x03, 0x83, 0xc7, 0xc7, 0x83, 0x03, 0x06, 0x02,
     0, 0, 0, 0, 0, 0, 0, 0x94, 0x43, 0x40, 0,
@@ -66,15 +75,31 @@ impl UserBindOffer {
         management: &ManagementBind,
         expected_mode: &str,
     ) -> Result<Self, UserBindError> {
+        Self::from_request_with_policy(
+            piu,
+            management,
+            UserBindPolicy {
+                plu: management.plu(),
+                slu: management.slu(),
+                mode: expected_mode,
+            },
+        )
+    }
+
+    pub fn from_request_with_policy(
+        piu: &[u8],
+        management: &ManagementBind,
+        policy: UserBindPolicy<'_>,
+    ) -> Result<Self, UserBindError> {
         let info = classify_bind(piu)
             .map_err(UserBindError::Invalid)?
             .ok_or(UserBindError::WrongMode)?;
         let mode = match info.class {
-            BindClass::Undetermined if expected_mode.is_empty() => String::new(),
-            BindClass::NamedLu62 { mode } if mode == expected_mode => mode,
+            BindClass::Undetermined if policy.mode.is_empty() => String::new(),
+            BindClass::NamedLu62 { mode } if mode == policy.mode => mode,
             _ => return Err(UserBindError::WrongMode),
         };
-        if info.plu != management.plu() || info.slu != management.slu() {
+        if info.plu != policy.plu || info.slu != policy.slu {
             return Err(UserBindError::WrongLuPair);
         }
         if piu.len() < 9
@@ -243,5 +268,40 @@ mod tests {
             offer.build_fixed_response(1),
             Err(UserBindError::UnsupportedProfile)
         );
+    }
+
+    #[test]
+    fn explicit_policy_can_select_distinct_application_lus() {
+        let mgmt = management();
+        let mut piu = user();
+        for (old, new) in [
+            ("SOLNET.SNAA", "SOLNET.APPA"),
+            ("SOLNET.SNAB", "SOLNET.APPB"),
+        ] {
+            let old = ebcdic_lu(old).unwrap();
+            let new = ebcdic_lu(new).unwrap();
+            for index in 0..=piu.len() - old.len() {
+                if piu[index..index + old.len()] == old {
+                    piu[index..index + new.len()].copy_from_slice(&new);
+                }
+            }
+        }
+        assert_eq!(
+            UserBindOffer::from_request(&piu, &mgmt, ""),
+            Err(UserBindError::WrongLuPair)
+        );
+        let offer = UserBindOffer::from_request_with_policy(
+            &piu,
+            &mgmt,
+            UserBindPolicy {
+                plu: "SOLNET.APPA",
+                slu: "SOLNET.APPB",
+                mode: "",
+            },
+        )
+        .unwrap();
+        assert_eq!(offer.plu, "SOLNET.APPA");
+        assert_eq!(offer.slu, "SOLNET.APPB");
+        assert_eq!(offer.build_fixed_response(1).unwrap().len(), 89);
     }
 }
