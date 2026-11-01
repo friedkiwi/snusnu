@@ -9,6 +9,7 @@ pub mod llc2;
 pub mod llc_type1;
 pub mod packet_log;
 pub mod xid3;
+pub mod xid3_activation;
 
 use std::num::NonZeroU64;
 
