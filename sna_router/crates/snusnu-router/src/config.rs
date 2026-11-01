@@ -62,6 +62,9 @@ pub(crate) struct LlcConfig {
     pub(crate) interface: String,
     pub(crate) guest_mac: String,
     pub(crate) proxy_mac: String,
+    pub(crate) local_cp: Option<String>,
+    #[serde(default)]
+    pub(crate) lus: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +151,24 @@ impl RouterConfig {
                     "duplicate LLC association on {}",
                     peer.interface
                 )));
+            }
+            if let Some(local_cp) = &peer.local_cp {
+                parse_cp(local_cp)?;
+            } else if !peer.lus.is_empty() {
+                return Err(invalid(format!(
+                    "LLC peer {} declares LUs without local_cp",
+                    peer.id
+                )));
+            }
+            let mut local_lus = HashSet::new();
+            for lu in &peer.lus {
+                let name = parse_cp(lu)?;
+                if !local_lus.insert((name.netid, name.name)) {
+                    return Err(invalid(format!(
+                        "duplicate LU {lu} on LLC peer {}",
+                        peer.id
+                    )));
+                }
             }
         }
         for peer in &self.hpr_lan {
@@ -357,12 +378,42 @@ impl RouterConfig {
                 ));
             }
             let local_id = directed[remote.id.as_str()];
-            if let Some(peer) = self.llc.iter().find(|peer| peer.id == local_id) {
-                let proxy = parse_mac(&peer.proxy_mac)?;
-                if proxy[..3] != [0x02, 0x53, 0x4e] {
+            let peer = self
+                .llc
+                .iter()
+                .find(|peer| peer.id == local_id)
+                .ok_or_else(|| {
+                    invalid(format!("remote {} must attach to an LLC peer", remote.id))
+                })?;
+            let proxy = parse_mac(&peer.proxy_mac)?;
+            if proxy[..3] != [0x02, 0x53, 0x4e] {
+                return Err(invalid(format!(
+                    "remote LLC peer {} must use assigned 02:53:4e virtual MAC",
+                    peer.id
+                )));
+            }
+            let owned_cp = peer.local_cp.as_ref().ok_or_else(|| {
+                invalid(format!(
+                    "remote {} cannot publish CP without local_cp on LLC peer {}",
+                    remote.id, peer.id
+                ))
+            })?;
+            if parse_cp(owned_cp)? != parse_cp(&remote.local_cp)? {
+                return Err(invalid(format!(
+                    "remote {} publishes CP {} not owned by LLC peer {}",
+                    remote.id, remote.local_cp, peer.id
+                )));
+            }
+            let owned_lus = peer
+                .lus
+                .iter()
+                .map(|lu| parse_cp(lu))
+                .collect::<io::Result<HashSet<_>>>()?;
+            for lu in &remote.lus {
+                if !owned_lus.contains(&parse_cp(lu)?) {
                     return Err(invalid(format!(
-                        "remote LLC peer {} must use assigned 02:53:4e virtual MAC",
-                        peer.id
+                        "remote {} publishes LU {lu} not owned by LLC peer {}",
+                        remote.id, peer.id
                     )));
                 }
             }
@@ -597,6 +648,8 @@ id = "a"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
 proxy_mac = "02:53:4e:00:00:01"
+local_cp = "SOLNET.SNAA"
+lus = ["SOLNET.LUA"]
 [[remote]]
 id = "upstream"
 url = "ws://127.0.0.1:8081/router/v1/ws"
@@ -616,6 +669,30 @@ to = "upstream"
         assert!(parse(&remote.replace("SOLNET.LUA", "bad.lu"))
             .validate()
             .is_err());
+        assert!(
+            parse(&remote.replace("local_cp = \"SOLNET.SNAA\"\nlus = [\"SOLNET.LUA\"]\n", ""))
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot publish CP")
+        );
+        assert!(parse(&remote.replacen(
+            "local_cp = \"SOLNET.SNAA\"\n",
+            "local_cp = \"SOLNET.OTHER\"\n",
+            1
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("not owned"));
+        assert!(parse(&remote.replace(
+            "lus = [\"SOLNET.LUA\"]\n[[route]]",
+            "lus = [\"SOLNET.LUB\"]\n[[route]]"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("not owned"));
     }
 
     #[test]

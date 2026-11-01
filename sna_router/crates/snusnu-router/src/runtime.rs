@@ -415,4 +415,30 @@ mod reconnect_tests {
             "example.org:443"
         );
     }
+
+    #[test]
+    fn rejects_unowned_remote_export_before_opening_local_or_upstream_port() {
+        let config: RouterConfig = toml::from_str(
+            r#"
+[[llc]]
+id = "guest"
+interface = "definitely-missing-sna-tap"
+guest_mac = "02:00:35:27:23:01"
+proxy_mac = "02:53:4e:00:00:02"
+local_cp = "SOLNET.SNAA"
+[[remote]]
+id = "upstream"
+url = "ws://127.0.0.1:9/router/v1/ws"
+local_cp = "SOLNET.OTHER"
+target_cp = "SOLNET.SNAB"
+[[route]]
+from = "guest"
+to = "upstream"
+"#,
+        )
+        .unwrap();
+        let error = run_config(&config).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("not owned"));
+    }
 }
