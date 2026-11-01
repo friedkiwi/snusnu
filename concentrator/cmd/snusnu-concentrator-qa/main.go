@@ -19,7 +19,11 @@ import (
 )
 
 func main() {
-	addr := flag.String("listen", "127.0.0.1:8081", "QA HTTP listen address")
+	listenDefault := os.Getenv("SNUSNU_LISTEN")
+	if listenDefault == "" {
+		listenDefault = ":8081"
+	}
+	addr := flag.String("listen", listenDefault, "QA HTTP listen address (host:port or :port for all interfaces)")
 	origin := flag.String("origin", "http://localhost:8081", "QA public origin")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

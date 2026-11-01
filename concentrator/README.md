@@ -13,7 +13,7 @@ export SNUSNU_ORIGIN=http://localhost:8080
 export SNUSNU_DB_DRIVER=sqlite
 export SNUSNU_DB_DSN=snusnu.db
 export SNUSNU_MFA_KEY="$(openssl rand -hex 32)"
-go run ./cmd/snusnu-concentrator -listen 127.0.0.1:8080
+go run ./cmd/snusnu-concentrator
 ```
 
 Keep `SNUSNU_MFA_KEY` stable across restarts: it encrypts stored TOTP secrets. Register at `http://localhost:8080/register`. In development mode, the six-digit verification code is written to the service log on registration. Codes expire after 10 minutes and allow five attempts.
@@ -32,6 +32,7 @@ If a user loses every MFA factor, an operator with database access can run `go r
 
 | Variable | Purpose |
 | --- | --- |
+| `SNUSNU_LISTEN` | HTTP listen address and port, default `:8080` (all interfaces); `-listen` overrides it |
 | `SNUSNU_DB_DRIVER` | `sqlite` (default) or `postgres` |
 | `SNUSNU_DB_DSN` | SQLite filename (default `snusnu.db`) or PostgreSQL connection URL |
 | `SNUSNU_ORIGIN` | Public origin; HTTPS required outside development |
@@ -42,7 +43,7 @@ If a user loses every MFA factor, an operator with database access can run `go r
 | `SNUSNU_SMTP_USER`, `SNUSNU_SMTP_PASSWORD` | SMTP credentials, when required by the server |
 | `SNUSNU_RECAPTCHA_SITE_KEY`, `SNUSNU_RECAPTCHA_SECRET` | Optional reCAPTCHA v2 checkbox keys; supply both or neither |
 
-Use TLS at the reverse proxy and set `SNUSNU_ORIGIN` to its HTTPS origin. The app checks the configured origin for passkeys and sets Secure session cookies on HTTPS origins. The SQLite database is initialized automatically, with WAL and foreign keys enabled. PostgreSQL uses the same versioned migrations through pgx. Run one concentrator process per database until distributed live-presence fencing is implemented; startup clears stale live connection epochs and route advertisements.
+The default listener binds all network interfaces on port 8080. Use `-listen 127.0.0.1:8080` for loopback only, `-listen 192.0.2.10:8443` for one interface, or set `SNUSNU_LISTEN` to either value. Use TLS at the reverse proxy and set `SNUSNU_ORIGIN` to its HTTPS origin. The app checks the configured origin for passkeys and sets Secure session cookies on HTTPS origins. The SQLite database is initialized automatically, with WAL and foreign keys enabled. PostgreSQL uses the same versioned migrations through pgx. Run one concentrator process per database until distributed live-presence fencing is implemented; startup clears stale live connection epochs and route advertisements.
 
 ## Roles and current records
 

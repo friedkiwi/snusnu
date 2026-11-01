@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("listen", "127.0.0.1:8080", "HTTP listen address")
+	addr := flag.String("listen", env("SNUSNU_LISTEN", ":8080"), "HTTP listen address (host:port or :port for all interfaces)")
 	promote := flag.String("promote-email", "", "promote a verified user to admin and exit")
 	resetMFA := flag.String("reset-mfa-email", "", "clear a user's MFA factors and sessions, then exit")
 	flag.Parse()
