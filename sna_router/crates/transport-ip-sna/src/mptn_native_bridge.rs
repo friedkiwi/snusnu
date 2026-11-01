@@ -22,6 +22,8 @@ pub enum Phase {
     Active,
     AttachPrepared,
     NormalPrepared,
+    NativeNormalPrepared,
+    AwaitNativeNormalAck,
     IprPrepared,
     Closed,
 }
@@ -36,6 +38,7 @@ pub struct Bridge {
     pacing: Option<UserPacingSession>,
     attach: Option<TcpRecord>,
     normal: Option<(TcpRecord, bool)>,
+    native_normal: Option<(Vec<u8>, usize)>,
     first_attach_complete: bool,
     phase: Phase,
 }
@@ -75,6 +78,7 @@ impl Bridge {
             pacing: None,
             attach: None,
             normal: None,
+            native_normal: None,
             first_attach_complete: false,
             phase: Phase::Idle,
         })
@@ -274,5 +278,66 @@ impl Bridge {
     }
     pub fn complete_tcp_delivery(&mut self, bytes: usize) -> io::Result<()> {
         self.gateway.complete_tcp_delivery(bytes)
+    }
+
+    /// Convert one TCP62 normal record (or a final segmented record) to the
+    /// established native user session. The native send window supplies PI;
+    /// TCP62 pacing bits and SNA session/DFC control remain unsupported.
+    /// `None` retains a bounded partial TCP62 RU without consuming LLC credit.
+    pub fn next_mptn_normal(&mut self, record: &TcpRecord) -> io::Result<Option<Vec<u8>>> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        let Some(piu) = self.gateway.mptn_normal(record)? else {
+            return Ok(None);
+        };
+        if piu.len() < 10 || piu[6] & 0xe0 != 0 {
+            self.gateway.complete_native_delivery(piu.len())?;
+            return Err(invalid("TCP62 normal data is not an FM request"));
+        }
+        let prepared = match self.pacing.as_mut().unwrap().prepare_normal_send(&piu) {
+            Ok(prepared) => prepared.to_vec(),
+            Err(_) => {
+                self.gateway.complete_native_delivery(piu.len())?;
+                return Err(invalid("TCP62 normal data violates native send pacing"));
+            }
+        };
+        self.native_normal = Some((prepared.clone(), piu.len()));
+        self.phase = Phase::NativeNormalPrepared;
+        Ok(Some(prepared))
+    }
+
+    /// Commit the exact PIU after it enters the native LLC egress queue.
+    /// Failed enqueue attempts leave both the prepared PIU and TCP credit.
+    pub fn mark_native_normal_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {
+        if self.phase != Phase::NativeNormalPrepared
+            || self
+                .native_normal
+                .as_ref()
+                .map(|(pending, _)| pending.as_slice())
+                != Some(piu)
+        {
+            return Err(wrong_phase());
+        }
+        self.pacing
+            .as_mut()
+            .unwrap()
+            .mark_egress_enqueued(piu)
+            .map_err(|_| invalid("native normal egress differs from prepared PIU"))?;
+        self.phase = Phase::AwaitNativeNormalAck;
+        Ok(())
+    }
+
+    /// One LLC2 completion retires the single native I-frame and releases
+    /// exactly its reserved gateway byte count.
+    pub fn acknowledge_native_normal(&mut self, completed: usize) -> io::Result<()> {
+        if self.phase != Phase::AwaitNativeNormalAck || completed != 1 {
+            return Err(wrong_phase());
+        }
+        let bytes = self.native_normal.as_ref().unwrap().1;
+        self.gateway.complete_native_delivery(bytes)?;
+        self.native_normal = None;
+        self.phase = Phase::Active;
+        Ok(())
     }
 }

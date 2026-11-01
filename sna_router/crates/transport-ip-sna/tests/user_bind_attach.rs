@@ -124,6 +124,22 @@ fn next_user_normal() -> Vec<u8> {
     hex("2c0001020002039120c1")
 }
 
+fn first_application_reply() -> Vec<u8> {
+    // Sanitized p90/p55 5250 application GDS. The actual response code is
+    // retained as raw data; the router only restores user-session PI.
+    let mut piu = hex(concat!(
+        "2c000201000103a100",
+        "004912a090000560060020c0003d0000",
+        "c9f9f0f3",
+        "e3c1d9c7c5e34040",
+        "d7c3d7d9c9d5e3c5d940"
+    ));
+    piu.extend_from_slice(&[0; 34]);
+    piu.push(2);
+    assert_eq!(piu.len(), 82);
+    piu
+}
+
 fn management_bind() -> ManagementBind {
     // Independent sanitized management BIND; FID2 address pair is kept
     // distinct from the normalized user session pair.
@@ -302,6 +318,48 @@ fn post_attach_fm_request_preserves_credit_and_requires_native_pacing_grant() {
     assert!(bridge.mark_ipr_enqueued(&ipr[..8]).is_err());
     bridge.mark_ipr_enqueued(&ipr).unwrap();
     bridge.complete_tcp_delivery(record.bytes.len()).unwrap();
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+    assert_eq!(bridge.phase(), BridgePhase::Active);
+}
+
+#[test]
+fn tcp62_application_record_waits_for_exact_native_llc_ack() {
+    use transport_ip_sna::mptn_gateway::native_normal_to_mptn;
+
+    let mut bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let reply = first_application_reply();
+    let tcp = TcpRecord::decode(native_normal_to_mptn(&reply).unwrap().bytes).unwrap();
+    assert_eq!(tcp.bytes[8] & 1, 0); // TCP62 never carries native PI.
+    assert!(bridge.next_mptn_normal(&tcp).is_err());
+    let connect_record = bridge.begin_native_bind(&user_bind(), template()).unwrap();
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    let response = bridge
+        .accept_connect_response(&positive_response(&connect))
+        .unwrap();
+    bridge.mark_native_bind_enqueued(&response).unwrap();
+    bridge.acknowledge_native_bind(1).unwrap();
+    let (attach, _) = bridge.first_attach(&first_user_attach()).unwrap();
+    let ipr = bridge.mark_attach_enqueued(&attach, 1).unwrap();
+    bridge.mark_ipr_enqueued(&ipr).unwrap();
+    bridge.complete_tcp_delivery(attach.bytes.len()).unwrap();
+
+    let prepared = bridge.next_mptn_normal(&tcp).unwrap().unwrap();
+    assert_eq!(prepared, reply);
+    assert_eq!(bridge.pending_bytes(), (0, reply.len()));
+    assert_eq!(bridge.phase(), BridgePhase::NativeNormalPrepared);
+    assert!(bridge.mark_native_normal_enqueued(&prepared[..9]).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, reply.len()));
+    bridge.mark_native_normal_enqueued(&prepared).unwrap();
+    assert!(bridge.acknowledge_native_normal(2).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, reply.len()));
+    bridge.acknowledge_native_normal(1).unwrap();
     assert_eq!(bridge.pending_bytes(), (0, 0));
     assert_eq!(bridge.phase(), BridgePhase::Active);
 }
