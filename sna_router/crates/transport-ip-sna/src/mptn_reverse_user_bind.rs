@@ -74,6 +74,11 @@ impl ReverseUserBind {
             address.oaf,
         ]);
         native_request.extend_from_slice(reduced);
+        // V4R4 native p70 and V5R4 TCP62 p8 share their variable LU/FQPCID
+        // fields but negotiate different local BIND capabilities and pacing.
+        native_request[4 + 3] = 0x85;
+        native_request[4 + 5 + 10..4 + 5 + 12].copy_from_slice(&[0xc7, 0xc7]);
+        native_request[4 + 5 + 25] = 0x40;
         Ok(Self {
             request,
             native_request,
@@ -130,9 +135,24 @@ impl ReverseUserBind {
                 "native user BIND did not return positive response for this session",
             ));
         }
-        validate_positive_response(self.request.connection_data(), &piu[4..]).map_err(|_| {
+        let mut native_request = self.native_request[4..].to_vec();
+        // The shared validator accepts the canonical native RH 0x84. Live
+        // V4R4 uses 0x85; normalize only this copy for correlation.
+        native_request[3] &= !1;
+        validate_positive_response(&native_request, &piu[4..]).map_err(|_| {
             invalid("native user BIND response failed LU, mode or FQPCID correlation")
         })?;
+        let mut tcp_bind_response = piu[4..].to_vec();
+        let fixed = &mut tcp_bind_response[5..32];
+        if fixed[8..14] != [0, 0x80, 0xc7, 0xc7, 0x80, 0] || fixed[25] != 0x40 {
+            return Err(invalid(
+                "native user BIND response is not captured V4R4 profile",
+            ));
+        }
+        fixed[8..14].copy_from_slice(&[3, 3, 0x8c, 0x8c, 0x83, 3]);
+        fixed[25] = 0;
+        validate_positive_response(self.request.connection_data(), &tcp_bind_response)
+            .map_err(|_| invalid("converted TCP62 BIND response failed correlation"))?;
         let mut response = self.request.clone();
         response.direction = Direction::PositiveResponse;
         response.processing = 0x8a;
@@ -141,7 +161,7 @@ impl ReverseUserBind {
             .iter_mut()
             .find(|field| field.kind == 0x0a)
             .ok_or_else(|| invalid("TCP62 user Connect lacks BIND option"))?
-            .value = piu[4..].to_vec();
+            .value = tcp_bind_response;
         if let Some(son) = response.options.iter_mut().find(|field| field.kind == 0x18) {
             son.value = vec![0];
         }
@@ -265,7 +285,10 @@ mod tests {
     }
 
     fn native_response() -> Vec<u8> {
-        [vec![0x2d, 0, 1, 2], hex(RESPONSE)].concat()
+        let mut reduced = hex(RESPONSE);
+        reduced[5 + 8..5 + 14].copy_from_slice(&[0, 0x80, 0xc7, 0xc7, 0x80, 0]);
+        reduced[5 + 25] = 0x40;
+        [vec![0x2d, 0, 1, 2], reduced].concat()
     }
 
     #[test]
@@ -274,8 +297,13 @@ mod tests {
         assert_eq!(bridge.phase(), Phase::NativeBindPrepared);
         assert_eq!(
             &bridge.native_bind()[..9],
-            &[0x2d, 0, 2, 1, 0, 0, 0x6b, 0x80, 0]
+            &[0x2d, 0, 2, 1, 0, 0, 0x6b, 0x85, 0]
         );
+        assert_eq!(
+            &bridge.native_bind()[4 + 5 + 8..4 + 5 + 14],
+            &[3, 0x83, 0xc7, 0xc7, 0x83, 3]
+        );
+        assert_eq!(bridge.native_bind()[4 + 5 + 25], 0x40);
         assert!(bridge.accept_native_response(&native_response()).is_err());
         let request = bridge.native_bind().to_vec();
         bridge.mark_native_bind_enqueued(&request).unwrap();
