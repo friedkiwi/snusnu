@@ -9,7 +9,10 @@ import (
 )
 
 type Account struct{ Email, Username, Password, Role, NetID string }
-type Router struct{ OwnerEmail, Name, Token, CP string }
+type Router struct {
+	OwnerEmail, Name, Token, CP string
+	LLCFacing                   bool
+}
 
 var Accounts = []Account{
 	{"admin@qa.snusnu.test", "qa_admin", "qa-admin-password-123", "admin", "QAADMIN"},
@@ -17,8 +20,8 @@ var Accounts = []Account{
 	{"bob@qa.snusnu.test", "qa_bob", "qa-bob-password-123", "user", "QABOB"},
 }
 var Routers = []Router{
-	{"alice@qa.snusnu.test", "Alice V4R4", "qa-alice-router-token-1234567890", "SNAA"},
-	{"bob@qa.snusnu.test", "Bob V4R4", "qa-bob-router-token-1234567890", "SNAB"},
+	{"alice@qa.snusnu.test", "Alice V4R4", "qa-alice-router-token-1234567890", "SNAA", true},
+	{"bob@qa.snusnu.test", "Bob V5R4", "qa-bob-router-token-1234567890", "SNAB", false},
 }
 
 const AdminAPIToken = "qa-admin-api-token-1234567890"
@@ -41,7 +44,7 @@ func Seed(ctx context.Context, db *store.Store) error {
 	for _, router := range Routers {
 		id := store.RandomUUID()
 		owner := owners[router.OwnerEmail]
-		_, err := db.Exec(ctx, "INSERT INTO routers(id,owner_id,display_name,llc_facing,created_at) VALUES(?,?,?,1,?)", id, owner, router.Name, store.Now())
+		_, err := db.Exec(ctx, "INSERT INTO routers(id,owner_id,display_name,llc_facing,created_at) VALUES(?,?,?,?,?)", id, owner, router.Name, router.LLCFacing, store.Now())
 		if err != nil {
 			return err
 		}
