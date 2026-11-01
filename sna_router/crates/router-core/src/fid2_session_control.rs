@@ -9,6 +9,19 @@
 use crate::fid2_bind::{classify_bind, BindClass, BindError};
 use std::{error::Error, fmt};
 
+const V4R4_MANAGEMENT_REQUEST_FIXED: [u8; 27] = [
+    0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x07, 0x87, 0x86, 0x86, 0x87, 0x07, 0x06, 0x02,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x94, 0x43, 0x40, 0x00,
+];
+// IBM SC31-6808-0 §4-24/25: when both halves support adaptive pacing the
+// negotiated send/receive windows become zero. Preserve the staging and
+// adaptive-pacing indicators; all remaining supported fixed fields agree.
+const V4R4_MANAGEMENT_RESPONSE_FIXED: [u8; 27] = [
+    0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x00, 0x80, 0x86, 0x86, 0x80, 0x00, 0x06, 0x02,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x94, 0x43, 0x40, 0x00,
+];
+const SNASVCMG: [u8; 8] = [0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionControlError {
     InvalidRequest(BindError),
@@ -123,6 +136,138 @@ impl ManagementBind {
         }
         Ok(())
     }
+
+    /// Construct one positive RSP(BIND) for the observed V4R4 SNASVCMG
+    /// profile. This is intentionally narrower than generic LU 6.2 BIND
+    /// negotiation: other fixed parameter sets, cryptography, and unrecognized
+    /// control vectors are rejected. Structured user subfield X'13' is ignored
+    /// as required for an unrecognized subfield. The caller must implement
+    /// the advertised CNOS/parallel-session behavior before transmitting.
+    pub fn build_v4r4_positive_response(
+        &self,
+        request_piu: &[u8],
+    ) -> Result<Vec<u8>, SessionControlError> {
+        if ManagementBind::from_request(request_piu, &self.plu, &self.slu)? != *self {
+            return Err(SessionControlError::WrongSession);
+        }
+        if request_piu[1] != 0
+            || request_piu[4..6] != [0, 0]
+            || request_piu[6..9] != [0x6b, 0x85, 0]
+        {
+            return Err(SessionControlError::UnsupportedRequest);
+        }
+        let ru = &request_piu[9..];
+        if ru.get(..27) != Some(&V4R4_MANAGEMENT_REQUEST_FIXED) {
+            return Err(SessionControlError::UnsupportedRequest);
+        }
+        validate_v4r4_request_tail(ru, &self.plu, &self.fqpcid)?;
+        let slu = encode_lu_name(&self.slu)?;
+        let mut user = vec![0x00, 0x09, 0x02];
+        user.extend_from_slice(&SNASVCMG);
+        // X'03': both sides use the FQPCID as the session-instance ID.
+        user.extend_from_slice(&[0x02, 0x03, 0x02]);
+        user.push((1 + slu.len()) as u8);
+        user.push(0x05);
+        user.extend_from_slice(&slu);
+        let mut response = vec![
+            request_piu[0],
+            0,
+            self.request_oaf,
+            self.request_daf,
+            0,
+            0,
+            0xeb,
+            0x80,
+            0,
+        ];
+        response.extend_from_slice(&V4R4_MANAGEMENT_RESPONSE_FIXED);
+        response.extend_from_slice(&[0, user.len() as u8]); // No outer PLU name.
+        response.extend_from_slice(&user);
+        response.extend_from_slice(&[0, 0]); // No URC or outer SLU name.
+        response.extend_from_slice(&self.fqpcid);
+        self.correlate_positive_response(&response)?;
+        Ok(response)
+    }
+}
+
+fn validate_v4r4_request_tail(
+    ru: &[u8],
+    plu: &str,
+    fqpcid: &[u8; 22],
+) -> Result<(), SessionControlError> {
+    let plu_len = ru[27] as usize;
+    let user_len_offset = 28 + plu_len;
+    let user_len = *ru
+        .get(user_len_offset)
+        .ok_or(SessionControlError::UnsupportedRequest)? as usize;
+    let user_start = user_len_offset + 1;
+    let user_end = user_start + user_len;
+    let user = ru
+        .get(user_start..user_end)
+        .ok_or(SessionControlError::UnsupportedRequest)?;
+    if user.first() != Some(&0)
+        || ru.get(28..user_len_offset) != Some(encode_lu_name(plu)?.as_slice())
+    {
+        return Err(SessionControlError::UnsupportedRequest);
+    }
+    let mut cursor = 1;
+    let mut found_instance = false;
+    let mut found_plu = false;
+    while cursor < user.len() {
+        let length = user[cursor] as usize;
+        let end = cursor + 1 + length;
+        let subfield = user
+            .get(cursor + 1..end)
+            .ok_or(SessionControlError::UnsupportedRequest)?;
+        match subfield.first() {
+            Some(2) if length == 9 && subfield[1..] == SNASVCMG => {}
+            Some(3) if length == 9 && subfield[1] == 1 => found_instance = true,
+            Some(4) if subfield[1..] == encode_lu_name(plu)? => found_plu = true,
+            Some(0x13) if length == 10 => {} // Unknown V4R4 extension: do not echo.
+            _ => return Err(SessionControlError::UnsupportedRequest),
+        }
+        cursor = end;
+    }
+    if !found_instance || !found_plu {
+        return Err(SessionControlError::UnsupportedRequest);
+    }
+    let urc_len = *ru
+        .get(user_end)
+        .ok_or(SessionControlError::UnsupportedRequest)? as usize;
+    if urc_len != 0 {
+        return Err(SessionControlError::UnsupportedRequest);
+    }
+    let slu_len_offset = user_end + 1;
+    let slu_len = *ru
+        .get(slu_len_offset)
+        .ok_or(SessionControlError::UnsupportedRequest)? as usize;
+    let fqpcid_offset = slu_len_offset + 1 + slu_len;
+    if ru.get(fqpcid_offset..fqpcid_offset + 22) != Some(fqpcid.as_slice()) {
+        return Err(SessionControlError::WrongSession);
+    }
+    let trailing = &ru[fqpcid_offset + 22..];
+    if !trailing.is_empty() && (trailing.len() != 12 || trailing[..2] != [0x2c, 0x0a]) {
+        return Err(SessionControlError::UnsupportedRequest);
+    }
+    Ok(())
+}
+
+fn encode_lu_name(name: &str) -> Result<Vec<u8>, SessionControlError> {
+    if name.len() > 17 || name.is_empty() {
+        return Err(SessionControlError::WrongLuPair);
+    }
+    name.bytes()
+        .map(|byte| {
+            Ok(match byte {
+                b'A'..=b'I' => 0xc1 + (byte - b'A'),
+                b'J'..=b'R' => 0xd1 + (byte - b'J'),
+                b'S'..=b'Z' => 0xe2 + (byte - b'S'),
+                b'0'..=b'9' => 0xf0 + (byte - b'0'),
+                b'.' => 0x4b,
+                _ => return Err(SessionControlError::WrongLuPair),
+            })
+        })
+        .collect()
 }
 
 fn request_fqpcid(ru: &[u8]) -> Result<[u8; 22], SessionControlError> {
@@ -228,6 +373,52 @@ pub fn solicited_ipm(piu: &[u8]) -> Option<SolicitedIpm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn builds_bounded_response_from_sanitized_v4r4_request() {
+        // Independent p54 request: guest session instance, FQPCID, and COS
+        // tokens replaced with synthetic bytes; configured lab LU names stay.
+        let request = hex_bytes(concat!(
+            "2f00010200006b850031001307b0b0513307878686870706020000000000000094434000",
+            "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
+            "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
+            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "2c0a00000000000000000000"
+        ));
+        assert_eq!(request.len(), 141);
+        let bind = ManagementBind::from_request(&request, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
+        let response = bind.build_v4r4_positive_response(&request).unwrap();
+        // SC31-6808-0 permits the unrecognized X'13' user subfield to be
+        // discarded. The 89-byte expectation has the documented adaptive
+        // pacing negotiation, own SLU name, and same FQPCID.
+        let expected = hex_bytes(concat!(
+            "2f0002010000eb800031001307b0b0513300808686800006020000000000000094434000",
+            "001b000902e2d5c1e2e5c3d4c70203020c05e2d6d3d5c5e34be2d5c1c2",
+            "000060141111111111111111111111111111111111111111"
+        ));
+        assert_eq!(response, expected);
+        assert_eq!(bind.correlate_positive_response(&response), Ok(()));
+
+        let mut unsupported = request.clone();
+        unsupported[9 + 9] &= !0x80; // No adaptive pacing in request.
+        assert_eq!(
+            bind.build_v4r4_positive_response(&unsupported),
+            Err(SessionControlError::UnsupportedRequest)
+        );
+        unsupported = request.clone();
+        unsupported[7] = 0x84;
+        assert_eq!(
+            bind.build_v4r4_positive_response(&unsupported),
+            Err(SessionControlError::UnsupportedRequest)
+        );
+    }
 
     fn management_request() -> Vec<u8> {
         // Synthetic names ABC/DEF; SNASVCMG and the fixed profile match the
