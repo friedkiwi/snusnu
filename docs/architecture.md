@@ -6,7 +6,7 @@ This is an implementer-facing foundation, based primarily on the read-only resea
 
 | Component | Responsibility |
 | --- | --- |
-| Local Rust router | Future Ethernet 802.3/802.2 packet I/O, local TEST/XID and LLC2 endpoint, MAC/SAP policy, DLC next-hop selection, and outbound WSS connections. |
+| Local Rust router | Initial Ethernet 802.3/802.2 packet I/O and LLC2 lab endpoint; future MAC/SAP policy, DLC next-hop selection, and outbound WSS connections. |
 | Central Go concentrator | Future authenticated site connections, authorized MAC/SAP reachability matching, independent circuit multiplexing, admission policy, resource limits, fairness, and operational HTTP facilities. |
 | Genuine SNA/APPN nodes | SNA sessions and PIUs; APPN topology, directory services, class-of-service route selection, and LU resource routing. |
 
@@ -14,7 +14,7 @@ This is an implementer-facing foundation, based primarily on the read-only resea
 
 **snusnu design choice.** Multiple sites initiate outbound connections to one central concentrator. A future binary circuit protocol over WSS carries circuit events, XID/TEST exchanges and information payloads. LLC2 sequencing, retries and link control terminate at the local router. The concentrator matches authorized DLC endpoints and forwards circuit messages; it does not inspect PIUs to route LUs. This is a stateful switched circuit service, not a stretched Ethernet broadcast domain: it does not flood arbitrary LAN frames across sites.
 
-The Rust `router-core` will own link/circuit state and route decisions. `link-linux` will isolate Linux packet capture/injection behind a safe interface; `transport-ws` will isolate the outbound concentrator connection. The initial host targets are Linux amd64 and arm64. No packet I/O or WSS implementation exists yet.
+The Rust `router-core` owns the initial LLC parser and LLC2 lab endpoint. `link-linux` isolates Linux packet capture/injection behind a safe interface; `transport-ws` remains a boundary for a future outbound concentrator connection. The initial host targets are Linux amd64 and arm64. The local two-TAP lab path has packet I/O and LLC2 termination; no WSS implementation exists yet.
 
 ## Resource and failure rules (proposed snusnu behavior)
 
