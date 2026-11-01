@@ -37,6 +37,7 @@ mod routing;
 #[cfg(target_os = "linux")]
 mod runtime;
 mod virtual_native_cp;
+mod virtual_ws_port;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
