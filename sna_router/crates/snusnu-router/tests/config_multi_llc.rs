@@ -381,4 +381,56 @@ fn distinct_proxy_macs_on_one_interface_select_distinct_llc_routes() {
         [0xa2],
         "second route must receive only second marker"
     );
+
+    // One failed association must not quarantine the other association's
+    // socket even though both receive from the same ingress interface.
+    let output = Command::new("ip")
+        .args(["link", "set", "dev", &names[2], "down"])
+        .output()
+        .expect("ip command is required");
+    assert!(
+        output.status.success(),
+        "cannot take first egress down: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    injection
+        .send_frame(&test_frame(PROXY_A1, 0xa3))
+        .expect("send TEST to faulted association");
+    let fault_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < fault_deadline
+        && !fs::read_to_string(&lab.log)
+            .expect("read router log")
+            .contains("route component quarantined")
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        fs::read_to_string(&lab.log)
+            .expect("read router log")
+            .contains("route component quarantined"),
+        "faulted association was not quarantined"
+    );
+    assert!(
+        lab.router.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "router exited when one association failed"
+    );
+
+    injection
+        .send_frame(&test_frame(PROXY_A2, 0xa4))
+        .expect("send TEST to healthy association");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut healthy = Vec::new();
+    while Instant::now() < deadline && healthy.is_empty() {
+        healthy.extend(collect_markers(&capture_b2, PROXY_B2, GUEST_B2).unwrap());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        healthy,
+        [0xa4],
+        "healthy shared-interface association stopped after peer route failed"
+    );
+    assert!(
+        lab.router.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "router exited while forwarding over healthy association"
+    );
 }
