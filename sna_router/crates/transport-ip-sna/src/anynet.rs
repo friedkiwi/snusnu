@@ -93,13 +93,7 @@ impl UdpDatagram {
                 UdpKind::OutOfBand
             }
             0x84 => {
-                if bytes.len() < 8 {
-                    return Err(invalid("short MPTN keepalive command"));
-                }
-                let command_length = u16::from_be_bytes(bytes[6..8].try_into().unwrap()) as usize;
-                if command_length + 4 != bytes.len() {
-                    return Err(invalid("MPTN keepalive command length mismatch"));
-                }
+                crate::mptn_keepalive::Keepalive::decode(&bytes)?;
                 UdpKind::Keepalive
             }
             _ => return Err(invalid("unsupported MPTN UDP command")),
@@ -303,6 +297,21 @@ mod tests {
         assert!(TcpRecord::decode(vec![0, 0, 0, 5, 0xff]).is_err());
         assert!(UdpDatagram::decode(vec![0, 0, 0, 5, 0x84]).is_err());
         assert!(Decoder::default().push(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn udp_keepalive_ingress_uses_strict_provider_address_parser() {
+        let valid = vec![
+            0, 0, 0, 24, 0x84, 0x02, 0, 20, 0x02, 0x01, 0x05, 10, 99, 4, 3, 0x01, 0x02, 0x01, 0x05,
+            10, 99, 4, 2, 0x01,
+        ];
+        assert_eq!(
+            UdpDatagram::decode(valid.clone()).unwrap().kind,
+            UdpKind::Keepalive
+        );
+        let mut wrong_address = valid;
+        wrong_address[10] = 4;
+        assert!(UdpDatagram::decode(wrong_address).is_err());
     }
 
     #[test]
