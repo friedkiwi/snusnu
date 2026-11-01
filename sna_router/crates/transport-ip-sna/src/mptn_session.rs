@@ -16,6 +16,7 @@ use crate::{
     mptn_connect::{Address, Connect, Direction},
     mptn_expedited::{Flow as ExpeditedFlow, Inbound as ExpeditedInbound},
     mptn_gateway::{mptn_normal_to_native, native_normal_to_mptn, NativeSessionAddress},
+    mptn_segments::Reassembler,
 };
 
 const MAX_PENDING: usize = MAX_RECORD * 4;
@@ -60,6 +61,7 @@ pub struct GatewaySession {
     pending_tcp: usize,
     pending_native: usize,
     expedited: ExpeditedFlow,
+    segments: Reassembler,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -138,6 +140,7 @@ impl GatewaySession {
         }
         Ok(Self {
             expedited: ExpeditedFlow::new(policy.max_pending_bytes)?,
+            segments: Reassembler::default(),
             policy,
             available_compensations,
             state: State::Idle,
@@ -321,12 +324,17 @@ impl GatewaySession {
         Ok(record)
     }
 
-    /// Reserve native output capacity and restore the local FID2 address.
-    /// The LLC endpoint must report delivery before credit is released.
-    pub fn mptn_normal(&mut self, record: &TcpRecord) -> io::Result<Vec<u8>> {
+    /// Reassemble segmented TCP62 normal data and restore the local FID2
+    /// address only when the final segment arrives. `None` means the bounded
+    /// partial RU is retained. The LLC endpoint must report delivery before
+    /// credit is released.
+    pub fn mptn_normal(&mut self, record: &TcpRecord) -> io::Result<Option<Vec<u8>>> {
         let State::Established { native } = self.state else {
             return Err(state_error("gateway session not established"));
         };
+        if !matches!(record.kind, TcpKind::Normal | TcpKind::Segmented) {
+            return Err(invalid("expected TCP62 normal or segmented data"));
+        }
         if !self.expedited.inbound_normal_may_pass() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -338,14 +346,16 @@ impl GatewaySession {
             oaf: native.daf,
             odai: native.odai,
         };
-        let checked = TcpRecord::decode(record.bytes.clone())?;
+        let Some(checked) = self.segments.push(record)? else {
+            return Ok(None);
+        };
         let piu = mptn_normal_to_native(&checked, reversed)?;
         reserve(
             &mut self.pending_native,
             self.policy.max_pending_bytes,
             piu.len(),
         )?;
-        Ok(piu)
+        Ok(Some(piu))
     }
 
     /// Carry a native expedited PIU over TCP62. The caller must enqueue this
@@ -408,6 +418,7 @@ impl GatewaySession {
         }
         let inbound = self.expedited.receive(record)?;
         if matches!(inbound, ExpeditedInbound::Aborted { .. }) {
+            self.segments.clear();
             self.close();
         }
         Ok(inbound)
@@ -453,6 +464,7 @@ impl GatewaySession {
         self.state = State::Closed;
         self.pending_tcp = 0;
         self.pending_native = 0;
+        self.segments.clear();
     }
 }
 
@@ -572,7 +584,7 @@ mod tests {
         session.complete_tcp_delivery(record.bytes.len()).unwrap();
         assert_eq!(session.pending_bytes(), (0, 0));
         let reverse = TcpRecord::decode(vec![0, 0, 0, 10, 0, 0, 1, 3, 0, 0]).unwrap();
-        let native_reverse = session.mptn_normal(&reverse).unwrap();
+        let native_reverse = session.mptn_normal(&reverse).unwrap().unwrap();
         assert_eq!(&native_reverse[..6], &[0x2c, 0, 2, 1, 0, 1]);
         assert_eq!(session.pending_bytes(), (0, native_reverse.len()));
         session
@@ -655,7 +667,7 @@ mod tests {
             .complete_native_expedited_delivery(native.len())
             .unwrap();
         assert_eq!(
-            session.mptn_normal(&later).unwrap()[..6],
+            session.mptn_normal(&later).unwrap().unwrap()[..6],
             [0x2c, 0, 2, 1, 0, 4]
         );
     }
@@ -677,6 +689,37 @@ mod tests {
         session.expedited_ack_timed_out().unwrap();
         assert_eq!(session.phase(), Phase::Closed);
         assert_eq!(session.pending_bytes(), (0, 0));
+    }
+
+    #[test]
+    fn segmented_normal_waits_for_final_and_expedited_delivery() {
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let request = session
+            .begin_native_bind(&captured_user_bind(), request_template())
+            .unwrap();
+        let decoded = Connect::decode(&request.bytes).unwrap();
+        session
+            .receive_connect_response(&response_for(&decoded))
+            .unwrap();
+
+        let first = TcpRecord::decode(vec![0, 0, 0, 11, 0x20, 0, 4, 3, 0, 0, 0xaa]).unwrap();
+        let final_part = TcpRecord::decode(vec![0, 0, 0, 6, 0, 0xbb]).unwrap();
+        assert!(session.mptn_normal(&first).unwrap().is_none());
+        assert_eq!(session.pending_bytes(), (0, 0));
+
+        let expedited =
+            TcpRecord::decode(vec![0, 0, 0, 11, 0x01, 0, 5, 0x4b, 0x80, 0, 0xc9]).unwrap();
+        let (urgent, _ack) = session.mptn_expedited(&expedited).unwrap();
+        assert_eq!(
+            session.mptn_normal(&final_part).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        session
+            .complete_native_expedited_delivery(urgent.len())
+            .unwrap();
+        let native = session.mptn_normal(&final_part).unwrap().unwrap();
+        assert_eq!(native, [0x2c, 0, 2, 1, 0, 4, 3, 0, 0, 0xaa, 0xbb]);
+        assert_eq!(session.pending_bytes(), (0, native.len()));
     }
 
     #[test]
