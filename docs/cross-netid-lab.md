@@ -131,3 +131,16 @@ positive response, so the guest reported APPC failure
 `0009000000000000`. This probe proves that explicit remote NETID selection
 reaches the router from the prepared V5 clone; it does not prove a completed
 management session. Captures remain private outside the repository.
+
+A third bounded probe, after the guarded token parser accepted Bob's
+observed variant, completed the TCP62 management exchange: Bob sent a
+228-byte SNASVCMG Connect and received a 189-byte positive response; it
+then sent a 47-byte CNOS record and received a 35-byte AcceptedPending
+reply. The peers exchanged 11-byte BIS records, and Bob sent a correlated
+37-byte management UNBIND before FIN. Bob opened a second TCP/397 session
+and sent a 228-byte user Connect. The opt-in management-only listener
+deliberately rejected that user session, and Bob reported APPC failure
+`68268002000032FE`. The private capture contains 22 packets and no UDP
+datagrams. This proves the copied V5 guest can initiate cross-NETID AnyNet
+management and reach user Connect; it does not establish the WebSocket or
+LLC2 route.
