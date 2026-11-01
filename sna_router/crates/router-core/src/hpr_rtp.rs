@@ -2,7 +2,7 @@
 //!
 //! IBM *SNA Formats* GA27-3136, HPR Headers chapter, defines the ANR NHDR
 //! delimiter and THDR offset, data length, byte sequence number, and EOM bit.
-//! This module reads those fields without interpreting optional RTP segments,
+//! This module reads those fields and frames optional RTP segments without
 //! acknowledging bytes, retransmitting, or offering an RTP endpoint. It is
 //! suitable for diagnostics and for a future, separately validated RTP layer.
 
@@ -19,6 +19,16 @@ pub enum RtpError {
     NonzeroNhdrReserved,
     InvalidDataOffset,
     DataLengthMismatch,
+    UnsupportedConnectionQualifier,
+    InvalidOptionalSegments,
+}
+
+/// A word-aligned RTP optional segment. The payload includes any segment
+/// padding; interpreting it requires the format for this particular key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtpOptionalSegment<'a> {
+    pub key: u8,
+    pub data: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +99,43 @@ impl<'a> RtpPacket<'a> {
         self.byte_sequence_number
             .wrapping_add(self.data.len() as u32)
             .wrapping_add(self.end_of_message as u32)
+    }
+
+    /// Frame the THDR optional segments. IBM SNA Formats GA27-3136-20,
+    /// pp. 2-11–2-13, gives a one-byte length in four-byte words and a
+    /// one-byte key for each segment. The connection qualifier precedes the
+    /// segments and requires its own CV parser, so this method rejects it.
+    /// No segment body, including ARB (X'22'), is interpreted here.
+    pub fn optional_segments(self) -> Result<Vec<RtpOptionalSegment<'a>>, RtpError> {
+        // Byte 9 bits 3–4 indicate a connection qualifier. Its X'05' CV
+        // cannot safely be mistaken for a segment's length/key pair.
+        if self.thdr[9] & 0x18 != 0 {
+            return Err(RtpError::UnsupportedConnectionQualifier);
+        }
+        let mut remaining = &self.thdr[MIN_THDR..];
+        if self.thdr[9] & 0x04 == 0 {
+            return if remaining.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(RtpError::InvalidOptionalSegments)
+            };
+        }
+        if remaining.is_empty() {
+            return Err(RtpError::InvalidOptionalSegments);
+        }
+        let mut segments = Vec::new();
+        while !remaining.is_empty() {
+            let length = usize::from(remaining[0]) * 4;
+            if length < 4 || length > remaining.len() {
+                return Err(RtpError::InvalidOptionalSegments);
+            }
+            segments.push(RtpOptionalSegment {
+                key: remaining[1],
+                data: &remaining[2..length],
+            });
+            remaining = &remaining[length..];
+        }
+        Ok(segments)
     }
 }
 
@@ -241,5 +288,45 @@ mod tests {
         assert_eq!(packet.data.len(), 0);
         assert!(packet.end_of_message);
         assert_eq!(packet.next_byte_sequence_number(), 0);
+    }
+
+    #[test]
+    fn frames_captured_v5r4_adaptive_rate_segment() {
+        let nlp = captured_header_with_synthetic_data();
+        let packet = RtpPacket::parse(&nlp).unwrap();
+        assert_eq!(
+            packet.optional_segments().unwrap(),
+            [RtpOptionalSegment {
+                key: 0x22,
+                data: &[0x80, 0x00, 0x01, 0x5d, 0x81, 0x80, 0, 0, 0, 0],
+            }]
+        );
+    }
+
+    #[test]
+    fn optional_segment_framing_rejects_invalid_flags_and_lengths() {
+        let mut nlp = captured_header_with_synthetic_data();
+        nlp[15] = 0; // THDR byte 9: OSI off while 12 segment bytes remain.
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().optional_segments(),
+            Err(RtpError::InvalidOptionalSegments)
+        );
+        nlp[15] = 0x04;
+        nlp[26] = 0; // zero-word segment
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().optional_segments(),
+            Err(RtpError::InvalidOptionalSegments)
+        );
+        nlp[26] = 4; // segment exceeds the THDR boundary
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().optional_segments(),
+            Err(RtpError::InvalidOptionalSegments)
+        );
+        nlp[26] = 3;
+        nlp[15] = 0x0c; // connection qualifier indicator
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().optional_segments(),
+            Err(RtpError::UnsupportedConnectionQualifier)
+        );
     }
 }
