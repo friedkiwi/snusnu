@@ -376,8 +376,11 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
     edge.poll_native_once().unwrap();
     assert_eq!(edge.pending_gateway_bytes(), (243, 0));
     assert_eq!(edge.native_mut().sent[1], hex("2d0002010000830100"));
+    assert!(edge.ipr_ack_outstanding());
+    assert!(!edge.first_attach_delivery_complete());
     edge.flush_tcp().unwrap();
     assert_eq!(edge.pending_gateway_bytes(), (0, 0));
+    assert!(!edge.first_attach_delivery_complete());
     let normal = TcpRecord::decode(read_record(&mut peer)).unwrap();
     assert_eq!(normal.kind, TcpKind::Normal);
     assert_eq!(normal.bytes.len(), 243);
@@ -386,11 +389,14 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
         .events
         .push_back(NativeEvent::EgressAck(1));
     edge.poll_native_once().unwrap();
+    assert!(!edge.ipr_ack_outstanding());
+    assert!(edge.first_attach_delivery_complete());
     edge.native_mut()
         .events
         .push_back(NativeEvent::EgressAck(1));
     assert!(edge.poll_native_once().is_err()); // Duplicate ACK aborts the edge.
     assert!(edge.is_closed());
+    assert!(!edge.first_attach_delivery_complete());
     assert!(edge.native_mut().closed);
 }
 

@@ -43,6 +43,8 @@ pub struct GatewayEdge<L: NativeLeg> {
     writes: VecDeque<(usize, bool)>,
     connect_fully_sent: bool,
     ipr_ack_outstanding: bool,
+    ipr_ack_received: bool,
+    attach_fully_sent: bool,
     closed: bool,
 }
 
@@ -63,6 +65,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             writes: VecDeque::new(),
             connect_fully_sent: false,
             ipr_ack_outstanding: false,
+            ipr_ack_received: false,
+            attach_fully_sent: false,
             closed: false,
         }
     }
@@ -75,6 +79,17 @@ impl<L: NativeLeg> GatewayEdge<L> {
     }
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+    /// True after the native IPR entered the LLC egress queue and before its
+    /// one exact LLC completion arrives. The lab harness uses this as a
+    /// read-only final gate for the first Attach exchange.
+    pub fn ipr_ack_outstanding(&self) -> bool {
+        self.ipr_ack_outstanding
+    }
+    /// True only after the first Attach record was written to TCP and the
+    /// native IPR for that Attach received its exact LLC completion.
+    pub fn first_attach_delivery_complete(&self) -> bool {
+        !self.closed && self.attach_fully_sent && self.ipr_ack_received
     }
     pub fn pending_gateway_bytes(&self) -> (usize, usize) {
         self.bridge.pending_bytes()
@@ -114,6 +129,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                         return Err(invalid("unexpected native user egress ACK"));
                     }
                     self.ipr_ack_outstanding = false;
+                    self.ipr_ack_received = true;
                 }
                 NativeEvent::Closed => return self.close(),
             }
@@ -187,6 +203,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             }
             if charged {
                 self.bridge.complete_tcp_delivery(len)?;
+                self.attach_fully_sent = true;
             } else if self.connect_fully_sent {
                 self.close()?;
                 return Err(invalid("duplicate TCP62 Connect write completion"));
@@ -260,6 +277,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.writes.clear();
             self.connect_fully_sent = false;
             self.ipr_ack_outstanding = false;
+            self.ipr_ack_received = false;
+            self.attach_fully_sent = false;
             self.native.close()?;
         }
         Ok(())
