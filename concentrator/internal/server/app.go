@@ -87,6 +87,12 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /routers/{id}/pause", a.full(a.routerPause))
 	m.HandleFunc("POST /routers/{id}/rotate", a.full(a.routerRotate))
 	m.HandleFunc("POST /routers/{id}/delete", a.full(a.routerDelete))
+	m.HandleFunc("POST /routers/{id}/llc-facing", a.full(a.routerLLCFacing))
+	m.HandleFunc("GET /llc-macs", a.full(a.managedCPPage))
+	m.HandleFunc("POST /llc-macs", a.full(a.managedCPCreate))
+	m.HandleFunc("POST /llc-macs/{id}/enabled", a.full(a.managedCPEnabled))
+	m.HandleFunc("POST /llc-macs/{id}/retire", a.full(a.managedCPRetire))
+	m.HandleFunc("GET /admin/llc-macs", a.admin(a.adminManagedCPPage))
 	m.HandleFunc("GET /flows", a.full(a.flows))
 	m.HandleFunc("GET /profile/edit", a.full(a.profileEditPage))
 	m.HandleFunc("POST /profile/edit", a.full(a.profileEdit))
@@ -578,7 +584,7 @@ func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 			return "Never"
 		}
 		return time.Unix(unix, 0).UTC().Format(time.RFC3339)
-	}}).Parse(layout + pages[name])
+	}}).Parse(layout + nodeAddressTemplate + pages[name])
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "template error", 500)

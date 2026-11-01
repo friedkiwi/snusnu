@@ -68,3 +68,19 @@ message RouteReference {
   uint64 route_id = 3;
   uint64 route_generation = 4;
 }
+
+// Server-stamped, downstream-only LLC address-book view. The Rust publisher
+// never includes a managed MAC in RouteSnapshot or RouteExport.
+message ManagedCpBindingSnapshot {
+  uint32 schema_version = 1; // Exactly 1 for this message shape.
+  bytes recipient_epoch = 2; // Current recipient RouterWelcome epoch.
+  uint64 revision = 3; // Increasing full-replacement revision for this recipient.
+  repeated ManagedCpBinding bindings = 4;
+}
+
+message ManagedCpBinding {
+  bytes address_id = 1; // Stable server-owned UUID for the address-book CP.
+  SnaName control_point = 2;
+  bytes virtual_mac = 3; // Exactly six bytes, 02:53:4E:xx:xx:xx.
+  repeated RouteReference candidates = 4; // Authorized live CP paths only.
+}

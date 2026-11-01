@@ -271,6 +271,16 @@ func TestBackends(t *testing.T) {
 			if logs, err := s.SearchRouterLogs(context.Background(), router.ID, "snapshot"); err != nil || len(logs) != 1 {
 				t.Fatalf("backend log search: %+v %v", logs, err)
 			}
+			cp, err := s.AllocateManagedCP(context.Background(), id, "SOLNET", "SNAB")
+			if err != nil || cp.Suffix < 1 || cp.MACColon() == "" {
+				t.Fatalf("managed CP allocation: %+v %v", cp, err)
+			}
+			if err := s.RetireManagedCP(context.Background(), cp.ID, id); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.AllocateManagedCP(context.Background(), id, "SOLNET", "SNAB"); !errors.Is(err, ErrRetiredCP) {
+				t.Fatalf("retired CP reused: %v", err)
+			}
 		})
 	}
 }

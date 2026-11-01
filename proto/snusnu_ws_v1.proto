@@ -23,6 +23,7 @@ message WsEnvelope {
     CircuitClose circuit_close = 12;        // Rust <-> Go <-> Rust.
     CircuitReset circuit_reset = 13;        // Rust <-> Go <-> Rust.
     RouterIdentityUpdate identity_update = 14; // Go -> Rust after owner renames router.
+    ManagedCpBindingSnapshot managed_cp_bindings = 15; // Go -> authorized LLC-facing Rust only.
   }
 }
 

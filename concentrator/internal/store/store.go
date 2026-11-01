@@ -191,7 +191,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -256,6 +256,14 @@ var schemaV2 = []string{
 	`CREATE TABLE router_logs (id TEXT PRIMARY KEY,router_id TEXT NOT NULL REFERENCES routers(id) ON DELETE CASCADE,owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,peer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound','system')),level TEXT NOT NULL CHECK(level IN ('info','warning','error')),event_type TEXT NOT NULL,netid TEXT NOT NULL DEFAULT '',node_name TEXT NOT NULL DEFAULT '',source_ip TEXT NOT NULL DEFAULT '',summary TEXT NOT NULL,details_json TEXT NOT NULL DEFAULT '',occurred_at BIGINT NOT NULL)`,
 	`CREATE INDEX idx_router_logs_router_time ON router_logs(router_id,occurred_at)`,
 	`CREATE INDEX idx_router_logs_owner_time ON router_logs(owner_id,occurred_at)`,
+}
+
+var schemaV3 = []string{
+	`ALTER TABLE routers ADD COLUMN llc_facing INTEGER NOT NULL DEFAULT 0`,
+	`CREATE TABLE mac_pool_state (id INTEGER PRIMARY KEY CHECK(id=1), next_suffix BIGINT NOT NULL)`,
+	`INSERT INTO mac_pool_state(id,next_suffix) VALUES(1,1)`,
+	`CREATE TABLE managed_cp_addresses (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, netid TEXT NOT NULL, cp_name TEXT NOT NULL, mac_suffix BIGINT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, created_at BIGINT NOT NULL, retired_at BIGINT NOT NULL DEFAULT 0, UNIQUE(owner_id,netid,cp_name))`,
+	`CREATE INDEX idx_managed_cp_addresses_owner ON managed_cp_addresses(owner_id)`,
 }
 
 var ErrNotFound = errors.New("not found")

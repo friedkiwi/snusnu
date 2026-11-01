@@ -12,20 +12,21 @@ var ErrPaused = errors.New("router paused")
 
 type Router struct {
 	ID, OwnerID, DisplayName, LastIP string
-	Paused, Connected                bool
+	Paused, Connected, LLCFacing     bool
 	CreatedAt, LastSeenAt            int64
 }
 
 func scanRouter(row *sql.Row) (Router, error) {
 	var r Router
-	var paused, connected int
-	err := row.Scan(&r.ID, &r.OwnerID, &r.DisplayName, &paused, &r.CreatedAt, &r.LastSeenAt, &r.LastIP, &connected)
+	var paused, connected, llcFacing int
+	err := row.Scan(&r.ID, &r.OwnerID, &r.DisplayName, &paused, &r.CreatedAt, &r.LastSeenAt, &r.LastIP, &llcFacing, &connected)
 	r.Paused = paused != 0
 	r.Connected = connected != 0
+	r.LLCFacing = llcFacing != 0
 	return r, err
 }
 
-const routerColumns = "id,owner_id,display_name,paused,created_at,last_seen_at,last_ip"
+const routerColumns = "id,owner_id,display_name,paused,created_at,last_seen_at,last_ip,llc_facing"
 
 func (s *Store) RouterByID(ctx context.Context, id string) (Router, error) {
 	return scanRouter(s.Row(ctx, "SELECT "+routerColumns+",CASE WHEN EXISTS(SELECT 1 FROM router_epochs e WHERE e.router_id=routers.id) THEN 1 ELSE 0 END FROM routers WHERE id=?", id))
@@ -121,6 +122,22 @@ func (s *Store) SetRouterPaused(ctx context.Context, id string, paused bool) err
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *Store) SetRouterLLCFacing(ctx context.Context, id string, enabled bool) error {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	res, err := s.Exec(ctx, "UPDATE routers SET llc_facing=? WHERE id=?", value, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 func (s *Store) DeleteRouter(ctx context.Context, id string) error {
 	res, err := s.Exec(ctx, "DELETE FROM routers WHERE id=?", id)
