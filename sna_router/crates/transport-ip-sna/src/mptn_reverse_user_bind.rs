@@ -96,6 +96,14 @@ impl ReverseUserBind {
         &self.native_request
     }
 
+    /// For the exact V4R4 positive BIND profile accepted by this gate, the
+    /// initiator's captured send window is three. Keep the local receive
+    /// budget at one until a wider V4 response/traffic profile is validated.
+    /// These are native hop pacing limits, not TCP62 BIND capability bytes.
+    pub fn native_flow_windows(&self) -> Option<(u8, u8)> {
+        matches!(self.phase, Phase::TcpResponsePrepared | Phase::Active).then_some((3, 1))
+    }
+
     pub fn mark_native_bind_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {
         if self.phase != Phase::NativeBindPrepared || piu != self.native_request {
             return Err(wrong_phase());
@@ -312,6 +320,7 @@ mod tests {
             .accept_native_response(&native_response())
             .unwrap()
             .clone();
+        assert_eq!(bridge.native_flow_windows(), Some((3, 1)));
         assert_eq!(bridge.phase(), Phase::TcpResponsePrepared);
         assert_eq!(response.direction, Direction::PositiveResponse);
         assert_eq!(response.connection_data(), hex(RESPONSE));
@@ -321,6 +330,7 @@ mod tests {
             .mark_tcp_response_enqueued(&response.encode().unwrap())
             .unwrap();
         assert_eq!(bridge.phase(), Phase::Active);
+        assert_eq!(bridge.native_flow_windows(), Some((3, 1)));
     }
 
     #[test]
