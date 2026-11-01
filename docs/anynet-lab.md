@@ -135,3 +135,16 @@ failure. The private unfiltered captures are
 `/tmp/snusnu-v4r4-regression/native-converter-v5-sol5.pcap` and
 `/tmp/snusnu-v5r4-ip-lab/native-converter-v5-sol7.pcap`. No application
 conversation crossed the media boundary in this run.
+
+The retry after the native overlap fix reached TCP62. Rust sent a 225-byte
+MPTN Connect request from `.10` to B `.3:397`, with destination
+`SOLNET.SNAB`, source `SOLNET.SNAA`, and a 141-byte BIND connection-data
+option. B ACKed it, then opened a separate connection from `.3` to
+`.10:397`; the host returned TCP RST because this diagnostic did not listen
+on port 397. B's 126-byte negative Connect response used processing flags
+`0xEA` and included a negative BIND sense `08050000` plus an `0xF0`
+diagnostic option. Rust then closed the outbound connection and sent native
+DISC. The failed reverse connection and negative response are observed in
+the private captures `native-converter-v5-retry-sol5.pcap` and
+`native-converter-v5-retry-sol7.pcap` in the lab directories above. Their
+causal relationship remains to be tested with a reverse TCP/397 listener.
