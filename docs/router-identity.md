@@ -1,6 +1,6 @@
 # Router identity and live SNA resource keys
 
-The concentrator owns each Rust router's identity. On onboarding it generates a stable UUID (`router_id`), records the router's owner and optional administrative site, and issues a separate opaque bearer credential. The Rust executable configures only its bearer credential and local routes. After authenticating its WebSocket, it receives `RouterWelcome.router_id` from the concentrator and logs/displays that assigned ID. It never sends a claimed local router ID or chooses one in configuration. On reconnect or credential rotation, the same router receives the same UUID.
+The concentrator owns each Rust router's identity. On onboarding it generates a stable UUID (`router_id`), records the router's owner and optional administrative site, and issues a separate opaque bearer credential. The owner sets a display name. The Rust executable configures only its bearer credential and local routes. After authenticating its WebSocket, it receives `RouterWelcome.router_id` and `RouterWelcome.display_name` from the concentrator and logs/displays both. It never sends a claimed local router ID or chooses one in configuration. On reconnect or credential rotation, the same router receives the same UUID.
 
 Authentication resolves `token hash → credential record → router_id`. A router may have more than one credential during rotation; revoking one credential does not rename the router. Each credential has its own creation, expiry/revocation and purpose. Revocation of an active credential closes or revalidates its WebSocket and withdraws its live routes. The concentrator stamps `router_id` on every relayed snapshot and checks it on circuit opens. The bearer token must travel over TLS and must not appear in logs; any holder can use it while valid ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html)).
 
@@ -12,7 +12,7 @@ router_credentials(id, router_id REFERENCES routers(id), secret_hash UNIQUE,
                    created_at, expires_at, revoked_at)
 ```
 
-Existing databases require a new migration version; changing the current version-1 schema slice alone would not apply the new tables. This document specifies the interface with the Go concentrator and does not implement that migration.
+The Go web service uses a version-2 migration for router records, router-scoped credentials, profiles, blocks and diagnostics. WebSocket authentication and `RouterWelcome` transmission are still pending.
 
 Internally, keep SNA resource keys as structured fields:
 

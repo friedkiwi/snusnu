@@ -1,0 +1,284 @@
+package server
+
+import (
+	"bytes"
+	"database/sql"
+	"errors"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/friedkiwi/snusnu/concentrator/internal/store"
+)
+
+var usernamePattern = regexp.MustCompile(`^[a-z0-9_][a-z0-9_-]{2,31}$`)
+
+func validRouterName(name string) bool {
+	if name == "" || utf8.RuneCountInString(name) > 80 {
+		return false
+	}
+	for _, c := range name {
+		if unicode.IsControl(c) {
+			return false
+		}
+	}
+	return true
+}
+func (a *App) routerForUser(w http.ResponseWriter, r *http.Request, u store.User) (store.Router, bool) {
+	item, err := a.DB.RouterByID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		dbError(w, err)
+		return item, false
+	}
+	if item.OwnerID != u.ID && u.Role != "admin" {
+		http.Error(w, "forbidden", 403)
+		return item, false
+	}
+	return item, true
+}
+func (a *App) websocketURL() string {
+	u, _ := url.Parse(a.Config.Origin)
+	if u.Scheme == "https" {
+		u.Scheme = "wss"
+	} else {
+		u.Scheme = "ws"
+	}
+	u.Path = "/router/v1/ws"
+	u.RawQuery = ""
+	return u.String()
+}
+func (a *App) routerNewPage(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	a.render(w, "router_new", map[string]any{"User": u, "CSRF": s.CSRF})
+}
+func (a *App) routerCreate(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	name := strings.TrimSpace(r.FormValue("name"))
+	if !validRouterName(name) {
+		http.Error(w, "name must be 1-80 printable characters", 400)
+		return
+	}
+	item, token, err := a.DB.CreateRouter(r.Context(), u.ID, name)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL()})
+}
+func (a *App) routerDetails(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	item, ok := a.routerForUser(w, r, u)
+	if !ok {
+		return
+	}
+	exports, err := a.DB.ListRouterExports(r.Context(), item.ID)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	logs, err := a.DB.SearchRouterLogs(r.Context(), item.ID, q)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "router_details", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Exports": exports, "Logs": logs, "Search": q, "WebSocketURL": a.websocketURL()})
+}
+func (a *App) routerRename(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	item, ok := a.routerForUser(w, r, u)
+	if !ok {
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if !validRouterName(name) {
+		http.Error(w, "invalid name", 400)
+		return
+	}
+	if _, err := a.DB.Exec(r.Context(), "UPDATE routers SET display_name=? WHERE id=?", name, item.ID); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/routers/"+item.ID, 303)
+}
+func (a *App) routerPause(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	item, ok := a.routerForUser(w, r, u)
+	if !ok {
+		return
+	}
+	paused := r.FormValue("paused") == "1"
+	if err := a.DB.SetRouterPaused(r.Context(), item.ID, paused); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/routers/"+item.ID, 303)
+}
+func (a *App) routerRotate(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	item, ok := a.routerForUser(w, r, u)
+	if !ok {
+		return
+	}
+	token, err := a.DB.RotateRouterToken(r.Context(), item.ID)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL(), "Rotated": true})
+}
+func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	item, ok := a.routerForUser(w, r, u)
+	if !ok {
+		return
+	}
+	if err := a.DB.DeleteRouter(r.Context(), item.ID); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/dashboard", 303)
+}
+func (a *App) globalDirectory(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	exports, err := a.DB.ListExports(r.Context(), "")
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "global_directory", map[string]any{"User": u, "CSRF": s.CSRF, "Exports": exports})
+}
+func (a *App) adminRouters(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	items, err := a.DB.ListRouters(r.Context(), "")
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "admin_routers", map[string]any{"User": u, "CSRF": s.CSRF, "Routers": items})
+}
+func (a *App) flows(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	logs, err := a.DB.SearchInboundFlows(r.Context(), u.ID, q)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "flows", map[string]any{"User": u, "CSRF": s.CSRF, "Logs": logs, "Search": q})
+}
+func (a *App) profileEditPage(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	a.render(w, "profile_edit", map[string]any{"User": u, "CSRF": s.CSRF})
+}
+func (a *App) profileEdit(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	username := strings.ToLower(strings.TrimSpace(r.FormValue("username")))
+	first := strings.TrimSpace(r.FormValue("first_name"))
+	last := strings.TrimSpace(r.FormValue("last_name"))
+	if !usernamePattern.MatchString(username) || utf8.RuneCountInString(first) > 80 || utf8.RuneCountInString(last) > 80 {
+		http.Error(w, "invalid profile fields", 400)
+		return
+	}
+	for _, value := range []string{first, last} {
+		for _, c := range value {
+			if unicode.IsControl(c) {
+				http.Error(w, "invalid name", 400)
+				return
+			}
+		}
+	}
+	public := 0
+	if r.FormValue("public_email") == "1" {
+		public = 1
+	}
+	if _, err := a.DB.Exec(r.Context(), "UPDATE users SET username=?,first_name=?,last_name=?,public_email=? WHERE id=?", username, first, last, public, u.ID); err != nil {
+		http.Error(w, "username already taken or invalid", 409)
+		return
+	}
+	http.Redirect(w, r, "/profiles/"+u.ID, 303)
+}
+func (a *App) profilePictureUpload(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	file, _, err := r.FormFile("picture")
+	if err != nil {
+		http.Error(w, "select an image", 400)
+		return
+	}
+	defer file.Close()
+	b, err := io.ReadAll(io.LimitReader(file, 256*1024+1))
+	if err != nil || len(b) > 256*1024 {
+		http.Error(w, "image must be at most 256 KiB", 400)
+		return
+	}
+	mime := http.DetectContentType(b)
+	if mime != "image/png" && mime != "image/jpeg" {
+		http.Error(w, "PNG or JPEG required", 400)
+		return
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(b))
+	if err != nil || config.Width < 1 || config.Height < 1 || config.Width > 2048 || config.Height > 2048 {
+		http.Error(w, "invalid image dimensions", 400)
+		return
+	}
+	if _, err = a.DB.Exec(r.Context(), "UPDATE users SET picture=?,picture_type=? WHERE id=?", b, mime, u.ID); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/profile/edit", 303)
+}
+func (a *App) profilePictureDelete(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	if _, err := a.DB.Exec(r.Context(), "UPDATE users SET picture=NULL,picture_type='' WHERE id=?", u.ID); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/profile/edit", 303)
+}
+func (a *App) profileView(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	target, err := a.DB.UserByID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	blocked, err := a.DB.IsBlocked(r.Context(), u.ID, target.ID)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	exports, err := a.DB.ListExports(r.Context(), target.ID)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	var picture int
+	if err = a.DB.Row(r.Context(), "SELECT CASE WHEN picture IS NULL THEN 0 ELSE 1 END FROM users WHERE id=?", target.ID).Scan(&picture); err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "profile_view", map[string]any{"User": u, "CSRF": s.CSRF, "Profile": target, "ShowEmail": target.PublicEmail || target.ID == u.ID, "Own": target.ID == u.ID, "Blocked": blocked, "Exports": exports, "HasPicture": picture != 0})
+}
+func (a *App) profilePicture(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	var picture []byte
+	var mime string
+	err := a.DB.Row(r.Context(), "SELECT picture,picture_type FROM users WHERE id=?", r.PathValue("id")).Scan(&picture, &mime)
+	if errors.Is(err, sql.ErrNoRows) || len(picture) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Write(picture)
+}
+func (a *App) profileBlock(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	id := r.PathValue("id")
+	if id == u.ID {
+		http.Error(w, "cannot block yourself", 400)
+		return
+	}
+	if _, err := a.DB.UserByID(r.Context(), id); err != nil {
+		dbError(w, err)
+		return
+	}
+	if err := a.DB.SetBlock(r.Context(), u.ID, id, r.FormValue("blocked") == "1"); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/profiles/"+id, 303)
+}

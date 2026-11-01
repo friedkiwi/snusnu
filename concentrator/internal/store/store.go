@@ -1,0 +1,261 @@
+package store
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
+)
+
+type Store struct {
+	DB       *sql.DB
+	postgres bool
+}
+
+func Open(ctx context.Context, driver, dsn string) (*Store, error) {
+	var name string
+	switch driver {
+	case "sqlite":
+		name = "sqlite"
+	case "postgres":
+		name = "pgx"
+	default:
+		return nil, fmt.Errorf("unsupported database driver %q", driver)
+	}
+	db, err := sql.Open(name, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if driver == "sqlite" {
+		db.SetMaxOpenConns(1)
+	} else {
+		db.SetMaxOpenConns(10)
+	}
+	if err = db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	s := &Store{DB: db, postgres: driver == "postgres"}
+	if driver == "sqlite" {
+		if _, err = db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+			db.Close()
+			return nil, err
+		}
+		if _, err = db.ExecContext(ctx, "PRAGMA busy_timeout = 5000"); err != nil {
+			db.Close()
+			return nil, err
+		}
+		if _, err = db.ExecContext(ctx, "PRAGMA journal_mode = WAL"); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	if err = s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) Q(query string) string {
+	if !s.postgres {
+		return query
+	}
+	var b strings.Builder
+	i := 1
+	for _, c := range query {
+		if c == '?' {
+			fmt.Fprintf(&b, "$%d", i)
+			i++
+		} else {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+func (s *Store) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.DB.ExecContext(ctx, s.Q(query), args...)
+}
+func (s *Store) Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return s.DB.QueryContext(ctx, s.Q(query), args...)
+}
+func (s *Store) Row(ctx context.Context, query string, args ...any) *sql.Row {
+	return s.DB.QueryRowContext(ctx, s.Q(query), args...)
+}
+
+func Random() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+func RandomUUID() string       { return uuid.NewString() }
+func Hash(token string) string { h := sha256.Sum256([]byte(token)); return hex.EncodeToString(h[:]) }
+func Now() int64               { return time.Now().UTC().Unix() }
+
+func (s *Store) Prune(ctx context.Context) error {
+	for _, q := range []string{"DELETE FROM sessions WHERE expires_at<?", "DELETE FROM email_tokens WHERE expires_at<?", "DELETE FROM ceremonies WHERE expires_at<?", "DELETE FROM auth_attempts WHERE reset_at<?", "DELETE FROM router_logs WHERE occurred_at<?"} {
+		cutoff := Now()
+		if strings.Contains(q, "router_logs") {
+			cutoff -= 30 * 24 * 3600
+		}
+		if _, err := s.Exec(ctx, q, cutoff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ResetMFA(ctx context.Context, email string) error {
+	u, err := s.UserByEmail(ctx, email)
+	if err != nil {
+		return err
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, query := range []string{
+		"DELETE FROM sessions WHERE user_id=?",
+		"DELETE FROM passkeys WHERE user_id=?",
+		"UPDATE users SET totp_secret='',pending_totp='',remind_after=0 WHERE id=?",
+	} {
+		if _, err = tx.ExecContext(ctx, s.Q(query), u.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+type User struct {
+	ID, Email, PasswordHash, Role, TOTPSecret, PendingTOTP string
+	VerifiedAt, RemindAfter                                int64
+	Username, FirstName, LastName                          string
+	PublicEmail                                            bool
+}
+
+func scanUser(row *sql.Row) (User, error) {
+	var u User
+	var public int
+	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.VerifiedAt, &u.RemindAfter, &u.TOTPSecret, &u.PendingTOTP, &u.Username, &u.FirstName, &u.LastName, &public)
+	u.PublicEmail = public != 0
+	return u, err
+}
+
+const userColumns = "id,email,password_hash,role,verified_at,remind_after,totp_secret,pending_totp,username,first_name,last_name,public_email"
+
+func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
+	return scanUser(s.Row(ctx, "SELECT "+userColumns+" FROM users WHERE email=?", strings.ToLower(email)))
+}
+func (s *Store) UserByID(ctx context.Context, id string) (User, error) {
+	return scanUser(s.Row(ctx, "SELECT "+userColumns+" FROM users WHERE id=?", id))
+}
+
+type Session struct {
+	ID, UserID, CSRF, State string
+	Expires                 int64
+}
+
+func (s *Store) Session(ctx context.Context, token string) (Session, error) {
+	var v Session
+	err := s.Row(ctx, "SELECT id,user_id,csrf,state,expires_at FROM sessions WHERE id=? AND expires_at>?", Hash(token), Now()).Scan(&v.ID, &v.UserID, &v.CSRF, &v.State, &v.Expires)
+	return v, err
+}
+func (s *Store) NewSession(ctx context.Context, userID, state string) (string, Session, error) {
+	token, err := Random()
+	if err != nil {
+		return "", Session{}, err
+	}
+	csrf, err := Random()
+	if err != nil {
+		return "", Session{}, err
+	}
+	v := Session{ID: Hash(token), UserID: userID, CSRF: csrf, State: state, Expires: Now() + 12*3600}
+	_, err = s.Exec(ctx, "INSERT INTO sessions(id,user_id,csrf,state,expires_at) VALUES(?,?,?,?,?)", v.ID, v.UserID, v.CSRF, v.State, v.Expires)
+	return token, v, err
+}
+
+func (s *Store) migrate(ctx context.Context) error {
+	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	for i, statements := range [][]string{schema, schemaV2} {
+		version := i + 1
+		var found int
+		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
+		if err == nil {
+			continue
+		}
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("migrate version %d: %w", version, err)
+		}
+		tx, err := s.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("migrate version %d: %w", version, err)
+		}
+		for _, stmt := range statements {
+			if _, err = tx.ExecContext(ctx, stmt); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("migrate version %d: %w", version, err)
+			}
+		}
+		if _, err = tx.ExecContext(ctx, s.Q("INSERT INTO schema_migrations(version) VALUES(?)"), version); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migrate version %d: %w", version, err)
+		}
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("migrate version %d: %w", version, err)
+		}
+	}
+	return nil
+}
+
+var schema = []string{
+	`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','user')), verified_at BIGINT NOT NULL DEFAULT 0, remind_after BIGINT NOT NULL DEFAULT 0, totp_secret TEXT NOT NULL DEFAULT '', pending_totp TEXT NOT NULL DEFAULT '')`,
+	`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, csrf TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('full','mfa','enroll')), expires_at BIGINT NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS email_tokens (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, code_hash TEXT NOT NULL, expires_at BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`,
+	`CREATE TABLE IF NOT EXISTS auth_attempts (id TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at BIGINT NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS passkeys (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, credential TEXT NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS ceremonies (session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE, kind TEXT NOT NULL, data TEXT NOT NULL, expires_at BIGINT NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS api_clients (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, secret_hash TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL, revoked_at BIGINT NOT NULL DEFAULT 0)`,
+	`CREATE TABLE IF NOT EXISTS directory (id TEXT PRIMARY KEY, site TEXT NOT NULL, mac TEXT NOT NULL, sap TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', owner_id TEXT REFERENCES users(id) ON DELETE SET NULL, UNIQUE(site,mac,sap))`,
+	`CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, remote_site TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned', notes TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_api_clients_user ON api_clients(user_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_connections_owner ON connections(owner_id)`,
+}
+
+var schemaV2 = []string{
+	`ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE users ADD COLUMN public_email INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE users ADD COLUMN picture BYTEA`,
+	`ALTER TABLE users ADD COLUMN picture_type TEXT NOT NULL DEFAULT ''`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE username<>''`,
+	`CREATE TABLE routers (id TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,display_name TEXT NOT NULL,paused INTEGER NOT NULL DEFAULT 0,created_at BIGINT NOT NULL,last_seen_at BIGINT NOT NULL DEFAULT 0,last_ip TEXT NOT NULL DEFAULT '')`,
+	`CREATE INDEX idx_routers_owner ON routers(owner_id)`,
+	`CREATE TABLE router_credentials (id TEXT PRIMARY KEY,router_id TEXT NOT NULL REFERENCES routers(id) ON DELETE CASCADE,secret_hash TEXT NOT NULL UNIQUE,purpose TEXT NOT NULL DEFAULT 'router',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL DEFAULT 0,revoked_at BIGINT NOT NULL DEFAULT 0)`,
+	`CREATE INDEX idx_router_credentials_router ON router_credentials(router_id)`,
+	`CREATE TABLE router_epochs (router_id TEXT PRIMARY KEY REFERENCES routers(id) ON DELETE CASCADE,epoch TEXT NOT NULL,revision BIGINT NOT NULL DEFAULT 0,connected_at BIGINT NOT NULL,source_ip TEXT NOT NULL)`,
+	`CREATE TABLE router_advertisements (router_id TEXT NOT NULL REFERENCES routers(id) ON DELETE CASCADE,route_id BIGINT NOT NULL,generation BIGINT NOT NULL,epoch TEXT NOT NULL,revision BIGINT NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('CP','LU')),netid TEXT NOT NULL,name TEXT NOT NULL,hosting_cp_netid TEXT NOT NULL DEFAULT '',hosting_cp_name TEXT NOT NULL DEFAULT '',PRIMARY KEY(router_id,route_id))`,
+	`CREATE INDEX idx_router_advertisements_name ON router_advertisements(kind,netid,name)`,
+	`CREATE TABLE user_blocks (owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at BIGINT NOT NULL,PRIMARY KEY(owner_id,blocked_user_id),CHECK(owner_id<>blocked_user_id))`,
+	`CREATE TABLE router_logs (id TEXT PRIMARY KEY,router_id TEXT NOT NULL REFERENCES routers(id) ON DELETE CASCADE,owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,peer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound','system')),level TEXT NOT NULL CHECK(level IN ('info','warning','error')),event_type TEXT NOT NULL,netid TEXT NOT NULL DEFAULT '',node_name TEXT NOT NULL DEFAULT '',source_ip TEXT NOT NULL DEFAULT '',summary TEXT NOT NULL,details_json TEXT NOT NULL DEFAULT '',occurred_at BIGINT NOT NULL)`,
+	`CREATE INDEX idx_router_logs_router_time ON router_logs(router_id,occurred_at)`,
+	`CREATE INDEX idx_router_logs_owner_time ON router_logs(owner_id,occurred_at)`,
+}
+
+var ErrNotFound = errors.New("not found")
