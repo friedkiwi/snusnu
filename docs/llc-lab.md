@@ -204,9 +204,25 @@ normal-flow DFC request and shares the negotiated fixed session pacing: the
 guest's BIS receives another IPR, while Rust's BIS uses the next local send
 slot without a new pacing indicator.
 
-On 2026-11-01, this probe completed its bounded exchange with the isolated
-V4R4 SNAA guest. The guest accepted Rust's positive BIND response, sent CNOS
-Attach, and acknowledged Rust's isolated pacing response and accepted-pending
-CEB reply. It subsequently sent its own normal-flow pacing response and BIS
-request after the one-shot probe exited. This confirms management BIND/CNOS
-interoperability through the reply ACK, but does not establish a user session.
+On 2026-11-01, an initial live run reached the accepted-pending CNOS reply;
+the guest sent BIS after that one-shot process exited. A subsequent run with
+the BIS responder active reached the following control sequence on the
+isolated `sol5` TAP. PIU lengths exclude the LLC header.
+
+| Sender | Control PIU | PIU length | TH / RH or RU marker |
+| --- | --- | ---: | --- |
+| Guest A | SNASVCMG BIND | 141 | `2d00010200006b8000`, RU `31` |
+| Rust | Positive BIND response | 89 | `2d0002010000eb8000`, RU `31` |
+| Guest A | FMH-5 Attach / CNOS request | 46 | `2c00010200010b9120`, TP `06f1` |
+| Rust | Isolated pacing response | 9 | `2d0002010000830100` |
+| Rust | Accepted-pending CNOS reply with CEB | 34 | `2c0002010001039101`, GDS `1210` service `0a` |
+| Guest A | Isolated pacing response, then BIS | 9, 10 | BIS `2c00010200024b910070` |
+| Rust | Isolated pacing response, then BIS | 9, 10 | BIS `2c00020100024bb00070` |
+| Guest A | User BIND with blank mode | 141 | `2d00020200006b8000`, RU `31` |
+
+Rust closed the link on the user BIND as its unsupported gateway boundary
+requires. The guest had acknowledged the CNOS reply and both sides had sent
+BIS; this run did not reach management UNBIND or a user session. The guest's
+display remained at pass-through initialization until the writable clone was
+stopped. The private capture is outside the repository and was not used as an
+application-data fixture.
