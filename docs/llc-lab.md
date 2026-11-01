@@ -238,3 +238,17 @@ debug level. This experiment cannot carry an application conversation or
 advertise a route. It exits with status 1 on the deliberate unsupported
 follow-up or a timeout; inspect the capture to judge whether OS/400 accepted
 the response. Run it only on an isolated TAP with an expendable guest.
+
+In the isolated V4R4 A run on 2026-11-01, the probe sent its 89-byte candidate
+user +RSP(BIND), and A acknowledged the LLC I-frame with RR `N(R)=6`. About
+14 ms later A sent a 37-byte PIU with TH `2d 00 01 02 00 00`, RH `6b 80 00`,
+and RU beginning `32 01 00 00 00 00`: UNBIND with SON `0x01`
+([normal end of session](https://www.ibm.com/docs/en/zos/2.5.0?topic=routine-unbind)).
+Its FQPCID matched the management BIND, consistent with the management
+teardown in the direct two-OS/400 baseline. The probe acknowledged UNBIND
+and sent DISC as designed. A's `STRPASTHR` returned to Main Menu with APPC
+failure `E022000BA2100000`, consistent with the deliberate probe disconnect.
+An LLC RR proves frame receipt, not acceptance of the candidate BIND response
+or establishment of a usable user session. The private unfiltered capture is
+`/tmp/snusnu-v4r4-regression/native-userbind-sol5.pcap`; no raw application
+payload is included here.
