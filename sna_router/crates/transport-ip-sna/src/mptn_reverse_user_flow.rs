@@ -37,6 +37,7 @@ pub struct ReverseUserFlow {
     receive_window: u8,
     pacing: FixedPacing,
     segments: Reassembler,
+    deferred_normal: Option<TcpRecord>,
     pending_native: Option<PendingNative>,
     pending_tcp: Option<PendingTcp>,
     grant_pending: bool,
@@ -71,6 +72,7 @@ impl ReverseUserFlow {
             receive_window,
             pacing,
             segments: Reassembler::default(),
+            deferred_normal: None,
             pending_native: None,
             pending_tcp: None,
             grant_pending: false,
@@ -89,6 +91,7 @@ impl ReverseUserFlow {
         if self.closed
             || self.pending_native.is_some()
             || self.grant.is_some()
+            || self.deferred_normal.is_some()
             || !self.expedited.inbound_normal_may_pass()
         {
             return Err(blocked());
@@ -99,6 +102,24 @@ impl ReverseUserFlow {
         let Some(complete) = self.segments.push(record)? else {
             return Ok(None);
         };
+        self.prepare_complete_normal(complete).map(Some)
+    }
+
+    /// A final TCP62 segment may complete while native send pacing is
+    /// exhausted. Keep that complete record and retry after a native IPR;
+    /// never ask the caller to replay the final fragment without its header.
+    pub fn retry_deferred_normal(&mut self) -> io::Result<Option<&[u8]>> {
+        if self.closed || self.pending_native.is_some() || !self.expedited.inbound_normal_may_pass()
+        {
+            return Err(blocked());
+        }
+        let Some(record) = self.deferred_normal.take() else {
+            return Ok(None);
+        };
+        self.prepare_complete_normal(record).map(Some)
+    }
+
+    fn prepare_complete_normal(&mut self, complete: TcpRecord) -> io::Result<&[u8]> {
         let mut piu = mptn_normal_to_native(
             &complete,
             NativeSessionAddress {
@@ -109,15 +130,23 @@ impl ReverseUserFlow {
         )?;
         let mut next = self.pacing.clone();
         if piu[6] & 0x80 == 0 {
-            if next.send_request().map_err(|_| blocked())? {
-                piu[7] |= 1;
+            match next.send_request() {
+                Ok(pi) => {
+                    if pi {
+                        piu[7] |= 1;
+                    }
+                }
+                Err(_) => {
+                    self.deferred_normal = Some(complete);
+                    return Err(blocked());
+                }
             }
         }
         self.pending_native = Some(PendingNative {
             piu,
             pacing_after: next,
         });
-        Ok(Some(&self.pending_native.as_ref().unwrap().piu))
+        Ok(&self.pending_native.as_ref().unwrap().piu)
     }
 
     pub fn mark_native_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {
@@ -321,6 +350,7 @@ impl ReverseUserFlow {
     pub fn close(&mut self) {
         self.closed = true;
         self.segments.clear();
+        self.deferred_normal = None;
         self.pending_native = None;
         self.pending_tcp = None;
         self.grant = None;
@@ -361,8 +391,9 @@ mod tests {
         assert_eq!(piu, [0x2c, 0, 2, 1, 0, 1, 3, 1, 0, 0xaa]);
         assert!(flow.mark_native_enqueued(&[0]).is_err());
         flow.mark_native_enqueued(&piu).unwrap();
+        let second = normal(2, [3, 0, 0], &[0xbb]);
         assert_eq!(
-            flow.prepare_tcp_normal(&first).unwrap_err().kind(),
+            flow.prepare_tcp_normal(&second).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         assert!(matches!(
@@ -370,8 +401,7 @@ mod tests {
                 .unwrap(),
             NativeInput::PacingGrant
         ));
-        let second = normal(2, [3, 0, 0], &[0xbb]);
-        let next = flow.prepare_tcp_normal(&second).unwrap().unwrap().to_vec();
+        let next = flow.retry_deferred_normal().unwrap().unwrap().to_vec();
         assert_eq!(&next[6..9], &[3, 1, 0]);
     }
 
@@ -447,5 +477,33 @@ mod tests {
         assert!(flow
             .accept_tcp_expedited_ack(&TcpRecord::decode(vec![0, 0, 0, 5, 3]).unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn final_segment_survives_exhausted_native_send_window() {
+        let mut flow = ReverseUserFlow::new(address(), 1, 1).unwrap();
+        let first = normal(1, [3, 0, 0], &[0xaa]);
+        let piu = flow.prepare_tcp_normal(&first).unwrap().unwrap().to_vec();
+        flow.mark_native_enqueued(&piu).unwrap();
+        let start = TcpRecord::decode(vec![0, 0, 0, 11, 0x20, 0, 2, 3, 0, 0, 0xbb]).unwrap();
+        let finish = TcpRecord::decode(vec![0, 0, 0, 6, 0, 0xcc]).unwrap();
+        assert!(flow.prepare_tcp_normal(&start).unwrap().is_none());
+        assert_eq!(
+            flow.prepare_tcp_normal(&finish).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            flow.prepare_tcp_normal(&finish).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(matches!(
+            flow.prepare_native_input(&[0x2d, 0, 1, 2, 0, 0, 0x83, 1, 0])
+                .unwrap(),
+            NativeInput::PacingGrant
+        ));
+        let piu = flow.retry_deferred_normal().unwrap().unwrap().to_vec();
+        assert_eq!(piu, [0x2c, 0, 2, 1, 0, 2, 3, 1, 0, 0xbb, 0xcc]);
+        flow.mark_native_enqueued(&piu).unwrap();
+        assert!(flow.retry_deferred_normal().unwrap().is_none());
     }
 }
