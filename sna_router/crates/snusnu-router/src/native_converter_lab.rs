@@ -13,9 +13,11 @@ use crate::{
     STOP,
 };
 use router_core::user_bind::UserBindOffer;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    fs::File,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::Path,
     sync::{atomic::Ordering, mpsc},
     thread,
@@ -75,6 +77,41 @@ fn template(plu: &str, slu: &str) -> io::Result<Connect> {
             },
         ],
     })
+}
+
+fn v5_template(plu: &str, slu: &str) -> io::Result<Connect> {
+    let mut connect = template(plu, slu)?;
+    // Direct V5R4 A→B p7: request flags 0x0a, TTL 42, eight-byte
+    // correlator, transport sizes 0x8005/0x76/0x76 and ordered optional
+    // fields 05, 0a, 18, 19. Captured optional 1a/84 is omitted because
+    // this bounded diagnostic does not answer UDP keepalives.
+    connect.ttl = 42;
+    let mut correlator = [0; 8];
+    File::open("/dev/urandom")?.read_exact(&mut correlator)?;
+    connect.correlator = correlator.to_vec();
+    connect.requirements = TransportRequirements {
+        max_record: 0x8005,
+        max_expedited: 0x76,
+        max_termination: 0x76,
+    };
+    connect.options.insert(
+        0,
+        OptionalField {
+            kind: 0x05,
+            processing: 0x08,
+            value: vec![0x01, 0x01],
+        },
+    );
+    connect.options.insert(
+        2,
+        OptionalField {
+            kind: 0x18,
+            processing: 0x00,
+            value: vec![0x01],
+        },
+    );
+    connect.options[3].value = vec![0x00, 0x20, 0x01, 0x03, 0x10, 0x83];
+    Ok(connect)
 }
 
 fn read_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
@@ -146,7 +183,9 @@ fn mock_peer(
     Ok(())
 }
 
-pub(crate) fn run(path: &Path) -> io::Result<()> {
+fn open_native(
+    path: &Path,
+) -> io::Result<(ProbeConfig, NativeLlcPort, String, String, [u8; 4], Instant)> {
     let config = ProbeConfig::load(path)?;
     let remote_cp = config
         .remote_cp
@@ -162,7 +201,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         .ok_or_else(|| invalid("user_slu required"))?;
     if user_plu != remote_cp || user_slu != config.local_cp {
         return Err(invalid(
-            "mock converter fixture requires user LU pair equal configured CP pair",
+            "converter fixture requires user LU pair equal configured CP pair",
         ));
     }
     let tp = parse_tp(
@@ -188,7 +227,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         user_slu.clone(),
     )?;
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
-    tracing::warn!(interface = %config.interface, "isolated native converter mock harness opened; no production route advertised");
+    tracing::warn!(interface = %config.interface, "isolated native converter harness opened; no production route advertised");
     // Construct the gateway as soon as the validated management BIND exists.
     // Waiting until BIS completes could consume and discard a UserBind event
     // delivered in the same LLC poll as the final management ACK.
@@ -210,9 +249,39 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     if native.management_bind().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "mock converter did not receive APPN management BIND",
+            "converter did not receive APPN management BIND",
         ));
     }
+    Ok((config, native, user_plu, user_slu, tp, deadline))
+}
+
+fn bridge(
+    native: &NativeLlcPort,
+    user_plu: &str,
+    user_slu: &str,
+    tp: [u8; 4],
+) -> io::Result<Bridge> {
+    let policy = BindPolicy {
+        plu: user_plu.to_owned(),
+        slu: user_slu.to_owned(),
+        mode: None,
+        allow_blank_mode: true,
+        max_pending_bytes: MAX_RECORD,
+    };
+    Bridge::new(
+        policy,
+        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?,
+        native
+            .management_bind()
+            .ok_or_else(|| invalid("management BIND missing"))?
+            .clone(),
+        tp,
+        1,
+    )
+}
+
+pub(crate) fn run(path: &Path) -> io::Result<()> {
+    let (config, native, user_plu, user_slu, tp, deadline) = open_native(path)?;
     let management = native
         .management_bind()
         .ok_or_else(|| invalid("management BIND missing"))?
@@ -228,20 +297,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     let mut mock_bytes = None;
     // All six codes are injected only because this peer is an in-process
     // mock on loopback. Never derive production handler availability here.
-    let policy = BindPolicy {
-        plu: user_plu.clone(),
-        slu: user_slu.clone(),
-        mode: None,
-        allow_blank_mode: true,
-        max_pending_bytes: MAX_RECORD,
-    };
-    let bridge = Bridge::new(
-        policy,
-        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?,
-        native.management_bind().unwrap().clone(),
-        tp,
-        1,
-    )?;
+    let bridge = bridge(&native, &user_plu, &user_slu, tp)?;
     let mut edge = GatewayEdge::new(
         native,
         TcpSession::new(sender)?,
@@ -287,6 +343,86 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn observe_udp(socket: &UdpSocket) -> io::Result<()> {
+    let mut packet = [0u8; 65_536];
+    match socket.recv_from(&mut packet) {
+        Ok((length, source)) => {
+            tracing::warn!(source = %source, bytes = length, code = ?packet.get(4), "experimental V5 AnyNet UDP received; stopping before unsupported X83 handling");
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "experimental AnyNet UDP/X83 response handling is unavailable",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Explicit one-shot diagnostic against an isolated real V5R4 TCP62 peer.
+/// The X'19' claim is restricted to this command and is never installed in
+/// the production route loader. Any UDP packet ends the diagnostic before an
+/// unimplemented X'83' control flow could be silently ignored.
+pub(crate) fn run_v5(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) -> io::Result<()> {
+    if local_ip.is_unspecified()
+        || local_ip.is_loopback()
+        || local_ip.is_multicast()
+        || remote_ip.is_unspecified()
+        || remote_ip.is_loopback()
+        || remote_ip.is_multicast()
+        || local_ip == remote_ip
+    {
+        return Err(invalid(
+            "isolated V5 lab needs two distinct unicast IPv4 addresses",
+        ));
+    }
+    let udp = UdpSocket::bind(SocketAddr::new(local_ip.into(), 397))?;
+    udp.set_nonblocking(true)?;
+    let (config, native, user_plu, user_slu, tp, deadline) = open_native(path)?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind(&SocketAddr::new(local_ip.into(), 0).into())?;
+    let remote = SocketAddr::new(remote_ip.into(), 397);
+    socket.connect_timeout(&remote.into(), Duration::from_secs(5))?;
+    let stream: TcpStream = socket.into();
+    let bridge = bridge(&native, &user_plu, &user_slu, tp)?;
+    let mut edge = GatewayEdge::new(
+        native,
+        TcpSession::new(stream)?,
+        bridge,
+        v5_template(&user_plu, &user_slu)?,
+    );
+    tracing::warn!(interface = %config.interface, local_ip = %local_ip, remote_ip = %remote_ip, "experimental V5 TCP62 diagnostic opened; X83 unavailable; no production route advertised");
+    while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+        observe_udp(&udp)?;
+        edge.poll_native_once()?;
+        edge.flush_tcp()?;
+        if edge.first_attach_delivery_complete() {
+            break;
+        }
+        // The first application reply is outside this bounded diagnostic.
+        // Once its Attach is queued, leave TCP readable for the next gateway
+        // implementation, while continuing to observe native ACK and UDP.
+        if !edge.ipr_ack_outstanding() {
+            edge.poll_tcp_once()?;
+        }
+        observe_udp(&udp)?;
+        if edge.first_attach_delivery_complete() {
+            break;
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+    if !edge.first_attach_delivery_complete() {
+        edge.close()?;
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "V5 TCP62 Connect, first Attach, or native IPR ACK incomplete",
+        ));
+    }
+    observe_udp(&udp)?;
+    tracing::info!(remote_ip = %remote_ip, "first native Attach written to isolated V5 TCP62 peer and native IPR acknowledged; application conversation unsupported");
+    edge.close()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +434,52 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn real_v5_template_matches_captured_nonvolatile_connect_profile() {
+        let request = v5_template("SOLNET.SNAA", "SOLNET.SNAB").unwrap();
+        assert_eq!(request.processing, 0x0a);
+        assert_eq!(request.ttl, 42);
+        assert_eq!(request.correlator.len(), 8);
+        assert_eq!(request.requirements.max_record, 0x8005);
+        assert_eq!(request.requirements.max_expedited, 0x76);
+        assert_eq!(request.requirements.max_termination, 0x76);
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .map(|option| option.kind)
+                .collect::<Vec<_>>(),
+            [0x05, 0x0a, 0x18, 0x19]
+        );
+        assert_eq!(request.options[0].value, [0x01, 0x01]);
+        assert_eq!(request.options[2].value, [0x01]);
+        assert_eq!(
+            request.options[3].value,
+            [0x00, 0x20, 0x01, 0x03, 0x10, 0x83]
+        );
+        assert_eq!(
+            Connect::decode(&request.encode().unwrap()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn real_v5_diagnostic_stops_on_udp_before_claiming_delivery() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(
+                &[0, 0, 0, 10, 0x83, 0, 0, 0, 0, 6],
+                receiver.local_addr().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            observe_udp(&receiver).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 
     #[test]

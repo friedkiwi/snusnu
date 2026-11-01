@@ -370,3 +370,23 @@ this bounded test. The private unfiltered capture
 frames with no capture drops. This establishes the first user Attach crossing
 the native LLC2-to-TCP62 boundary in the mock harness, while a real V5R4
 AnyNet peer and completed conversation remain untested.
+
+The separate `--native-converter-v5-lab` diagnostic uses the same native
+configuration and dials a real isolated V5R4 AnyNet listener at TCP/397.
+For the sol5/sol7 lab only, the invocation is:
+
+```sh
+cargo run -p snusnu-router -- --native-converter-v5-lab \
+  /tmp/snusnu-native-v4a-user-pacing.toml 10.99.4.10 10.99.4.3 \
+  --acknowledge-experimental-x83
+```
+
+The local IPv4 address must already exist on isolated sol7. The diagnostic
+binds UDP/397 locally and stops on any incoming datagram; it has no X'83'
+out-of-band responder. Its TCP62 Connect advertises the six codes only under
+the explicit lab flag, following the observed V5R4 Connect profile for its
+nonvolatile fields except the optional X'84' keepalive field, which it omits
+because it has no keepalive responder. It closes after the first native Attach has been fully
+written to TCP and its native IPR is LLC-acknowledged. Any positive result is
+limited to that exchange; production configuration continues to reject
+LLC-to-AnyNet conversion.
