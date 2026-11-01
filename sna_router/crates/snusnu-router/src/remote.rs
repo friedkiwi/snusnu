@@ -1,7 +1,7 @@
 //! WebSocket circuit adapter. The routing core sees the same SNA units as it
 //! does on a local LLC port; only this module knows the concentrator protocol.
 
-use crate::routing::{RoutePort, RoutedUnit, RouterEvent};
+use crate::routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent};
 use router_core::packet_log::{decode_llc_pdu, decode_sna_information, hex_dump};
 use std::{
     cell::RefCell,
@@ -808,6 +808,18 @@ impl WsRoutePort {
 }
 
 impl RoutePort for WsRoutePort {
+    fn failure_scope(&self, error: &io::Error) -> FailureScope {
+        if error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<transport_ws::Error>())
+            .is_some()
+        {
+            FailureScope::SharedTransport
+        } else {
+            FailureScope::Route
+        }
+    }
+
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
         if can_accept_information {
             if let Some(data) = self.pending_information.pop_front() {
@@ -1334,6 +1346,16 @@ mod tests {
             }],
         )
         .unwrap();
+        assert!(matches!(
+            ports[0].failure_scope(&io_error(transport_ws::Error::Protocol(
+                "server closed connection"
+            ))),
+            FailureScope::SharedTransport
+        ));
+        assert!(matches!(
+            ports[0].failure_scope(&protocol("invalid circuit")),
+            FailureScope::Route
+        ));
         let mut received = [None, None];
         let mut managed_macs = [None, None];
         let deadline = Instant::now() + Duration::from_secs(2);
