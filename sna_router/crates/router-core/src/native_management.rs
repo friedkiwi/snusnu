@@ -446,4 +446,58 @@ mod tests {
         assert_eq!(session.phase(), Phase::CnosComplete);
         assert_eq!(session.pacing().unwrap().send_remaining(), 6);
     }
+
+    #[test]
+    fn rejected_early_attach_and_ack_overcount_leave_management_state_usable() {
+        let attach = [
+            0x2c, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20, 0x0c, 0x05, 0x02, 0xff, 0, 3, 0xd0, 0, 0, 2,
+            0x06, 0xf1, 0, 25, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 8, 0, 4, 0, 4, 0, 8, 0x40, 0x40, 0x40,
+            0x40, 0x40, 0x40, 0x40, 0x40,
+        ];
+        let mut session = ManagementSession::new("SOLNET.SNAA".into(), "SOLNET.SNAB".into());
+        session.observe_bind(&live_shape_bind()).unwrap();
+        let bind_reply = session.prepare_bind_response().unwrap().to_vec();
+        session.mark_bind_enqueued(&bind_reply).unwrap();
+
+        let mut wrong_session = attach;
+        wrong_session[2] = 3;
+        assert_eq!(
+            session.buffer_early_attach(&wrong_session),
+            Err(ManagementError::UnexpectedState)
+        );
+        let mut wrong_odai = attach;
+        wrong_odai[0] ^= 0x02;
+        assert_eq!(
+            session.buffer_early_attach(&wrong_odai),
+            Err(ManagementError::UnexpectedState)
+        );
+        assert_eq!(session.phase(), Phase::AwaitBindAck);
+        session.buffer_early_attach(&attach).unwrap();
+        session.acknowledge_bind(1).unwrap();
+        let buffered = session.take_early_attach().unwrap();
+        let (ipr, reply) = session.observe_attach(&buffered).unwrap();
+        let (ipr, reply) = (ipr.to_vec(), reply.to_vec());
+
+        let mut wrong_reply = reply.clone();
+        wrong_reply[3] = 3;
+        assert_eq!(
+            session.mark_attach_replies_enqueued(&ipr, &wrong_reply),
+            Err(ManagementError::WrongEgress)
+        );
+        assert_eq!(session.phase(), Phase::AttachRepliesPrepared);
+        session.mark_attach_replies_enqueued(&ipr, &reply).unwrap();
+        assert_eq!(
+            session.acknowledge_attach_replies(3),
+            Err(ManagementError::UnexpectedState)
+        );
+        assert_eq!(session.phase(), Phase::AwaitCnosAck);
+        session.acknowledge_attach_replies(1).unwrap();
+        assert_eq!(
+            session.acknowledge_attach_replies(2),
+            Err(ManagementError::UnexpectedState)
+        );
+        assert_eq!(session.phase(), Phase::AwaitCnosAck);
+        session.acknowledge_attach_replies(1).unwrap();
+        assert_eq!(session.phase(), Phase::CnosComplete);
+    }
 }
