@@ -17,6 +17,7 @@ use router_core::{
     llc2::State,
     native_management::{ManagementSession, Phase as ManagementPhase},
     user_bind::UserBindOffer,
+    user_fmh5::parse_first_user_attach,
     xid3::{Role, Xid3},
     xid3_activation::Phase,
 };
@@ -30,6 +31,7 @@ pub(crate) struct NativePeerPort {
     reached_management_bind: bool,
     management: Option<ManagementSession>,
     user_probe: UserProbeState,
+    user_offer: Option<UserBindOffer>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +60,7 @@ impl NativePeerPort {
             reached_management_bind: false,
             management: None,
             user_probe: UserProbeState::Off,
+            user_offer: None,
         })
     }
 
@@ -222,6 +225,23 @@ impl NativePeerPort {
         if self.user_probe == UserProbeState::AwaitResponseAck
             || (self.user_probe == UserProbeState::AwaitFollowup && !management_unbind)
         {
+            if self.user_probe == UserProbeState::AwaitFollowup {
+                if let Some(offer) = &self.user_offer {
+                    match parse_first_user_attach(&piu, offer) {
+                        Ok(attach) => tracing::info!(
+                            daf = attach.daf,
+                            oaf = attach.oaf,
+                            sequence = attach.sequence,
+                            fmh5_bytes = attach.fmh5_bytes,
+                            opaque_tail_bytes = attach.opaque_tail_bytes,
+                            "native user FMH-5 Attach recognized; no application gateway active"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "native user follow-up differs from captured FMH-5 Attach")
+                        }
+                    }
+                }
+            }
             tracing::warn!(bytes = piu.len(), th = ?piu.get(..6), rh = ?piu.get(6..9), "native user BIND probe reached peer follow-up; closing before unsupported user traffic");
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -344,6 +364,7 @@ impl NativePeerPort {
                                 "native user BIND response queue full",
                             ));
                         }
+                        self.user_offer = Some(offer);
                         self.user_probe = UserProbeState::AwaitResponseAck;
                         tracing::warn!("experimental fixed-window native user BIND response queued; no user gateway active");
                         return Ok(());
