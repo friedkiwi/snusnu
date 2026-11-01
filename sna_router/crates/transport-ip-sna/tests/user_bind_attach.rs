@@ -293,12 +293,14 @@ fn gateway_tcp_credit_releases_after_complete_socket_write() {
 struct MockNative {
     events: VecDeque<NativeEvent>,
     sent: Vec<Vec<u8>>,
+    ingress_capacity: Vec<bool>,
     accepts: bool,
     closed: bool,
 }
 
 impl NativeLeg for MockNative {
-    fn receive_once(&mut self) -> io::Result<Option<NativeEvent>> {
+    fn receive_once(&mut self, can_accept_information: bool) -> io::Result<Option<NativeEvent>> {
+        self.ingress_capacity.push(can_accept_information);
         Ok(self.events.pop_front())
     }
     fn enqueue(&mut self, piu: &[u8]) -> io::Result<bool> {
@@ -375,6 +377,10 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
         .push_back(NativeEvent::FirstAttach(first_user_attach()));
     edge.poll_native_once().unwrap();
     assert_eq!(edge.pending_gateway_bytes(), (243, 0));
+    // The first Attach is held for TCP delivery. A later native information
+    // frame must not be LLC-acknowledged while this edge has no APPC handler.
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.native_mut().ingress_capacity.last(), Some(&false));
     assert_eq!(edge.native_mut().sent[1], hex("2d0002010000830100"));
     assert!(edge.ipr_ack_outstanding());
     assert!(!edge.first_attach_delivery_complete());

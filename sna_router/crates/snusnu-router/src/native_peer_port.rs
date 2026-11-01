@@ -684,9 +684,9 @@ fn management_error(error: impl std::fmt::Display) -> io::Error {
 }
 
 impl RoutePort for NativePeerPort {
-    fn poll(&mut self, _: bool) -> io::Result<Option<Vec<RouterEvent>>> {
+    fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
         self.endpoint
-            .poll(true)?
+            .poll(self.converter_policy.is_none() || can_accept_information)?
             .map(|events| self.process(events))
             .transpose()
     }

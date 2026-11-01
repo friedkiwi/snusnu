@@ -37,10 +37,17 @@ impl NativeLlcPort {
     }
 
     pub(crate) fn receive_once(&mut self) -> io::Result<Option<NativeLlcEvent>> {
+        self.receive_once_with_capacity(true)
+    }
+
+    fn receive_once_with_capacity(
+        &mut self,
+        can_accept_information: bool,
+    ) -> io::Result<Option<NativeLlcEvent>> {
         if let Some(event) = self.inner.take_converter_event() {
             return Ok(Some(event));
         }
-        self.inner.poll(true)?;
+        self.inner.poll(can_accept_information)?;
         self.inner.tick()?;
         Ok(self.inner.take_converter_event())
     }
@@ -63,8 +70,8 @@ impl NativeLlcPort {
 }
 
 impl NativeLeg for NativeLlcPort {
-    fn receive_once(&mut self) -> io::Result<Option<NativeEvent>> {
-        let event = NativeLlcPort::receive_once(self)?;
+    fn receive_once(&mut self, can_accept_information: bool) -> io::Result<Option<NativeEvent>> {
+        let event = self.receive_once_with_capacity(can_accept_information)?;
         Ok(match event {
             Some(NativeLlcEvent::UserBind(piu)) => Some(NativeEvent::UserBind(piu)),
             Some(NativeLlcEvent::BindResponseAck) => Some(NativeEvent::BindResponseAck(1)),

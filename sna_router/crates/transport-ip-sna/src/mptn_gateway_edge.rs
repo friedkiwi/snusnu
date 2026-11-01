@@ -20,7 +20,9 @@ pub enum NativeEvent {
 /// The native adapter owns XID, LLC2 and SNASVCMG. `Bridge` owns the user
 /// session. Successful enqueue means the exact PIU entered a bounded queue.
 pub trait NativeLeg {
-    fn receive_once(&mut self) -> io::Result<Option<NativeEvent>>;
+    /// The edge must reserve converter capacity before the native leg may
+    /// acknowledge another LLC information frame.
+    fn receive_once(&mut self, can_accept_information: bool) -> io::Result<Option<NativeEvent>>;
     fn enqueue(&mut self, piu: &[u8]) -> io::Result<bool>;
     fn available_slots(&self) -> usize;
     fn close(&mut self) -> io::Result<()>;
@@ -107,7 +109,12 @@ impl<L: NativeLeg> GatewayEdge<L> {
         if self.closed {
             return Err(invalid("gateway edge is closed"));
         }
-        if let Some(event) = self.native.receive_once()? {
+        // This edge supports one user Attach. Hold subsequent native I-frames
+        // at LLC2 until a later APPC flow handler owns their TCP credit.
+        let attach_in_flight = self.attach.is_some()
+            || self.attach_fully_sent
+            || self.writes.iter().any(|(_, charged)| *charged);
+        if let Some(event) = self.native.receive_once(!attach_in_flight)? {
             match event {
                 NativeEvent::UserBind(piu) => {
                     let template = self
