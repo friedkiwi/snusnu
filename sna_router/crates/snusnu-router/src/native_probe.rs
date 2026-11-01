@@ -23,6 +23,12 @@ struct ProbeConfig {
     local_cp: String,
     #[serde(default)]
     remote_cp: Option<String>,
+    #[serde(default)]
+    user_plu: Option<String>,
+    #[serde(default)]
+    user_slu: Option<String>,
+    #[serde(default)]
+    user_tp_hex: Option<String>,
     local_station: String,
     local_node_id: String,
     tg_number: u8,
@@ -64,6 +70,15 @@ fn parse_node_id(value: &str) -> io::Result<[u8; 4]> {
         .to_be_bytes())
 }
 
+fn parse_tp(value: &str) -> io::Result<[u8; 4]> {
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("user_tp_hex must be eight hexadecimal digits"));
+    }
+    Ok(u32::from_str_radix(value, 16)
+        .map_err(|_| invalid("invalid user_tp_hex"))?
+        .to_be_bytes())
+}
+
 impl ProbeConfig {
     fn load(path: &Path) -> io::Result<Self> {
         let content = fs::read_to_string(path)?;
@@ -94,18 +109,27 @@ impl ProbeConfig {
 }
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
-    run_with_mode(path, false, false)
+    run_with_mode(path, false, false, false)
 }
 
 pub(crate) fn run_management(path: &Path) -> io::Result<()> {
-    run_with_mode(path, true, false)
+    run_with_mode(path, true, false, false)
 }
 
 pub(crate) fn run_user_bind(path: &Path) -> io::Result<()> {
-    run_with_mode(path, true, true)
+    run_with_mode(path, true, true, false)
 }
 
-fn run_with_mode(path: &Path, management: bool, user_bind: bool) -> io::Result<()> {
+pub(crate) fn run_user_pacing(path: &Path) -> io::Result<()> {
+    run_with_mode(path, true, true, true)
+}
+
+fn run_with_mode(
+    path: &Path,
+    management: bool,
+    user_bind: bool,
+    user_pacing: bool,
+) -> io::Result<()> {
     let config = ProbeConfig::load(path)?;
     let profile = config.profile()?;
     let xid = profile
@@ -135,7 +159,28 @@ fn run_with_mode(path: &Path, management: bool, user_bind: bool) -> io::Result<(
             .remote_cp
             .clone()
             .ok_or_else(|| invalid("remote_cp required for management probe"))?;
-        if user_bind {
+        if user_pacing {
+            NativePeerPort::open_user_pacing_probe(
+                peer,
+                xid,
+                remote_cp,
+                config.local_cp.clone(),
+                config
+                    .user_plu
+                    .clone()
+                    .ok_or_else(|| invalid("user_plu required for pacing probe"))?,
+                config
+                    .user_slu
+                    .clone()
+                    .ok_or_else(|| invalid("user_slu required for pacing probe"))?,
+                parse_tp(
+                    config
+                        .user_tp_hex
+                        .as_deref()
+                        .ok_or_else(|| invalid("user_tp_hex required for pacing probe"))?,
+                )?,
+            )?
+        } else if user_bind {
             NativePeerPort::open_user_bind_probe(peer, xid, remote_cp, config.local_cp.clone())?
         } else {
             NativePeerPort::open_management(peer, xid, remote_cp, config.local_cp.clone())?
@@ -158,7 +203,9 @@ fn run_with_mode(path: &Path, management: bool, user_bind: bool) -> io::Result<(
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                if user_bind {
+                if user_pacing {
+                    "native user pacing probe timed out before next user PIU"
+                } else if user_bind {
                     "native user BIND probe timed out before peer follow-up"
                 } else if management {
                     "native management probe timed out before UNBIND completion"

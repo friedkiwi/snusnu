@@ -254,6 +254,26 @@ recognizes the first Attach header and leaves its application data opaque.
 The reply semantics still need the next live probe and APPC conversation
 implementation before Rust can generate a response.
 
+### Experimental user pacing probe
+
+`--native-user-pacing-probe` adds a separate fixed-window user-session pacing
+test after the user BIND response. Supply explicit policy fields alongside
+the management probe configuration:
+
+```toml
+user_plu = "SOLNET.SNAA"
+user_slu = "SOLNET.SNAB"
+user_tp_hex = "30f0f0f5"
+```
+
+The TP value is the raw four-byte name observed for this pass-through test;
+other applications require their own configured LU pair and TP value. The
+probe validates and retains exactly one first FMH-5 Attach, reserves a bounded
+receive slot, sends a correlated nine-byte user pacing response, and closes
+on the next user PIU. It never sends an APPC Attach reply or advertises a
+ready route. Use only the isolated V4R4 guest and expect exit status 1 at the
+intentional unsupported user-data boundary.
+
 In the isolated V4R4 A run on 2026-11-01, the probe sent its 89-byte candidate
 user +RSP(BIND), and A acknowledged the LLC I-frame with RR `N(R)=6`. About
 14 ms later A sent a 37-byte PIU with TH `2d 00 01 02 00 00`, RH `6b 80 00`,

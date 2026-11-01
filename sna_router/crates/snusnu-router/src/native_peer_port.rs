@@ -16,8 +16,9 @@ use router_core::{
     fid2_bind::{classify_bind, BindClass},
     llc2::State,
     native_management::{ManagementSession, Phase as ManagementPhase},
-    user_bind::UserBindOffer,
+    user_bind::{UserBindOffer, UserBindPolicy},
     user_fmh5::parse_first_user_attach,
+    user_pacing::UserPacingSession,
     xid3::{Role, Xid3},
     xid3_activation::Phase,
 };
@@ -32,6 +33,15 @@ pub(crate) struct NativePeerPort {
     management: Option<ManagementSession>,
     user_probe: UserProbeState,
     user_offer: Option<UserBindOffer>,
+    user_pacing: Option<UserPacingSession>,
+    pacing_probe: Option<PacingProbePolicy>,
+    first_user_attach: Option<Vec<u8>>,
+}
+
+struct PacingProbePolicy {
+    plu: String,
+    slu: String,
+    tp: [u8; 4],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +50,8 @@ enum UserProbeState {
     AwaitBind,
     AwaitResponseAck,
     AwaitFollowup,
+    AwaitPacingIprAck,
+    AwaitPacingFollowup,
 }
 
 impl NativePeerPort {
@@ -61,6 +73,9 @@ impl NativePeerPort {
             management: None,
             user_probe: UserProbeState::Off,
             user_offer: None,
+            user_pacing: None,
+            pacing_probe: None,
+            first_user_attach: None,
         })
     }
 
@@ -93,6 +108,24 @@ impl NativePeerPort {
         Ok(port)
     }
 
+    pub(crate) fn open_user_pacing_probe(
+        peer: LlcPeer<'_>,
+        local_xid: Xid3,
+        remote_plu: String,
+        local_slu: String,
+        user_plu: String,
+        user_slu: String,
+        tp: [u8; 4],
+    ) -> io::Result<Self> {
+        let mut port = Self::open_user_bind_probe(peer, local_xid, remote_plu, local_slu)?;
+        port.pacing_probe = Some(PacingProbePolicy {
+            plu: user_plu,
+            slu: user_slu,
+            tp,
+        });
+        Ok(port)
+    }
+
     pub(crate) fn reached_management_bind(&self) -> bool {
         self.reached_management_bind
     }
@@ -101,8 +134,18 @@ impl NativePeerPort {
         if let Some(management) = self.management.as_mut() {
             let completed = self.endpoint.take_completed_information_count();
             if self.user_probe == UserProbeState::AwaitResponseAck && completed == 1 {
+                if let Some(pacing) = self.user_pacing.as_mut() {
+                    pacing
+                        .acknowledge_bind(completed)
+                        .map_err(management_error)?;
+                }
                 self.user_probe = UserProbeState::AwaitFollowup;
                 tracing::info!("experimental native user BIND response acknowledged by LLC2; awaiting peer follow-up");
+            } else if self.user_probe == UserProbeState::AwaitPacingIprAck && completed == 1 {
+                self.user_probe = UserProbeState::AwaitPacingFollowup;
+                tracing::info!(
+                    "experimental user pacing IPR acknowledged by LLC2; awaiting next user PIU"
+                );
             } else {
                 match management.phase() {
                     ManagementPhase::AwaitBindAck if completed != 0 => management
@@ -222,8 +265,47 @@ impl NativePeerPort {
     fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
         let management = self.management.as_mut().expect("management mode");
         let management_unbind = piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32;
+        if self.user_probe == UserProbeState::AwaitFollowup
+            && !management_unbind
+            && self.pacing_probe.is_some()
+        {
+            if management.phase() != ManagementPhase::Closed || self.first_user_attach.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "user Attach before management teardown or duplicate Attach",
+                ));
+            }
+            let policy = self.pacing_probe.as_ref().unwrap();
+            let offer = self.user_offer.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "user BIND offer missing")
+            })?;
+            let pacing = self.user_pacing.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "user pacing session missing")
+            })?;
+            let route = pacing
+                .observe_first_attach(offer, &policy.tp, &piu)
+                .map_err(management_error)?;
+            self.first_user_attach = Some(piu);
+            let ipr = pacing.prepare_ipr(1).map_err(management_error)?.to_vec();
+            if !self.endpoint.queue_information(ipr.clone())? {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "user pacing IPR queue full",
+                ));
+            }
+            pacing
+                .mark_egress_enqueued(&ipr)
+                .map_err(management_error)?;
+            self.user_probe = UserProbeState::AwaitPacingIprAck;
+            tracing::info!(remote_lu = %route.remote_lu, local_lu = %route.local_lu, mode = %route.mode, tp = ?route.transaction_program, pip_bytes = route.pip_bytes, "native user Attach buffered and fixed pacing IPR queued; no application gateway active");
+            return Ok(());
+        }
         if self.user_probe == UserProbeState::AwaitResponseAck
             || (self.user_probe == UserProbeState::AwaitFollowup && !management_unbind)
+            || matches!(
+                self.user_probe,
+                UserProbeState::AwaitPacingIprAck | UserProbeState::AwaitPacingFollowup
+            )
         {
             if self.user_probe == UserProbeState::AwaitFollowup {
                 if let Some(offer) = &self.user_offer {
@@ -347,23 +429,50 @@ impl NativePeerPort {
             }
             ManagementPhase::BisComplete => {
                 if matches!(classify_bind(&piu), Ok(Some(_))) {
-                    let offer = UserBindOffer::from_request(
-                        &piu,
-                        management.bind().ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
-                        })?,
-                        "",
-                    )
+                    let bind = management.bind().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
+                    })?;
+                    let offer = if let Some(policy) = &self.pacing_probe {
+                        UserBindOffer::from_request_with_policy(
+                            &piu,
+                            bind,
+                            UserBindPolicy {
+                                plu: &policy.plu,
+                                slu: &policy.slu,
+                                mode: "",
+                            },
+                        )
+                    } else {
+                        UserBindOffer::from_request(&piu, bind, "")
+                    }
                     .map_err(management_error)?;
                     tracing::warn!(plu = %offer.plu, slu = %offer.slu, daf = offer.daf, oaf = offer.oaf, mode = %offer.mode, bytes = offer.request().len(), experimental_response = self.user_probe == UserProbeState::AwaitBind, "native user BIND offer validated; user gateway unavailable");
                     if self.user_probe == UserProbeState::AwaitBind {
-                        let response = offer.build_fixed_response(1).map_err(management_error)?;
-                        if !self.endpoint.queue_information(response)? {
+                        let mut pacing = if self.pacing_probe.is_some() {
+                            Some(
+                                UserPacingSession::new(&offer, bind, 1)
+                                    .map_err(management_error)?,
+                            )
+                        } else {
+                            None
+                        };
+                        let response = if let Some(session) = &pacing {
+                            session.prepared_bind_response().to_vec()
+                        } else {
+                            offer.build_fixed_response(1).map_err(management_error)?
+                        };
+                        if !self.endpoint.queue_information(response.clone())? {
                             return Err(io::Error::new(
                                 io::ErrorKind::WouldBlock,
                                 "native user BIND response queue full",
                             ));
                         }
+                        if let Some(session) = pacing.as_mut() {
+                            session
+                                .mark_bind_enqueued(&response)
+                                .map_err(management_error)?;
+                        }
+                        self.user_pacing = pacing;
                         self.user_offer = Some(offer);
                         self.user_probe = UserProbeState::AwaitResponseAck;
                         tracing::warn!("experimental fixed-window native user BIND response queued; no user gateway active");

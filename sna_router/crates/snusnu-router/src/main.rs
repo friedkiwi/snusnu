@@ -120,6 +120,15 @@ fn run() -> io::Result<()> {
         return native_probe::run_user_bind(std::path::Path::new(&path));
     }
     #[cfg(target_os = "linux")]
+    if first.as_deref() == Some("--native-user-pacing-probe") {
+        let path = args.next().ok_or_else(usage_error)?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        install_signals();
+        return native_probe::run_user_pacing(std::path::Path::new(&path));
+    }
+    #[cfg(target_os = "linux")]
     if first.as_deref() == Some("--lab-link") {
         let interface_a = args.next().ok_or_else(usage_error)?;
         let interface_b = args.next().ok_or_else(usage_error)?;
@@ -196,7 +205,7 @@ fn run() -> io::Result<()> {
         None => "local-dev".to_owned(),
         Some("--help") if args.next().is_none() => {
             println!(
-                "usage: snusnu-router --config FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
+                "usage: snusnu-router --config FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | --native-user-pacing-probe FILE | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
             );
             return Ok(());
         }
@@ -226,7 +235,7 @@ fn run() -> io::Result<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: snusnu-router --config FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
+        "usage: snusnu-router --config FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | --native-user-pacing-probe FILE | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
     )
 }
 
