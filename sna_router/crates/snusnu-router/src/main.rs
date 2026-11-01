@@ -19,6 +19,8 @@ mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
 #[cfg(target_os = "linux")]
+mod native_type1;
+#[cfg(target_os = "linux")]
 mod remote;
 #[cfg(target_os = "linux")]
 mod routing;
