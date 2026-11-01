@@ -1,5 +1,6 @@
 //! Platform-independent circuit domain foundation.
 
+pub mod fid2_bind;
 pub mod llc;
 pub mod llc2;
 pub mod llc_type1;
