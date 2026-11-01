@@ -405,6 +405,22 @@ impl NativePeerPort {
         let management = self.management.as_mut().expect("management mode");
         let management_unbind = piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32;
         if self.converter_policy.is_some() && management.phase() == ManagementPhase::Closed {
+            if self.converter_offer.is_none() {
+                let bind = management.bind().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
+                })?;
+                let (plu, slu) = self.converter_policy.as_ref().unwrap();
+                return queue_converter_bind(
+                    management.phase(),
+                    &piu,
+                    bind,
+                    plu,
+                    slu,
+                    &mut self.converter_offer,
+                    &mut self.converter_bind_waits_for_bis_ack,
+                    &mut self.converter_events,
+                );
+            }
             if !self.converter_bind_response_acked {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -738,7 +754,7 @@ fn queue_converter_bind(
 ) -> io::Result<()> {
     if !matches!(
         phase,
-        ManagementPhase::AwaitBisAck | ManagementPhase::BisComplete
+        ManagementPhase::AwaitBisAck | ManagementPhase::BisComplete | ManagementPhase::Closed
     ) || !matches!(classify_bind(piu), Ok(Some(_)))
     {
         return Err(io::Error::new(
@@ -923,6 +939,39 @@ mod completion_tests {
         publish_pending_converter_bind(Phase::BisComplete, &offer, &mut pending, &mut events)
             .unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn user_bind_after_management_unbind_is_published_immediately() {
+        let (management, piu) = bind_pair();
+        let mut offer = None;
+        let mut pending = false;
+        let mut events = VecDeque::new();
+        queue_converter_bind(
+            Phase::Closed,
+            &piu,
+            &management,
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &mut offer,
+            &mut pending,
+            &mut events,
+        )
+        .unwrap();
+        assert!(!pending);
+        assert_eq!(offer.as_ref().unwrap().request(), piu);
+        assert!(matches!(events.pop_front(), Some(NativeLlcEvent::UserBind(sent)) if sent == piu));
+        assert!(queue_converter_bind(
+            Phase::Closed,
+            &piu,
+            &management,
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &mut offer,
+            &mut pending,
+            &mut events,
+        )
+        .is_err());
     }
 
     #[test]
