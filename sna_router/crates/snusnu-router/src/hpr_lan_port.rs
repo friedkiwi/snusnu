@@ -694,7 +694,10 @@ mod diagnostic_test {
             let xid = Xid3::decode(&payload[3..]);
             match xid {
                 Ok(xid) => eprintln!("{direction}: XID3 length={} node_id={:02x?} role={:?} exchange={:?} abm={} btu={} cv61_sap={:?}", payload.len()-3, xid.node_id(), xid.role(), xid.exchange_state(), xid.abm_capable(), xid.max_receive_btu(), hpr_lan::advertised_hpr_sap(&payload[3..], if direction == "LAN to EE" { HprMedium::Lan } else { HprMedium::EnterpriseExtender })),
-                Err(error) => eprintln!("{direction}: XID control length={} XID3 parse={error:?}", payload.len()-3),
+                Err(error) => {
+                    eprintln!("{direction}: XID control length={} XID3 rejected={error:?}", payload.len()-3);
+                    return Ok(());
+                }
             }
         } else {
             eprintln!("{direction}: {:?} control", datagram.kind);
