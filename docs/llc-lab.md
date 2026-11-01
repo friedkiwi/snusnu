@@ -134,3 +134,40 @@ were already in flight from an authenticated circuit participant when the
 other participant closed the circuit.
 The APPC controllers had to be varied on after guest IPL before initiating
 the pass-through session.
+
+## One-guest native APPN probe
+
+`--native-probe` tests the Rust router as one locally identified APPN link
+station against an isolated guest. It handles TEST, a null XID poll, XID3
+role negotiation, and LLC2 contact. On the first SNASVCMG BIND, it logs the
+PLU/SLU and disconnects because a positive management BIND response is not yet
+implemented. It does not advertise a ready route or carry user traffic.
+
+Use a dedicated TAP and a guest configured to target the probe's proxy MAC and
+CP. For the isolated V4R4 SNAA guest on `sol5`, an example configuration is:
+
+```toml
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+proxy_mac = "02:00:35:27:23:02"
+local_cp = "SOLNET.SNAB"
+local_station = "SNAB"
+local_node_id = "fff12345"
+tg_number = 1
+role = "secondary"
+timeout_seconds = 180
+```
+
+The node ID must be a locally assigned eight-digit hexadecimal value in the
+`000` or `FFF` block with a nonzero ID number; it must not be copied from the
+guest. `local_station` is this router's unqualified adjacent link-station name.
+The configured TG number must match the guest's link definition. The probe
+advertises the actual LLC receive limits: BTU 1496 and one I-frame before
+acknowledgement. `role` can be `primary` or `secondary`; the primary sends
+SABME after complementary XID3 negotiation, while the secondary waits for it.
+
+Run `snusnu-router --native-probe probe.toml` with `CAP_NET_RAW` and optionally
+`RUST_LOG=debug` for decoded frames and hex dumps. Exit status 0 with a
+`reached SNASVCMG BIND` log means XID3 and LLC2 contact succeeded and the
+first management BIND arrived. Protocol errors and the configured timeout
+exit with status 1. An operator interrupt exits without a success claim.
