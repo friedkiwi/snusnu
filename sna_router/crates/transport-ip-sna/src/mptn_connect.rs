@@ -134,9 +134,11 @@ fn validate_optional(field: &OptionalField, direction: Direction) -> io::Result<
         return Err(invalid("incorrect MPTN optional processing requirement"));
     }
     match field.kind {
-        0x05 if field.value.len() >= 2
+        0x05 if !field.value.is_empty()
             && field.value[0] <= 5
-            && field.value[1] as usize == field.value.len() - 1 => {}
+            && ((field.value.len() == 1 && field.value[0] != 0)
+                || (field.value.len() >= 2
+                    && field.value[1] as usize == field.value.len() - 1)) => {}
         0x0a if !field.value.is_empty() => {}
         0x18 if !field.value.is_empty()
             && field
@@ -336,6 +338,12 @@ mod tests {
         assert_eq!(request.correlator, [0x12, 0x34]);
         assert_eq!(request.connection_data(), [0x31, 0x00, 0x13]);
         assert_eq!(request.encode().unwrap(), REQUEST);
+        assert_eq!(
+            crate::anynet::TcpRecord::decode(REQUEST.to_vec())
+                .unwrap()
+                .kind,
+            crate::anynet::TcpKind::Connect
+        );
     }
 
     #[test]

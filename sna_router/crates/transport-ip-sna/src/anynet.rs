@@ -64,15 +64,7 @@ impl TcpRecord {
         check_length(&bytes)?;
         let kind = match bytes[4] {
             0x80 => {
-                // Connect has a common prefix: command, processing, 4-byte
-                // command length, TTL, then destination and source addresses.
-                if bytes.len() < 12 {
-                    return Err(invalid("short MPTN_Connect"));
-                }
-                let command_length = u32::from_be_bytes(bytes[6..10].try_into().unwrap()) as usize;
-                if command_length + 4 != bytes.len() {
-                    return Err(invalid("MPTN_Connect command length mismatch"));
-                }
+                crate::mptn_connect::Connect::decode(&bytes)?;
                 TcpKind::Connect
             }
             0x00 => TcpKind::Normal,
@@ -286,5 +278,11 @@ mod tests {
         assert!(TcpRecord::decode(vec![0, 0, 0, 5, 0xff]).is_err());
         assert!(UdpDatagram::decode(vec![0, 0, 0, 5, 0x84]).is_err());
         assert!(Decoder::default().push(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn connect_record_uses_strict_mptn_validation() {
+        // Lengths are consistent, but no addresses, correlator or BIND.
+        assert!(TcpRecord::decode(vec![0, 0, 0, 11, 0x80, 0x0a, 0, 0, 0, 7, 8]).is_err());
     }
 }
