@@ -10,6 +10,7 @@ use crate::{
     virtual_native_cp::VirtualNativeCp,
 };
 use router_core::{
+    fixed_pacing::is_canonical_ipr,
     native_management_initiator::{NativeManagementInitiator, Phase as ManagementPhase},
     xid3::Xid3,
 };
@@ -25,6 +26,14 @@ use transport_ip_sna::{
 enum NativeUserOutputKind {
     Normal,
     Grant,
+    Expedited,
+}
+
+#[derive(Clone, Copy)]
+enum TcpUserOutputKind {
+    Normal,
+    Expedited,
+    ExpeditedAck,
 }
 
 pub(crate) struct VirtualWsPort<P: RoutePort> {
@@ -50,6 +59,8 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     native_user_output_queued: bool,
     native_user_input: Option<Vec<u8>>,
     tcp_user_output: Option<TcpRecord>,
+    tcp_user_output_kind: Option<TcpUserOutputKind>,
+    expedited_ack: Option<TcpRecord>,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -83,6 +94,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
             native_user_output_queued: false,
             native_user_input: None,
             tcp_user_output: None,
+            tcp_user_output_kind: None,
+            expedited_ack: None,
         })
     }
 
@@ -167,10 +180,14 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.tcp_user_input.is_some()
             || self.native_user_output.is_some()
             || self.deferred_user_normal
+            || self.expedited_ack.is_some()
         {
             return Ok(false);
         }
-        if !matches!(record.kind, TcpKind::Normal | TcpKind::Segmented) {
+        if !matches!(
+            record.kind,
+            TcpKind::Normal | TcpKind::Segmented | TcpKind::Expedited | TcpKind::ExpeditedAck
+        ) {
             return Err(protocol(
                 "virtual user flow does not accept this TCP62 record kind",
             ));
@@ -187,11 +204,22 @@ impl<P: RoutePort> VirtualWsPort<P> {
         if self.tcp_user_output.as_ref() != Some(record) {
             return Err(protocol("TCP62 user output differs from prepared record"));
         }
-        self.user_flow
+        let flow = self
+            .user_flow
             .as_mut()
-            .ok_or_else(|| protocol("virtual user flow absent"))?
-            .mark_tcp_enqueued(record)?;
+            .ok_or_else(|| protocol("virtual user flow absent"))?;
+        match self
+            .tcp_user_output_kind
+            .take()
+            .ok_or_else(|| protocol("TCP62 user output kind missing"))?
+        {
+            TcpUserOutputKind::Normal => flow.mark_tcp_enqueued(record)?,
+            TcpUserOutputKind::Expedited => flow.mark_expedited_tcp_enqueued(record)?,
+            TcpUserOutputKind::ExpeditedAck => {}
+        }
         self.tcp_user_output = None;
+        self.tcp_user_output_kind = None;
+        self.expedited_ack = None;
         Ok(())
     }
 
@@ -273,6 +301,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 management
                     .observe(&piu)
                     .map_err(|_| protocol("early virtual management PIU is invalid"))?;
+                self.inner.on_downstream_completed(1)?;
             }
         } else if completed == 1
             && self
@@ -284,6 +313,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             self.user_bind_native_completed = true;
             if let Some(piu) = self.early_user_response.take() {
                 self.accept_user_response(&piu)?;
+                self.inner.on_downstream_completed(1)?;
             }
         } else if completed == 1 && self.native_user_output_queued {
             let piu = self
@@ -301,6 +331,11 @@ impl<P: RoutePort> VirtualWsPort<P> {
             match kind {
                 NativeUserOutputKind::Normal => flow.mark_native_enqueued(&piu)?,
                 NativeUserOutputKind::Grant => flow.mark_native_grant_enqueued(&piu)?,
+                NativeUserOutputKind::Expedited => {
+                    flow.mark_expedited_native_enqueued(&piu)?;
+                    self.tcp_user_output = self.expedited_ack.take();
+                    self.tcp_user_output_kind = Some(TcpUserOutputKind::ExpeditedAck);
+                }
             }
             self.native_user_output_queued = false;
         } else {
@@ -355,10 +390,22 @@ impl<P: RoutePort> VirtualWsPort<P> {
         };
         if self.tcp_user_output.is_none() && self.native_user_output.is_none() {
             if let Some(piu) = self.native_user_input.take() {
-                match flow.prepare_native_input(&piu)? {
-                    NativeInput::PacingGrant => {}
-                    NativeInput::TcpRecord(record) => self.tcp_user_output = Some(record.clone()),
+                if piu.len() >= 9
+                    && piu[0] & 1 != 0
+                    && !(piu.len() == 9 && is_canonical_ipr(&piu[6..9], &piu[9..]))
+                {
+                    self.tcp_user_output = Some(flow.prepare_native_expedited(&piu)?.clone());
+                    self.tcp_user_output_kind = Some(TcpUserOutputKind::Expedited);
+                } else {
+                    match flow.prepare_native_input(&piu)? {
+                        NativeInput::PacingGrant => {}
+                        NativeInput::TcpRecord(record) => {
+                            self.tcp_user_output = Some(record.clone());
+                            self.tcp_user_output_kind = Some(TcpUserOutputKind::Normal);
+                        }
+                    }
                 }
+                self.inner.on_downstream_completed(1)?;
             }
         }
         if self.native_user_output.is_none() {
@@ -374,18 +421,30 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     Err(error) => return Err(error),
                 }
             } else if let Some(record) = self.tcp_user_input.take() {
-                match flow.prepare_tcp_normal(&record) {
-                    Ok(Some(piu)) => {
+                match record.kind {
+                    TcpKind::Expedited => {
+                        let (piu, ack) = flow.prepare_tcp_expedited(&record)?;
                         self.native_user_output = Some(piu.to_vec());
-                        self.native_user_output_kind = Some(NativeUserOutputKind::Normal);
+                        self.native_user_output_kind = Some(NativeUserOutputKind::Expedited);
+                        self.expedited_ack = Some(ack);
                     }
-                    Ok(None) => {} // One segmented fragment was retained.
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        // The final segment is retained by ReverseUserFlow
-                        // when the native send window is exhausted.
-                        self.deferred_user_normal = true;
+                    TcpKind::ExpeditedAck => flow.accept_tcp_expedited_ack(&record)?,
+                    TcpKind::Normal | TcpKind::Segmented => {
+                        match flow.prepare_tcp_normal(&record) {
+                            Ok(Some(piu)) => {
+                                self.native_user_output = Some(piu.to_vec());
+                                self.native_user_output_kind = Some(NativeUserOutputKind::Normal);
+                            }
+                            Ok(None) => {} // One segmented fragment was retained.
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                // The final segment is retained by ReverseUserFlow
+                                // when the native send window is exhausted.
+                                self.deferred_user_normal = true;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
-                    Err(error) => return Err(error),
+                    _ => return Err(protocol("unsupported TCP62 user record kind")),
                 }
             } else if self.tcp_user_output.is_none() {
                 match flow.prepare_native_grant(1) {
@@ -428,6 +487,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     output.push(RouterEvent::Ready);
                 }
                 RouterEvent::Unit(RoutedUnit::SnaInformation(piu)) => {
+                    let mut observed = false;
                     let management = self.management.as_mut().ok_or_else(|| {
                         protocol("virtual native session handler is not installed")
                     })?;
@@ -445,6 +505,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
                         }
                         if self.user_bind_native_completed {
                             self.accept_user_response(&piu)?;
+                            observed = true;
                         } else if self.early_user_response.replace(piu).is_some() {
                             return Err(protocol("multiple early virtual user BIND responses"));
                         }
@@ -456,6 +517,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
                         management
                             .observe(&piu)
                             .map_err(|_| protocol("virtual management peer PIU is invalid"))?;
+                        observed = true;
+                    }
+                    if observed {
+                        self.inner.on_downstream_completed(1)?;
                     }
                 }
                 RouterEvent::Unit(_) => {
@@ -558,6 +623,7 @@ mod tests {
         sent: Vec<Vec<u8>>,
         information: Vec<Vec<u8>>,
         completed: usize,
+        inbound_completed: usize,
         ready_sent: usize,
     }
 
@@ -581,6 +647,10 @@ mod tests {
         }
         fn take_completed_information_count(&mut self) -> usize {
             std::mem::take(&mut self.completed)
+        }
+        fn on_downstream_completed(&mut self, count: usize) -> io::Result<()> {
+            self.inbound_completed += count;
+            Ok(())
         }
         fn set_ingress_busy(&mut self, _: bool) -> io::Result<()> {
             Ok(())
@@ -697,6 +767,7 @@ mod tests {
             sent: vec![],
             information: vec![],
             completed: 0,
+            inbound_completed: 0,
             ready_sent: 0,
         };
         let mut port = VirtualWsPort::new(
@@ -759,12 +830,15 @@ mod tests {
                 "2d0000010000830100007fff",
             ))));
         port.poll(false).unwrap();
+        assert_eq!(port.inner.inbound_completed, 0);
         assert_eq!(
             port.management.as_ref().unwrap().phase(),
             ManagementPhase::AwaitBindAck
         );
         port.inner.completed = 1;
         port.poll(false).unwrap();
+        assert_eq!(port.inner.inbound_completed, 1);
+
         assert_eq!(
             port.management.as_ref().unwrap().phase(),
             ManagementPhase::AwaitBindResponse
@@ -885,6 +959,19 @@ mod tests {
         );
         port.inner.completed = 1;
         port.poll(false).unwrap();
+        let expedited = TcpRecord::decode(hex("0000000b010002030000cc")).unwrap();
+        assert!(port.submit_tcp_user_record(&expedited).unwrap());
+        port.poll(false).unwrap();
+        assert_eq!(
+            port.inner.information.last().unwrap(),
+            &hex("2d0002010002030000cc")
+        );
+        assert!(port.tcp_user_record().is_none());
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        let expedited_ack = port.tcp_user_record().unwrap().clone();
+        assert_eq!(expedited_ack.bytes, hex("0000000503"));
+        port.mark_tcp_user_record_enqueued(&expedited_ack).unwrap();
     }
 
     #[test]
@@ -894,6 +981,7 @@ mod tests {
             sent: vec![],
             information: vec![],
             completed: 0,
+            inbound_completed: 0,
             ready_sent: 0,
         };
         let mut port = VirtualWsPort::new(
@@ -939,6 +1027,7 @@ mod tests {
             sent: vec![],
             information: vec![],
             completed: 0,
+            inbound_completed: 0,
             ready_sent: 0,
         };
         let mut port = VirtualWsPort::new(
