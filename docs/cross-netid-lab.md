@@ -73,7 +73,9 @@ CHGCTLAPPC CTLD(SNAB) RMTNETID(QABOB) RMTCPNAME(SNAB) ADPTADR(02534E000002) INLC
 
 `DSPNETA` confirmed `QAALICE.SNAA`, and `DSPCTLD SNAB` confirmed remote
 `QABOB.SNAB`, answer mode, and the expected Bob managed MAC. The managed MAC
-must still be compared with the actual fresh QA address-book assignment.
+was later compared with the live fresh QA address-book assignment: the
+concentrator sent `QABOB.SNAB` as `02:53:4e:00:00:02` to Alice's router,
+matching V4's configured adapter address.
 An opt-in active-XID probe on isolated `sol8` then reached LLC2 contact:
 Alice answered the null XID, negotiated XID3, and sent SABME to Rust; the
 probe answered UA. The probe stopped before any application session. Alice's
