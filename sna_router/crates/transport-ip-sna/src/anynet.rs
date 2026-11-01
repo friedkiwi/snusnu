@@ -241,6 +241,14 @@ impl TcpSession {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
+        self.flush_with_completion(|_| {})
+    }
+
+    /// Invoke `on_complete` once for each complete TCP62 record only after
+    /// its final byte has been accepted by the socket. A partial write never
+    /// releases record credit. The callback runs before a later write error
+    /// is returned, so completed records are not lost on that error path.
+    pub fn flush_with_completion(&mut self, mut on_complete: impl FnMut(usize)) -> io::Result<()> {
         while let Some(front) = self.outbound.front() {
             match self.stream.write(&front[self.write_offset..]) {
                 Ok(0) => {
@@ -258,6 +266,7 @@ impl TcpSession {
                 let sent = self.outbound.pop_front().unwrap();
                 self.outbound_bytes -= sent.len();
                 self.write_offset = 0;
+                on_complete(sent.len());
             }
         }
         Ok(())

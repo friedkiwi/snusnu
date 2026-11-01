@@ -2,8 +2,12 @@
 //! This does not activate a runtime route or assert that UDP X'83' works.
 
 use router_core::fid2_session_control::ManagementBind;
+use std::{
+    io::Read,
+    net::{TcpListener, TcpStream},
+};
 use transport_ip_sna::{
-    anynet::{TcpKind, TcpRecord, MAX_RECORD},
+    anynet::{TcpKind, TcpRecord, TcpSession, MAX_RECORD},
     mptn_compensations::{CompensationSet, TCP62_REQUIRED},
     mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
     mptn_native_bridge::{Bridge, Phase as BridgePhase},
@@ -237,4 +241,47 @@ fn pure_bridge_rejects_unavailable_oob_before_opening() {
     .unwrap();
     assert!(bridge.begin_native_bind(&user_bind(), template()).is_err());
     assert_eq!(bridge.phase(), BridgePhase::Idle);
+}
+
+#[test]
+fn gateway_tcp_credit_releases_after_complete_socket_write() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut receiver, _) = listener.accept().unwrap();
+    let mut transport = TcpSession::new(sender).unwrap();
+
+    let mut gateway = GatewaySession::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+    )
+    .unwrap();
+    let connect_record = gateway.begin_native_bind(&user_bind(), template()).unwrap();
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    gateway
+        .receive_connect_response(&positive_response(&connect))
+        .unwrap();
+    let (record, pacing_requested) = gateway
+        .native_normal_observe_pacing(&first_user_attach())
+        .unwrap();
+    assert!(pacing_requested);
+    assert_eq!(gateway.pending_bytes(), (record.bytes.len(), 0));
+    transport.queue(record.clone()).unwrap();
+    assert_eq!(gateway.pending_bytes(), (record.bytes.len(), 0));
+
+    let mut completed = Vec::new();
+    transport
+        .flush_with_completion(|bytes| completed.push(bytes))
+        .unwrap();
+    assert_eq!(completed, [record.bytes.len()]);
+    for bytes in &completed {
+        gateway.complete_tcp_delivery(*bytes).unwrap();
+    }
+    assert_eq!(gateway.pending_bytes(), (0, 0));
+    let mut received = vec![0; record.bytes.len()];
+    receiver.read_exact(&mut received).unwrap();
+    assert_eq!(received, record.bytes);
+    transport
+        .flush_with_completion(|bytes| completed.push(bytes))
+        .unwrap();
+    assert_eq!(completed.len(), 1);
 }
