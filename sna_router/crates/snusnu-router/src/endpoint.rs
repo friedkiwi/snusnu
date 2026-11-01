@@ -10,13 +10,107 @@ use router_core::{
     packet_log::{decode_ethernet, hex_dump},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io,
     time::{Duration, Instant},
 };
 
 const QUEUE_LIMIT: usize = 32;
 const RETRY_INTERVAL: Duration = Duration::from_secs(4);
+const MANAGED_MAC_PREFIX: [u8; 3] = [0x02, 0x53, 0x4e];
+
+/// Tracks LLC associations configured on this router. Each association has
+/// its own socket and LLC2 state, even when several use the same interface.
+/// Sharing a proxy MAC between distinct guests is valid; the complete
+/// interface/guest/proxy tuple identifies an association.
+#[derive(Default)]
+pub(crate) struct EndpointRegistry {
+    associations: HashSet<(String, [u8; 6], [u8; 6])>,
+}
+
+impl EndpointRegistry {
+    pub(crate) fn register(
+        &mut self,
+        interface: &str,
+        guest_mac: [u8; 6],
+        proxy_mac: [u8; 6],
+    ) -> io::Result<()> {
+        validate_mac_pair(guest_mac, proxy_mac)?;
+        if interface.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty interface",
+            ));
+        }
+        if !self
+            .associations
+            .insert((interface.to_owned(), guest_mac, proxy_mac))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "duplicate LLC association",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rebind an already registered endpoint and its registry entry together.
+    /// The registry is checked before the endpoint is changed, so a rejected
+    /// address cannot leave the two disagreeing.
+    pub(crate) fn apply_managed_proxy_mac(
+        &mut self,
+        endpoint: &mut Endpoint,
+        proxy_mac: [u8; 6],
+    ) -> io::Result<()> {
+        let old = (
+            endpoint.interface.clone(),
+            endpoint.guest_mac,
+            endpoint.proxy_mac,
+        );
+        if !self.associations.contains(&old) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "LLC association is not registered",
+            ));
+        }
+        let new = (endpoint.interface.clone(), endpoint.guest_mac, proxy_mac);
+        if new != old && self.associations.contains(&new) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed proxy MAC duplicates an LLC association",
+            ));
+        }
+        endpoint.set_managed_proxy_mac(proxy_mac)?;
+        self.associations.remove(&old);
+        self.associations.insert(new);
+        Ok(())
+    }
+}
+
+fn validate_mac_pair(guest_mac: [u8; 6], proxy_mac: [u8; 6]) -> io::Result<()> {
+    if guest_mac == proxy_mac
+        || guest_mac == [0; 6]
+        || proxy_mac == [0; 6]
+        || guest_mac[0] & 1 != 0
+        || proxy_mac[0] & 1 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LLC guest and proxy MACs must be distinct nonzero unicast addresses",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_managed_proxy_mac(guest_mac: [u8; 6], proxy_mac: [u8; 6]) -> io::Result<()> {
+    if proxy_mac[..3] != MANAGED_MAC_PREFIX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed proxy MAC is outside the SNUSNU namespace",
+        ));
+    }
+    validate_mac_pair(guest_mac, proxy_mac)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Event {
@@ -45,6 +139,7 @@ impl Endpoint {
         guest_mac: [u8; 6],
         proxy_mac: [u8; 6],
     ) -> io::Result<Self> {
+        validate_mac_pair(guest_mac, proxy_mac)?;
         let port = PacketPort::open(interface).map_err(|error| {
             tracing::error!(interface, error = %error, "failed to open AF_PACKET interface");
             error
@@ -65,6 +160,29 @@ impl Endpoint {
 
     pub(crate) fn state(&self) -> State {
         self.llc.state()
+    }
+
+    /// Apply a concentrator-assigned address before an LLC association is
+    /// established. Existing queued or in-flight traffic must stay bound to
+    /// the MAC address under which it was received.
+    pub(crate) fn set_managed_proxy_mac(&mut self, proxy_mac: [u8; 6]) -> io::Result<()> {
+        validate_managed_proxy_mac(self.guest_mac, proxy_mac)?;
+        if self.proxy_mac == proxy_mac {
+            return Ok(());
+        }
+        if self.llc.state() != State::Disconnected
+            || !self.queued.is_empty()
+            || self.llc.has_pending_information()
+            || self.connect_after.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cannot change proxy MAC during an LLC association",
+            ));
+        }
+        tracing::info!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), old_proxy_mac = %format_mac(self.proxy_mac), new_proxy_mac = %format_mac(proxy_mac), "managed proxy MAC applied");
+        self.proxy_mac = proxy_mac;
+        Ok(())
     }
 
     pub(crate) fn has_capacity(&self) -> bool {
@@ -311,4 +429,61 @@ fn is_type1(frame: &LlcFrame<'_>) -> bool {
 
 fn llc_error(error: LlcError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("LLC2: {error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_allows_distinct_associations_on_one_interface() {
+        let mut registry = EndpointRegistry::default();
+        let guest_a = [0x02, 0, 0, 0, 0, 1];
+        let guest_b = [0x02, 0, 0, 0, 0, 2];
+        let proxy = [0x02, 0x53, 0x4e, 0, 0, 1];
+        registry.register("tap0", guest_a, proxy).unwrap();
+        registry.register("tap0", guest_b, proxy).unwrap();
+        registry.register("tap1", guest_a, proxy).unwrap();
+        assert_eq!(
+            registry
+                .register("tap0", guest_a, proxy)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn registry_rejects_invalid_mac_pairs_without_reserving_them() {
+        let mut registry = EndpointRegistry::default();
+        let guest = [0x02, 0, 0, 0, 0, 1];
+        let proxy = [0x02, 0x53, 0x4e, 0, 0, 1];
+        for (a, b) in [
+            ([0; 6], proxy),
+            (guest, [0; 6]),
+            (guest, guest),
+            ([0x01, 0, 0, 0, 0, 1], proxy),
+            (guest, [0xff; 6]),
+        ] {
+            assert_eq!(
+                registry.register("tap0", a, b).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        registry.register("tap0", guest, proxy).unwrap();
+    }
+
+    #[test]
+    fn managed_mac_must_use_reserved_prefix_and_be_distinct() {
+        let guest = [0x02, 0, 0, 0, 0, 1];
+        assert!(validate_managed_proxy_mac(guest, [0x02, 0x53, 0x4e, 0, 0, 1]).is_ok());
+        assert_eq!(
+            validate_managed_proxy_mac(guest, [0x02, 0, 0, 0, 0, 2])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let managed_guest = [0x02, 0x53, 0x4e, 0, 0, 1];
+        assert!(validate_managed_proxy_mac(managed_guest, managed_guest).is_err());
+    }
 }
