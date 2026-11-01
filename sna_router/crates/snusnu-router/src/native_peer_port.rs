@@ -71,6 +71,17 @@ enum UserProbeState {
     AwaitPacingFollowup,
 }
 
+fn exclusive_bind_ack(completed: usize) -> io::Result<bool> {
+    match completed {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "converter user BIND ACK includes another LLC completion",
+        )),
+    }
+}
+
 impl NativePeerPort {
     pub(crate) fn open(peer: LlcPeer<'_>, local_xid: Xid3) -> io::Result<Self> {
         let type1 = NativeType1::new(local_xid.clone())?;
@@ -179,6 +190,12 @@ impl NativePeerPort {
             && !self.converter_bind_response_acked
             && !self.converter_bind_response_pending
         {
+            // Management BIS must have drained before this first user egress.
+            // Keep its LLC completion exclusive, even if a future management
+            // handler queues another frame in this phase.
+            if self.endpoint.buffered_information_count() != 0 {
+                return Ok(false);
+            }
             let offer = self.converter_offer.as_ref().unwrap();
             if piu != offer.build_fixed_response(1).map_err(management_error)? {
                 return Err(io::Error::new(
@@ -224,7 +241,7 @@ impl NativePeerPort {
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
         if let Some(management) = self.management.as_mut() {
             let completed = self.endpoint.take_completed_information_count();
-            if self.converter_bind_response_pending && completed == 1 {
+            if self.converter_bind_response_pending && exclusive_bind_ack(completed)? {
                 self.converter_bind_response_pending = false;
                 self.converter_bind_response_acked = true;
                 self.converter_events
@@ -705,5 +722,17 @@ impl RoutePort for NativePeerPort {
 
     fn flush(&mut self) -> io::Result<()> {
         self.endpoint.flush()
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::exclusive_bind_ack;
+
+    #[test]
+    fn converter_bind_ack_cannot_claim_another_frame_completion() {
+        assert!(!exclusive_bind_ack(0).unwrap());
+        assert!(exclusive_bind_ack(1).unwrap());
+        assert!(exclusive_bind_ack(2).is_err());
     }
 }
