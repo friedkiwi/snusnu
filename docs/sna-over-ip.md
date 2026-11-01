@@ -30,7 +30,7 @@ The Rust router now has reusable native LLC2 associations, bounded receive press
 ## Suggested experiments
 
 1. Extend the [direct V5R4 AnyNet capture](anynet-lab.md) through teardown and out-of-band traffic. It already showed `MPTN_Connect`, BIND, normal, expedited, and acknowledgement records on TCP/397, plus a UDP/397 keepalive with embedded peer IPs after four minutes idle. Compare these with native PIUs before adding a gateway.
-2. Capture paired native HPR LAN traffic if EE-to-HPR-LAN media conversion is needed. The direct and Rust-relayed EE captures already verify XID3, TEST, and UI NLPs on UDP 12000–12004 for the V5R4 pair.
+2. Compare the [direct HPR LAN capture](hpr-lan-lab.md) with direct and Rust-relayed EE captures. The LAN session had XID3, SABME/UA/RR and SAP C8 UI NLPs, but no LLC2 I frames; EE used XID3 and SAP 04 UI over UDP. Test a constrained media adapter only after defining the activation and SAP mapping.
 3. Demonstrate a genuine dual-attached APPN/HPR or MPTN gateway linking IP peers to the working native LLC2 circuit. Implement a custom gateway only after the corresponding captures identify the required session behavior.
 
 The Rust runtime supports standalone local LLC2 and EE routes. AnyNet interoperation with LLC2 still needs a session gateway. WebSocket and the Go concentrator are optional remote hops, not a prerequisite for local routes.
