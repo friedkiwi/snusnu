@@ -14,8 +14,16 @@ use std::{
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
 };
 use transport_ip_sna::anynet::{self, TcpKind, TcpRecord, TcpSession};
+use transport_ip_sna::mptn_connect::{Connect, Direction};
 
 const PENDING_LIMIT: usize = anynet::MAX_RECORD * 4;
+
+struct SessionIdentity {
+    source: Vec<u8>,
+    destination: Vec<u8>,
+    correlator: Vec<u8>,
+    accepted: bool,
+}
 
 pub(crate) struct AnyNetPort {
     local_ip: IpAddr,
@@ -28,11 +36,37 @@ pub(crate) struct AnyNetPort {
     incoming: VecDeque<TcpRecord>,
     pending: VecDeque<TcpRecord>,
     pending_bytes: usize,
+    expected_local_lu: Option<Vec<u8>>,
+    expected_remote_lu: Option<Vec<u8>>,
+    identity: Option<SessionIdentity>,
+    close_pending: bool,
 }
 
 impl AnyNetPort {
     pub(crate) fn open(local_ip: IpAddr, peer_ip: IpAddr) -> io::Result<Self> {
         Self::open_at(local_ip, peer_ip, anynet::MPTN_PORT)
+    }
+
+    pub(crate) fn open_with_lus(
+        local_ip: IpAddr,
+        peer_ip: IpAddr,
+        local_lu: Option<String>,
+        remote_lu: Option<String>,
+    ) -> io::Result<Self> {
+        let (local, remote) = match (local_lu, remote_lu) {
+            (Some(local), Some(remote)) => (Some(encode_lu(&local)?), Some(encode_lu(&remote)?)),
+            (None, None) => (None, None),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "both AnyNet LU names are required",
+                ))
+            }
+        };
+        let mut port = Self::open(local_ip, peer_ip)?;
+        port.expected_local_lu = local;
+        port.expected_remote_lu = remote;
+        Ok(port)
     }
 
     fn open_at(local_ip: IpAddr, peer_ip: IpAddr, port: u16) -> io::Result<Self> {
@@ -57,6 +91,10 @@ impl AnyNetPort {
             incoming: VecDeque::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
+            expected_local_lu: None,
+            expected_remote_lu: None,
+            identity: None,
+            close_pending: false,
         })
     }
 
@@ -165,11 +203,114 @@ impl AnyNetPort {
 
     fn pop_incoming(&mut self) -> Option<Vec<RouterEvent>> {
         let record = self.incoming.pop_front()?;
+        if let Err(error) = self.validate_record(&record, true) {
+            tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, error = %error, "AnyNet session identity rejected");
+            let _ = self.disconnect();
+            return Some(vec![RouterEvent::Closed]);
+        }
         tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, kind = ?record.kind, bytes = record.bytes.len(), hex = %hex_dump(&record.bytes), "AnyNet TCP record received");
         Some(vec![RouterEvent::Unit(RoutedUnit::AnyNetTcpRecord(
             record.bytes,
         ))])
     }
+
+    fn validate_record(&mut self, record: &TcpRecord, from_peer: bool) -> io::Result<()> {
+        if record.kind != TcpKind::Connect {
+            return if self
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.accepted)
+            {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AnyNet data before accepted Connect",
+                ))
+            };
+        }
+        let connect = Connect::decode(&record.bytes)?;
+        match connect.direction {
+            Direction::Request => {
+                if self.identity.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate AnyNet Connect request",
+                    ));
+                }
+                if let (Some(local), Some(remote)) =
+                    (&self.expected_local_lu, &self.expected_remote_lu)
+                {
+                    let (source, destination) = if from_peer {
+                        (local, remote)
+                    } else {
+                        (remote, local)
+                    };
+                    if connect.source.node != *source || connect.destination.node != *destination {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "AnyNet LU pair does not match route",
+                        ));
+                    }
+                }
+                self.identity = Some(SessionIdentity {
+                    source: connect.source.node,
+                    destination: connect.destination.node,
+                    correlator: connect.correlator,
+                    accepted: false,
+                });
+                Ok(())
+            }
+            Direction::PositiveResponse | Direction::NegativeResponse => {
+                let identity = self.identity.as_mut().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AnyNet Connect response without request",
+                    )
+                })?;
+                if identity.source != connect.source.node
+                    || identity.destination != connect.destination.node
+                    || identity.correlator != connect.correlator
+                    || identity.accepted
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AnyNet Connect response identity mismatch",
+                    ));
+                }
+                identity.accepted = connect.direction == Direction::PositiveResponse;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn encode_lu(name: &str) -> io::Result<Vec<u8>> {
+    let (netid, lu) = name
+        .split_once('.')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "AnyNet LU must be NETID.LU"))?;
+    if netid.is_empty() || lu.is_empty() || netid.len() > 8 || lu.len() > 8 || lu.contains('.') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid AnyNet LU name",
+        ));
+    }
+    name.bytes()
+        .map(|ch| match ch {
+            b'A'..=b'I' => Ok(0xc1 + (ch - b'A')),
+            b'J'..=b'R' => Ok(0xd1 + (ch - b'J')),
+            b'S'..=b'Z' => Ok(0xe2 + (ch - b'S')),
+            b'0'..=b'9' => Ok(0xf0 + (ch - b'0')),
+            b'@' => Ok(0x7c),
+            b'#' => Ok(0x7b),
+            b'$' => Ok(0x5b),
+            b'.' => Ok(0x4b),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid AnyNet LU character",
+            )),
+        })
+        .collect()
 }
 
 impl RoutePort for AnyNetPort {
@@ -210,6 +351,10 @@ impl RoutePort for AnyNetPort {
     }
 
     fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
+        if self.close_pending {
+            self.disconnect()?;
+            return Ok(vec![RouterEvent::Closed]);
+        }
         if self.connecting.is_some() {
             if let Err(error) = self.finish_dial() {
                 tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, error = %error, "AnyNet TCP connection failed");
@@ -229,6 +374,11 @@ impl RoutePort for AnyNetPort {
             ));
         };
         let record = TcpRecord::decode(bytes)?;
+        if let Err(error) = self.validate_record(&record, false) {
+            tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, error = %error, "AnyNet routed session identity rejected");
+            self.close_pending = true;
+            return Ok(true);
+        }
         if self.session.is_none() && self.connecting.is_none() {
             if record.kind != TcpKind::Connect {
                 return Err(io::Error::new(
@@ -265,6 +415,8 @@ impl RoutePort for AnyNetPort {
         self.incoming.clear();
         self.pending.clear();
         self.pending_bytes = 0;
+        self.identity = None;
+        self.close_pending = false;
         Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -336,6 +488,10 @@ mod tests {
         let port = 18_397;
         let mut a = AnyNetPort::open_at(a_ip, IpAddr::V4(Ipv4Addr::LOCALHOST), port).unwrap();
         let mut b = AnyNetPort::open_at(b_ip, b_peer, port).unwrap();
+        a.expected_local_lu = Some(encode_lu("SOLNET.SNAA").unwrap());
+        a.expected_remote_lu = Some(encode_lu("SOLNET.SNAB").unwrap());
+        b.expected_local_lu = Some(encode_lu("SOLNET.SNAB").unwrap());
+        b.expected_remote_lu = Some(encode_lu("SOLNET.SNAA").unwrap());
         let server = TcpListener::bind(SocketAddr::new(b_peer, port)).unwrap();
         server.set_nonblocking(true).unwrap();
         let mut client = TcpStream::connect(SocketAddr::new(a_ip, port)).unwrap();
@@ -398,6 +554,24 @@ mod tests {
             a.poll(true).unwrap().unwrap().as_slice(),
             [RouterEvent::Closed]
         ));
+        assert!(a.session.is_none());
+
+        a.expected_local_lu = Some(encode_lu("SOLNET.SNAX").unwrap());
+        let mut wrong = TcpStream::connect(SocketAddr::new(a_ip, port)).unwrap();
+        wait_until(|| {
+            a.session.is_some() || {
+                a.poll(true).unwrap();
+                a.session.is_some()
+            }
+        });
+        wrong.write_all(CONNECT).unwrap();
+        let mut rejected = false;
+        wait_until(|| {
+            if let Some(events) = a.poll(true).unwrap() {
+                rejected = matches!(events.as_slice(), [RouterEvent::Closed]);
+            }
+            rejected
+        });
         assert!(a.session.is_none());
     }
 }
