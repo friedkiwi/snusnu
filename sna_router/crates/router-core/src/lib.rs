@@ -15,6 +15,7 @@ pub mod llc_type1;
 pub mod native_management;
 pub mod packet_log;
 pub mod user_bind;
+pub mod user_session_control;
 pub mod xid3;
 pub mod xid3_activation;
 pub mod xid3_local;
