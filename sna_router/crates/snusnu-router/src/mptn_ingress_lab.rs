@@ -244,6 +244,14 @@ mod tests {
         bytes
     }
 
+    fn closed_without_data(result: io::Result<usize>) -> bool {
+        match result {
+            Ok(0) => true,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => true,
+            _ => false,
+        }
+    }
+
     #[test]
     fn loopback_management_finishes_but_no_user_route_is_opened() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -367,8 +375,32 @@ mod tests {
             .unwrap();
         client.write_all(&user.encode().unwrap()).unwrap();
         let mut one = [0u8; 1];
-        assert_eq!(client.read(&mut one).unwrap(), 0);
+        assert!(closed_without_data(client.read(&mut one)));
         assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn udp_397_packet_aborts_pending_management_without_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve(stream, &udp, "QABOB.SNAB", "QAALICE.SNAA")
+        });
+        let mut client = TcpStream::connect(listen_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(&[0, 0]).unwrap(); // incomplete Connect
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(&[0, 0, 0, 5, 0x83], udp_addr).unwrap();
+        let mut one = [0u8; 1];
+        assert!(closed_without_data(client.read(&mut one)));
+        let error = server.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     const BIS_REQUEST_FOR_TEST: [u8; 11] = [0, 0, 0, 11, 0, 0, 2, 0x4b, 0x90, 0, 0x70];
