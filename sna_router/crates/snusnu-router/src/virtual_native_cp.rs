@@ -1,8 +1,9 @@
 //! Virtual APPN Type 1 endpoint for a WebSocket native circuit.
 //!
 //! The remote LLC port owns Ethernet, LLC2, SABME and retransmission. This
-//! endpoint owns only its configured CP identity and the XID3 exchange. It
-//! cannot mark a circuit ready until the remote port reports LinkReady.
+//! endpoint owns its configured CP identity and initiates the XID3 exchange
+//! as a fixed secondary with an answering V4 primary. It cannot mark a
+//! circuit ready until the remote port reports LinkReady.
 
 use crate::native_type1::{NativeType1, OutboundType1};
 use router_core::{
@@ -22,14 +23,14 @@ pub(crate) struct VirtualNativeCp {
 impl VirtualNativeCp {
     /// `local_xid` is a locally constructed capability profile. In particular,
     /// its node ID and control vectors must describe this router, not a copy
-    /// of a captured OS/400 peer. The remote V4 LLC leg is fixed secondary.
+    /// of a captured OS/400 peer. The passive V4 LLC station becomes primary.
     pub(crate) fn new(local_xid: Xid3, local_cp: &str, expected_peer_cp: &str) -> io::Result<Self> {
         if local_cp == expected_peer_cp
             || local_xid.cp_name().ok().as_deref() != Some(local_cp)
-            || local_xid.role() != Ok(Role::Primary)
+            || local_xid.role() != Ok(Role::Secondary)
         {
             return Err(invalid(
-                "virtual CP requires its own fixed-primary XID3 identity",
+                "virtual CP requires its own fixed-secondary XID3 identity",
             ));
         }
         Ok(Self {
@@ -47,6 +48,23 @@ impl VirtualNativeCp {
 
     pub(crate) fn peer_cp(&self) -> Option<&str> {
         self.type1.peer_name()
+    }
+
+    pub(crate) fn xid_ready(&self) -> bool {
+        self.pending.is_none() && self.type1.phase() == Phase::ReadyForSabme
+    }
+
+    /// Queue the first null XID command. This also gives a WebSocket route
+    /// port an outbound Type1 event with which to open its circuit. Commit it
+    /// only after the route port has accepted the event.
+    pub(crate) fn prepare_active_null_xid(&mut self) -> io::Result<Vec<u8>> {
+        if self.pending.is_some() {
+            return Err(invalid("virtual CP has an unconfirmed Type1 command"));
+        }
+        let outbound = self.type1.prepare_active_null_xid()?;
+        let pdu = outbound.pdu.clone();
+        self.pending = Some(outbound);
+        Ok(pdu)
     }
 
     /// Feed one decoded WebSocket Type1 LLC PDU. The caller must send the
@@ -148,34 +166,27 @@ mod tests {
     }
 
     #[test]
-    fn passive_virtual_primary_activates_with_secondary_llc_and_link_ready() {
+    fn active_virtual_secondary_activates_with_passive_v4_primary_and_link_ready() {
         let mut virtual_cp = VirtualNativeCp::new(
-            xid("QABOB.SNAB", Role::Primary, [0xff, 0xf1, 0x12, 0x34]),
+            xid("QABOB.SNAB", Role::Secondary, [0xff, 0xf1, 0x12, 0x34]),
             "QABOB.SNAB",
             "QAALICE.SNAA",
         )
         .unwrap();
-        let mut llc = NativeType1::new(xid(
-            "QAALICE.SNAA",
-            Role::Secondary,
-            [0x05, 0x63, 0x39, 0x50],
-        ))
-        .unwrap();
-        let first = llc.prepare_active_null_xid().unwrap();
-        llc.confirm_sent(&first).unwrap();
-        let mut next = first.pdu;
+        let mut llc =
+            NativeType1::new(xid("QAALICE.SNAA", Role::Primary, [0x05, 0x63, 0x39, 0x50])).unwrap();
+        let mut next = virtual_cp.prepare_active_null_xid().unwrap();
+        assert_eq!(next, [4, 4, 0xbf]);
+        assert!(virtual_cp.prepare_active_null_xid().is_err());
+        virtual_cp.confirm_sent(&next).unwrap();
         for _ in 0..8 {
-            let response = virtual_cp.receive_type1(&next).unwrap().unwrap();
+            let reply = llc.on_pdu(&next).unwrap().unwrap();
+            llc.confirm_sent(&reply).unwrap();
+            let response = virtual_cp.receive_type1(&reply.pdu).unwrap().unwrap();
             assert!(!virtual_cp.ready());
-            // A duplicate or reordered Type1 cannot overtake an unsent reply.
-            assert!(virtual_cp.receive_type1(&next).is_err());
+            assert!(virtual_cp.receive_type1(&reply.pdu).is_err());
             virtual_cp.confirm_sent(&response).unwrap();
-            if let Some(reply) = llc.on_pdu(&response).unwrap() {
-                next = reply.pdu.clone();
-                llc.confirm_sent(&reply).unwrap();
-            } else {
-                break;
-            }
+            next = response;
             if llc.phase() == Phase::ReadyForSabme
                 && virtual_cp.type1.phase() == Phase::ReadyForSabme
             {
@@ -193,13 +204,13 @@ mod tests {
     #[test]
     fn rejects_wrong_peer_and_early_link_ready() {
         let mut virtual_cp = VirtualNativeCp::new(
-            xid("QABOB.SNAB", Role::Primary, [0xff, 0xf1, 0x12, 0x34]),
+            xid("QABOB.SNAB", Role::Secondary, [0xff, 0xf1, 0x12, 0x34]),
             "QABOB.SNAB",
             "QAALICE.SNAA",
         )
         .unwrap();
         assert!(virtual_cp.receive_link_ready().is_err());
-        let mut wrong = vec![4, 4, 0xbf];
+        let mut wrong = vec![4, 5, 0xbf];
         wrong.extend(
             xid("QAALICE.OTHER", Role::Negotiable, [0x05, 0x63, 0x39, 0x50])
                 .encode()

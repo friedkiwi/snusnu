@@ -1,7 +1,7 @@
 //! A virtual native Type1 peer over one WebSocket circuit.
 //!
 //! The wrapped port owns circuit open, credit and transport retry. This
-//! adapter answers XID without a local Ethernet interface, then waits for the
+//! adapter starts XID without a local Ethernet interface, then waits for the
 //! remote LLC endpoint's LinkReady. User and management PIUs remain disabled
 //! until a session gateway is attached.
 
@@ -18,6 +18,7 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     local_xid: Xid3,
     local_cp: String,
     peer_cp: String,
+    initial_xid_sent: bool,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -34,6 +35,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             local_xid,
             local_cp: local_cp.to_owned(),
             peer_cp: peer_cp.to_owned(),
+            initial_xid_sent: false,
         })
     }
 
@@ -43,6 +45,20 @@ impl<P: RoutePort> VirtualWsPort<P> {
 
     fn reset_cp(&mut self) -> io::Result<()> {
         self.cp = VirtualNativeCp::new(self.local_xid.clone(), &self.local_cp, &self.peer_cp)?;
+        self.initial_xid_sent = false;
+        Ok(())
+    }
+
+    fn start_if_needed(&mut self) -> io::Result<()> {
+        if self.initial_xid_sent {
+            return Ok(());
+        }
+        let pdu = self.cp.prepare_active_null_xid()?;
+        if !self.inner.send(RoutedUnit::DlcType1(pdu.clone()))? {
+            return Err(protocol("WebSocket refused initial virtual null XID"));
+        }
+        self.cp.confirm_sent(&pdu)?;
+        self.initial_xid_sent = true;
         Ok(())
     }
 
@@ -84,6 +100,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
 
 impl<P: RoutePort> RoutePort for VirtualWsPort<P> {
     fn poll(&mut self, _can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
+        self.start_if_needed()?;
         // Pull pending information so an unsupported PIU causes an immediate
         // reset instead of being left indefinitely in the WebSocket queue.
         let Some(events) = self.inner.poll(true)? else {
@@ -93,6 +110,7 @@ impl<P: RoutePort> RoutePort for VirtualWsPort<P> {
     }
 
     fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
+        self.start_if_needed()?;
         let events = self.inner.tick()?;
         self.handle(events)
     }
@@ -208,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_type1_then_link_ready_and_rejects_unhandled_piu() {
+    fn starts_type1_then_link_ready_and_rejects_unhandled_piu() {
         let inner = MockWs {
             incoming: VecDeque::new(),
             sent: vec![],
@@ -216,32 +234,23 @@ mod tests {
         };
         let mut port = VirtualWsPort::new(
             inner,
-            xid("QABOB.SNAB", Role::Primary),
+            xid("QABOB.SNAB", Role::Secondary),
             "QABOB.SNAB",
             "QAALICE.SNAA",
         )
         .unwrap();
-        let mut llc = NativeType1::new(xid("QAALICE.SNAA", Role::Secondary)).unwrap();
-        let first = llc.prepare_active_null_xid().unwrap();
-        llc.confirm_sent(&first).unwrap();
-        let mut next = first.pdu;
+        let mut llc = NativeType1::new(xid("QAALICE.SNAA", Role::Primary)).unwrap();
+        port.tick().unwrap();
+        assert_eq!(port.inner.sent, vec![vec![4, 4, 0xbf]]);
         for _ in 0..8 {
+            let next = port.inner.sent.pop().unwrap();
+            let reply = llc.on_pdu(&next).unwrap().unwrap();
+            llc.confirm_sent(&reply).unwrap();
             port.inner
                 .incoming
-                .push_back(RouterEvent::Unit(RoutedUnit::DlcType1(next)));
+                .push_back(RouterEvent::Unit(RoutedUnit::DlcType1(reply.pdu)));
             assert!(port.poll(false).unwrap().unwrap().is_empty());
-            let response = port.inner.sent.pop().unwrap();
-            let Some(reply) = llc.on_pdu(&response).unwrap() else {
-                break;
-            };
-            next = reply.pdu.clone();
-            llc.confirm_sent(&reply).unwrap();
-            if llc.phase() == Phase::ReadyForSabme && port.cp.peer_cp() == Some("QAALICE.SNAA") {
-                // The final Type1 may still need delivery to the virtual CP.
-                port.inner
-                    .incoming
-                    .push_back(RouterEvent::Unit(RoutedUnit::DlcType1(next)));
-                assert!(port.poll(false).unwrap().unwrap().is_empty());
+            if llc.phase() == Phase::ReadyForSabme && port.cp.xid_ready() {
                 break;
             }
         }
@@ -268,7 +277,7 @@ mod tests {
         };
         let mut port = VirtualWsPort::new(
             inner,
-            xid("QABOB.SNAB", Role::Primary),
+            xid("QABOB.SNAB", Role::Secondary),
             "QABOB.SNAB",
             "QAALICE.SNAA",
         )
