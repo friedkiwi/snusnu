@@ -211,6 +211,51 @@ pub(crate) struct WsRoutePort {
     // Each unit forwarded into the LLC endpoint remains retained here until
     // that endpoint's ACK releases its queue/pending I-frame slot.
     downstream_sizes: VecDeque<usize>,
+    // A-side CircuitCredit is issued by the remote LLC adapter only after
+    // information delivery. Account by exact PIU lengths, not socket writes.
+    outbound_completions: OutboundCompletions,
+}
+
+#[derive(Default)]
+struct OutboundCompletions {
+    sizes: VecDeque<usize>,
+    pending_bytes: u64,
+    partial_credit: u64,
+    completed: usize,
+}
+
+impl OutboundCompletions {
+    fn sent(&mut self, bytes: usize) -> io::Result<()> {
+        self.pending_bytes = self
+            .pending_bytes
+            .checked_add(bytes as u64)
+            .ok_or_else(|| protocol("outbound completion byte count overflow"))?;
+        self.sizes.push_back(bytes);
+        Ok(())
+    }
+
+    fn credit(&mut self, bytes: u64) -> io::Result<()> {
+        if bytes > self.pending_bytes.saturating_sub(self.partial_credit) {
+            return Err(protocol("CircuitCredit exceeds unacknowledged information"));
+        }
+        let mut available = self.partial_credit + bytes;
+        while self
+            .sizes
+            .front()
+            .is_some_and(|size| *size as u64 <= available)
+        {
+            let size = self.sizes.pop_front().unwrap() as u64;
+            available -= size;
+            self.pending_bytes -= size;
+            self.completed += 1;
+        }
+        self.partial_credit = available;
+        Ok(())
+    }
+
+    fn take_completed(&mut self) -> usize {
+        std::mem::take(&mut self.completed)
+    }
 }
 
 impl WsRoutePort {
@@ -425,6 +470,7 @@ impl WsRoutePort {
                 pending_type1: VecDeque::new(),
                 pending_information: VecDeque::new(),
                 downstream_sizes: VecDeque::new(),
+                outbound_completions: OutboundCompletions::default(),
             })
             .collect())
     }
@@ -700,6 +746,9 @@ impl WsRoutePort {
                 if credit.allowance_bytes <= circuit.send_allowance {
                     return Err(protocol("credit did not increase"));
                 }
+                let granted = credit.allowance_bytes - circuit.send_allowance;
+                self.outbound_completions.credit(granted)?;
+                let circuit = self.checked_circuit_mut(&credit.circuit_id)?;
                 circuit.send_allowance = credit.allowance_bytes;
                 debug!(
                     circuit_id = %format_uuid(&credit.circuit_id),
@@ -936,6 +985,7 @@ impl WsRoutePort {
         self.pending_type1.clear();
         self.pending_information.clear();
         self.downstream_sizes.clear();
+        self.outbound_completions = OutboundCompletions::default();
         self.local_ready = false;
     }
 }
@@ -1008,6 +1058,7 @@ impl RoutePort for WsRoutePort {
                 if data.is_empty() || data.len() > 1496 {
                     return Err(protocol("invalid SNA information size"));
                 }
+                let bytes = data.len();
                 let Some(circuit) = self.circuit.as_mut().filter(|c| c.ready) else {
                     return Ok(false);
                 };
@@ -1025,6 +1076,7 @@ impl RoutePort for WsRoutePort {
                     "send SNA information over WebSocket"
                 );
                 self.send_event(wire::circuit_event::Event::SnaInformation(data))?;
+                self.outbound_completions.sent(bytes)?;
                 Ok(true)
             }
             RoutedUnit::AnyNetTcpRecord(_)
@@ -1040,6 +1092,10 @@ impl RoutePort for WsRoutePort {
         self.circuit
             .as_ref()
             .is_some_and(|c| c.ready && c.send_allowance.saturating_sub(c.sent_bytes) >= 1500)
+    }
+
+    fn take_completed_information_count(&mut self) -> usize {
+        self.outbound_completions.take_completed()
     }
 
     fn set_ingress_busy(&mut self, _busy: bool) -> io::Result<()> {
@@ -1345,6 +1401,23 @@ mod tests {
         http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue},
         Message as WsMessage,
     };
+
+    #[test]
+    fn circuit_credit_retires_only_whole_outbound_information_frames() {
+        let mut completions = OutboundCompletions::default();
+        completions.sent(141).unwrap();
+        completions.sent(46).unwrap();
+        completions.credit(100).unwrap();
+        assert_eq!(completions.take_completed(), 0);
+        completions.credit(41).unwrap();
+        assert_eq!(completions.take_completed(), 1);
+        completions.credit(46).unwrap();
+        assert_eq!(completions.take_completed(), 1);
+        assert_eq!(
+            completions.credit(1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     fn name(netid: &str, name: &str) -> wire::SnaName {
         wire::SnaName {
