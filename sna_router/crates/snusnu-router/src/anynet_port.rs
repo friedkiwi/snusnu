@@ -14,9 +14,13 @@ use std::{
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
 };
 use transport_ip_sna::anynet::{self, TcpKind, TcpRecord, TcpSession};
-use transport_ip_sna::mptn_connect::{Connect, Direction};
+use transport_ip_sna::{
+    mptn_connect::{Connect, Direction},
+    mptn_keepalive::{Exchange, Keepalive},
+};
 
 const PENDING_LIMIT: usize = anynet::MAX_RECORD * 4;
+const UDP_QUEUE_LIMIT: usize = 64;
 
 struct SessionIdentity {
     source: Vec<u8>,
@@ -36,6 +40,8 @@ pub(crate) struct AnyNetPort {
     incoming: VecDeque<TcpRecord>,
     pending: VecDeque<TcpRecord>,
     pending_bytes: usize,
+    pending_udp: VecDeque<Keepalive>,
+    keepalive_exchange: Exchange,
     expected_local_lu: Option<Vec<u8>>,
     expected_remote_lu: Option<Vec<u8>>,
     identity: Option<SessionIdentity>,
@@ -91,6 +97,8 @@ impl AnyNetPort {
             incoming: VecDeque::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
+            pending_udp: VecDeque::new(),
+            keepalive_exchange: Exchange::default(),
             expected_local_lu: None,
             expected_remote_lu: None,
             identity: None,
@@ -186,19 +194,58 @@ impl AnyNetPort {
         let mut bytes = [0; anynet::MAX_RECORD];
         match self.udp.recv_from(&mut bytes) {
             Ok((size, source)) => {
-                if source.ip() != self.peer_ip {
-                    tracing::warn!(local_ip = %self.local_ip, source_ip = %source.ip(), "UDP/397 from unconfigured peer discarded");
+                if source.ip() != self.peer_ip || source.port() != self.port {
+                    tracing::warn!(local_ip = %self.local_ip, source_ip = %source.ip(), source_port = source.port(), "UDP/397 from unconfigured peer discarded");
                     return Ok(Some(Vec::new()));
                 }
-                let decoded = anynet::UdpDatagram::decode(bytes[..size].to_vec());
-                tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, source_port = source.port(), kind = ?decoded.as_ref().map(|message| message.kind), "AnyNet UDP/397 requires provider-address translation; session closed");
-                tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, bytes = size, hex = %hex_dump(&bytes[..size]), "unsupported AnyNet UDP datagram");
-                self.disconnect()?;
-                Ok(Some(vec![RouterEvent::Closed]))
+                let decoded = Keepalive::decode(&bytes[..size]).and_then(|keepalive| {
+                    keepalive.validate_ingress(self.peer_ip, self.local_ip)?;
+                    self.keepalive_exchange.received(keepalive.kind)?;
+                    Ok(keepalive)
+                });
+                match decoded {
+                    Ok(keepalive) => {
+                        tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, kind = ?keepalive.kind, bytes = size, hex = %hex_dump(&bytes[..size]), "AnyNet node-pair keepalive received");
+                        Ok(Some(vec![RouterEvent::Unit(
+                            RoutedUnit::AnyNetUdpDatagram(bytes[..size].to_vec()),
+                        )]))
+                    }
+                    Err(error) => {
+                        tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, source_port = source.port(), error = %error, "unsupported AnyNet UDP/397 traffic; session closed");
+                        tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, bytes = size, hex = %hex_dump(&bytes[..size]), "unsupported AnyNet UDP datagram");
+                        self.disconnect()?;
+                        Ok(Some(vec![RouterEvent::Closed]))
+                    }
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn drain_udp(&mut self) -> io::Result<()> {
+        while let Some(keepalive) = self.pending_udp.front().copied() {
+            let bytes = keepalive.encode();
+            match self
+                .udp
+                .send_to(&bytes, SocketAddr::new(self.peer_ip, self.port))
+            {
+                Ok(n) if n == bytes.len() => {
+                    self.pending_udp.pop_front();
+                    self.keepalive_exchange.sent(keepalive.kind);
+                    tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, kind = ?keepalive.kind, bytes = n, hex = %hex_dump(&bytes), "AnyNet node-pair keepalive sent");
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short AnyNet UDP send",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn pop_incoming(&mut self) -> Option<Vec<RouterEvent>> {
@@ -315,8 +362,10 @@ fn encode_lu(name: &str) -> io::Result<Vec<u8>> {
 
 impl RoutePort for AnyNetPort {
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
-        if let Some(events) = self.check_udp()? {
-            return Ok(Some(events));
+        if can_accept_information {
+            if let Some(events) = self.check_udp()? {
+                return Ok(Some(events));
+            }
         }
         if self.accept_once()? {
             return Ok(Some(Vec::new()));
@@ -363,10 +412,29 @@ impl RoutePort for AnyNetPort {
             }
         }
         self.drain()?;
+        self.drain_udp()?;
         Ok(Vec::new())
     }
 
     fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> {
+        if let RoutedUnit::AnyNetUdpDatagram(bytes) = unit {
+            let keepalive = match Keepalive::decode(&bytes)
+                .and_then(|message| message.for_egress(self.local_ip, self.peer_ip))
+            {
+                Ok(message) => message,
+                Err(error) => {
+                    tracing::warn!(local_ip = %self.local_ip, peer_ip = %self.peer_ip, error = %error, "invalid routed AnyNet keepalive; closing node pair");
+                    self.close_pending = true;
+                    return Ok(true);
+                }
+            };
+            if self.pending_udp.len() >= UDP_QUEUE_LIMIT {
+                return Ok(false);
+            }
+            self.pending_udp.push_back(keepalive);
+            self.drain_udp()?;
+            return Ok(true);
+        }
         let RoutedUnit::AnyNetTcpRecord(bytes) = unit else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -399,6 +467,7 @@ impl RoutePort for AnyNetPort {
 
     fn has_capacity(&self) -> bool {
         self.pending_bytes <= PENDING_LIMIT - anynet::MAX_RECORD
+            && self.pending_udp.len() < UDP_QUEUE_LIMIT
     }
     fn available_receive_slots(&self) -> usize {
         usize::from(self.has_capacity())
@@ -415,12 +484,15 @@ impl RoutePort for AnyNetPort {
         self.incoming.clear();
         self.pending.clear();
         self.pending_bytes = 0;
+        self.pending_udp.clear();
+        self.keepalive_exchange.clear();
         self.identity = None;
         self.close_pending = false;
         Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.drain()
+        self.drain()?;
+        self.drain_udp()
     }
 }
 
@@ -433,6 +505,7 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+    use transport_ip_sna::mptn_keepalive::Kind;
 
     // Synthetic TCP62 Connect from the IBM draft's fixed field layout.
     // The three-byte connection data is a marker, not a captured BIND.
@@ -457,6 +530,21 @@ mod tests {
             if let Some(events) = port.poll(true).unwrap() {
                 for event in events {
                     if let RouterEvent::Unit(RoutedUnit::AnyNetTcpRecord(bytes)) = event {
+                        found = Some(bytes);
+                    }
+                }
+            }
+            found.is_some()
+        });
+        found.unwrap()
+    }
+
+    fn next_udp_unit(port: &mut AnyNetPort) -> Vec<u8> {
+        let mut found = None;
+        wait_until(|| {
+            if let Some(events) = port.poll(true).unwrap() {
+                for event in events {
+                    if let RouterEvent::Unit(RoutedUnit::AnyNetUdpDatagram(bytes)) = event {
                         found = Some(bytes);
                     }
                 }
@@ -547,7 +635,7 @@ mod tests {
         assert!(a.session.is_some());
         drop(second);
 
-        let udp = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let udp = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).unwrap();
         udp.send_to(&[0, 0, 0, 8, 0x84, 0, 0, 4], SocketAddr::new(a_ip, port))
             .unwrap();
         assert!(matches!(
@@ -573,5 +661,74 @@ mod tests {
             rejected
         });
         assert!(a.session.is_none());
+    }
+
+    #[test]
+    fn ipv4_keepalive_rewrites_provider_addresses_on_each_leg() {
+        let a_ip = IpAddr::V4(Ipv4Addr::new(127, 84, 0, 1));
+        let a_peer = IpAddr::V4(Ipv4Addr::new(127, 84, 0, 2));
+        let b_ip = IpAddr::V4(Ipv4Addr::new(127, 84, 0, 3));
+        let b_peer = IpAddr::V4(Ipv4Addr::new(127, 84, 0, 4));
+        let port = 18_398;
+        let mut a = AnyNetPort::open_at(a_ip, a_peer, port).unwrap();
+        let mut b = AnyNetPort::open_at(b_ip, b_peer, port).unwrap();
+        let guest_a = UdpSocket::bind(SocketAddr::new(a_peer, port)).unwrap();
+        let guest_b = UdpSocket::bind(SocketAddr::new(b_peer, port)).unwrap();
+        guest_a
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        guest_b
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let request = Keepalive {
+            kind: Kind::Request,
+            source: Ipv4Addr::new(127, 84, 0, 2),
+            destination: Ipv4Addr::new(127, 84, 0, 1),
+        }
+        .encode();
+        guest_a
+            .send_to(&request, SocketAddr::new(a_ip, port))
+            .unwrap();
+        assert!(b
+            .send(RoutedUnit::AnyNetUdpDatagram(next_udp_unit(&mut a)))
+            .unwrap());
+        let mut bytes = [0; 64];
+        let (n, source) = guest_b.recv_from(&mut bytes).unwrap();
+        assert_eq!(source, SocketAddr::new(b_ip, port));
+        let forwarded = Keepalive::decode(&bytes[..n]).unwrap();
+        assert_eq!(forwarded.kind, Kind::Request);
+        assert_eq!(forwarded.source, Ipv4Addr::new(127, 84, 0, 3));
+        assert_eq!(forwarded.destination, Ipv4Addr::new(127, 84, 0, 4));
+
+        let response = Keepalive {
+            kind: Kind::Response,
+            ..forwarded
+        }
+        .encode();
+        guest_b
+            .send_to(&response, SocketAddr::new(b_ip, port))
+            .unwrap();
+        assert!(a
+            .send(RoutedUnit::AnyNetUdpDatagram(next_udp_unit(&mut b)))
+            .unwrap());
+        let (n, source) = guest_a.recv_from(&mut bytes).unwrap();
+        assert_eq!(source, SocketAddr::new(a_ip, port));
+        let returned = Keepalive::decode(&bytes[..n]).unwrap();
+        assert_eq!(returned.kind, Kind::Response);
+        assert_eq!(returned.source, Ipv4Addr::new(127, 84, 0, 2));
+        assert_eq!(returned.destination, Ipv4Addr::new(127, 84, 0, 1));
+
+        guest_b
+            .send_to(&response, SocketAddr::new(b_ip, port))
+            .unwrap();
+        let mut closed = false;
+        wait_until(|| {
+            closed = b
+                .poll(true)
+                .unwrap()
+                .is_some_and(|events| matches!(events.as_slice(), [RouterEvent::Closed]));
+            closed
+        });
     }
 }
