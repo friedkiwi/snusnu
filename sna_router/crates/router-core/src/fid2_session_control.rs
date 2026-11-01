@@ -62,7 +62,7 @@ pub struct ManagementBind {
     request_daf: u8,
     request_oaf: u8,
     odai: u8,
-    fqpcid: [u8; 22],
+    fqpcid: Vec<u8>,
 }
 
 impl ManagementBind {
@@ -109,7 +109,7 @@ impl ManagementBind {
         (self.request_daf, self.request_oaf)
     }
 
-    pub fn fqpcid(&self) -> &[u8; 22] {
+    pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
     }
 
@@ -235,7 +235,7 @@ impl ManagementBind {
 fn validate_v4r4_request_tail(
     ru: &[u8],
     plu: &str,
-    fqpcid: &[u8; 22],
+    fqpcid: &[u8],
 ) -> Result<(), SessionControlError> {
     let plu_len = ru[27] as usize;
     let user_len_offset = 28 + plu_len;
@@ -284,10 +284,10 @@ fn validate_v4r4_request_tail(
         .get(slu_len_offset)
         .ok_or(SessionControlError::UnsupportedRequest)? as usize;
     let fqpcid_offset = slu_len_offset + 1 + slu_len;
-    if ru.get(fqpcid_offset..fqpcid_offset + 22) != Some(fqpcid.as_slice()) {
+    if ru.get(fqpcid_offset..fqpcid_offset + fqpcid.len()) != Some(fqpcid) {
         return Err(SessionControlError::WrongSession);
     }
-    let trailing = &ru[fqpcid_offset + 22..];
+    let trailing = &ru[fqpcid_offset + fqpcid.len()..];
     if !trailing.is_empty() && (trailing.len() != 12 || trailing[..2] != [0x2c, 0x0a]) {
         return Err(SessionControlError::UnsupportedRequest);
     }
@@ -295,7 +295,16 @@ fn validate_v4r4_request_tail(
 }
 
 fn encode_lu_name(name: &str) -> Result<Vec<u8>, SessionControlError> {
-    if name.len() > 17 || name.is_empty() {
+    let mut parts = name.split('.');
+    let (Some(netid), Some(lu)) = (parts.next(), parts.next()) else {
+        return Err(SessionControlError::WrongLuPair);
+    };
+    if netid.is_empty()
+        || netid.len() > 8
+        || lu.is_empty()
+        || lu.len() > 8
+        || parts.next().is_some()
+    {
         return Err(SessionControlError::WrongLuPair);
     }
     name.bytes()
@@ -312,7 +321,7 @@ fn encode_lu_name(name: &str) -> Result<Vec<u8>, SessionControlError> {
         .collect()
 }
 
-pub(crate) fn request_fqpcid(ru: &[u8]) -> Result<[u8; 22], SessionControlError> {
+pub(crate) fn request_fqpcid(ru: &[u8]) -> Result<Vec<u8>, SessionControlError> {
     let mut offset = 27;
     for _ in 0..4 {
         let length = *ru
@@ -323,16 +332,29 @@ pub(crate) fn request_fqpcid(ru: &[u8]) -> Result<[u8; 22], SessionControlError>
             .filter(|&end| end <= ru.len())
             .ok_or(SessionControlError::UnsupportedRequest)?;
     }
-    let vector = ru
-        .get(offset..offset + 22)
-        .ok_or(SessionControlError::UnsupportedRequest)?;
-    if vector[..2] != [0x60, 0x14] {
-        return Err(SessionControlError::UnsupportedRequest);
-    }
-    Ok(vector.try_into().unwrap())
+    parse_fqpcid(
+        ru.get(offset..)
+            .ok_or(SessionControlError::UnsupportedRequest)?,
+    )
 }
 
-fn response_mode_and_fqpcid(ru: &[u8]) -> Result<(bool, [u8; 22]), SessionControlError> {
+pub(crate) fn parse_fqpcid(bytes: &[u8]) -> Result<Vec<u8>, SessionControlError> {
+    // GA27-3136-20 p. 9-107: X'60' uses a two-byte KL header, eight-byte
+    // PCID, one-byte CP-name length, then 3..17 CP-name bytes. The name is
+    // an opaque identity here; the BIND's PLU/SLU names are checked above.
+    let data_len = *bytes
+        .get(1)
+        .ok_or(SessionControlError::UnsupportedRequest)? as usize;
+    let vector = bytes
+        .get(..2 + data_len)
+        .ok_or(SessionControlError::UnsupportedRequest)?;
+    if vector[0] != 0x60 || !(12..=26).contains(&data_len) || vector[10] as usize + 9 != data_len {
+        return Err(SessionControlError::UnsupportedRequest);
+    }
+    Ok(vector.to_vec())
+}
+
+fn response_mode_and_fqpcid(ru: &[u8]) -> Result<(bool, Vec<u8>), SessionControlError> {
     // V4R4 negotiable response: fixed 27 bytes, PLU length/name, structured
     // user data, URC length/data, SLU length/name, then the FQPCID vector.
     let plu_len = *ru.get(27).ok_or(SessionControlError::TruncatedResponse)? as usize;
@@ -375,13 +397,15 @@ fn response_mode_and_fqpcid(ru: &[u8]) -> Result<(bool, [u8; 22]), SessionContro
         return Err(SessionControlError::UnsupportedResponse);
     }
     let fqpcid_offset = slu_len_offset + 1 + slu_len;
-    let vector = ru
-        .get(fqpcid_offset..fqpcid_offset + 22)
-        .ok_or(SessionControlError::TruncatedResponse)?;
-    if vector[..2] != [0x60, 0x14] {
+    let vector = parse_fqpcid(
+        ru.get(fqpcid_offset..)
+            .ok_or(SessionControlError::TruncatedResponse)?,
+    )
+    .map_err(|_| SessionControlError::UnsupportedResponse)?;
+    if fqpcid_offset + vector.len() != ru.len() {
         return Err(SessionControlError::UnsupportedResponse);
     }
-    Ok((mode, vector.try_into().unwrap()))
+    Ok((mode, vector))
 }
 
 /// A solicited adaptive pacing message (IPM) observed on native V4R4.
@@ -431,7 +455,7 @@ mod tests {
             "2f00010200006b850031001307b0b0513307878686870706020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "0be2d6d3d5c5e34be2d5c1c2601411111111111111110b1111111111111111111111",
             "2c0a00000000000000000000"
         ));
         assert_eq!(request.len(), 141);
@@ -446,7 +470,7 @@ mod tests {
         let expected = hex_bytes(concat!(
             "2f0002010000eb800031001307b0b0513300808686800006020000000000000000234000",
             "001b000902e2d5c1e2e5c3d4c70203020c05e2d6d3d5c5e34be2d5c1c2",
-            "000060141111111111111111111111111111111111111111"
+            "0000601411111111111111110b1111111111111111111111"
         ));
         assert_eq!(response, expected);
         assert_eq!(bind.correlate_positive_response(&response), Ok(()));
@@ -527,7 +551,9 @@ mod tests {
         ru.extend_from_slice(&[11, 0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]);
         ru.extend_from_slice(&[0, 3, 0xc4, 0xc5, 0xc6]);
         ru.extend_from_slice(&[0x60, 0x14]);
-        ru.extend_from_slice(&[0x11; 20]); // Synthetic FQPCID token.
+        ru.extend_from_slice(&[0x11; 8]); // Synthetic PCID.
+        ru.push(11); // Network-qualified CP name length.
+        ru.extend_from_slice(&[0x11; 11]); // Synthetic CP-name token.
         piu.extend(ru);
         piu
     }
@@ -538,7 +564,7 @@ mod tests {
         let hex = concat!(
             "2f0002010000eb800031001307b0b05133008086868000060200000000000000944340000026",
             "000902e2d5c1e2e5c3d4c70203020c05e2d6d3d5c5e34be2d5c1c20a1300",
-            "0000000000000000000060141111111111111111111111111111111111111111"
+            "00000000000000000000601411111111111111110b1111111111111111111111"
         );
         let piu = hex
             .as_bytes()

@@ -60,20 +60,24 @@ pub fn correlate_observed_v4r4_user_response(
     {
         return Err(UserResponseError::WrongSession);
     }
-    if piu[6..9] != [0xeb, 0x80, 0] || piu.len() != 100 || piu[9..36] != OBSERVED_RESPONSE_FIXED {
+    if piu.len() < 36 || piu[6..9] != [0xeb, 0x80, 0] || piu[9..36] != OBSERVED_RESPONSE_FIXED {
         return Err(UserResponseError::UnsupportedResponse);
     }
     let ru = &piu[9..];
     // Response outer PLU/SLU names are absent, as in the management reply.
     // User subfields are mode, session-instance, responder SLU, and opaque
     // X'13' in that order. Each length includes the one-byte subfield key.
-    if ru[27..32] != [0, 38, 0, 9, 2] || ru[32..40] != [0x40; 8] || ru[40..43] != [2, 3, 2] {
+    let slu = encode_lu_name(&offer.slu)?;
+    let user_len = 27 + slu.len();
+    if ru.get(27..32) != Some(&[0, user_len as u8, 0, 9, 2])
+        || ru.get(32..40) != Some(&[0x40; 8])
+        || ru.get(40..43) != Some(&[2, 3, 2])
+    {
         return Err(UserResponseError::UnsupportedResponse);
     }
-    let slu = encode_lu_name(&offer.slu)?;
     if slu.len() > 17
-        || ru[43] != (1 + slu.len()) as u8
-        || ru[44] != 5
+        || ru.get(43) != Some(&((1 + slu.len()) as u8))
+        || ru.get(44) != Some(&5)
         || ru.get(45..45 + slu.len()) != Some(slu.as_slice())
     {
         return Err(UserResponseError::WrongSession);
@@ -81,8 +85,8 @@ pub fn correlate_observed_v4r4_user_response(
     let unknown = 45 + slu.len();
     if ru.get(unknown..unknown + 2) != Some(&[10, 0x13])
         || ru.get(unknown + 11..unknown + 13) != Some(&[0, 0])
-        || ru.get(unknown + 13..unknown + 35) != Some(offer.fqpcid.as_slice())
-        || unknown + 35 != ru.len()
+        || ru.get(unknown + 13..unknown + 13 + offer.fqpcid.len()) != Some(offer.fqpcid.as_slice())
+        || unknown + 13 + offer.fqpcid.len() != ru.len()
     {
         return Err(UserResponseError::WrongSession);
     }
@@ -126,7 +130,7 @@ mod tests {
             "2f00010200006b850031001307b0b0513307878686870706020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "0be2d6d3d5c5e34be2d5c1c2601411111111111111110b1111111111111111111111",
             "2c0a00000000000000000000"
         ));
         let bind = ManagementBind::from_request(&management, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
@@ -134,7 +138,7 @@ mod tests {
             "2f00020200006b850031001307b0b051330383c7c7830306020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902404040404040404009030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260142222222222222222222222222222222222222222",
+            "0be2d6d3d5c5e34be2d5c1c2601422222222222222220b2222222222222222222222",
             "2c0a01087bc3d6d5d5c5c3e3"
         ));
         UserBindOffer::from_request(&user, &bind, "").unwrap()
@@ -146,7 +150,7 @@ mod tests {
         hex(concat!(
             "2f0002020000eb800031001307b0b051330080c7c7800006020000000000000094434000",
             "002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c2",
-            "0a13000000000000000000000060142222222222222222222222222222222222222222"
+            "0a130000000000000000000000601422222222222222220b2222222222222222222222"
         ))
     }
 

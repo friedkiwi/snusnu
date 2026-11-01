@@ -1,7 +1,7 @@
 //! Read-only first user-session FMH-5 boundary after user BIND.
 //!
 //! Two independent V4R4 peer traces start the default-mode APPC conversation
-//! with a 36-byte FMH-5 Attach in a 242-byte FID2 PIU. The following bytes
+//! with a length-qualified FMH-5 Attach in a 242-byte FID2 PIU. The following bytes
 //! carry application/conversation data and are deliberately left opaque.
 //! Parsing this header does not authorize a positive reply or a route.
 
@@ -38,7 +38,8 @@ pub fn parse_first_user_attach(
     piu: &[u8],
     offer: &UserBindOffer,
 ) -> Result<FirstUserAttach, UserFmh5Error> {
-    if piu.len() < 9 + 36 {
+    let fmh5_bytes = 25 + offer.plu.len();
+    if piu.len() < 9 + fmh5_bytes {
         return Err(UserFmh5Error::Truncated);
     }
     if piu.len() > 1496
@@ -51,8 +52,9 @@ pub fn parse_first_user_attach(
         return Err(UserFmh5Error::WrongSession);
     }
     if piu[4..9] != [0, 1, 0x0b, 0x91, 0x20]
-        || piu[9..16] != [0x24, 0x05, 0x02, 0xff, 0x08, 0x03, 0xd0]
-        || piu.len() == 9 + 36
+        || piu[9] as usize != fmh5_bytes
+        || piu[10..16] != [0x05, 0x02, 0xff, 0x08, 0x03, 0xd0]
+        || piu.len() == 9 + fmh5_bytes
     {
         return Err(UserFmh5Error::UnsupportedPiu);
     }
@@ -60,8 +62,8 @@ pub fn parse_first_user_attach(
         daf: piu[2],
         oaf: piu[3],
         sequence: 1,
-        fmh5_bytes: 36,
-        opaque_tail_bytes: piu.len() - 9 - 36,
+        fmh5_bytes,
+        opaque_tail_bytes: piu.len() - 9 - fmh5_bytes,
     })
 }
 
@@ -83,7 +85,7 @@ mod tests {
             "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "0be2d6d3d5c5e34be2d5c1c2601411111111111111110b1111111111111111111111",
             "2c0a00000000000000000000"
         ));
         let management = ManagementBind::from_request(&mgmt, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
@@ -91,7 +93,7 @@ mod tests {
             "2d00020200006b800031001307b0b051330383c7c7830306020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902404040404040404009030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260142222222222222222222222222222222222222222",
+            "0be2d6d3d5c5e34be2d5c1c2601422222222222222220b2222222222222222222222",
             "2c0a01087bc3d6d5d5c5c3e3"
         ));
         UserBindOffer::from_request(&user, &management, "").unwrap()

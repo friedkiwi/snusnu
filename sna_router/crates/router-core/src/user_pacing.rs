@@ -86,7 +86,7 @@ struct PendingEgress {
 pub struct UserPacingSession {
     daf: u8,
     oaf: u8,
-    fqpcid: [u8; 22],
+    fqpcid: Vec<u8>,
     expedited_th0: u8,
     response: Vec<u8>,
     local_receive_window: u8,
@@ -121,7 +121,7 @@ impl UserPacingSession {
         management_closed: bool,
     ) -> Result<Self, UserPacingError> {
         if (!management_closed && (offer.daf, offer.oaf) == management.request_addresses())
-            || &offer.fqpcid == management.fqpcid()
+            || offer.fqpcid == management.fqpcid()
             || offer.request()[0] & 0x08 == 0
         {
             return Err(UserPacingError::WrongSession);
@@ -139,7 +139,7 @@ impl UserPacingSession {
         Ok(Self {
             daf: offer.daf,
             oaf: offer.oaf,
-            fqpcid: offer.fqpcid,
+            fqpcid: offer.fqpcid.clone(),
             expedited_th0: offer.request()[0],
             response,
             local_receive_window,
@@ -183,23 +183,26 @@ impl UserPacingSession {
         }
         parse_first_user_attach(piu, offer)?;
         let ru = &piu[9..];
-        if ru.len() < 44
-            || ru[0] != 36
+        let plu = encode_lu_name(&offer.plu)?;
+        let fmh_len = 25 + plu.len();
+        if ru.len() < fmh_len + 8
+            || ru[0] as usize != fmh_len
             || ru[4..10] != [8, 3, 0xd0, 0, 0x40, 4]
-            || ru[14..17] != [0, 20, 11]
+            || ru[14..16] != [0, (plu.len() + 9) as u8]
+            || ru[16] as usize != plu.len()
         {
             return Err(UserPacingError::InvalidFmh5);
         }
         if expected_tp.len() != 4 || ru[10..14] != *expected_tp {
             return Err(UserPacingError::WrongRoute);
         }
-        if ru.get(17..28) != Some(encode_lu_name(&offer.plu)?.as_slice()) {
+        if ru.get(17..17 + plu.len()) != Some(plu.as_slice()) {
             return Err(UserPacingError::WrongRoute);
         }
-        // The FMH-5 ends at offset 36. Its PIP flag requires one complete
+        // The FMH-5 ends after its length-qualified LUW name. Its PIP flag requires one complete
         // GDS X'12F5' containing one X'12E2' subfield. Do not interpret the
         // application-specific subfield body or expose it as route metadata.
-        let pip = &ru[36..];
+        let pip = &ru[fmh_len..];
         let gds_len = u16::from_be_bytes([pip[0], pip[1]]) as usize;
         let sub_len = u16::from_be_bytes([pip[4], pip[5]]) as usize;
         if gds_len != pip.len()
@@ -220,8 +223,8 @@ impl UserPacingSession {
             local_lu: offer.slu.clone(),
             mode: offer.mode.clone(),
             transaction_program: expected_tp.to_vec(),
-            luw_instance: ru[28..34].try_into().unwrap(),
-            luw_sequence: u16::from_be_bytes([ru[34], ru[35]]),
+            luw_instance: ru[17 + plu.len()..23 + plu.len()].try_into().unwrap(),
+            luw_sequence: u16::from_be_bytes([ru[23 + plu.len()], ru[24 + plu.len()]]),
             pip_bytes: pip.len(),
         })
     }
@@ -413,7 +416,7 @@ mod tests {
             "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "0be2d6d3d5c5e34be2d5c1c2601411111111111111110b1111111111111111111111",
             "2c0a00000000000000000000"
         ));
         let mgmt = ManagementBind::from_request(&management, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
@@ -421,7 +424,7 @@ mod tests {
             "2d00020200006b800031001307b0b051330383c7c7830306020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902404040404040404009030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260142222222222222222222222222222222222222222",
+            "0be2d6d3d5c5e34be2d5c1c2601422222222222222220b2222222222222222222222",
             "2c0a01087bc3d6d5d5c5c3e3"
         ));
         let offer = UserBindOffer::from_request(&user, &mgmt, "").unwrap();
@@ -631,7 +634,7 @@ mod tests {
         ));
         assert!(UserPacingSession::new_after_management(&alias, &management, 1).is_ok());
         alias = offer;
-        alias.fqpcid = *management.fqpcid();
+        alias.fqpcid = management.fqpcid().to_vec();
         assert!(matches!(
             UserPacingSession::new(&alias, &management, 1),
             Err(UserPacingError::WrongSession)

@@ -442,10 +442,13 @@ impl ManagementSession {
     /// The FQPCID ties the UNBIND to this BIND instance; no opaque tail is
     /// echoed. A different reason or session instance fails closed.
     pub fn prepare_unbind_response(&mut self, piu: &[u8]) -> Result<&[u8], ManagementError> {
-        if self.phase != Phase::BisComplete || piu.len() != 37 {
+        if self.phase != Phase::BisComplete {
             return Err(ManagementError::UnexpectedState);
         }
         let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
+        if piu.len() != 15 + bind.fqpcid().len() {
+            return Err(ManagementError::UnexpectedState);
+        }
         let request = self
             .request
             .as_ref()
@@ -457,7 +460,7 @@ impl ManagementSession {
             || piu[3] != oaf
             || piu[4..9] != [0, 0, 0x6b, 0x80, 0]
             || piu[9..15] != [0x32, 1, 0, 0, 0, 0]
-            || piu[15..37] != *bind.fqpcid()
+            || piu[15..] != *bind.fqpcid()
         {
             return Err(ManagementError::UnexpectedState);
         }
@@ -499,7 +502,7 @@ mod tests {
             "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
             "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
-            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "0be2d6d3d5c5e34be2d5c1c2601411111111111111110b1111111111111111111111",
             "2c0a00000000000000000000"
         );
         hex.as_bytes()
