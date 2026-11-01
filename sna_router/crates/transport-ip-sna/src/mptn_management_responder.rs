@@ -50,9 +50,9 @@ pub struct ManagementResponder {
     phase: Phase,
 }
 
-/// Handler declarations for the optional V5R4 Connect values kept in a
-/// captured-shape positive response. A caller must supply real socket-side
-/// handlers before setting either field; this module implements neither.
+/// Handler declarations for optional V5R4 Connect values. Unsupported
+/// options are cleared in the positive response per TCP62 §5.3.1.1.3/5.
+/// A caller must supply real socket-side handlers before setting either field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V5Options {
     pub son_handler: bool,
@@ -96,8 +96,6 @@ impl ManagementResponder {
             .map_err(|_| invalid("management Connect compensation field invalid"))?;
         if !required.is_complete_tcp62()
             || !required.missing_from(available).is_empty()
-            || !options.son_handler
-            || !options.keepalive_handler
             || request.options.len() != 5
             || request
                 .options
@@ -150,6 +148,8 @@ impl ManagementResponder {
         response.direction = Direction::PositiveResponse;
         response.processing = 0x8a;
         response.options[1].value = data;
+        response.options[2].value = vec![u8::from(options.son_handler)];
+        response.options[4].value = vec![if options.keepalive_handler { 0x84 } else { 0 }];
         let connect_response = response.encode()?;
         let checked = Connect::decode(&connect_response)?;
         if !request.matches_response(&checked)
@@ -394,17 +394,20 @@ mod tests {
         )
         .is_err());
         let all = CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83]).unwrap();
-        assert!(ManagementResponder::new(
+        let cleared = ManagementResponder::new(
             &admitted,
             all,
             V5Options {
-                son_handler: true,
-                keepalive_handler: false
+                son_handler: false,
+                keepalive_handler: false,
             },
             [0x23, 0x33, 0x33, 0x33, 0x33, 0x80, 0],
             "",
             8,
         )
-        .is_err());
+        .unwrap();
+        let response = Connect::decode(cleared.connect_response()).unwrap();
+        assert_eq!(response.options[2].value, [0]);
+        assert_eq!(response.options[4].value, [0]);
     }
 }
