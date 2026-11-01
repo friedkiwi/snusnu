@@ -1,0 +1,259 @@
+//! Explicit experimental TCP62 to virtual native WebSocket gateway.
+//!
+//! X'83' UDP fallback remains fail closed. This lab only exercises peers that
+//! complete the captured TCP path without sending out-of-band datagrams.
+
+use crate::{
+    config::{self, ConfiguredLuType},
+    mptn_gateway_port::{GatewayConfig, GatewayEvent, MptnGatewayPort},
+    remote::{Config as RemoteConfig, WsRoutePort},
+    routing::{RoutePort, RouterEvent},
+    virtual_ws_port::VirtualWsPort,
+    STOP,
+};
+use router_core::{
+    native_management_initiator::NativeManagementInitiator, xid3::Role, xid3_local::LocalLlcProfile,
+};
+use std::{
+    fs::File,
+    io::{self, Read},
+    net::SocketAddr,
+    path::Path,
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, Instant},
+};
+use transport_ip_sna::{
+    anynet::TcpRecord, mptn_compensations::CompensationSet, mptn_management_responder::V5Options,
+    mptn_reverse_user_bind::NativeAddress,
+};
+use transport_ws::wire;
+
+const TIMEOUT: Duration = Duration::from_secs(180);
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn node_id(value: &str) -> io::Result<[u8; 4]> {
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("gateway local_node_id must be eight hex digits"));
+    }
+    Ok(u32::from_str_radix(value, 16)
+        .map_err(|_| invalid("invalid gateway local_node_id"))?
+        .to_be_bytes())
+}
+
+fn check_shape(config: &config::RouterConfig) -> io::Result<()> {
+    if config.mptn_gateway.len() != 1
+        || config.remote.len() != 1
+        || config.route.len() != 1
+        || !config.llc.is_empty()
+        || !config.ee.is_empty()
+        || !config.anynet.is_empty()
+        || !config.hpr_lan.is_empty()
+    {
+        return Err(invalid(
+            "experimental gateway requires one MPTN gateway, remote and route",
+        ));
+    }
+    let gateway = &config.mptn_gateway[0];
+    let remote = &config.remote[0];
+    if !remote
+        .lu_types
+        .get(&gateway.source_lu)
+        .is_some_and(|types| types.contains(&ConfiguredLuType::Lu6_2))
+    {
+        return Err(invalid("source LU must be exported as LU6.2"));
+    }
+    Ok(())
+}
+
+fn pump_virtual(port: &mut VirtualWsPort<WsRoutePort>) -> io::Result<()> {
+    if let Some(events) = port.poll(false)? {
+        for event in events {
+            match event {
+                RouterEvent::Ready => tracing::info!("virtual native LLC link ready"),
+                RouterEvent::Closed | RouterEvent::TimedOut => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "virtual WS link closed",
+                    ));
+                }
+                RouterEvent::Unit(_) | RouterEvent::ManagedMac(_) => {
+                    return Err(invalid("unexpected virtual gateway route event"));
+                }
+            }
+        }
+    }
+    for event in port.tick()? {
+        if matches!(event, RouterEvent::Closed | RouterEvent::TimedOut) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "virtual WS link closed",
+            ));
+        }
+    }
+    port.flush()
+}
+
+pub(crate) fn run(path: &Path) -> io::Result<()> {
+    let config = config::load(path)?;
+    check_shape(&config)?;
+    let gateway = &config.mptn_gateway[0];
+    let remote = &config.remote[0];
+    let bearer = std::env::var("SNUSNU_ROUTER_TOKEN")
+        .map_err(|_| invalid("SNUSNU_ROUTER_TOKEN is required"))?;
+    let profile = LocalLlcProfile {
+        cp_name: gateway.local_cp.clone(),
+        station_name: gateway.local_station.clone(),
+        node_id: node_id(&gateway.local_node_id)?,
+        tg_number: gateway.tg_number,
+        max_receive_btu: 1496,
+        max_iframes_before_ack: 1,
+        role: Role::Secondary,
+    };
+    let local_xid = profile
+        .build()
+        .map_err(|error| invalid(format!("local XID3: {error}")))?;
+    let source_lu = config::parse_cp(&gateway.source_lu)?;
+    let route = RemoteConfig {
+        url: remote.url.clone(),
+        bearer,
+        local_cp: config::parse_cp(&remote.local_cp)?,
+        target_cp: config::parse_cp(&remote.target_cp)?,
+        target_lu: Some(config::parse_cp(
+            remote
+                .target_lu
+                .as_deref()
+                .ok_or_else(|| invalid("missing target LU"))?,
+        )?),
+    };
+    let source = wire::LuReachability {
+        lu: Some(source_lu.clone()),
+        hosting_cp: Some(route.local_cp.clone()),
+        supported_types: vec![wire::LuType::LuType62 as i32],
+    };
+    let ws = WsRoutePort::connect_gateway_v2(route, vec![source], source_lu)?;
+    let mut virtual_port = VirtualWsPort::new(ws, local_xid, &gateway.local_cp, &gateway.peer_cp)?;
+    let mut random = [0u8; 14];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let mut token = [0u8; 7];
+    token[0] = 0x23;
+    token[1..].copy_from_slice(&random[8..]);
+    let management = NativeManagementInitiator::new(
+        &gateway.local_cp,
+        &gateway.peer_cp,
+        0x2f,
+        1,
+        2,
+        random[..8].try_into().expect("eight bytes"),
+        token,
+        "",
+        8,
+    )
+    .map_err(|error| invalid(format!("native management: {error}")))?;
+    virtual_port.attach_management(management)?;
+    let deadline = Instant::now() + TIMEOUT;
+    while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+        pump_virtual(&mut virtual_port)?;
+        if virtual_port.management_complete() {
+            break;
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+    if STOP.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if !virtual_port.management_complete() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "native management timed out",
+        ));
+    }
+    tracing::info!(local_cp=%gateway.local_cp, peer_cp=%gateway.peer_cp, "native management ready; opening TCP62");
+    let required =
+        CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83]).map_err(io::Error::other)?;
+    let mut tcp = MptnGatewayPort::bind(GatewayConfig {
+        local: SocketAddr::new(gateway.local_ip, 397),
+        peer_ip: gateway.peer_ip,
+        source_lu: gateway.source_lu.clone(),
+        destination_lu: gateway.destination_lu.clone(),
+        available_compensations: required,
+        options: V5Options {
+            son_handler: false,
+            keepalive_handler: false,
+        },
+        cnos_mode: String::new(),
+        cnos_limit: 8,
+    })?;
+    tracing::info!(local_ip=%gateway.local_ip, peer_ip=%gateway.peer_ip, "experimental TCP62 gateway listening");
+    let mut pending_user_input: Option<TcpRecord> = None;
+    while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+        pump_virtual(&mut virtual_port)?;
+        if let Some(record) = pending_user_input.as_ref() {
+            if virtual_port.submit_tcp_user_record(record)? {
+                pending_user_input = None;
+                tcp.complete_user_record()?;
+            }
+        }
+        if let Some(bytes) = virtual_port.tcp_bind_response().map(ToOwned::to_owned) {
+            if tcp.queue_user_bind_response(&bytes)? {
+                virtual_port.mark_tcp_bind_response_enqueued(&bytes)?;
+                tracing::info!("native user BIND accepted; TCP62 positive queued");
+            }
+        }
+        if let Some(record) = virtual_port.tcp_user_record().cloned() {
+            if tcp.queue_user_record(&record)? {
+                virtual_port.mark_tcp_user_record_enqueued(&record)?;
+            }
+        }
+        if let Some(event) = tcp.poll_once(pending_user_input.is_none())? {
+            match event {
+                GatewayEvent::ManagementReady => tracing::info!("TCP62 management ready"),
+                GatewayEvent::UserBind(offer) => {
+                    // Observed successful V4 answer-side profile. Only valid
+                    // for this explicit QA fixture, not a production address rule.
+                    virtual_port.begin_user_bind(
+                        &offer,
+                        NativeAddress {
+                            daf: 2,
+                            oaf: 2,
+                            odai: true,
+                        },
+                    )?;
+                    tracing::info!("TCP62 user BIND offered to virtual native link");
+                }
+                GatewayEvent::UserNormal(record) | GatewayEvent::UserExpedited(record) => {
+                    if virtual_port.submit_tcp_user_record(&record)? {
+                        tcp.complete_user_record()?;
+                    } else {
+                        pending_user_input = Some(record);
+                    }
+                }
+                GatewayEvent::UserAbort(_) => {
+                    return Err(invalid("TCP62 user Abort handling unavailable"))
+                }
+                GatewayEvent::Closed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "TCP62 peer closed",
+                    ))
+                }
+                GatewayEvent::Rejected(reason) => {
+                    return Err(invalid(format!("TCP62 peer rejected: {reason}")))
+                }
+            }
+        }
+        let _ = tcp.take_completed_user_records();
+        thread::sleep(Duration::from_micros(200));
+    }
+    if STOP.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "experimental gateway timed out",
+        ))
+    }
+}
