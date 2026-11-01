@@ -84,6 +84,7 @@ pub struct ManagementSession {
     cnos: Option<ControlResponder>,
     pending_ipr: Option<[u8; 9]>,
     pending_cnos: Option<Vec<u8>>,
+    attach_th0: Option<u8>,
     attach_acks: usize,
     bis: Option<BisPeer>,
     pending_unbind: Option<[u8; 10]>,
@@ -103,6 +104,7 @@ impl ManagementSession {
             cnos: None,
             pending_ipr: None,
             pending_cnos: None,
+            attach_th0: None,
             attach_acks: 0,
             bis: None,
             pending_unbind: None,
@@ -267,6 +269,7 @@ impl ManagementSession {
         self.bis = Some(bis);
         self.pending_ipr = Some(ipr);
         self.pending_cnos = Some(reply);
+        self.attach_th0 = Some(piu[0]);
         self.phase = Phase::AttachRepliesPrepared;
         Ok((
             self.pending_ipr.as_ref().unwrap(),
@@ -322,12 +325,8 @@ impl ManagementSession {
             return Err(ManagementError::UnexpectedState);
         }
         let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
-        let request = self
-            .request
-            .as_ref()
-            .ok_or(ManagementError::UnexpectedState)?;
         let (daf, oaf) = bind.request_addresses();
-        if piu[0] != request[0]
+        if Some(piu[0]) != self.attach_th0
             || piu[1] != 0
             || piu[2] != daf
             || piu[3] != oaf
@@ -537,7 +536,7 @@ mod tests {
         let (ipr, reply) = (ipr.to_vec(), reply.to_vec());
         assert_eq!(session.phase(), Phase::AttachRepliesPrepared);
         assert_eq!(session.mark_attach_replies_enqueued(&ipr, &reply), Ok(()));
-        let peer_ipr = [0x2d, 0, 1, 2, 0, 0, 0x83, 1, 0];
+        let peer_ipr = [0x2c, 0, 1, 2, 0, 0, 0x83, 1, 0];
         assert_eq!(session.observe_ipr(&peer_ipr), Ok(()));
         assert_eq!(
             session.observe_ipr(&peer_ipr),

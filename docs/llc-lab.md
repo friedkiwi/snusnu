@@ -197,3 +197,10 @@ replies were acknowledged by LLC2. The probe does not accept a user BIND,
 advertise a ready route, or carry routed traffic. Link loss, unsupported
 management PIUs, and timeout exit with status 1. Keep `timeout_seconds = 600`
 for a full V4R4 IPL and manual `STRPASTHR` activation.
+
+On 2026-11-01, this probe completed its bounded exchange with the isolated
+V4R4 SNAA guest. The guest accepted Rust's positive BIND response, sent CNOS
+Attach, and acknowledged Rust's isolated pacing response and accepted-pending
+CEB reply. It subsequently sent its own normal-flow pacing response and BIS
+request after the one-shot probe exited. This confirms management BIND/CNOS
+interoperability through the reply ACK, but does not establish a user session.
