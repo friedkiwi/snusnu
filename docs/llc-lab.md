@@ -192,11 +192,16 @@ data.
 against the configured LU pair, sends a fixed one-stage +RSP(BIND), accounts
 for the LLC acknowledgement, then handles one CNOS Attach with a pacing grant
 and an accepted-pending CEB reply. A received isolated pacing response must
-match the management session. Exit status 0 means those bounded management
-replies were acknowledged by LLC2. The probe does not accept a user BIND,
+match the CNOS flow. It then accepts the guest's BIS, sends its own BIS after
+the CNOS bracket drains, and responds to a correlated management UNBIND.
+Exit status 0 means the UNBIND response was acknowledged by LLC2. The probe
+does not accept a user BIND,
 advertise a ready route, or carry routed traffic. Link loss, unsupported
 management PIUs, and timeout exit with status 1. Keep `timeout_seconds = 600`
 for a full V4R4 IPL and manual `STRPASTHR` activation.
+This bounded responder follows the captured remote-first BIS order. The
+normal-flow BIS pacing semantics still need protocol validation; BIS is kept
+separate from the fixed CNOS send window.
 
 On 2026-11-01, this probe completed its bounded exchange with the isolated
 V4R4 SNAA guest. The guest accepted Rust's positive BIND response, sent CNOS

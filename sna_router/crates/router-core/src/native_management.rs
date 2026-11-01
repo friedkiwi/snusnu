@@ -66,6 +66,7 @@ pub enum Phase {
     AttachRepliesPrepared,
     AwaitCnosAck,
     CnosComplete,
+    AwaitBisAck,
     BisComplete,
     UnbindResponsePrepared,
     AwaitUnbindAck,
@@ -359,6 +360,12 @@ impl ManagementSession {
         if self.phase != Phase::CnosComplete {
             return Err(ManagementError::UnexpectedState);
         }
+        if self.bis.as_ref().and_then(BisPeer::remote).is_none() {
+            // The bounded V4R4 responder follows the captured remote-first
+            // order. BisPeer itself can model either order, but this session
+            // has no separate local initiation timer or bracket scheduler.
+            return Err(ManagementError::UnexpectedState);
+        }
         Ok(self
             .bis
             .as_mut()
@@ -372,9 +379,15 @@ impl ManagementSession {
         }
         let bis = self.bis.as_mut().ok_or(ManagementError::UnexpectedState)?;
         bis.mark_local_bis_transmitted(piu)?;
-        if bis.complete() {
-            self.phase = Phase::BisComplete;
+        self.phase = Phase::AwaitBisAck;
+        Ok(())
+    }
+
+    pub fn acknowledge_bis(&mut self, completed_information: usize) -> Result<(), ManagementError> {
+        if self.phase != Phase::AwaitBisAck || completed_information != 1 {
+            return Err(ManagementError::UnexpectedState);
         }
+        self.phase = Phase::BisComplete;
         Ok(())
     }
 
@@ -558,6 +571,8 @@ mod tests {
         let local_bis = session.prepare_local_bis(true).unwrap().to_vec();
         assert_eq!(local_bis, [0x2c, 0, 2, 1, 0, 2, 0x4b, 0xb1, 0, 0x70]);
         session.mark_local_bis_enqueued(&local_bis).unwrap();
+        assert_eq!(session.phase(), Phase::AwaitBisAck);
+        session.acknowledge_bis(1).unwrap();
         assert_eq!(session.phase(), Phase::BisComplete);
         let mut unbind = vec![0x2d, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0];
         unbind.extend_from_slice(session.bind().unwrap().fqpcid());

@@ -64,7 +64,7 @@ impl NativePeerPort {
     pub(crate) fn management_complete(&self) -> bool {
         matches!(
             self.management.as_ref().map(ManagementSession::phase),
-            Some(ManagementPhase::CnosComplete)
+            Some(ManagementPhase::Closed)
         )
     }
 
@@ -81,6 +81,12 @@ impl NativePeerPort {
                     .map_err(management_error)?,
                 ManagementPhase::AwaitCnosAck if completed != 0 => management
                     .acknowledge_attach_replies(completed)
+                    .map_err(management_error)?,
+                ManagementPhase::AwaitBisAck if completed != 0 => management
+                    .acknowledge_bis(completed)
+                    .map_err(management_error)?,
+                ManagementPhase::AwaitUnbindAck if completed != 0 => management
+                    .acknowledge_unbind(completed)
                     .map_err(management_error)?,
                 _ if completed != 0 => {
                     return Err(io::Error::new(
@@ -238,6 +244,49 @@ impl NativePeerPort {
                 tracing::info!(
                     "native CNOS accepted-pending response queued; no user route active"
                 );
+            }
+            ManagementPhase::CnosComplete => {
+                management
+                    .observe_remote_bis(&piu)
+                    .map_err(management_error)?;
+                let local_bis = management
+                    .prepare_local_bis(true)
+                    .map_err(management_error)?
+                    .to_vec();
+                if !self.endpoint.queue_information(local_bis.clone())? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native BIS egress queue full",
+                    ));
+                }
+                management
+                    .mark_local_bis_enqueued(&local_bis)
+                    .map_err(management_error)?;
+                tracing::info!(
+                    "native bilateral BIS exchange queued; awaiting LLC acknowledgement"
+                );
+            }
+            ManagementPhase::BisComplete => {
+                if matches!(classify_bind(&piu), Ok(Some(_))) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "native user BIND gateway is not implemented",
+                    ));
+                }
+                let response = management
+                    .prepare_unbind_response(&piu)
+                    .map_err(management_error)?
+                    .to_vec();
+                if !self.endpoint.queue_information(response.clone())? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native UNBIND response queue full",
+                    ));
+                }
+                management
+                    .mark_unbind_enqueued(&response)
+                    .map_err(management_error)?;
+                tracing::info!("native management UNBIND response queued; no user route active");
             }
             _ => {
                 return Err(io::Error::new(

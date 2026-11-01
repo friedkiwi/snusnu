@@ -139,7 +139,7 @@ fn run_with_mode(path: &Path, management: bool) -> io::Result<()> {
     while !STOP.load(Ordering::Relaxed) {
         let had_frame = port.poll(true)?.is_some();
         if management && port.management_complete() {
-            tracing::info!("native management probe completed bounded CNOS exchange; user routing remains disabled");
+            tracing::info!("native management probe completed bounded UNBIND exchange; user routing remains disabled");
             return Ok(());
         }
         if !management && port.reached_management_bind() {
@@ -151,7 +151,7 @@ fn run_with_mode(path: &Path, management: bool) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 if management {
-                    "native management probe timed out before CNOS completion"
+                    "native management probe timed out before UNBIND completion"
                 } else {
                     "native probe timed out before SNASVCMG BIND"
                 },
