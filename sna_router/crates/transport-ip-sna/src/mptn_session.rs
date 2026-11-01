@@ -257,11 +257,17 @@ impl GatewaySession {
             ));
         }
         if response.direction == Direction::NegativeResponse {
+            let data = response.connection_data();
+            let detail = if data.len() >= 9 && data[..5] == [0, 0, 0xef, 0x90, 0] {
+                format!(
+                    "MPTN peer rejected BIND: SNA sense {:02x}{:02x}{:02x}{:02x}",
+                    data[5], data[6], data[7], data[8]
+                )
+            } else {
+                "MPTN peer rejected BIND".to_owned()
+            };
             self.state = State::Closed;
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "MPTN peer rejected BIND",
-            ));
+            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, detail));
         }
         let required = required_from_connect(&response)
             .map_err(|_| invalid("MPTN response lacks valid required compensations"))?;
@@ -770,9 +776,11 @@ mod tests {
         let mut negative = decoded.clone();
         negative.direction = Direction::NegativeResponse;
         negative.processing = 0xca;
-        negative.options[0].value = vec![0, 0, 0xeb, 0x80, 0, 0x31, 0];
+        negative.options[0].value = vec![0, 0, 0xef, 0x90, 0, 0x08, 0x05, 0, 0, 0x31];
         let record = TcpRecord::decode(negative.encode().unwrap()).unwrap();
-        assert!(session.receive_connect_response(&record).is_err());
+        let err = session.receive_connect_response(&record).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(err.to_string().contains("SNA sense 08050000"));
         assert_eq!(session.phase(), Phase::Closed);
     }
 
