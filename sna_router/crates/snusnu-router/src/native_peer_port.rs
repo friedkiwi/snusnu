@@ -97,7 +97,10 @@ impl NativePeerPort {
                 _ => {}
             }
             if let Some(attach) = management.take_early_attach() {
-                self.process_management_piu(attach)?;
+                if let Err(error) = self.process_management_piu(attach) {
+                    self.endpoint.disconnect()?;
+                    return Err(error);
+                }
             }
         }
         for event in events {
@@ -131,7 +134,10 @@ impl NativePeerPort {
                 }
                 Event::Information(piu) => {
                     if self.management.is_some() {
-                        self.process_management_piu(piu)?;
+                        if let Err(error) = self.process_management_piu(piu) {
+                            self.endpoint.disconnect()?;
+                            return Err(error);
+                        }
                         continue;
                     }
                     let bind = match classify_bind(&piu) {
