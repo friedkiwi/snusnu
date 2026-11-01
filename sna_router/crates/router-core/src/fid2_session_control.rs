@@ -132,9 +132,11 @@ impl ManagementBind {
         if piu[2] != self.request_oaf || piu[3] != self.request_daf {
             return Err(SessionControlError::WrongSession);
         }
-        // Positive response, category Session Control. The V4R4 negotiated
-        // BIND carries RH EB 80 00; tolerate the FID2 TH's variable flags.
-        if piu[6..9] != [0xeb, 0x80, 0x00] || piu[9] != 0x31 {
+        // Positive response, category Session Control. V4R4 peers have
+        // returned both X'80' and X'85' in RH byte 1. X'85' includes PI;
+        // its X'04' bit is reserved for responses in GA27-3136-20 §5-4,
+        // so admit only this exact captured V4R4 variant, not arbitrary bits.
+        if piu[6] != 0xeb || !matches!(piu[7], 0x80 | 0x85) || piu[8] != 0 || piu[9] != 0x31 {
             return Err(SessionControlError::WrongResponse);
         }
         let ru = &piu[9..];

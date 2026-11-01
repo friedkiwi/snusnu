@@ -420,6 +420,43 @@ mod tests {
     }
 
     #[test]
+    fn accepts_captured_qa_cross_netid_response_with_v4_pacing_rh() {
+        // Bob's 139-byte management BIND and Alice's 100-byte response from
+        // the QAALICE/QABOB virtual native link. FQPCID is 21 bytes because
+        // QABOB.SNAB is ten bytes rather than SOLNET.SNAA's eleven.
+        let mut session = NativeManagementInitiator::new(
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            0x2f,
+            1,
+            2,
+            [0xca, 0x49, 0x00, 0x8b, 0x5c, 0x01, 0xb3, 0xa4],
+            [0x23, 0x5f, 0xc8, 0x9a, 0x6f, 0x50, 0x09],
+            "",
+            8,
+        )
+        .unwrap();
+        let request = session.prepared().unwrap().to_vec();
+        assert_eq!(request.len(), 139);
+        session.mark_enqueued(&request).unwrap();
+        session.acknowledge(1).unwrap();
+        let response = hex(concat!(
+            "2f0002010000eb850031001307b0b0513300808686800006020000000000000094434000",
+            "0027000902e2d5c1e2e5c3d4c70203020d05d8c1c1d3c9c3c54be2d5c1c1",
+            "0a1300b023f3e0f3fe000000006013ca49008b5c01b3a40ad8c1c2d6c24be2d5c1c2"
+        ));
+        assert_eq!(response.len(), 100);
+        let mut unsupported_rh = response.clone();
+        unsupported_rh[7] = 0x84;
+        assert_eq!(
+            session.observe(&unsupported_rh),
+            Err(InitiatorError::WrongPeerPiu)
+        );
+        session.observe(&response).unwrap();
+        assert_eq!(session.phase(), Phase::CnosPrepared);
+    }
+
+    #[test]
     fn direct_v4r4_management_bind_and_control_bytes_match_capture() {
         let mut session = direct();
         let bind = hex(concat!(
