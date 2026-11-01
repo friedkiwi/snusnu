@@ -25,7 +25,7 @@ pub(crate) enum RouteAddress {
     },
     LogicalUnit {
         netid: String,
-        cp: String,
+        cp: Option<String>,
         name: String,
     },
 }
@@ -39,7 +39,10 @@ impl fmt::Display for RouteAddress {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             ),
             Self::ControlPoint { netid, name } => write!(f, "{netid}.{name}"),
-            Self::LogicalUnit { netid, cp, name } => write!(f, "{netid}.{cp}.{name}"),
+            Self::LogicalUnit { netid, cp, name } => match cp {
+                Some(cp) => write!(f, "{netid}.{cp}.{name}"),
+                None => write!(f, "{netid}.{name}"),
+            },
         }
     }
 }
@@ -571,7 +574,7 @@ mod tests {
         let second = fake_port(&mut router, "second");
         let lu = |name: &str| RouteAddress::LogicalUnit {
             netid: "NET".into(),
-            cp: "CPA".into(),
+            cp: Some("CPA".into()),
             name: name.into(),
         };
         router
@@ -582,6 +585,38 @@ mod tests {
             .unwrap();
         router.bind_destination(&source, lu("LU2")).unwrap();
         assert_eq!(router.target(&source).unwrap(), &second);
+    }
+
+    #[test]
+    fn unknown_lu_hosting_cp_does_not_alias_a_known_cp() {
+        let mut router = Router::new();
+        let source = fake_port(&mut router, "source");
+        let known = fake_port(&mut router, "known");
+        let unknown = fake_port(&mut router, "unknown");
+        let known_lu = RouteAddress::LogicalUnit {
+            netid: "NET".into(),
+            cp: Some("CPA".into()),
+            name: "LU1".into(),
+        };
+        let unknown_lu = RouteAddress::LogicalUnit {
+            netid: "NET".into(),
+            cp: None,
+            name: "LU1".into(),
+        };
+        router
+            .add_address_route(&source, known_lu.clone(), &known)
+            .unwrap();
+        router
+            .add_address_route(&source, unknown_lu.clone(), &unknown)
+            .unwrap();
+        router
+            .bind_destination(&source, unknown_lu.clone())
+            .unwrap();
+        assert_eq!(router.target(&source).unwrap(), &unknown);
+        router.bind_destination(&source, known_lu.clone()).unwrap();
+        assert_eq!(router.target(&source).unwrap(), &known);
+        assert_eq!(known_lu.to_string(), "NET.CPA.LU1");
+        assert_eq!(unknown_lu.to_string(), "NET.LU1");
     }
 
     #[test]
