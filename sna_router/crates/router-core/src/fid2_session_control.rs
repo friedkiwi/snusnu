@@ -18,7 +18,7 @@ const V4R4_MANAGEMENT_REQUEST_FIXED: [u8; 27] = [
 // adaptive-pacing indicators; all remaining supported fixed fields agree.
 const V4R4_MANAGEMENT_RESPONSE_FIXED: [u8; 27] = [
     0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x00, 0x80, 0x86, 0x86, 0x80, 0x00, 0x06, 0x02,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x94, 0x43, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x40, 0x00,
 ];
 const SNASVCMG: [u8; 8] = [0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
 
@@ -142,7 +142,10 @@ impl ManagementBind {
     /// negotiation: other fixed parameter sets, cryptography, and unrecognized
     /// control vectors are rejected. Structured user subfield X'13' is ignored
     /// as required for an unrecognized subfield. The caller must implement
-    /// the advertised CNOS/parallel-session behavior before transmitting.
+    /// the advertised adaptive pacing, CNOS, and parallel-session behavior
+    /// before transmitting. Unlike the captured OS/400 response, byte 23 is
+    /// zero: this peer does not provide conversation security or password
+    /// substitution.
     pub fn build_v4r4_positive_response(
         &self,
         request_piu: &[u8],
@@ -396,10 +399,10 @@ mod tests {
         let bind = ManagementBind::from_request(&request, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
         let response = bind.build_v4r4_positive_response(&request).unwrap();
         // SC31-6808-0 permits the unrecognized X'13' user subfield to be
-        // discarded. The 89-byte expectation has the documented adaptive
-        // pacing negotiation, own SLU name, and same FQPCID.
+        // discarded. The 89-byte expectation negotiates adaptive pacing,
+        // advertises no security features, and carries our SLU name/FQPCID.
         let expected = hex_bytes(concat!(
-            "2f0002010000eb800031001307b0b0513300808686800006020000000000000094434000",
+            "2f0002010000eb800031001307b0b0513300808686800006020000000000000000434000",
             "001b000902e2d5c1e2e5c3d4c70203020c05e2d6d3d5c5e34be2d5c1c2",
             "000060141111111111111111111111111111111111111111"
         ));
