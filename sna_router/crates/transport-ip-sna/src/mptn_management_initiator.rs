@@ -249,7 +249,11 @@ impl ManagementInitiator {
             || response.connection_data()[5..32] != RESPONSE_FIXED
             || response.connection_data()[61..65] != [10, 0x13, 0, 0xb0]
             || response.connection_data()[65] != 0x23
-            || response.connection_data()[70..72] != [0x80, 0]
+            // Both the direct V5R4 response and B's reply to our minted
+            // instance end X'13' in zero; its preceding dynamic flag was
+            // X'80' in the former and X'00' in the latter.
+            || !matches!(response.connection_data()[70], 0 | 0x80)
+            || response.connection_data()[71] != 0
             || required_from_connect(&response).is_err()
             || validate_positive_response(
                 self.request.connection_data(),
@@ -480,6 +484,30 @@ mod tests {
             .accept_connect_response(&stale.encode().unwrap())
             .is_err());
         assert_eq!(peer.phase(), Phase::AwaitConnect);
+    }
+
+    #[test]
+    fn accepts_live_b_response_with_zero_x13_dynamic_flag() {
+        // The first router-originated management Connect received a positive
+        // 189-byte reply. Its X'13' token ended ...4e 00 00, whereas the
+        // direct V5↔V5 positive reply ended ...43 80 00. The final zero and
+        // all other captured profile bytes are the same.
+        let mut peer = session();
+        let request = Connect::decode(peer.connect_request()).unwrap();
+        let mut live = Connect::decode(&positive(&request)).unwrap();
+        live.options[1].value[70] = 0;
+        let cnos = peer
+            .accept_connect_response(&live.encode().unwrap())
+            .unwrap();
+        assert_eq!(cnos.len(), 47);
+        assert_eq!(peer.phase(), Phase::AwaitCnosReply);
+
+        let mut reject = session();
+        live.options[1].value[70] = 0x40;
+        assert!(reject
+            .accept_connect_response(&live.encode().unwrap())
+            .is_err());
+        assert_eq!(reject.phase(), Phase::AwaitConnect);
     }
 
     #[test]
