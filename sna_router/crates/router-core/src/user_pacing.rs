@@ -11,17 +11,22 @@ use crate::{
     fid2_session_control::ManagementBind,
     fixed_pacing::{is_canonical_ipr, FixedPacing, PacingError, IPR_RH, PACING_INDICATOR},
     user_bind::{UserBindError, UserBindOffer},
+    user_fmh5::{parse_first_user_attach, UserFmh5Error},
 };
 use std::{error::Error, fmt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserPacingError {
     Bind(UserBindError),
+    Fmh5(UserFmh5Error),
     Pacing(PacingError),
     WrongSession,
+    WrongRoute,
     WrongPhase,
     WrongEgress,
     UnsupportedPiu,
+    InvalidFmh5,
+    DuplicateAttach,
 }
 
 impl fmt::Display for UserPacingError {
@@ -44,6 +49,25 @@ impl From<PacingError> for UserPacingError {
     }
 }
 
+impl From<UserFmh5Error> for UserPacingError {
+    fn from(value: UserFmh5Error) -> Self {
+        Self::Fmh5(value)
+    }
+}
+
+/// The route selected for one observed first APPC Attach. The TP name is raw
+/// SNA bytes because service TP names need not be ordinary EBCDIC text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FirstAttachRoute {
+    pub remote_lu: String,
+    pub local_lu: String,
+    pub mode: String,
+    pub transaction_program: Vec<u8>,
+    pub luw_instance: [u8; 6],
+    pub luw_sequence: u16,
+    pub pip_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserPacingPhase {
     ResponsePrepared,
@@ -62,12 +86,14 @@ struct PendingEgress {
 pub struct UserPacingSession {
     daf: u8,
     oaf: u8,
+    fqpcid: [u8; 22],
     expedited_th0: u8,
     response: Vec<u8>,
     local_receive_window: u8,
     phase: UserPacingPhase,
     pacing: Option<FixedPacing>,
     pending: Option<PendingEgress>,
+    first_attach_seen: bool,
 }
 
 impl UserPacingSession {
@@ -95,17 +121,91 @@ impl UserPacingSession {
         Ok(Self {
             daf: offer.daf,
             oaf: offer.oaf,
+            fqpcid: offer.fqpcid,
             expedited_th0: offer.request()[0],
             response,
             local_receive_window,
             phase: UserPacingPhase::ResponsePrepared,
             pacing: None,
             pending: None,
+            first_attach_seen: false,
         })
     }
 
     pub fn phase(&self) -> UserPacingPhase {
         self.phase
+    }
+
+    /// Bind a later APPC frame gate to this exact user session rather than
+    /// merely matching the FID2 address pair, which peers may reuse.
+    pub fn matches_offer(&self, offer: &UserBindOffer) -> bool {
+        self.daf == offer.daf
+            && self.oaf == offer.oaf
+            && self.fqpcid == offer.fqpcid
+            && self.expedited_th0 == offer.request()[0]
+    }
+
+    /// Correlate the first captured user FMH-5 to this BIND and an explicit
+    /// TP route before charging the user receive window. The p86/p51 profile
+    /// has basic half-duplex, CONFIRM, no access security, a LUW origin equal
+    /// to the remote PLU, and one PIP GDS variable. Application data remains
+    /// opaque. This does not prepare or authorize an APPC response.
+    pub fn observe_first_attach(
+        &mut self,
+        offer: &UserBindOffer,
+        expected_tp: &[u8],
+        piu: &[u8],
+    ) -> Result<FirstAttachRoute, UserPacingError> {
+        self.require_active_idle()?;
+        if self.first_attach_seen {
+            return Err(UserPacingError::DuplicateAttach);
+        }
+        if !self.matches_offer(offer) {
+            return Err(UserPacingError::WrongSession);
+        }
+        parse_first_user_attach(piu, offer)?;
+        let ru = &piu[9..];
+        if ru.len() < 44
+            || ru[0] != 36
+            || ru[4..10] != [8, 3, 0xd0, 0, 0x40, 4]
+            || ru[14..17] != [0, 20, 11]
+        {
+            return Err(UserPacingError::InvalidFmh5);
+        }
+        if expected_tp.len() != 4 || ru[10..14] != *expected_tp {
+            return Err(UserPacingError::WrongRoute);
+        }
+        if ru.get(17..28) != Some(encode_lu_name(&offer.plu)?.as_slice()) {
+            return Err(UserPacingError::WrongRoute);
+        }
+        // The FMH-5 ends at offset 36. Its PIP flag requires one complete
+        // GDS X'12F5' containing one X'12E2' subfield. Do not interpret the
+        // application-specific subfield body or expose it as route metadata.
+        let pip = &ru[36..];
+        let gds_len = u16::from_be_bytes([pip[0], pip[1]]) as usize;
+        let sub_len = u16::from_be_bytes([pip[4], pip[5]]) as usize;
+        if gds_len != pip.len()
+            || gds_len < 8
+            || pip[2..4] != [0x12, 0xf5]
+            || sub_len != pip.len() - 4
+            || sub_len < 4
+            || pip[6..8] != [0x12, 0xe2]
+        {
+            return Err(UserPacingError::InvalidFmh5);
+        }
+        // `observe_normal_request` checks ODAI, addresses, complete BIU, and
+        // the required PI before it consumes this session's receive credit.
+        self.observe_normal_request(piu)?;
+        self.first_attach_seen = true;
+        Ok(FirstAttachRoute {
+            remote_lu: offer.plu.clone(),
+            local_lu: offer.slu.clone(),
+            mode: offer.mode.clone(),
+            transaction_program: expected_tp.to_vec(),
+            luw_instance: ru[28..34].try_into().unwrap(),
+            luw_sequence: u16::from_be_bytes([ru[34], ru[35]]),
+            pip_bytes: pip.len(),
+        })
     }
 
     pub fn prepared_bind_response(&self) -> &[u8] {
@@ -257,6 +357,21 @@ impl UserPacingSession {
     }
 }
 
+fn encode_lu_name(name: &str) -> Result<Vec<u8>, UserPacingError> {
+    name.bytes()
+        .map(|byte| {
+            Ok(match byte {
+                b'A'..=b'I' => 0xc1 + (byte - b'A'),
+                b'J'..=b'R' => 0xd1 + (byte - b'J'),
+                b'S'..=b'Z' => 0xe2 + (byte - b'S'),
+                b'0'..=b'9' => 0xf0 + (byte - b'0'),
+                b'.' => 0x4b,
+                _ => return Err(UserPacingError::WrongRoute),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +434,83 @@ mod tests {
         session.acknowledge_bind(1).unwrap();
         assert_eq!(session.phase(), UserPacingPhase::Active);
         session
+    }
+
+    fn first_attach() -> Vec<u8> {
+        // Independent sanitized V4R4 p86/p51 first user Attach. The PIP GDS
+        // body is application-private and replaced with zeros; all lengths,
+        // IDs, route fields, and the PI-bearing FID2 header are preserved.
+        let mut piu = hex(concat!(
+            "2c00020200010b9120",
+            "240502ff0803d000400430f0f0f500140b",
+            "e2d6d3d5c5e34be2d5c1c1",
+            "0102030405060001",
+            "00c512f500c112e2"
+        ));
+        piu.extend_from_slice(&[0; 189]);
+        assert_eq!(piu.len(), 242);
+        piu
+    }
+
+    #[test]
+    fn first_attach_selects_explicit_tp_and_charges_only_user_pacing() {
+        let mut session = active();
+        let (_, offer) = sessions();
+        let piu = first_attach();
+        let route = session
+            .observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf5], &piu)
+            .unwrap();
+        assert_eq!(route.remote_lu, "SOLNET.SNAA");
+        assert_eq!(route.local_lu, "SOLNET.SNAB");
+        assert_eq!(route.mode, "");
+        assert_eq!(route.transaction_program, [0x30, 0xf0, 0xf0, 0xf5]);
+        assert_eq!(route.luw_instance, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(route.luw_sequence, 1);
+        assert_eq!(route.pip_bytes, 197);
+        assert_eq!(
+            session.observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf5], &piu),
+            Err(UserPacingError::DuplicateAttach)
+        );
+        assert_eq!(session.prepare_ipr(1).unwrap(), &hex("2d0002020000830100"));
+    }
+
+    #[test]
+    fn malformed_first_attach_does_not_consume_user_window() {
+        let mut session = active();
+        let (_, offer) = sessions();
+        let piu = first_attach();
+        assert_eq!(
+            session.observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf6], &piu),
+            Err(UserPacingError::WrongRoute)
+        );
+        let mut wrong_luw = piu.clone();
+        wrong_luw[9 + 17] ^= 1;
+        assert_eq!(
+            session.observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf5], &wrong_luw),
+            Err(UserPacingError::WrongRoute)
+        );
+        let mut bad_pip = piu.clone();
+        bad_pip[9 + 36 + 1] = 0xc4;
+        assert_eq!(
+            session.observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf5], &bad_pip),
+            Err(UserPacingError::InvalidFmh5)
+        );
+        let mut wrong_pi = piu.clone();
+        wrong_pi[7] &= !PACING_INDICATOR;
+        assert!(matches!(
+            session.observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf5], &wrong_pi),
+            Err(UserPacingError::Fmh5(UserFmh5Error::UnsupportedPiu))
+        ));
+        let mut alias = offer.clone();
+        alias.fqpcid[2] ^= 1;
+        assert_eq!(
+            session.observe_first_attach(&alias, &[0x30, 0xf0, 0xf0, 0xf5], &piu),
+            Err(UserPacingError::WrongSession)
+        );
+        // All rejected variants leave the receive window available.
+        session
+            .observe_first_attach(&offer, &[0x30, 0xf0, 0xf0, 0xf5], &piu)
+            .unwrap();
     }
 
     #[test]
