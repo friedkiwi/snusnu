@@ -19,6 +19,7 @@ pub mod user_bind;
 pub mod user_fmh5;
 pub mod user_pacing;
 pub mod user_session_control;
+pub mod user_startup_record;
 pub mod xid3;
 pub mod xid3_activation;
 pub mod xid3_local;
