@@ -44,6 +44,7 @@ struct SharedWs {
     closed_circuits: VecDeque<Vec<u8>>,
     closed_requests: VecDeque<u64>,
     next_request_id: u64,
+    last_managed_revision: u64,
 }
 
 impl SharedWs {
@@ -94,7 +95,13 @@ impl SharedWs {
         let body = message.body.ok_or_else(|| protocol("empty envelope"))?;
         use wire::ws_envelope::Body;
         match &body {
-            Body::OriginRoutes(_) | Body::OriginWithdraw(_) | Body::ManagedCpBindings(_) => {
+            Body::OriginRoutes(_) | Body::OriginWithdraw(_) => {
+                for inbox in &mut self.inbox {
+                    inbox.push_back(body.clone());
+                }
+            }
+            Body::ManagedCpBindings(bindings) => {
+                accept_managed_revision(&mut self.last_managed_revision, bindings.revision)?;
                 for inbox in &mut self.inbox {
                     inbox.push_back(body.clone());
                 }
@@ -307,6 +314,7 @@ impl WsRoutePort {
             closed_circuits: VecDeque::new(),
             closed_requests: VecDeque::new(),
             next_request_id: 0,
+            last_managed_revision: 0,
         }));
         Ok(configs
             .into_iter()
@@ -1078,6 +1086,14 @@ fn stable_route_id(kind: u8, name: &wire::SnaName) -> u64 {
     hash
 }
 
+fn accept_managed_revision(last: &mut u64, next: u64) -> io::Result<()> {
+    if next == 0 || next <= *last {
+        return Err(protocol("managed CP binding revision is not increasing"));
+    }
+    *last = next;
+    Ok(())
+}
+
 fn validate_managed_bindings(bindings: &[wire::ManagedCpBinding]) -> io::Result<()> {
     let mut addresses = HashSet::new();
     for binding in bindings {
@@ -1596,6 +1612,19 @@ mod tests {
         assert!(validate_managed_bindings(&[valid.clone()]).is_ok());
         assert!(validate_managed_bindings(&[valid.clone(), valid]).is_err());
         assert!(validate_managed_bindings(&[binding(&[0x02, 0x53, 0x4f, 0, 0, 1])]).is_err());
+    }
+
+    #[test]
+    fn managed_binding_revisions_cannot_replay_or_regress() {
+        let mut last = 0;
+        assert!(accept_managed_revision(&mut last, 0).is_err());
+        assert_eq!(last, 0);
+        accept_managed_revision(&mut last, 1).unwrap();
+        accept_managed_revision(&mut last, 2).unwrap();
+        assert!(accept_managed_revision(&mut last, 2).is_err());
+        assert!(accept_managed_revision(&mut last, 1).is_err());
+        assert_eq!(last, 2);
+        accept_managed_revision(&mut last, 3).unwrap();
     }
 
     #[test]
