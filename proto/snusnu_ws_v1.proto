@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package snusnu.control.v1;
+
+option go_package = "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1;routesv1";
+
+import "snusnu_routes_v1.proto";
+
+// One encoded Envelope is one binary WebSocket message. No extra length prefix.
+message WsEnvelope {
+  oneof body {
+    RouterWelcome welcome = 1;                // Go -> Rust, first message.
+    RouteSnapshot publish_routes = 2;        // Rust -> Go.
+    OriginRouteSnapshot origin_routes = 3;    // Go -> Rust.
+    OriginWithdraw origin_withdraw = 4;      // Go -> Rust.
+    OpenRequest open_request = 5;            // Rust -> Go.
+    IncomingOpen incoming_open = 6;          // Go -> target Rust.
+    OpenDecision open_decision = 7;          // Target Rust -> Go.
+    OpenResult open_result = 8;              // Go -> initiating Rust.
+    OpenReady open_ready = 9;                // Go -> target Rust.
+    CircuitEvent circuit_event = 10;        // Rust <-> Go <-> Rust.
+    CircuitCredit circuit_credit = 11;      // Rust <-> Go <-> Rust.
+    CircuitClose circuit_close = 12;        // Rust <-> Go <-> Rust.
+    CircuitReset circuit_reset = 13;        // Rust <-> Go <-> Rust.
+  }
+}
+
+// request_id is unique among outstanding opens on the initiating connection.
+message OpenRequest {
+  uint64 request_id = 1;
+  RouteReference target = 2;
+  uint64 receive_allowance_bytes = 3; // Initial total data bytes peer may send.
+}
+
+// Go allocates a 16-byte circuit ID and stamps the authenticated source.
+message IncomingOpen {
+  bytes circuit_id = 1;
+  bytes source_router_id = 2;
+  RouteReference target = 3;
+  uint64 source_receive_allowance_bytes = 4;
+}
+
+message OpenDecision {
+  bytes circuit_id = 1;
+  bool accept = 2;
+  uint64 receive_allowance_bytes = 3; // Required only when accepting.
+  OpenFailure reason = 4;             // Required only when rejecting.
+}
+
+message OpenResult {
+  uint64 request_id = 1;
+  bytes circuit_id = 2; // Present only when accepted.
+  bool accepted = 3;
+  uint64 peer_receive_allowance_bytes = 4; // Present only when accepted.
+  OpenFailure reason = 5; // Present only when rejected.
+}
+
+// The target may send events only after this server confirmation.
+message OpenReady {
+  bytes circuit_id = 1;
+}
+
+enum OpenFailure {
+  OPEN_FAILURE_UNSPECIFIED = 0;
+  OPEN_FAILURE_ROUTE_GONE = 1;
+  OPEN_FAILURE_FORBIDDEN = 2;
+  OPEN_FAILURE_UNSUPPORTED = 3;
+  OPEN_FAILURE_BUSY = 4;
+  OPEN_FAILURE_PROTOCOL = 5;
+}
+
+// V1 uses a logical native DLC/PIU circuit profile. This is independent of
+// the target's advertised CP/LU identity and its local wire encapsulation.
+message CircuitEvent {
+  bytes circuit_id = 1;
+  oneof event {
+    DlcType1 type1 = 2;
+    LinkReady link_ready = 3;
+    bytes sna_information = 4; // LLC2 I information field; may need SNA reassembly.
+  }
+}
+
+message DlcType1 {
+  Type1Kind kind = 1;
+  bool response = 2;
+  bool poll_final = 3;
+  uint32 dsap = 4; // Even base SAP; validate 2..254.
+  uint32 ssap = 5; // Even base SAP; response bit is separate.
+  bytes information = 6; // Excludes MAC, 802.3 length, LLC header and padding.
+}
+
+enum Type1Kind {
+  TYPE1_KIND_UNSPECIFIED = 0;
+  TYPE1_KIND_XID = 1;
+  TYPE1_KIND_TEST = 2;
+}
+
+message LinkReady {}
+
+// Absolute total number of sna_information bytes allowed in this direction
+// since circuit creation. A grant must increase; it cannot revoke sent credit.
+message CircuitCredit {
+  bytes circuit_id = 1;
+  uint64 allowance_bytes = 2;
+}
+
+// Orderly end after earlier events in this direction are delivered.
+message CircuitClose {
+  bytes circuit_id = 1;
+}
+
+// Immediate abort: discard queued events for this circuit.
+message CircuitReset {
+  bytes circuit_id = 1;
+  ResetReason reason = 2;
+}
+
+enum ResetReason {
+  RESET_REASON_UNSPECIFIED = 0;
+  RESET_REASON_LOCAL_LINK = 1;
+  RESET_REASON_REMOTE_LINK = 2;
+  RESET_REASON_ROUTE_GONE = 3;
+  RESET_REASON_CREDIT = 4;
+  RESET_REASON_PROTOCOL = 5;
+}
