@@ -30,35 +30,7 @@ message OriginWithdraw {
 message RouteExport {
   uint64 id = 1;
   uint64 generation = 2;
-  Handoff handoff = 3;
-
-  oneof destination {
-    LlcDestination llc = 4;
-    Lu62Destination lu62 = 5;
-  }
-}
-
-// Exact native 802.3/LLC destination; sap is the destination SAP (2..254,
-// even). The origin keeps its local interface, proxy MAC and SAP private.
-message LlcDestination {
-  bytes mac = 1; // Exactly six bytes, unicast.
-  uint32 sap = 2;
-}
-
-// A configured LU6.2 service, not an APPN topology announcement. Names are
-// network-qualified and validated by the application against SNA name rules.
-message Lu62Destination {
-  string netid = 1;
-  string lu = 2;
-  repeated string modes = 3; // Exact supported modes; nonempty in v1.
-}
-
-// The event contract accepted by this origin when a remote circuit opens.
-// Other handoff types can be added with new enum values and destinations.
-enum Handoff {
-  HANDOFF_UNSPECIFIED = 0;
-  HANDOFF_NATIVE_LLC2_CIRCUIT = 1; // Type 1, connect and PIU events.
-  HANDOFF_LU62_SESSION = 2;        // LU6.2 session events.
+  string peer_id = 3; // Operator-assigned identity, independent of wire DLC.
 }
 
 // Included in a circuit OPEN, which also carries its own circuit ID. The
@@ -68,5 +40,4 @@ message RouteReference {
   bytes epoch = 2;
   uint64 route_id = 3;
   uint64 route_generation = 4;
-  Handoff handoff = 5;
 }

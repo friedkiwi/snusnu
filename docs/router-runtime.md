@@ -24,7 +24,7 @@ For a native LLC2 circuit, useful events are `Type1(XID|TEST, bytes)`, `Connecte
 | EE ↔ EE | Ordinary IP routing for EE-capable peers; an in-process EE link adapter only if local policy/translation requires it | IP network already supplies the underlay |
 | EE ↔ native HPR LAN | Possible HPR media conversion with per-leg XID/link state and both LAN SAP paths; verify with paired traces | Unverified |
 | EE ↔ legacy LLC2 APPC | APPN/HPR network-node behavior or a genuine dual-attached node | Not implemented |
-| Any compatible circuit ↔ WebSocket ↔ remote circuit | Transport versioned, typed circuit events between Rust routers; both ends retain adapter state | Optional future hop |
+| Any compatible circuit ↔ WebSocket ↔ remote circuit | Transport a versioned logical peer circuit between Rust routers; each router owns its local adapter state | Optional future hop |
 
 Reject an unsupported or ambiguous route when loading configuration. Route selectors differ: native LLC uses endpoint/MAC/SAP, AnyNet uses configured LU/CP names and IP, and EE uses IP/SAP/TG link identity. MPTN correlators identify live sessions rather than static routes. A configured conversion must state its protocol and supported session scope; `llc-to-anynet` cannot mean every possible SNA PIU.
 
@@ -37,7 +37,7 @@ An illustrative local configuration, **not accepted by the current executable**,
 3. **AnyNet evidence:** capture direct V5R4 AnyNet APPC traffic on TCP/UDP 397 and the same application over native LLC2. Parse MPTN framing and correlate BIND, data, pacing, expedited, UNBIND and keepalive with native PIUs. The [IBM-authored TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00) describes access nodes but explicitly leaves MPTN gateway behavior beyond its scope.
 4. **First standalone LLC2 ↔ AnyNet route:** support one configured independent LU6.2 pair and one session/mode. Terminate native LLC2; track native CP/session and BIND state; map the session to TCP/397; translate full/reduced TH, RH pacing and segmented RUs; handle UDP/397 out-of-band and keepalive. Prove initiation and teardown from both directions against real Solstice peers before widening supported session types.
 5. **EE investigation:** capture EE between EE-capable peers and paired native HPR LAN traffic. Add separate LDLC/HPR types and validate any proposed media adapter against XID/TG/link activation and both LAN SAP paths. General legacy LLC2-to-EE APPN routing is a larger network-node feature.
-6. **Remote hop:** define a versioned, typed circuit envelope, then implement `transport-ws` and its Go concentrator path. Local route behavior and tests must continue to work with the remote endpoint absent.
+6. **Remote hop:** define a versioned logical peer-circuit envelope and the conversions it requires, then implement `transport-ws` and its Go concentrator path. The route advertisement exposes only peer identity. Local route behavior and tests must continue to work with the remote endpoint absent.
 
 The V5R4 Solstice network template has TCP/IP but no documented successful AnyNet or EE session yet; it also uses a frozen custom Solstice build. Validate that guest setup before relying on IP captures. The V4R4 LLC2 two-TAP pass-through is the current regression baseline.
 

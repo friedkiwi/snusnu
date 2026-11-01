@@ -1,6 +1,6 @@
 # `snusnu.v1` binary protocol — draft
 
-This is a proposed snusnu-specific circuit protocol for an optional WebSocket hop between Rust routers, not an IBM-defined wire format or RFC 1795 DLSw SSP. No circuit-data byte layout or interoperability claim is frozen yet. The Rust router must also run with only local routes. This protocol carries typed circuit events; it does not turn incompatible LLC2, HPR and MPTN payloads into one generic byte stream. See [router-runtime.md](router-runtime.md) and the draft [route advertisement schema](route-advertisements.md).
+This is a proposed snusnu-specific circuit protocol for an optional WebSocket hop between Rust routers, not an IBM-defined wire format or RFC 1795 DLSw SSP. No circuit-data byte layout or interoperability claim is frozen yet. The Rust router must also run with only local routes. Route discovery names peers without exposing their local encapsulation. A common logical circuit contract and local protocol converters are still needed for data traffic; LLC2 PIUs, HPR NLPs and MPTN records cannot be treated as one raw byte stream. See [router-runtime.md](router-runtime.md) and the draft [route advertisement schema](route-advertisements.md).
 
 ## Goals and proposed invariants
 
