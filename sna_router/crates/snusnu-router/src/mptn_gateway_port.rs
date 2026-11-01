@@ -34,6 +34,9 @@ pub(crate) struct GatewayConfig {
     pub options: V5Options,
     pub cnos_mode: String,
     pub cnos_limit: u16,
+    /// Caller asserts a prior TCP62 CNOS exchange is still valid at this
+    /// peer. Set only after the corresponding native management is complete.
+    pub allow_resumed_user: bool,
 }
 
 pub(crate) enum GatewayEvent {
@@ -305,7 +308,9 @@ impl MptnGatewayPort {
                         )?;
                         Ok((None, true))
                     }
-                    IngressKind::User { .. } if self.management_ready => {
+                    IngressKind::User { .. }
+                        if self.management_ready || self.config.allow_resumed_user =>
+                    {
                         association.state = SessionState::UserAwaitResponse(offer.clone());
                         Ok((Some(GatewayEvent::UserBind(offer)), true))
                     }
@@ -464,7 +469,7 @@ mod tests {
     use super::*;
     use socket2::{Domain, Protocol, Socket, Type};
     use std::{
-        io::Write,
+        io::{Read, Write},
         net::{Ipv4Addr, TcpStream, UdpSocket},
         thread,
         time::Duration,
@@ -498,6 +503,79 @@ mod tests {
         socket.into()
     }
 
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn resumed_qa_user_connect_is_held_for_native_bind_response() {
+        // Sanitized byte shape from Bob's autonomous user Connect. The
+        // BIND's variable LU lengths are 10 (QABOB) and 12 (QAALICE).
+        let request = hex(concat!(
+            "000000e4800a00e02a0b010dd8c1c1d3c9c3c54be2d5c1c1010b010bd8c1c2d6c24be2d5c1c201",
+            "09b023f6611b4500000f00008005000000760000007620000508000601010a02008b00006b80003100",
+            "1307b0b0513303838c8c8303060200000000000000944300000ad8c1c2d6c24be2d5c1c22c0009",
+            "02404040404040404009030123f661184500000b04d8c1c2d6c24be2d5c1c20a1300b023f66118",
+            "450000000cd8c1c1d3c9c3c54be2d5c1c16013e8e772dd240702490ad8c1c2d6c24be2d5c1c2",
+            "2c0a01087bc3d6d5d5c5c3e31800000501190a000a0020010310831a00000584"
+        ));
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        let mut client = peer_socket(port.listener.local_addr().unwrap());
+        client.write_all(&request).unwrap();
+        let event = (0..1000)
+            .find_map(|_| {
+                let event = port.poll_once(true).unwrap();
+                if event.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                event
+            })
+            .expect("user offer");
+        assert!(matches!(event, GatewayEvent::UserBind(_)));
+        assert!(!port.management_ready());
+        assert!(!port.user_active());
+        client.set_nonblocking(true).unwrap();
+        let mut output = [0; 1];
+        assert_eq!(
+            client.read(&mut output).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(client);
+        port.active = None;
+        port.config.allow_resumed_user = false;
+        let mut next = peer_socket(port.listener.local_addr().unwrap());
+        next.write_all(&request).unwrap();
+        let denied = (0..1000)
+            .find_map(|_| {
+                let event = port.poll_once(true).unwrap();
+                if event.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                event
+            })
+            .expect("default rejection");
+        assert!(matches!(denied, GatewayEvent::Rejected(_)));
+    }
+
     #[test]
     fn captured_shape_keepalive_replies_only_to_configured_pair() {
         let mut port = MptnGatewayPort::bind(GatewayConfig {
@@ -512,6 +590,7 @@ mod tests {
             },
             cnos_mode: String::new(),
             cnos_limit: 8,
+            allow_resumed_user: false,
         })
         .unwrap();
         let peer = UdpSocket::bind("127.0.0.2:0").unwrap();
@@ -550,6 +629,7 @@ mod tests {
             },
             cnos_mode: String::new(),
             cnos_limit: 8,
+            allow_resumed_user: false,
         })
         .unwrap();
         let address = port.listener.local_addr().unwrap();
@@ -583,6 +663,7 @@ mod tests {
             },
             cnos_mode: String::new(),
             cnos_limit: 8,
+            allow_resumed_user: false,
         })
         .unwrap();
         let address = port.listener.local_addr().unwrap();

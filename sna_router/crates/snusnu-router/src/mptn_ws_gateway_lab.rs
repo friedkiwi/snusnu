@@ -186,6 +186,10 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         },
         cnos_mode: String::new(),
         cnos_limit: 8,
+        // Bob may retain its successfully negotiated TCP62 CNOS state from
+        // a prior association. This explicit lab starts only after the
+        // matching native management exchange has completed.
+        allow_resumed_user: true,
     })?;
     tracing::info!(local_ip=%gateway.local_ip, peer_ip=%gateway.peer_ip, "experimental TCP62 gateway listening");
     let mut pending_user_input: Option<TcpRecord> = None;
