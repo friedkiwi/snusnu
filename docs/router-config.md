@@ -74,9 +74,9 @@ to = "ee_b"
 
 EE↔EE relays EE datagrams. The loader rejects LLC↔EE routes and does not translate LLC2 PIUs into AnyNet MPTN or HPR records. Those profiles require explicit protocol converters.
 
-## Constrained AnyNet TCP62 relay
+## Constrained AnyNet relay
 
-Two `[[anynet]]` ports can form a standalone AnyNet↔AnyNet route. Each port binds TCP and UDP port 397 on its `local_ip` and accepts only the configured `peer_ip`. The current adapter handles **one TCP62 LU6.2 session at a time** and validates complete MPTN records before forwarding them. It closes the TCP session if UDP/397 traffic appears, because out-of-band MPTN addresses and keepalives are not yet translated. This mode is useful for controlled TCP-only interoperability experiments; it is not a general AnyNet gateway.
+Two `[[anynet]]` ports can form a standalone AnyNet↔AnyNet route. Each port binds TCP and UDP port 397 on its `local_ip` and accepts only the configured `peer_ip`. The adapter handles **one TCP62 LU6.2 session at a time** and validates complete MPTN records before forwarding them. It also validates and rewrites IPv4 UDP/397 node-pair keepalives (`0x84`), including response correlation. UDP/397 expedited traffic (`0x83`) and unknown datagrams close the routed session because their session semantics are not yet supported. This is a constrained AnyNet relay, not a general MPTN gateway.
 
 ```toml
 [[anynet]]
