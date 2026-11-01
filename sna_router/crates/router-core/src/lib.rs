@@ -11,6 +11,7 @@ pub mod hpr_setmode;
 pub mod llc;
 pub mod llc2;
 pub mod llc_type1;
+pub mod native_management;
 pub mod packet_log;
 pub mod xid3;
 pub mod xid3_activation;
