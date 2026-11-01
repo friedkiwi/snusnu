@@ -2,11 +2,13 @@
 //! does on a local LLC port; only this module knows the concentrator protocol.
 
 use crate::routing::{RoutePort, RoutedUnit, RouterEvent};
+use router_core::packet_log::{decode_llc_pdu, decode_sna_information, hex_dump};
 use std::{
     collections::{HashSet, VecDeque},
     io,
     time::Duration,
 };
+use tracing::{debug, info, warn};
 use transport_ws::{wire, WsClient};
 
 const INITIAL_ALLOWANCE: u64 = 1500;
@@ -33,6 +35,7 @@ struct Circuit {
 pub(crate) struct WsRoutePort {
     client: WsClient,
     welcome: wire::RouterWelcome,
+    local_cp: wire::SnaName,
     target_cp: wire::SnaName,
     target: Option<wire::RouteReference>,
     circuit: Option<Circuit>,
@@ -52,11 +55,19 @@ impl WsRoutePort {
         validate_name(&config.target_cp)?;
         let (mut client, welcome) =
             WsClient::connect(&config.url, &config.bearer).map_err(io_error)?;
-        eprintln!(
-            "router {} ({}) connected; server-owned id {}",
-            welcome.display_name,
-            config.url,
-            format_uuid(&welcome.router_id)
+        let upstream_address = client
+            .peer_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        info!(
+            server = %server_authority(&config.url),
+            upstream_address = %upstream_address,
+            router_id = %format_uuid(&welcome.router_id),
+            connection_epoch = %format_uuid(&welcome.connection_epoch),
+            display_name = %welcome.display_name,
+            local_cp = %format_cp(&config.local_cp),
+            target_cp = %format_cp(&config.target_cp),
+            "connected to concentrator"
         );
         let snapshot = wire::RouteSnapshot {
             epoch: welcome.connection_epoch.clone(),
@@ -72,9 +83,18 @@ impl WsRoutePort {
         client
             .send(envelope(wire::ws_envelope::Body::PublishRoutes(snapshot)))
             .map_err(io_error)?;
+        info!(
+            router_id = %format_uuid(&welcome.router_id),
+            local_cp = %format_cp(&config.local_cp),
+            route_id = 1,
+            generation = 1,
+            revision = 1,
+            "published local CP route"
+        );
         Ok(Self {
             client,
             welcome,
+            local_cp: config.local_cp,
             target_cp: config.target_cp,
             target: None,
             circuit: None,
@@ -103,6 +123,15 @@ impl WsRoutePort {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("request ID exhausted"))?;
         self.opening = true;
+        info!(
+            request_id = self.request_id,
+            target_router_id = %format_uuid(&target.router_id),
+            target_epoch = %format_uuid(&target.epoch),
+            target_route_id = target.route_id,
+            target_generation = target.route_generation,
+            target_cp = %format_cp(&self.target_cp),
+            "requesting circuit open"
+        );
         self.send_body(wire::ws_envelope::Body::OpenRequest(wire::OpenRequest {
             request_id: self.request_id,
             target: Some(target),
@@ -128,9 +157,20 @@ impl WsRoutePort {
             let Some(pdu) = self.pending_type1.pop_front() else {
                 break;
             };
+            debug!(
+                circuit_id = %self.circuit.as_ref().map(|c| format_uuid(&c.id)).unwrap_or_default(),
+                bytes = pdu.len(),
+                decoded = %decode_llc_pdu(&pdu),
+                hex = %hex_dump(&pdu),
+                "send Type1 over WebSocket"
+            );
             self.send_event(wire::circuit_event::Event::Type1(encode_type1(&pdu)?))?;
         }
         if self.local_ready && self.circuit.as_ref().is_some_and(|c| c.ready) {
+            info!(
+                circuit_id = %self.circuit.as_ref().map(|c| format_uuid(&c.id)).unwrap_or_default(),
+                "send local link ready"
+            );
             self.send_event(wire::circuit_event::Event::LinkReady(wire::LinkReady {}))?;
             self.local_ready = false;
         }
@@ -161,8 +201,18 @@ impl WsRoutePort {
                         route_generation: route.generation,
                     };
                     let retargeted = self.target.as_ref().is_some_and(|old| old != &next_target);
+                    debug!(
+                        origin_router_id = %format_uuid(&next_target.router_id),
+                        origin_epoch = %format_uuid(&next_target.epoch),
+                        target_cp = %format_cp(&self.target_cp),
+                        route_id = next_target.route_id,
+                        generation = next_target.route_generation,
+                        retargeted,
+                        "received target route"
+                    );
                     self.target = Some(next_target);
                     if retargeted && self.circuit.is_some() {
+                        warn!(target_cp = %format_cp(&self.target_cp), "target route changed; closing circuit");
                         self.clear_circuit();
                         return Ok(vec![RouterEvent::Closed]);
                     }
@@ -172,6 +222,11 @@ impl WsRoutePort {
                     .as_ref()
                     .is_some_and(|r| r.router_id == origin.router_id)
                 {
+                    warn!(
+                        origin_router_id = %format_uuid(&origin.router_id),
+                        target_cp = %format_cp(&self.target_cp),
+                        "target CP withdrawn from route snapshot"
+                    );
                     self.target = None;
                     if self.circuit.is_some() {
                         self.clear_circuit();
@@ -185,6 +240,12 @@ impl WsRoutePort {
                     .as_ref()
                     .is_some_and(|r| r.router_id == withdraw.router_id && r.epoch == withdraw.epoch)
                 {
+                    warn!(
+                        origin_router_id = %format_uuid(&withdraw.router_id),
+                        origin_epoch = %format_uuid(&withdraw.epoch),
+                        target_cp = %format_cp(&self.target_cp),
+                        "target router withdrew routes"
+                    );
                     self.target = None;
                     if self.circuit.is_some() {
                         self.clear_circuit();
@@ -199,11 +260,22 @@ impl WsRoutePort {
                     return Err(protocol("invalid managed CP binding snapshot"));
                 }
                 validate_managed_bindings(&bindings.bindings)?;
+                debug!(
+                    revision = bindings.revision,
+                    binding_count = bindings.bindings.len(),
+                    "received managed CP bindings"
+                );
                 if let Some(binding) = bindings
                     .bindings
                     .into_iter()
                     .find(|b| b.control_point.as_ref() == Some(&self.target_cp))
                 {
+                    info!(
+                        target_cp = %format_cp(&self.target_cp),
+                        virtual_mac = %format_mac(&binding.virtual_mac),
+                        candidate_count = binding.candidates.len(),
+                        "selected managed CP binding"
+                    );
                     self.target = binding.candidates.into_iter().next();
                     self.maybe_open()?;
                 }
@@ -218,6 +290,7 @@ impl WsRoutePort {
                     return Err(protocol("wrong circuit ID"));
                 }
                 circuit.ready = true;
+                info!(circuit_id = %format_uuid(&ready.circuit_id), "incoming circuit ready");
                 self.flush_type1()?;
             }
             Body::OpenResult(result) => {
@@ -234,18 +307,36 @@ impl WsRoutePort {
                     return Err(protocol("credit did not increase"));
                 }
                 circuit.send_allowance = credit.allowance_bytes;
+                debug!(
+                    circuit_id = %format_uuid(&credit.circuit_id),
+                    allowance_bytes = credit.allowance_bytes,
+                    sent_bytes = circuit.sent_bytes,
+                    "received circuit credit"
+                );
             }
             Body::CircuitClose(close) => {
+                info!(circuit_id = %format_uuid(&close.circuit_id), "remote closed circuit");
                 self.checked_circuit_mut(&close.circuit_id)?;
                 self.clear_circuit();
                 return Ok(vec![RouterEvent::Closed]);
             }
             Body::CircuitReset(reset) => {
+                warn!(
+                    circuit_id = %format_uuid(&reset.circuit_id),
+                    reason = reset.reason,
+                    "remote reset circuit"
+                );
                 self.checked_circuit_mut(&reset.circuit_id)?;
                 self.clear_circuit();
                 return Ok(vec![RouterEvent::Closed]);
             }
-            Body::IdentityUpdate(update) => eprintln!("router renamed to {}", update.display_name),
+            Body::IdentityUpdate(update) => {
+                info!(
+                    router_id = %format_uuid(&self.welcome.router_id),
+                    display_name = %update.display_name,
+                    "server updated router identity"
+                );
+            }
             _ => return Err(protocol("unexpected server message")),
         }
         Ok(Vec::new())
@@ -269,6 +360,23 @@ impl WsRoutePort {
         } else {
             wire::OpenFailure::RouteGone
         };
+        if accept {
+            info!(
+                circuit_id = %format_uuid(&incoming.circuit_id),
+                source_router_id = %format_uuid(&incoming.source_router_id),
+                local_router_id = %format_uuid(&self.welcome.router_id),
+                local_cp = %format_cp(&self.local_cp),
+                receive_allowance_bytes = INITIAL_ALLOWANCE,
+                "accepted incoming circuit"
+            );
+        } else {
+            warn!(
+                circuit_id = %format_uuid(&incoming.circuit_id),
+                source_router_id = %format_uuid(&incoming.source_router_id),
+                reason = ?reason,
+                "rejected incoming circuit"
+            );
+        }
         self.send_body(wire::ws_envelope::Body::OpenDecision(wire::OpenDecision {
             circuit_id: incoming.circuit_id.clone(),
             accept,
@@ -294,12 +402,25 @@ impl WsRoutePort {
         }
         self.opening = false;
         if !result.accepted {
+            warn!(
+                request_id = result.request_id,
+                reason = result.reason,
+                target_cp = %format_cp(&self.target_cp),
+                "circuit open rejected"
+            );
             self.pending_type1.clear();
             return Ok(());
         }
         if result.circuit_id.len() != 16 {
             return Err(protocol("invalid circuit ID"));
         }
+        info!(
+            request_id = result.request_id,
+            circuit_id = %format_uuid(&result.circuit_id),
+            target_cp = %format_cp(&self.target_cp),
+            peer_allowance_bytes = result.peer_receive_allowance_bytes,
+            "outgoing circuit open accepted"
+        );
         self.circuit = Some(Circuit {
             id: result.circuit_id,
             ready: true,
@@ -317,10 +438,21 @@ impl WsRoutePort {
             return Err(protocol("event before OpenReady"));
         }
         match event.event.ok_or_else(|| protocol("empty circuit event"))? {
-            wire::circuit_event::Event::Type1(type1) => Ok(vec![RouterEvent::Unit(
-                RoutedUnit::DlcType1(decode_type1(type1)?),
-            )]),
-            wire::circuit_event::Event::LinkReady(_) => Ok(vec![RouterEvent::Ready]),
+            wire::circuit_event::Event::Type1(type1) => {
+                let pdu = decode_type1(type1)?;
+                debug!(
+                    circuit_id = %format_uuid(&event.circuit_id),
+                    bytes = pdu.len(),
+                    decoded = %decode_llc_pdu(&pdu),
+                    hex = %hex_dump(&pdu),
+                    "received Type1 over WebSocket"
+                );
+                Ok(vec![RouterEvent::Unit(RoutedUnit::DlcType1(pdu))])
+            }
+            wire::circuit_event::Event::LinkReady(_) => {
+                info!(circuit_id = %format_uuid(&event.circuit_id), "remote link ready");
+                Ok(vec![RouterEvent::Ready])
+            }
             wire::circuit_event::Event::SnaInformation(data) => {
                 if data.is_empty() || data.len() > 1496 {
                     return Err(protocol("invalid SNA information size"));
@@ -337,6 +469,13 @@ impl WsRoutePort {
                 {
                     return Err(protocol("receive event backlog full"));
                 }
+                debug!(
+                    circuit_id = %format_uuid(&event.circuit_id),
+                    bytes = data.len(),
+                    decoded = %decode_sna_information(&data),
+                    hex = %hex_dump(&data),
+                    "received SNA information over WebSocket"
+                );
                 self.pending_information.push_back(data);
                 Ok(Vec::new())
             }
@@ -397,6 +536,11 @@ impl RoutePort for WsRoutePort {
                     return Ok(true);
                 }
                 if self.pending_type1.len() >= MAX_PENDING_TYPE1 {
+                    warn!(
+                        target_cp = %format_cp(&self.target_cp),
+                        queued = self.pending_type1.len(),
+                        "dropping oldest pre-open Type1 retry"
+                    );
                     self.pending_type1.pop_front();
                 }
                 self.pending_type1.push_back(pdu);
@@ -415,6 +559,15 @@ impl RoutePort for WsRoutePort {
                     return Ok(false);
                 }
                 circuit.sent_bytes += data.len() as u64;
+                debug!(
+                    circuit_id = %format_uuid(&circuit.id),
+                    bytes = data.len(),
+                    sent_bytes = circuit.sent_bytes,
+                    allowance_bytes = circuit.send_allowance,
+                    decoded = %decode_sna_information(&data),
+                    hex = %hex_dump(&data),
+                    "send SNA information over WebSocket"
+                );
                 self.send_event(wire::circuit_event::Event::SnaInformation(data))?;
                 Ok(true)
             }
@@ -438,6 +591,7 @@ impl RoutePort for WsRoutePort {
 
     fn disconnect(&mut self) -> io::Result<()> {
         if let Some(circuit) = self.circuit.take() {
+            info!(circuit_id = %format_uuid(&circuit.id), "closing circuit");
             self.send_body(wire::ws_envelope::Body::CircuitClose(wire::CircuitClose {
                 circuit_id: circuit.id,
             }))?;
@@ -469,6 +623,13 @@ impl RoutePort for WsRoutePort {
                     .ok_or_else(|| protocol("credit counter overflow"))?;
                 let id = circuit.id.clone();
                 let allowance = circuit.receive_allowance;
+                debug!(
+                    circuit_id = %format_uuid(&id),
+                    completed_information = count,
+                    freed_bytes = freed,
+                    allowance_bytes = allowance,
+                    "granting circuit receive credit"
+                );
                 self.send_body(wire::ws_envelope::Body::CircuitCredit(
                     wire::CircuitCredit {
                         circuit_id: id,
@@ -564,6 +725,29 @@ fn format_uuid(bytes: &[u8]) -> String {
     )
 }
 
+fn format_cp(name: &wire::SnaName) -> String {
+    format!("{}.{}", name.netid, name.name)
+}
+
+fn format_mac(mac: &[u8]) -> String {
+    if mac.len() != 6 {
+        return "invalid".to_owned();
+    }
+    mac.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn server_authority(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("unknown")
+}
+
 fn protocol(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -608,5 +792,21 @@ mod tests {
         assert!(validate_managed_bindings(&[valid.clone()]).is_ok());
         assert!(validate_managed_bindings(&[valid.clone(), valid]).is_err());
         assert!(validate_managed_bindings(&[binding(&[0x02, 0x53, 0x4f, 0, 0, 1])]).is_err());
+    }
+
+    #[test]
+    fn logged_server_authority_excludes_url_query() {
+        assert_eq!(
+            server_authority("wss://concentrator.example:443/router/v1/ws?private=value"),
+            "concentrator.example:443"
+        );
+        assert_eq!(
+            server_authority("ws://[::1]:18743/router/v1/ws"),
+            "[::1]:18743"
+        );
+        assert_eq!(
+            server_authority("ws://127.0.0.1:18743?token=secret"),
+            "127.0.0.1:18743"
+        );
     }
 }

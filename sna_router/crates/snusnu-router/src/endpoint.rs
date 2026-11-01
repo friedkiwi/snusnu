@@ -7,6 +7,7 @@ use link_linux::packet::{PacketPort, MAX_FRAME_LEN};
 use router_core::{
     llc::{parse_8023, Control, LlcFrame, SNA_SAP},
     llc2::{Effect, Error as LlcError, Llc2, State},
+    packet_log::{decode_ethernet, hex_dump},
 };
 use std::{
     collections::VecDeque,
@@ -28,6 +29,7 @@ pub(crate) enum Event {
 
 pub(crate) struct Endpoint {
     port: PacketPort,
+    interface: String,
     guest_mac: [u8; 6],
     proxy_mac: [u8; 6],
     llc: Llc2,
@@ -43,8 +45,14 @@ impl Endpoint {
         guest_mac: [u8; 6],
         proxy_mac: [u8; 6],
     ) -> io::Result<Self> {
+        let port = PacketPort::open(interface).map_err(|error| {
+            tracing::error!(interface, error = %error, "failed to open AF_PACKET interface");
+            error
+        })?;
+        tracing::info!(interface, guest_mac = %format_mac(guest_mac), proxy_mac = %format_mac(proxy_mac), sap = SNA_SAP, "LLC endpoint opened");
         Ok(Self {
-            port: PacketPort::open(interface)?,
+            port,
+            interface: interface.to_owned(),
             guest_mac,
             proxy_mac,
             llc: Llc2::new(SNA_SAP, SNA_SAP),
@@ -88,7 +96,10 @@ impl Endpoint {
                 self.receive_frame(&buffer[..length], can_accept_information)?,
             )),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
+            Err(error) => {
+                tracing::error!(interface = %self.interface, error = %error, "failed to receive Ethernet frame");
+                Err(error)
+            }
         }
     }
 
@@ -97,13 +108,19 @@ impl Endpoint {
         bytes: &[u8],
         can_accept_information: bool,
     ) -> io::Result<Vec<Event>> {
-        let Ok(frame) = parse_8023(bytes) else {
-            return Ok(Vec::new());
+        let frame = match parse_8023(bytes) {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::trace!(interface = %self.interface, bytes = bytes.len(), reason = ?error, "ignored non-LLC Ethernet frame");
+                return Ok(Vec::new());
+            }
         };
         if frame.source != self.guest_mac || frame.destination != self.proxy_mac || !frame.is_sna()
         {
+            tracing::trace!(interface = %self.interface, source_mac = %format_mac(frame.source), destination_mac = %format_mac(frame.destination), dsap = frame.dsap, ssap = frame.ssap, "ignored LLC frame outside configured peer");
             return Ok(Vec::new());
         }
+        tracing::debug!(interface = %self.interface, source_mac = %format_mac(frame.source), destination_mac = %format_mac(frame.destination), dsap = frame.dsap, ssap = frame.ssap, control = ?frame.control, information_bytes = frame.information.len(), decoded = %decode_ethernet(bytes), hex = %hex_dump(bytes), "ethernet frame received");
         if is_type1(&frame) {
             // The declared 802.3 length excludes any Ethernet padding. The
             // LLC PDU remains unchanged across the router.
@@ -121,6 +138,7 @@ impl Endpoint {
             && self.llc.state() == State::Connected
         {
             self.completed_information += 1;
+            tracing::trace!(interface = %self.interface, completed = self.completed_information, "LLC information acknowledged by peer");
         }
         let events = self.apply(effects)?;
         self.flush()?;
@@ -146,8 +164,10 @@ impl Endpoint {
     /// or acknowledge the payload; callers must apply upstream backpressure.
     pub(crate) fn queue_information(&mut self, information: Vec<u8>) -> io::Result<bool> {
         if !self.has_capacity() {
+            tracing::warn!(interface = %self.interface, queued = self.buffered_information_count(), limit = QUEUE_LIMIT, "LLC egress queue full");
             return Ok(false);
         }
+        tracing::trace!(interface = %self.interface, bytes = information.len(), queued = self.buffered_information_count() + 1, "SNA information queued for LLC peer");
         self.queued.push_back(information);
         self.flush()?;
         self.sync_deadline();
@@ -173,6 +193,7 @@ impl Endpoint {
 
     pub(crate) fn set_local_busy(&mut self, busy: bool) -> io::Result<()> {
         if let Some(pdu) = self.llc.set_local_busy(busy) {
+            tracing::debug!(interface = %self.interface, busy, signal = if busy { "RNR" } else { "RR" }, "LLC receive flow state changed");
             self.send_llc(&pdu)?;
         }
         Ok(())
@@ -180,6 +201,7 @@ impl Endpoint {
 
     pub(crate) fn begin_connect_after(&mut self, delay: Duration) {
         self.connect_after = Some(Instant::now() + delay);
+        tracing::debug!(interface = %self.interface, delay_ms = delay.as_millis(), "LLC active connect scheduled");
     }
 
     pub(crate) fn cancel_connect(&mut self) {
@@ -187,6 +209,7 @@ impl Endpoint {
     }
 
     pub(crate) fn disconnect(&mut self) -> io::Result<()> {
+        tracing::info!(interface = %self.interface, state = ?self.llc.state(), "LLC endpoint disconnecting");
         self.queued.clear();
         self.connect_after = None;
         if let Some(pdu) = self.llc.disconnect() {
@@ -201,6 +224,7 @@ impl Endpoint {
         if self.connect_after.is_some_and(|deadline| now >= deadline) {
             self.connect_after = None;
             if self.llc.state() == State::Disconnected {
+                tracing::info!(interface = %self.interface, "LLC active connect starting");
                 let pdu = self.llc.begin_connect().map_err(llc_error)?;
                 self.send_llc(&pdu)?;
                 self.sync_deadline();
@@ -210,6 +234,7 @@ impl Endpoint {
             return Ok(Vec::new());
         }
         self.deadline = None;
+        tracing::warn!(interface = %self.interface, state = ?self.llc.state(), "LLC acknowledgement timer expired");
         let effects = self.llc.on_ack_timeout();
         let events = self.apply(effects)?;
         self.sync_deadline();
@@ -222,14 +247,22 @@ impl Endpoint {
             match effect {
                 Effect::Send(pdu) => self.send_llc(&pdu)?,
                 Effect::Deliver(information) => {
+                    tracing::trace!(interface = %self.interface, bytes = information.len(), "SNA information accepted from LLC peer");
                     events.push(Event::Information(information.to_vec()))
                 }
                 Effect::Connected => {
                     self.connect_after = None;
+                    tracing::info!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), proxy_mac = %format_mac(self.proxy_mac), "LLC2 connected");
                     events.push(Event::Connected);
                 }
-                Effect::Disconnected => events.push(Event::Disconnected),
-                Effect::TimedOut => events.push(Event::TimedOut),
+                Effect::Disconnected => {
+                    tracing::info!(interface = %self.interface, "LLC2 disconnected");
+                    events.push(Event::Disconnected)
+                }
+                Effect::TimedOut => {
+                    tracing::warn!(interface = %self.interface, "LLC2 timed out");
+                    events.push(Event::TimedOut)
+                }
             }
         }
         Ok(events)
@@ -247,7 +280,12 @@ impl Endpoint {
         frame.extend_from_slice(&self.proxy_mac);
         frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
         frame.extend_from_slice(pdu);
-        self.port.send_frame(&frame)
+        self.port.send_frame(&frame).map_err(|error| {
+            tracing::error!(interface = %self.interface, destination_mac = %format_mac(self.guest_mac), error = %error, "failed to send Ethernet frame");
+            error
+        })?;
+        tracing::debug!(interface = %self.interface, source_mac = %format_mac(self.proxy_mac), destination_mac = %format_mac(self.guest_mac), decoded = %decode_ethernet(&frame), hex = %hex_dump(&frame), "ethernet frame sent");
+        Ok(())
     }
 
     fn sync_deadline(&mut self) {
@@ -258,6 +296,13 @@ impl Endpoint {
             self.deadline = None;
         }
     }
+}
+
+pub(crate) fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 fn is_type1(frame: &LlcFrame<'_>) -> bool {

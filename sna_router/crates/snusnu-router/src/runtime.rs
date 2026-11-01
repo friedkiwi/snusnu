@@ -1,7 +1,7 @@
 //! LLC adapter and local route configuration.
 
 use crate::{
-    endpoint::{Endpoint, Event},
+    endpoint::{format_mac, Endpoint, Event},
     remote::{Config as RemoteConfig, WsRoutePort},
     routing::{PortId, RoutePort, RoutedUnit, Router, RouterEvent},
 };
@@ -100,10 +100,7 @@ impl RoutePort for LlcPort {
 }
 
 pub(crate) fn run(a: LlcPeer<'_>, b: LlcPeer<'_>) -> io::Result<()> {
-    eprintln!(
-        "local link: {} <-> {}; SNA SAP 04",
-        a.interface, b.interface
-    );
+    tracing::info!(interface_a = a.interface, guest_mac_a = %format_mac(a.guest_mac), proxy_mac_a = %format_mac(a.proxy_mac), interface_b = b.interface, guest_mac_b = %format_mac(b.guest_mac), proxy_mac_b = %format_mac(b.proxy_mac), sap = 4, "standalone LLC route starting");
     let mut router = Router::new();
     let a_id = PortId::new("local-a");
     let b_id = PortId::new("local-b");
@@ -118,11 +115,12 @@ pub(crate) fn run_remote(local: LlcPeer<'_>, config: RemoteConfig) -> io::Result
     const FIRST_RETRY: Duration = Duration::from_millis(500);
     const MAX_RETRY: Duration = Duration::from_secs(30);
     let mut delay = FIRST_RETRY;
+    tracing::info!(interface = local.interface, guest_mac = %format_mac(local.guest_mac), proxy_mac = %format_mac(local.proxy_mac), local_cp = %format!("{}.{}", config.local_cp.netid, config.local_cp.name), target_cp = %format!("{}.{}", config.target_cp.netid, config.target_cp.name), upstream = upstream_authority(&config.url), "remote LLC route starting");
     while !crate::STOP.load(Ordering::Relaxed) {
         let remote = match WsRoutePort::connect(config.clone()) {
             Ok(port) => port,
             Err(error) if retryable_remote_error(&error) => {
-                eprintln!("concentrator connection failed: {error}; retrying in {delay:?}");
+                tracing::warn!(upstream = upstream_authority(&config.url), error = %error, retry_ms = delay.as_millis(), "concentrator connection failed");
                 wait_or_stop(delay);
                 delay = delay.saturating_mul(2).min(MAX_RETRY);
                 continue;
@@ -149,7 +147,7 @@ pub(crate) fn run_remote(local: LlcPeer<'_>, config: RemoteConfig) -> io::Result
                 if connected_at.elapsed() >= MAX_RETRY {
                     delay = FIRST_RETRY;
                 }
-                eprintln!("concentrator link lost: {error}; reconnecting in {delay:?}");
+                tracing::warn!(upstream = upstream_authority(&config.url), error = %error, retry_ms = delay.as_millis(), "concentrator link lost");
                 wait_or_stop(delay);
                 delay = delay.saturating_mul(2).min(MAX_RETRY);
             }
@@ -164,6 +162,12 @@ fn retryable_remote_error(error: &io::Error) -> bool {
         .get_ref()
         .and_then(|source| source.downcast_ref::<WsError>())
         .is_some_and(WsError::is_retryable)
+}
+
+fn upstream_authority(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit('@').next().unwrap_or("")
 }
 
 fn wait_or_stop(delay: Duration) {
@@ -188,5 +192,13 @@ mod reconnect_tests {
         assert!(!retryable_remote_error(&io::Error::other(
             "local TAP failed"
         )));
+    }
+
+    #[test]
+    fn upstream_log_field_omits_url_credentials_and_query() {
+        assert_eq!(
+            upstream_authority("wss://hidden@example.org:443/router/v1/ws?token=secret"),
+            "example.org:443"
+        );
     }
 }

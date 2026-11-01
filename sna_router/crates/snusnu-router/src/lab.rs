@@ -20,7 +20,7 @@ pub(super) fn run(
         Endpoint::open(interface_b, mac_b, mac_a)?,
     ];
     let mut delivered = [0u64; 2];
-    eprintln!("lab link: {interface_a} <-> {interface_b}; SNA SAP 04");
+    tracing::info!(interface_a, interface_b, sap = 4, "lab LLC link started");
     while !STOP.load(Ordering::Relaxed) {
         let mut received = false;
         for side in 0..2 {
@@ -58,7 +58,12 @@ fn handle(
         match event {
             Event::Type1(pdu) => {
                 remote.send_type1(&pdu)?;
-                eprintln!("lab link: relayed XID/TEST from leg {side}");
+                tracing::debug!(
+                    source_leg = side,
+                    target_leg = 1 - side,
+                    bytes = pdu.len(),
+                    "LLC Type1 relayed"
+                );
             }
             Event::Information(information) => {
                 if !remote.queue_information(information)? {
@@ -67,14 +72,16 @@ fn handle(
                 }
                 delivered[side] += 1;
                 if delivered[side] == 1 || delivered[side] % 10 == 0 {
-                    eprintln!(
-                        "lab link: leg {side} delivered {} SNA fields",
-                        delivered[side]
+                    tracing::debug!(
+                        source_leg = side,
+                        target_leg = 1 - side,
+                        delivered = delivered[side],
+                        "SNA information relayed"
                     );
                 }
             }
             Event::Connected => {
-                eprintln!("lab link: leg {side} connected");
+                tracing::info!(leg = side, "lab LLC leg connected");
                 if remote.state() == State::Disconnected {
                     // The answering SNA endpoint may still be exchanging XIDs
                     // and can initiate SABME itself during this interval.
@@ -82,12 +89,12 @@ fn handle(
                 }
             }
             Event::Disconnected => {
-                eprintln!("lab link: leg {side} disconnected");
+                tracing::info!(leg = side, "lab LLC leg disconnected");
                 local.disconnect()?;
                 remote.disconnect()?;
             }
             Event::TimedOut => {
-                eprintln!("lab link: leg {side} timed out");
+                tracing::warn!(leg = side, "lab LLC leg timed out");
                 if local.state() == State::Disconnected {
                     remote.disconnect()?;
                 }

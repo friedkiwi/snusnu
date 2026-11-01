@@ -6,7 +6,7 @@
 use prost::Message as ProstMessage;
 use std::fmt;
 use std::io::ErrorKind;
-use std::net::{IpAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
@@ -89,6 +89,19 @@ pub struct WsClient {
 }
 
 impl WsClient {
+    /// The resolved TCP peer, useful for logging the actual upstream IP.
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match self.socket.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.peer_addr(),
+            MaybeTlsStream::Rustls(stream) => stream.sock.peer_addr(),
+            #[allow(unreachable_patterns)]
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unknown WebSocket stream type",
+            )),
+        }
+    }
+
     /// Connect using an HTTP Authorization header. A plaintext `ws` URL is
     /// accepted only for loopback development servers.
     pub fn connect(url: &str, bearer: &str) -> Result<(Self, wire::RouterWelcome), Error> {
@@ -338,6 +351,7 @@ mod tests {
         });
         let url = format!("ws://{address}/router/v1/ws");
         let (mut client, welcome) = WsClient::connect(&url, "test-token").unwrap();
+        assert_eq!(client.peer_addr().unwrap(), address);
         assert_eq!(welcome.router_id, vec![7; 16]);
         client
             .send(wire::WsEnvelope {

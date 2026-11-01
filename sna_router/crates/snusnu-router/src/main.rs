@@ -4,6 +4,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tracing_subscriber::{fmt::time::UtcTime, EnvFilter};
 
 #[cfg(target_os = "linux")]
 mod endpoint;
@@ -23,9 +24,44 @@ extern "C" fn handle_signal(_: i32) {
 }
 
 fn main() {
+    if let Err(err) = init_logging() {
+        eprintln!("snusnu-router: logging: {err}");
+        process::exit(2);
+    }
     if let Err(err) = run() {
-        eprintln!("snusnu-router: {err}");
+        tracing::error!(error = %err, "router stopped");
         process::exit(1);
+    }
+}
+
+fn init_logging() -> io::Result<()> {
+    let directives = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
+    let filter = EnvFilter::try_new(directives).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid RUST_LOG: {error}"),
+        )
+    })?;
+    let format = env::var("SNUSNU_LOG_FORMAT").unwrap_or_else(|_| "text".to_owned());
+    match format.as_str() {
+        "text" => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_timer(UtcTime::rfc_3339())
+            .with_writer(io::stderr)
+            .with_ansi(false)
+            .try_init()
+            .map_err(io::Error::other),
+        "json" => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_timer(UtcTime::rfc_3339())
+            .with_writer(io::stderr)
+            .json()
+            .try_init()
+            .map_err(io::Error::other),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SNUSNU_LOG_FORMAT must be text or json",
+        )),
     }
 }
 
@@ -129,7 +165,7 @@ fn run() -> io::Result<()> {
         ));
     }
     install_signals();
-    println!("snusnu-router site {site} ready (foundation only); send SIGINT or SIGTERM to stop");
+    tracing::info!(site_id = %site, "router foundation ready");
     while !STOP.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
     }

@@ -82,6 +82,7 @@ impl Router {
             ));
         }
         self.order.push(id.clone());
+        tracing::info!(port = %id.0, "router port registered");
         self.ports.insert(id, port);
         Ok(())
     }
@@ -95,6 +96,7 @@ impl Router {
             ));
         }
         self.routes.insert(source.clone(), target.clone());
+        tracing::info!(source_port = %source.0, target_port = %target.0, "route installed");
         Ok(())
     }
 
@@ -131,6 +133,7 @@ impl Router {
     /// End a local association before a failed transport is discarded. This
     /// gives an LLC peer a DISC instead of leaving it linked to a dead route.
     pub(crate) fn disconnect_port(&mut self, id: &PortId) -> io::Result<()> {
+        tracing::info!(port = %id.0, "router port disconnecting");
         self.port_mut(id)?.disconnect()
     }
 
@@ -146,6 +149,7 @@ impl Router {
     fn release_completed(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
         let completed = self.port_mut(target)?.take_completed_information_count();
         if completed != 0 {
+            tracing::trace!(source_port = %source.0, target_port = %target.0, completed, "downstream delivery completed");
             self.port_mut(source)?.on_downstream_completed(completed)?;
         }
         Ok(())
@@ -175,19 +179,31 @@ impl Router {
         for event in events {
             match event {
                 RouterEvent::Unit(unit) => {
+                    let (kind, bytes) = match &unit {
+                        RoutedUnit::DlcType1(data) => ("dlc_type1", data.len()),
+                        RoutedUnit::SnaInformation(data) => ("sna_information", data.len()),
+                    };
+                    tracing::trace!(source_port = %source.0, target_port = %target.0, kind, bytes, "unit routed");
                     if !self.port_mut(&target)?.send(unit)? {
+                        tracing::warn!(source_port = %source.0, target_port = %target.0, kind, bytes, "route target rejected unit");
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
                             "route capacity changed during dispatch",
                         ));
                     }
                 }
-                RouterEvent::Ready => self.port_mut(&target)?.on_peer_ready()?,
+                RouterEvent::Ready => {
+                    tracing::info!(source_port = %source.0, target_port = %target.0, "route source ready");
+                    self.port_mut(&target)?.on_peer_ready()?
+                }
                 RouterEvent::Closed => {
+                    tracing::info!(source_port = %source.0, target_port = %target.0, "route closed");
                     self.port_mut(source)?.disconnect()?;
                     self.port_mut(&target)?.disconnect()?;
                 }
-                RouterEvent::TimedOut => eprintln!("router port {} timed out", source.0),
+                RouterEvent::TimedOut => {
+                    tracing::warn!(source_port = %source.0, target_port = %target.0, "router port timed out")
+                }
             }
         }
         self.port_mut(source)?.flush()?;

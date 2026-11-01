@@ -7,3 +7,5 @@ edition = "2021"
 router-core = { path = "../router-core" }
 link-linux = { path = "../link-linux" }
 transport-ws = { path = "../transport-ws" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }

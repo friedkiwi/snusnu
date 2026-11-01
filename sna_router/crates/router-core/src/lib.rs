@@ -3,6 +3,7 @@
 pub mod llc;
 pub mod llc2;
 pub mod llc_type1;
+pub mod packet_log;
 
 use std::num::NonZeroU64;
 
