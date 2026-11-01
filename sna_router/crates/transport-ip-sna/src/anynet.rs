@@ -95,13 +95,10 @@ impl UdpDatagram {
         check_length(&bytes)?;
         let kind = match bytes[4] {
             0x83 => {
-                if bytes.len() < 10 {
-                    return Err(invalid("short MPTN out-of-band command"));
-                }
-                let command_length = u32::from_be_bytes(bytes[6..10].try_into().unwrap()) as usize;
-                if !(6..=bytes.len() - 4).contains(&command_length) {
-                    return Err(invalid("MPTN out-of-band command length mismatch"));
-                }
+                // Structural validation is strict even while the runtime
+                // rejects all X'83' traffic. Its V5R4 wire variant and
+                // retry behavior have not been observed in a live capture.
+                crate::mptn_oob::Datagram::decode(&bytes)?;
                 UdpKind::OutOfBand
             }
             0x84 => {
@@ -318,6 +315,25 @@ mod tests {
         assert!(TcpRecord::decode(vec![0, 0, 0, 5, 0xff]).is_err());
         assert!(UdpDatagram::decode(vec![0, 0, 0, 5, 0x84]).is_err());
         assert!(Decoder::default().push(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn oob_boundary_requires_correlator_and_reduced_sna_header() {
+        // Synthetic section-5.3.3 request; no application bytes. The
+        // command length ends before MPTN header and reduced SNA data.
+        let mut oob = vec![
+            0, 0, 0, 29, 0x83, 0x02, 0, 0, 0, 18, 0, 0, 0x0b, 0x01, 0x05, 0xc1, 0x4b, 0xc2, 0xc3,
+            0x01, 0x02, 0x44, 0x01, 0, 1, 3, 0, 0, 0xaa,
+        ];
+        assert_eq!(
+            UdpDatagram::decode(oob.clone()).unwrap().kind,
+            UdpKind::OutOfBand
+        );
+        oob[13] = 0xff; // Invalid correlator address mode.
+        assert!(UdpDatagram::decode(oob.clone()).is_err());
+        oob[13] = 0x01;
+        oob[22] = 0x03; // TCP ACK marker is not an X'83' request header.
+        assert!(UdpDatagram::decode(oob).is_err());
     }
 
     #[test]
