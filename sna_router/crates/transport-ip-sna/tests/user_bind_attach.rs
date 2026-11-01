@@ -1,10 +1,12 @@
 //! Pure V4R4 user-session path through the bounded LLC-to-TCP62 gateway.
 //! This does not activate a runtime route or assert that UDP X'83' works.
 
+use router_core::fid2_session_control::ManagementBind;
 use transport_ip_sna::{
     anynet::{TcpKind, TcpRecord, MAX_RECORD},
     mptn_compensations::{CompensationSet, TCP62_REQUIRED},
     mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
+    mptn_native_bridge::{Bridge, Phase as BridgePhase},
     mptn_session::{BindPolicy, GatewaySession, Phase},
 };
 
@@ -96,12 +98,32 @@ fn positive_response(request: &Connect) -> TcpRecord {
 }
 
 fn first_user_attach() -> Vec<u8> {
-    // V4R4 first user-session normal PIU: TH/RH and 36-byte FMH5 shape are
-    // retained; the following application/conversation bytes are redacted.
-    let mut piu = vec![0x2c, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20];
-    piu.extend_from_slice(&[0x24, 0x05, 0x02, 0xff, 0x08, 0x03, 0xd0]);
-    piu.resize(242, 0);
+    // V4R4 p86/p51: TH/RH, FMH5 route fields and PIP lengths retained;
+    // application-specific PIP body redacted.
+    let mut piu = hex(concat!(
+        "2c00010200010b9120",
+        "240502ff0803d000400430f0f0f500140b",
+        "e2d6d3d5c5e34be2d5c1c1",
+        "0102030405060001",
+        "00c512f500c112e2"
+    ));
+    piu.extend_from_slice(&[0; 189]);
+    assert_eq!(piu.len(), 242);
     piu
+}
+
+fn management_bind() -> ManagementBind {
+    // Independent sanitized management BIND; FID2 address pair is kept
+    // distinct from the normalized user session pair.
+    let mut piu = hex(concat!(
+        "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
+        "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
+        "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
+        "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+        "2c0a00000000000000000000"
+    ));
+    piu[2..4].copy_from_slice(&[3, 4]);
+    ManagementBind::from_request(&piu, "SOLNET.SNAA", "SOLNET.SNAB").unwrap()
 }
 
 #[test]
@@ -152,4 +174,67 @@ fn missing_oob_handler_blocks_the_same_bind_before_connect() {
     let mut session = GatewaySession::new(policy(), supported).unwrap();
     assert!(session.begin_native_bind(&user_bind(), template()).is_err());
     assert_eq!(session.phase(), Phase::Idle);
+}
+
+#[test]
+fn pure_bridge_waits_for_remote_bind_and_native_ack_before_attach() {
+    let mut bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let attach = first_user_attach();
+    assert!(bridge.first_attach(&attach).is_err());
+    let connect_record = bridge.begin_native_bind(&user_bind(), template()).unwrap();
+    assert_eq!(bridge.phase(), BridgePhase::AwaitConnect);
+    assert!(bridge.first_attach(&attach).is_err());
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    let local_response = bridge
+        .accept_connect_response(&positive_response(&connect))
+        .unwrap();
+    assert_eq!(bridge.phase(), BridgePhase::NativeBindPrepared);
+    assert_eq!(local_response[9 + 9], 1); // local fixed receive window
+    assert_eq!(local_response[9 + 24], 0x23); // CONFIRM, no SYNCPT
+    assert!(bridge.acknowledge_native_bind(1).is_err());
+    assert!(bridge
+        .mark_native_bind_enqueued(&local_response[..9])
+        .is_err());
+    bridge.mark_native_bind_enqueued(&local_response).unwrap();
+    assert!(bridge.first_attach(&attach).is_err());
+    bridge.acknowledge_native_bind(1).unwrap();
+    let mut wrong_tp = attach.clone();
+    wrong_tp[9 + 10] ^= 1;
+    assert!(bridge.first_attach(&wrong_tp).is_err());
+    assert_eq!(bridge.phase(), BridgePhase::Active);
+    let (record, route) = bridge.first_attach(&attach).unwrap();
+    assert_eq!(route.transaction_program, [0x30, 0xf0, 0xf0, 0xf5]);
+    assert_eq!(record.bytes.len(), 243);
+    assert_eq!(bridge.phase(), BridgePhase::AttachPrepared);
+    let mut wrong_record = record.clone();
+    wrong_record.bytes[9] ^= 1;
+    assert!(bridge.mark_attach_enqueued(&wrong_record, 1).is_err());
+    assert!(bridge.mark_attach_enqueued(&record, 0).is_err());
+    let ipr = bridge.mark_attach_enqueued(&record, 1).unwrap();
+    assert_eq!(ipr, hex("2d0002010000830100"));
+    assert!(bridge.mark_ipr_enqueued(&ipr[..8]).is_err());
+    bridge.mark_ipr_enqueued(&ipr).unwrap();
+    bridge.complete_tcp_delivery(record.bytes.len()).unwrap();
+    assert_eq!(bridge.phase(), BridgePhase::Active);
+}
+
+#[test]
+fn pure_bridge_rejects_unavailable_oob_before_opening() {
+    let mut bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&[0x00, 0x01, 0x03, 0x10, 0x20]).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    assert!(bridge.begin_native_bind(&user_bind(), template()).is_err());
+    assert_eq!(bridge.phase(), BridgePhase::Idle);
 }
