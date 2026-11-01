@@ -157,3 +157,73 @@ fn hex(bytes: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        net::{Ipv4Addr, SocketAddr, UdpSocket},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn wait_event(port: &mut EePort) -> io::Result<Vec<RouterEvent>> {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if let Some(events) = port.poll(true)? {
+                return Ok(events);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "EE datagram missing",
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn ee_port_preserves_priority_and_rejects_other_sources() {
+        let local_ip = IpAddr::V4(Ipv4Addr::new(127, 82, 0, 1));
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 82, 0, 2));
+        let stranger_ip = IpAddr::V4(Ipv4Addr::new(127, 82, 0, 3));
+        let mut port = EePort::open(local_ip, peer_ip).unwrap();
+        let target = SocketAddr::new(local_ip, CONTROL_PORT);
+        let stranger = UdpSocket::bind(SocketAddr::new(stranger_ip, 0)).unwrap();
+        stranger.send_to(&[4, 4, 0xaf, 0x81], target).unwrap();
+        assert!(wait_event(&mut port).unwrap().is_empty());
+
+        let peer = UdpSocket::bind(SocketAddr::new(peer_ip, 0)).unwrap();
+        peer.send_to(&[4, 4, 0xaf, 0x81], target).unwrap();
+        let events = wait_event(&mut port).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [RouterEvent::Unit(RoutedUnit::EeDatagram {
+                priority: 0,
+                payload
+            })] if payload == &[4, 4, 0xaf, 0x81]
+        ));
+
+        peer.send_to(&[4, 4, 0x00], target).unwrap();
+        assert_eq!(
+            wait_event(&mut port).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let capture = UdpSocket::bind(SocketAddr::new(peer_ip, CONTROL_PORT + 2)).unwrap();
+        capture
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert!(port
+            .send(RoutedUnit::EeDatagram {
+                priority: 2,
+                payload: vec![0x80, 0x80, 0x03, 0x12],
+            })
+            .unwrap());
+        let mut buf = [0u8; 32];
+        let (n, source) = capture.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &[0x80, 0x80, 0x03, 0x12]);
+        assert_eq!(source, SocketAddr::new(local_ip, CONTROL_PORT + 2));
+    }
+}
