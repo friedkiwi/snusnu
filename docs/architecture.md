@@ -1,20 +1,20 @@
 # Architecture
 
-This is an implementer-facing foundation, based primarily on the read-only research note `syspass_research/docs/sources/hobbyist-sna-internet-network.md`. Its AnyNet investigation is background for a separate future gateway; AnyNet is outside this milestone.
+This is an implementer-facing foundation, based primarily on the read-only research note `syspass_research/docs/sources/hobbyist-sna-internet-network.md`. The Rust process is intended to route between local SNA links without a concentrator. A WebSocket link to another Rust router is an optional route hop. The concrete decomposition and compatibility rules are in [router-runtime.md](router-runtime.md); [sna-over-ip.md](sna-over-ip.md) covers Enterprise Extender and AnyNet.
 
 ## Boundaries
 
 | Component | Responsibility |
 | --- | --- |
-| Local Rust router | Initial Ethernet 802.3/802.2 packet I/O and LLC2 lab endpoint; future MAC/SAP policy, DLC next-hop selection, and outbound WSS connections. |
-| Central Go concentrator | Future authenticated site connections, authorized MAC/SAP reachability matching, independent circuit multiplexing, admission policy, resource limits, fairness, and operational HTTP facilities. |
+| Local Rust router | Owns endpoint adapters, protocol conversion, route selection, circuit/session lifecycle, bounded queues and local forwarding. The present code implements only a fixed two-TAP LLC2 lab route. |
+| Optional Go concentrator | Connects remote Rust routers and applies site-level policy when a route uses a WebSocket hop. It is not needed for local routes or LLC-to-AnyNet conversion. |
 | Genuine SNA/APPN nodes | SNA sessions and PIUs; APPN topology, directory services, class-of-service route selection, and LU resource routing. |
 
 **IBM-defined boundary.** IBM's APPN network nodes exchange topology information and use directory and topology services to locate resources and select session routes. The router's proposed MAC/SAP lookup is DLC reachability only; it cannot substitute for those APPN functions. See IBM, *APPN network topology*, *How directory services locate resources in APPN*, and *Route selection in an APPN network* (references below).
 
-**snusnu design choice.** Multiple sites initiate outbound connections to one central concentrator. A future binary circuit protocol over WSS carries circuit events, XID/TEST exchanges and information payloads. LLC2 sequencing, retries and link control terminate at the local router. The concentrator matches authorized DLC endpoints and forwards circuit messages; it does not inspect PIUs to route LUs. This is a stateful switched circuit service, not a stretched Ethernet broadcast domain: it does not flood arbitrary LAN frames across sites.
+**snusnu design choice.** The Rust router starts with local endpoint and route definitions. LLC2 sequencing, retries and link control terminate there. Route compatibility is checked before traffic flows: native LLC2 circuits can exchange Type 1 and PIU events, while AnyNet requires an LU6.2/MPTN gateway and Enterprise Extender requires an HPR/LDLC adapter or an APPN/HPR node, depending on the route. WebSocket can carry typed circuit events to a remote Rust router but does not change the local routing model. The router does not flood arbitrary LAN frames across sites.
 
-The Rust `router-core` owns the initial LLC parser and LLC2 lab endpoint. `link-linux` isolates Linux packet capture/injection behind a safe interface; `transport-ws` remains a boundary for a future outbound concentrator connection. The initial host targets are Linux amd64 and arm64. The local two-TAP lab path has packet I/O and LLC2 termination; no WSS implementation exists yet.
+The Rust `router-core` owns the initial LLC parser and LLC2 state machine. The fixed lab endpoint is currently in `snusnu-router`; `link-linux` isolates Linux packet capture/injection behind a safe interface; `transport-ws` is only a placeholder. The initial host targets are Linux amd64 and arm64. The local two-TAP lab path has packet I/O and LLC2 termination; there is no general route runtime, AnyNet/EE adapter or WSS implementation yet.
 
 ## Resource and failure rules (proposed snusnu behavior)
 
@@ -26,7 +26,9 @@ WSS server authentication and site authentication will protect the transport. Au
 
 1. Build local 802.3/802.2 capture and replay, then collect TEST, XID and LLC2 traces from genuine SNA equipment. Keep SNA information fields opaque while validating DLC behavior.
 2. Implement trace-tested LLC Type 1 handling and the local LLC2 endpoint, including timers, sequencing and bounded buffering. Test against scripted peers and captured traffic.
-3. Specify the cross-language circuit protocol and shared vectors, then add the authenticated WSS path, authorized DLC reachability, fault/reconnect tests and operational facilities. Test with genuine APPN nodes.
+3. Extract the lab's LLC2 legs into reusable local endpoints and route them through a standalone Rust runtime. Validate missing/ambiguous routes, queue pressure and teardown; rerun the V4R4 interoperability test.
+4. Capture and implement AnyNet/TCP62 as a separate LU6.2 gateway, beginning with one configured native LLC2-to-AnyNet session. Capture Enterprise Extender and native HPR LAN links before attempting HPR media conversion.
+5. Specify the cross-language circuit protocol and shared vectors, then add the optional authenticated WebSocket path, remote reachability, fault/reconnect tests and operational facilities.
 
 ## References and status
 

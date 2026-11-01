@@ -1,6 +1,6 @@
 # `snusnu.v1` binary protocol — draft
 
-This is a proposed snusnu-specific WSS circuit protocol, not an IBM-defined wire format or RFC 1795 DLSw SSP. No byte layout or interoperability claim is frozen yet. IBM SNA and APPN behavior remains at the endpoints; this protocol concerns the switched DLC circuit between routers.
+This is a proposed snusnu-specific circuit protocol for an optional WebSocket hop between Rust routers, not an IBM-defined wire format or RFC 1795 DLSw SSP. No byte layout or interoperability claim is frozen yet. The Rust router must also run with only local routes. This protocol carries typed circuit events; it does not turn incompatible LLC2, HPR and MPTN payloads into one generic byte stream. See [router-runtime.md](router-runtime.md).
 
 ## Goals and proposed invariants
 
