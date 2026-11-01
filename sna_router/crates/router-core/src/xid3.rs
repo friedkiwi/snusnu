@@ -117,6 +117,7 @@ impl Xid3 {
             .try_into()
             .map_err(|_| XidError::InvalidLength)?;
         result.validate()?;
+        result.cp_name()?;
         Ok(result)
     }
 
@@ -256,7 +257,18 @@ impl Xid3 {
         if self.max_receive_btu() == 0 || self.max_iframes_before_ack() == 0 {
             return Err(XidError::InvalidFormat);
         }
-        self.cp_name()?;
+        // Older adjacent nodes may omit the CP-name vector. IBM SC30-3422-0
+        // requires current senders to supply it but explicitly says a
+        // receiver must not treat its absence as a protocol error.
+        let mut cp_names = self.vectors.iter().filter(|vector| {
+            vector.key == CV_NETWORK_NAME && vector.data.first() == Some(&NAME_CP)
+        });
+        if let Some(vector) = cp_names.next() {
+            decode_cp_name(&vector.data[1..])?;
+            if cp_names.next().is_some() {
+                return Err(XidError::DuplicateCpName);
+            }
+        }
         for vector in &self.vectors {
             if vector.key == CV_PRODUCT_SET_ID && vector.data.len() > 60 {
                 return Err(XidError::InvalidControlVector);
@@ -429,5 +441,28 @@ mod tests {
         let mut wire = sample().encode().unwrap();
         wire[19] = wire[19] & !0x30 | 0x20;
         assert_eq!(Xid3::decode(&wire), Err(XidError::UnsupportedRole));
+    }
+
+    #[test]
+    fn older_peer_may_omit_cp_name_but_local_sender_may_not() {
+        let mut wire = sample().encode().unwrap();
+        wire.drain(FIXED_BYTES..FIXED_BYTES + 14);
+        wire[1] = wire.len() as u8;
+        assert!(Xid3::decode(&wire).is_ok());
+        assert_eq!(
+            Xid3::decode(&wire).unwrap().cp_name(),
+            Err(XidError::InvalidCpName)
+        );
+        let fixed = wire[..FIXED_BYTES].try_into().unwrap();
+        assert_eq!(
+            Xid3::from_parts(
+                fixed,
+                vec![ControlVector {
+                    key: CV_PRODUCT_SET_ID,
+                    data: vec![0x11, 0x01]
+                }]
+            ),
+            Err(XidError::InvalidCpName)
+        );
     }
 }
