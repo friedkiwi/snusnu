@@ -1,7 +1,7 @@
-//! Bounded XID3 activation for a locally configured secondary ABM link station.
+//! Bounded XID3 activation for a locally configured fixed-role ABM link station.
 //!
-//! IBM SC30-3422-0, chapter 2, permits a fixed secondary to pair with a
-//! negotiable or fixed primary. Each station must send and receive a
+//! IBM SC30-3422-0, chapter 2, permits a fixed primary or secondary to pair
+//! with a negotiable or complementary fixed-role station. Each must exchange
 //! negotiation-proceeding XID3 with complementary nonnegotiable roles before
 //! link activation completes. This engine stops there. The caller remains
 //! responsible for LLC command/response framing, retries, and SABME, and must
@@ -34,18 +34,22 @@ pub enum Phase {
     ReadyForSabme,
 }
 
-pub struct SecondaryActivation {
+pub struct FixedRoleActivation {
     local: Xid3,
+    local_role: Role,
     awaiting_send: Option<Xid3>,
     sent_proceeding: bool,
-    received_primary_proceeding: bool,
+    received_complementary_proceeding: bool,
     peer_name: Option<String>,
     peer_node_id: Option<[u8; 4]>,
 }
 
-impl SecondaryActivation {
+impl FixedRoleActivation {
     pub fn new(local: Xid3) -> Result<Self, ActivationError> {
-        if local.role() != Ok(Role::Secondary)
+        let local_role = local
+            .role()
+            .map_err(|_| ActivationError::InvalidLocalProfile)?;
+        if local_role == Role::Negotiable
             || !local.abm_capable()
             || local.exchange_state() != ExchangeState::Prenegotiation
             || local.cp_name().is_err()
@@ -55,16 +59,17 @@ impl SecondaryActivation {
         }
         Ok(Self {
             local,
+            local_role,
             awaiting_send: None,
             sent_proceeding: false,
-            received_primary_proceeding: false,
+            received_complementary_proceeding: false,
             peer_name: None,
             peer_node_id: None,
         })
     }
 
     pub fn phase(&self) -> Phase {
-        if self.sent_proceeding && self.received_primary_proceeding {
+        if self.sent_proceeding && self.received_complementary_proceeding {
             Phase::ReadyForSabme
         } else {
             Phase::Exchanging
@@ -77,6 +82,10 @@ impl SecondaryActivation {
 
     pub fn peer_node_id(&self) -> Option<[u8; 4]> {
         self.peer_node_id
+    }
+
+    pub fn local_role(&self) -> Role {
+        self.local_role
     }
 
     /// Respond to a null XID command with a locally owned XID3. Once a peer
@@ -96,22 +105,31 @@ impl SecondaryActivation {
 
     /// Process the complete I-field from a peer XID3 and prepare the local
     /// response. The local ESI advances to proceeding only after a peer XID3
-    /// is seen; the local role remains fixed secondary throughout.
+    /// is seen; the local role remains fixed throughout.
     pub fn on_peer_xid(&mut self, bytes: &[u8]) -> Result<Xid3, ActivationError> {
-        if self.phase() == Phase::ReadyForSabme {
-            return Err(ActivationError::UnexpectedState);
-        }
         let peer = Xid3::decode(bytes).map_err(ActivationError::InvalidPeer)?;
         if !peer.abm_capable() {
             return Err(ActivationError::IncompatibleAbm);
         }
-        if !matches!(peer.role(), Ok(Role::Primary | Role::Negotiable)) {
+        let expected_peer_role = match self.local_role {
+            Role::Primary => Role::Secondary,
+            Role::Secondary => Role::Primary,
+            Role::Negotiable => unreachable!("constructor rejects negotiable role"),
+        };
+        if !matches!(peer.role(), Ok(role) if role == expected_peer_role || role == Role::Negotiable)
+        {
             return Err(ActivationError::IncompatibleRole);
         }
         if !matches!(
             peer.exchange_state(),
             ExchangeState::Prenegotiation | ExchangeState::NegotiationProceeding
         ) {
+            return Err(ActivationError::UnexpectedState);
+        }
+        if self.phase() == Phase::ReadyForSabme
+            && (peer.exchange_state() != ExchangeState::NegotiationProceeding
+                || peer.role() != Ok(expected_peer_role))
+        {
             return Err(ActivationError::UnexpectedState);
         }
         if let Ok(name) = peer.cp_name() {
@@ -129,9 +147,9 @@ impl SecondaryActivation {
         }
         self.peer_node_id = Some(peer.node_id());
         if peer.exchange_state() == ExchangeState::NegotiationProceeding
-            && peer.role() == Ok(Role::Primary)
+            && peer.role() == Ok(expected_peer_role)
         {
-            self.received_primary_proceeding = true;
+            self.received_complementary_proceeding = true;
         }
         let mut outgoing = self.local.clone();
         outgoing.set_exchange_state(ExchangeState::NegotiationProceeding);
@@ -193,7 +211,7 @@ mod tests {
             Role::Secondary,
             ExchangeState::Prenegotiation,
         );
-        let mut activation = SecondaryActivation::new(local).unwrap();
+        let mut activation = FixedRoleActivation::new(local).unwrap();
         let pre = activation.on_null_xid().unwrap();
         assert_eq!(pre.exchange_state(), ExchangeState::Prenegotiation);
         assert_eq!(activation.confirm_sent(&pre), Ok(Phase::Exchanging));
@@ -235,7 +253,7 @@ mod tests {
             Role::Secondary,
             ExchangeState::Prenegotiation,
         );
-        let mut activation = SecondaryActivation::new(local.clone()).unwrap();
+        let mut activation = FixedRoleActivation::new(local.clone()).unwrap();
         assert_eq!(
             activation.confirm_sent(&local),
             Err(ActivationError::UnconfirmedSend)
@@ -257,5 +275,33 @@ mod tests {
             activation.on_peer_xid(&wire),
             Err(ActivationError::IncompatibleAbm)
         );
+    }
+
+    #[test]
+    fn fixed_primary_waits_for_peer_secondary_before_sabme() {
+        let local = xid(
+            "SOLNET.ROUTER",
+            Role::Primary,
+            ExchangeState::Prenegotiation,
+        );
+        let mut activation = FixedRoleActivation::new(local).unwrap();
+        assert_eq!(activation.local_role(), Role::Primary);
+        let peer_pre = xid(
+            "SOLNET.SNAA",
+            Role::Negotiable,
+            ExchangeState::Prenegotiation,
+        );
+        let outgoing = activation.on_peer_xid(&peer_pre.encode().unwrap()).unwrap();
+        assert_eq!(outgoing.role(), Ok(Role::Primary));
+        assert_eq!(activation.confirm_sent(&outgoing), Ok(Phase::Exchanging));
+        let peer_final = xid(
+            "SOLNET.SNAA",
+            Role::Secondary,
+            ExchangeState::NegotiationProceeding,
+        );
+        let outgoing = activation
+            .on_peer_xid(&peer_final.encode().unwrap())
+            .unwrap();
+        assert_eq!(activation.confirm_sent(&outgoing), Ok(Phase::ReadyForSabme));
     }
 }

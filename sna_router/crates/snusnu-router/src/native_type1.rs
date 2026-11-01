@@ -7,8 +7,8 @@
 
 use router_core::{
     llc::SNA_SAP,
-    xid3::Xid3,
-    xid3_activation::{ActivationError, Phase, SecondaryActivation},
+    xid3::{Role, Xid3},
+    xid3_activation::{ActivationError, FixedRoleActivation, Phase},
 };
 use std::io;
 
@@ -22,13 +22,13 @@ pub(crate) struct OutboundType1 {
 }
 
 pub(crate) struct NativeType1 {
-    activation: SecondaryActivation,
+    activation: FixedRoleActivation,
 }
 
 impl NativeType1 {
     pub(crate) fn new(local_xid: Xid3) -> io::Result<Self> {
         Ok(Self {
-            activation: SecondaryActivation::new(local_xid).map_err(protocol_error)?,
+            activation: FixedRoleActivation::new(local_xid).map_err(protocol_error)?,
         })
     }
 
@@ -38,6 +38,10 @@ impl NativeType1 {
 
     pub(crate) fn peer_name(&self) -> Option<&str> {
         self.activation.peer_name()
+    }
+
+    pub(crate) fn local_role(&self) -> Role {
+        self.activation.local_role()
     }
 
     pub(crate) fn on_pdu(&mut self, pdu: &[u8]) -> io::Result<Option<OutboundType1>> {
@@ -57,13 +61,15 @@ impl NativeType1 {
             })),
             TEST => Ok(None),
             XID if is_response && info.is_empty() => Ok(None),
+            // V4R4 on Solstice answers the initial null poll with a null
+            // response, then sends its own prenegotiation XID3 command.
+            // Defer the local identity until that command arrives.
+            XID if info.is_empty() => Ok(Some(OutboundType1 {
+                pdu: vec![SNA_SAP, SNA_SAP | 1, XID | (pdu[2] & POLL_FINAL)],
+                xid: None,
+            })),
             XID => {
-                let xid = if info.is_empty() {
-                    self.activation.on_null_xid()
-                } else {
-                    self.activation.on_peer_xid(info)
-                }
-                .map_err(protocol_error)?;
+                let xid = self.activation.on_peer_xid(info).map_err(protocol_error)?;
                 let mut outgoing = Vec::with_capacity(3 + 255);
                 outgoing.extend_from_slice(&[
                     SNA_SAP,
@@ -138,11 +144,7 @@ mod tests {
         );
         let mut handler = NativeType1::new(local.clone()).unwrap();
         let pre = handler.on_pdu(&[4, 4, 0xbf]).unwrap().unwrap();
-        assert_eq!(&pre.pdu[..3], &[4, 5, 0xbf]);
-        assert_eq!(
-            Xid3::decode(&pre.pdu[3..]).unwrap().cp_name().unwrap(),
-            "SOLNET.ROUTER"
-        );
+        assert_eq!(pre.pdu, [4, 5, 0xbf]);
         assert_eq!(handler.confirm_sent(&pre).unwrap(), Phase::Exchanging);
 
         let mut peer = xid(
@@ -154,6 +156,10 @@ mod tests {
         command.extend_from_slice(&peer.encode().unwrap());
         let response = handler.on_pdu(&command).unwrap().unwrap();
         assert_eq!(&response.pdu[..3], &[4, 5, 0xbf]);
+        assert_eq!(
+            Xid3::decode(&response.pdu[3..]).unwrap().cp_name().unwrap(),
+            "SOLNET.ROUTER"
+        );
         assert_eq!(handler.confirm_sent(&response).unwrap(), Phase::Exchanging);
         peer.set_role(Role::Primary);
         peer.set_exchange_state(ExchangeState::NegotiationProceeding);

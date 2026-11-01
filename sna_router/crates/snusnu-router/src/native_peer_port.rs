@@ -12,8 +12,12 @@ use crate::{
     routing::{RoutePort, RoutedUnit, RouterEvent},
     runtime::LlcPeer,
 };
-use router_core::{llc2::State, xid3::Xid3, xid3_activation::Phase};
-use std::io;
+use router_core::{
+    llc2::State,
+    xid3::{Role, Xid3},
+    xid3_activation::Phase,
+};
+use std::{io, time::Duration};
 
 pub(crate) struct NativePeerPort {
     endpoint: Endpoint,
@@ -52,7 +56,12 @@ impl NativePeerPort {
                         self.endpoint.send_type1(&outbound.pdu)?;
                         if self.type1.confirm_sent(&outbound)? == Phase::ReadyForSabme {
                             self.endpoint.set_connect_allowed(true)?;
-                            tracing::info!(peer_cp = ?self.type1.peer_name(), "APPN XID3 negotiation complete; SABME permitted");
+                            if self.type1.local_role() == Role::Primary {
+                                // Let any crossed final XID command/response
+                                // settle before the primary sets LLC2 mode.
+                                self.endpoint.begin_connect_after(Duration::from_millis(50));
+                            }
+                            tracing::info!(peer_cp = ?self.type1.peer_name(), local_role = ?self.type1.local_role(), "APPN XID3 negotiation complete; SABME permitted");
                         }
                     }
                 }
