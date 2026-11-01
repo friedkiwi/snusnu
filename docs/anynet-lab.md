@@ -72,3 +72,43 @@ helps explain the lack of a UDP fallback in this particular exchange, but
 does not establish when other expedited senders choose to retry.
 
 The UDP wire format has an unresolved contradiction in the [IBM-authored TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00): section 3.2.2.1 says an out-of-band UDP datagram omits the four-byte record length because UDP preserves message boundaries, while section 5.3.3 lists that length as the first field of `MPTN_DG_OOB_Data`. No captured `0x83` packet settles which form V5R4 sends. Rust has a bounded section-5.3.3 structural parser and separate TCP/UDP expedited sequence-deduplication state, but `GatewaySession` does not accept or emit `0x83`, send its UDP acknowledgement, or retry it. The `0x83` required compensation must stay unavailable. To complete it, capture an actual V5R4 `0x83` request and response, establish the record-length and alias forms, then verify duplicate suppression when the same expedited message arrives over both TCP and UDP, response correlation, retry limits, and abort handling.
+
+## Proposed V4R4 LLC2 to V5R4 AnyNet lab
+
+This topology is a plan for the first media-conversion test; it has not been
+run. Keep V4R4 A on isolated `sol5` and V5R4 B on isolated `sol7`, with no
+Linux bridge between them. Remove `sol7` from the direct V5 bridge and keep
+V5R4 A on `sol6` disconnected or stopped, so its `SOLNET.SNAA` identity cannot
+compete with the Rust router. The V4R4 A guest is `SOLNET.SNAA`, MAC
+`02:00:35:27:23:01`; its existing `SNAB` LAN controller targets proxy MAC
+`02:00:35:27:23:02` and remote CP `SOLNET.SNAB`. V5R4 B is `SOLNET.SNAB`, IP
+`10.99.4.3`; its existing `ANYTOA` controller targets remote CP
+`SOLNET.SNAA`, with `ALWANYNET(*YES)` and the `SNAA` APPN remote entry.
+
+When the gateway harness is ready, give the Rust host `10.99.4.10/32` on
+`sol7` and a host route to B. The V4R4 LLC leg needs no IP address:
+
+```sh
+sudo ip link set sol7 nomaster
+sudo ip addr add 10.99.4.10/32 dev sol7
+sudo ip route replace 10.99.4.3/32 dev sol7 src 10.99.4.10
+```
+
+On B, point the host-table name `SNAA.SOLNET.SNA.IBM.COM` at `.10` instead of
+the direct V5 peer `.2`, checking the existing entry before changing it.
+IBM documents this [AnyNet name form](https://www.ibm.com/docs/en/i/7.5.0?topic=beginning-add-tcpip-host-table-entry)
+and the [host-entry address rename command](https://www.ibm.com/docs/en/i/7.5.0?topic=r-rename-tcpip-host-table-entry).
+If `.2` has a dedicated `SNAA` entry, the planned OS/400 command is
+`RNMTCPHTE INTNETADR('10.99.4.2') NEWINTNETA('10.99.4.10')`; otherwise edit
+only that alias. Vary B `ANYTOA` off before the change and on after Rust is
+listening. Vary A `SNAB` on only after the LLC side is listening.
+
+The Rust LLC side must present CP `SOLNET.SNAB`, station `SNAB`, and proxy MAC
+`02:00:35:27:23:02` to A. Its AnyNet side must bind `.10`, target B `.3`,
+and present local LU `SOLNET.SNAA` to remote LU `SOLNET.SNAB`. These local
+identities are the adjacent peer identities each guest already expects.
+The mixed test requires the gateway to correlate user BIND, management
+teardown, FMH-5 Attach and replies, pacing, and session cleanup across the
+two media. The current native probe has reached A's first FMH-5 Attach but
+has not completed an application conversation, so the plan is not yet a
+pass-through acceptance result.
