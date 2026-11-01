@@ -35,6 +35,7 @@ type App struct {
 	Config   Config
 	webauthn *webauthn.WebAuthn
 	client   *http.Client
+	hub      *routerHub
 }
 
 func NewApp(db *store.Store, cfg Config) (*App, error) {
@@ -55,7 +56,9 @@ func NewApp(db *store.Store, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}}, nil
+	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}}
+	a.hub = newRouterHub(a)
+	return a, nil
 }
 
 func (a *App) Handler() http.Handler {
@@ -65,6 +68,7 @@ func (a *App) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprint(w, "ok\n")
 	})
+	m.HandleFunc("GET /router/v1/ws", a.routerWebSocket)
 	m.HandleFunc("GET /", a.home)
 	m.HandleFunc("GET /register", a.registerPage)
 	m.HandleFunc("POST /register", a.register)

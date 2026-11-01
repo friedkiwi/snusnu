@@ -2,7 +2,7 @@
 
 The Rust router publishes **exported reachability** over its optional WebSocket connection. It does not publish its private route table, TAP names or local converter internals. An export says that this router currently offers a network-qualified SNA control point or LU/location to remote routers. Local-only routes still work with no WebSocket or concentrator. See [OS/400 SNA names](os400-sna-names.md) for the distinction between CP, LU, system name and site ID.
 
-The draft wire schema is [`proto/snusnu_routes_v1.proto`](../proto/snusnu_routes_v1.proto). These protobuf messages ride inside the versioned [WebSocket envelope](websocket-protocol.md); the Go/Rust generated bindings do not exist yet. The `snusnu.v1` WebSocket subprotocol and server Welcome establish the version and connection epoch before route messages. A protobuf encoding is binary but need not have a byte-for-byte canonical serialization: receivers validate the decoded fields, and shared fixtures test the same semantic values and rejection cases.
+The v1 wire schema is [`proto/snusnu_routes_v1.proto`](../proto/snusnu_routes_v1.proto). These protobuf messages ride inside the versioned [WebSocket envelope](websocket-protocol.md); Go and Rust generate bindings from the same schema. The `snusnu.v1` WebSocket subprotocol and server Welcome establish the version and connection epoch before route messages. A protobuf encoding is binary but need not have a byte-for-byte canonical serialization: receivers validate the decoded fields and tests check the same semantic values.
 
 ## Snapshot and identity
 

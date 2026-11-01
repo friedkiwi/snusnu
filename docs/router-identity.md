@@ -12,7 +12,7 @@ router_credentials(id, router_id REFERENCES routers(id), secret_hash UNIQUE,
                    created_at, expires_at, revoked_at)
 ```
 
-The Go web service uses a version-2 migration for router records, router-scoped credentials, profiles, blocks and diagnostics. WebSocket authentication and `RouterWelcome` transmission are still pending.
+The Go web service uses versioned migrations for router records, router-scoped credentials, profiles, blocks and diagnostics. The WebSocket endpoint authenticates router bearer tokens before upgrade and sends `RouterWelcome` with the server-owned router UUID, display name and fresh connection epoch.
 
 Internally, keep SNA resource keys as structured fields:
 

@@ -5,9 +5,11 @@ go 1.26.0
 require (
 	github.com/go-webauthn/webauthn v0.18.2
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/pquerna/otp v1.5.0
 	golang.org/x/crypto v0.58.0
+	google.golang.org/protobuf v1.36.10
 	modernc.org/sqlite v1.61.1
 )
 

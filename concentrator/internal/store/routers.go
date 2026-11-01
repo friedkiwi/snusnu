@@ -151,7 +151,7 @@ func (s *Store) DeleteRouter(ctx context.Context, id string) error {
 	return nil
 }
 
-// CanForward is the policy gate the future transport must call for each route or circuit.
+// CanForward is the policy gate the WebSocket transport calls for each route or circuit.
 // A block by either owner rejects traffic in both directions.
 func (s *Store) CanForward(ctx context.Context, sourceID, targetID string) (bool, error) {
 	var srcOwner, dstOwner string
