@@ -249,7 +249,7 @@ func (a *App) profileView(w http.ResponseWriter, r *http.Request, u store.User, 
 		dbError(w, err)
 		return
 	}
-	a.render(w, "profile_view", map[string]any{"User": u, "CSRF": s.CSRF, "Profile": target, "ShowEmail": target.PublicEmail || target.ID == u.ID, "Own": target.ID == u.ID, "Blocked": blocked, "Exports": exports, "HasPicture": picture != 0})
+	a.render(w, "profile_view", map[string]any{"User": u, "CSRF": s.CSRF, "Profile": target, "ShowEmail": target.PublicEmail || target.ID == u.ID || u.Role == "admin", "Own": target.ID == u.ID, "Blocked": blocked, "Exports": exports, "HasPicture": picture != 0})
 }
 func (a *App) profilePicture(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	var picture []byte

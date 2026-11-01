@@ -105,7 +105,7 @@ func Hash(token string) string { h := sha256.Sum256([]byte(token)); return hex.E
 func Now() int64               { return time.Now().UTC().Unix() }
 
 func (s *Store) Prune(ctx context.Context) error {
-	for _, q := range []string{"DELETE FROM sessions WHERE expires_at<?", "DELETE FROM email_tokens WHERE expires_at<?", "DELETE FROM ceremonies WHERE expires_at<?", "DELETE FROM auth_attempts WHERE reset_at<?", "DELETE FROM router_logs WHERE occurred_at<?"} {
+	for _, q := range []string{"DELETE FROM sessions WHERE expires_at<?", "DELETE FROM email_tokens WHERE expires_at<?", "DELETE FROM password_reset_tokens WHERE expires_at<?", "DELETE FROM ceremonies WHERE expires_at<?", "DELETE FROM auth_attempts WHERE reset_at<?", "DELETE FROM router_logs WHERE occurred_at<?"} {
 		cutoff := Now()
 		if strings.Contains(q, "router_logs") {
 			cutoff -= 30 * 24 * 3600
@@ -191,7 +191,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2, schemaV3} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -264,6 +264,10 @@ var schemaV3 = []string{
 	`INSERT INTO mac_pool_state(id,next_suffix) VALUES(1,1)`,
 	`CREATE TABLE managed_cp_addresses (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, netid TEXT NOT NULL, cp_name TEXT NOT NULL, mac_suffix BIGINT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, created_at BIGINT NOT NULL, retired_at BIGINT NOT NULL DEFAULT 0, UNIQUE(owner_id,netid,cp_name))`,
 	`CREATE INDEX idx_managed_cp_addresses_owner ON managed_cp_addresses(owner_id)`,
+}
+
+var schemaV4 = []string{
+	`CREATE TABLE password_reset_tokens (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, code_hash TEXT NOT NULL, expires_at BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`,
 }
 
 var ErrNotFound = errors.New("not found")

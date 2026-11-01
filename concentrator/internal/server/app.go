@@ -71,6 +71,9 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /verify", a.verifyPage)
 	m.HandleFunc("POST /verify", a.verify)
 	m.HandleFunc("POST /verify/resend", a.resendVerification)
+	m.HandleFunc("GET /password-reset", a.passwordResetPage)
+	m.HandleFunc("POST /password-reset/request", a.passwordResetRequest)
+	m.HandleFunc("POST /password-reset", a.passwordResetComplete)
 	m.HandleFunc("GET /login", a.loginPage)
 	m.HandleFunc("POST /login", a.login)
 	m.HandleFunc("POST /logout", a.full(a.logout))
@@ -118,6 +121,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /admin/users", a.admin(a.users))
 	m.HandleFunc("GET /admin/routers", a.admin(a.adminRouters))
 	m.HandleFunc("POST /admin/users/role", a.admin(a.setRole))
+	m.HandleFunc("POST /admin/users/reset-password", a.admin(a.adminResetPassword))
 	m.HandleFunc("POST /admin/directory", a.admin(a.createDirectory))
 	m.HandleFunc("POST /admin/directory/update", a.admin(a.updateDirectory))
 	m.HandleFunc("POST /admin/directory/delete", a.admin(a.deleteDirectory))
@@ -297,15 +301,18 @@ func verificationCode() (string, error) {
 	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 func (a *App) sendVerification(email, code string) error {
+	return a.sendEmailCode(email, code, "email verification")
+}
+func (a *App) sendEmailCode(email, code, purpose string) error {
 	if a.Config.Development {
-		log.Printf("development email verification code for %s: %s", email, code)
+		log.Printf("development %s code for %s: %s", purpose, email, code)
 		return nil
 	}
 	from := a.Config.SMTPFrom
 	if from == "" {
 		return errors.New("SMTP_FROM missing")
 	}
-	msg := []byte("From: " + from + "\r\nTo: " + email + "\r\nSubject: snusnu email verification\r\n\r\nYour verification code is " + code + ". It expires in 10 minutes.\r\n")
+	msg := []byte("From: " + from + "\r\nTo: " + email + "\r\nSubject: snusnu " + purpose + "\r\n\r\nYour " + purpose + " code is " + code + ". It expires in 10 minutes.\r\n")
 	host, _, err := net.SplitHostPort(a.Config.SMTPAddr)
 	if err != nil {
 		return err

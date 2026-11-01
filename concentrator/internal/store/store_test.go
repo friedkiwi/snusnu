@@ -281,6 +281,12 @@ func TestBackends(t *testing.T) {
 			if _, err := s.AllocateManagedCP(context.Background(), id, "SOLNET", "SNAB"); !errors.Is(err, ErrRetiredCP) {
 				t.Fatalf("retired CP reused: %v", err)
 			}
+			if err := s.IssuePasswordReset(context.Background(), id, "123456"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.CompletePasswordReset(context.Background(), id, "123456", "new-hash"); err != nil {
+				t.Fatal(err)
+			}
 		})
 	}
 }
