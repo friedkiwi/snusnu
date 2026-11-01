@@ -219,7 +219,12 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
         for peer in &config.anynet {
             router.register_port(
                 PortId::new(&peer.id),
-                Box::new(AnyNetPort::open(peer.local_ip, peer.peer_ip)?),
+                Box::new(AnyNetPort::open_with_lus(
+                    peer.local_ip,
+                    peer.peer_ip,
+                    peer.local_lu.clone(),
+                    peer.remote_lu.clone(),
+                )?),
             )?;
         }
         if let Some(remote_ports) = remote_ports {
@@ -269,6 +274,17 @@ fn install_config_route(
             netid: cp.netid,
             name: cp.name,
         })
+    } else if let Some(anynet) = config.anynet.iter().find(|peer| peer.id == source.0) {
+        if let Some(lu) = &anynet.remote_lu {
+            let lu = config::parse_cp(lu)?;
+            Some(RouteAddress::LogicalUnit {
+                netid: lu.netid,
+                cp: None,
+                name: lu.name,
+            })
+        } else {
+            None
+        }
     } else {
         None
     };

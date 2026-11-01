@@ -39,6 +39,8 @@ pub(crate) struct AnyNetConfig {
     pub(crate) id: String,
     pub(crate) local_ip: IpAddr,
     pub(crate) peer_ip: IpAddr,
+    pub(crate) local_lu: Option<String>,
+    pub(crate) remote_lu: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +166,25 @@ impl RouterConfig {
                     peer.local_ip
                 )));
             }
+            match (&peer.local_lu, &peer.remote_lu) {
+                (Some(local), Some(remote)) => {
+                    let local = parse_cp(local)?;
+                    let remote = parse_cp(remote)?;
+                    if local == remote {
+                        return Err(invalid(format!(
+                            "AnyNet LU pair for {} is identical",
+                            peer.id
+                        )));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(invalid(format!(
+                        "AnyNet peer {} requires both local_lu and remote_lu",
+                        peer.id
+                    )))
+                }
+            }
         }
         let mut exported_cps = HashSet::new();
         let mut exported_lus = HashSet::new();
@@ -223,6 +244,24 @@ impl RouterConfig {
                     "unsupported route {} ({source_kind}) -> {} ({target_kind})",
                     route.from, route.to
                 )));
+            }
+            if source_kind == "anynet" {
+                let from = self
+                    .anynet
+                    .iter()
+                    .find(|peer| peer.id == route.from)
+                    .expect("kind checked");
+                let to = self
+                    .anynet
+                    .iter()
+                    .find(|peer| peer.id == route.to)
+                    .expect("kind checked");
+                if from.local_lu != to.remote_lu || from.remote_lu != to.local_lu {
+                    return Err(invalid(format!(
+                        "AnyNet LU policy mismatch between {} and {}",
+                        route.from, route.to
+                    )));
+                }
             }
             add_directed(&mut directed, &route.from, &route.to)?;
             if route.bidirectional {
@@ -533,5 +572,40 @@ to = "hpr"
             .unwrap_err()
             .to_string()
             .contains("unsupported route"));
+    }
+
+    #[test]
+    fn anynet_lu_policy_must_be_complete_and_reciprocal() {
+        let strict = r#"
+[[anynet]]
+id = "east"
+local_ip = "127.0.0.2"
+peer_ip = "127.0.0.3"
+local_lu = "SOLNET.SNAA"
+remote_lu = "SOLNET.SNAB"
+[[anynet]]
+id = "west"
+local_ip = "127.0.0.4"
+peer_ip = "127.0.0.5"
+local_lu = "SOLNET.SNAB"
+remote_lu = "SOLNET.SNAA"
+[[route]]
+from = "east"
+to = "west"
+"#;
+        parse(strict).validate().unwrap();
+        assert!(parse(&strict.replace(
+            "remote_lu = \"SOLNET.SNAA\"",
+            "remote_lu = \"SOLNET.OTHER\""
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("policy mismatch"));
+        assert!(parse(&strict.replace("local_lu = \"SOLNET.SNAA\"", ""))
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires both"));
     }
 }
