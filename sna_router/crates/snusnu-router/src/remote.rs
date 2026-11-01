@@ -987,6 +987,7 @@ fn envelope(body: wire::ws_envelope::Body) -> wire::WsEnvelope {
 fn validate_name(name: &wire::SnaName) -> io::Result<()> {
     let valid = |value: &str| {
         (1..=8).contains(&value.len())
+            && matches!(value.as_bytes()[0], b'A'..=b'Z' | b'@' | b'#' | b'$')
             && value.bytes().all(|b| {
                 b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'@' | b'#' | b'$')
             })
@@ -1027,6 +1028,9 @@ pub(crate) fn local_route_snapshot(
     }];
     for cp in additional_cps {
         validate_name(cp)?;
+        if cp.netid != primary_cp.netid {
+            return Err(protocol("local CP export outside assigned NETID"));
+        }
         if !identities.insert((cp.netid.clone(), cp.name.clone(), false)) {
             return Err(protocol("duplicate local CP export"));
         }
@@ -1046,8 +1050,16 @@ pub(crate) fn local_route_snapshot(
             .as_ref()
             .ok_or_else(|| protocol("LU export missing name"))?;
         validate_name(name)?;
+        if name.netid != primary_cp.netid {
+            return Err(protocol("local LU export outside assigned NETID"));
+        }
         if let Some(host) = &lu.hosting_cp {
             validate_name(host)?;
+            if host.netid != primary_cp.netid
+                || !identities.contains(&(host.netid.clone(), host.name.clone(), false))
+            {
+                return Err(protocol("LU hosting CP is not an exported local CP"));
+            }
         }
         if !identities.insert((name.netid.clone(), name.name.clone(), true)) {
             return Err(protocol("duplicate local LU export"));
@@ -1587,6 +1599,50 @@ mod tests {
             &[wire::LuReachability {
                 lu: None,
                 hosting_cp: None,
+                supported_types: Vec::new(),
+            }]
+        )
+        .is_err());
+        assert!(local_route_snapshot(
+            &[0; 16],
+            1,
+            &primary,
+            &[name("OTHER", "SNAB")],
+            &[]
+        )
+        .is_err());
+        assert!(local_route_snapshot(
+            &[0; 16],
+            1,
+            &primary,
+            &[],
+            &[wire::LuReachability {
+                lu: Some(name("OTHER", "USER1")),
+                hosting_cp: Some(primary.clone()),
+                supported_types: Vec::new(),
+            }]
+        )
+        .is_err());
+        assert!(local_route_snapshot(
+            &[0; 16],
+            1,
+            &primary,
+            &[],
+            &[wire::LuReachability {
+                lu: Some(name("SOLNET", "USER1")),
+                hosting_cp: Some(name("SOLNET", "OTHERCP")),
+                supported_types: Vec::new(),
+            }]
+        )
+        .is_err());
+        assert!(local_route_snapshot(
+            &[0; 16],
+            1,
+            &primary,
+            &[],
+            &[wire::LuReachability {
+                lu: Some(name("SOLNET", "1BAD")),
+                hosting_cp: Some(primary.clone()),
                 supported_types: Vec::new(),
             }]
         )

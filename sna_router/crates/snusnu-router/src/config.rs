@@ -503,6 +503,7 @@ pub(crate) fn parse_cp(input: &str) -> io::Result<wire::SnaName> {
 fn valid_sna_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 8
+        && matches!(value.as_bytes()[0], b'A'..=b'Z' | b'@' | b'#' | b'$')
         && value.bytes().all(|b| {
             b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'@' | b'#' | b'$')
         })
@@ -514,6 +515,13 @@ mod tests {
 
     fn parse(text: &str) -> RouterConfig {
         toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn qualified_names_match_server_sna_identity_syntax() {
+        assert!(parse_cp("SOLNET.CP1").is_ok());
+        assert!(parse_cp("1OLNET.CP1").is_err());
+        assert!(parse_cp("SOLNET.1P1").is_err());
     }
 
     const GOOD: &str = r#"
