@@ -6,7 +6,13 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+mod endpoint;
+#[cfg(target_os = "linux")]
 mod lab;
+#[cfg(target_os = "linux")]
+mod routing;
+#[cfg(target_os = "linux")]
+mod runtime;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -36,11 +42,40 @@ fn run() -> io::Result<()> {
         install_signals();
         return lab::run(&interface_a, &interface_b, mac_a, mac_b);
     }
+    #[cfg(target_os = "linux")]
+    if first.as_deref() == Some("--local-link") {
+        let interface_a = args.next().ok_or_else(usage_error)?;
+        let guest_a = parse_mac(&args.next().ok_or_else(usage_error)?)?;
+        let proxy_a = parse_mac(&args.next().ok_or_else(usage_error)?)?;
+        let interface_b = args.next().ok_or_else(usage_error)?;
+        let guest_b = parse_mac(&args.next().ok_or_else(usage_error)?)?;
+        let proxy_b = parse_mac(&args.next().ok_or_else(usage_error)?)?;
+        if args.next().is_some()
+            || interface_a == interface_b
+            || guest_a == proxy_a
+            || guest_b == proxy_b
+        {
+            return Err(usage_error());
+        }
+        install_signals();
+        return runtime::run(
+            runtime::LlcPeer {
+                interface: &interface_a,
+                guest_mac: guest_a,
+                proxy_mac: proxy_a,
+            },
+            runtime::LlcPeer {
+                interface: &interface_b,
+                guest_mac: guest_b,
+                proxy_mac: proxy_b,
+            },
+        );
+    }
     let site = match first.as_deref() {
         None => "local-dev".to_owned(),
         Some("--help") if args.next().is_none() => {
             println!(
-                "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B"
+                "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B"
             );
             return Ok(());
         }
@@ -70,7 +105,7 @@ fn run() -> io::Result<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B",
+        "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B",
     )
 }
 
