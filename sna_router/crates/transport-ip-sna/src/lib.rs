@@ -3,6 +3,7 @@
 
 pub mod anynet;
 pub mod ee;
+pub mod mptn_bind_negotiation;
 pub mod mptn_compensations;
 pub mod mptn_connect;
 pub mod mptn_gateway;

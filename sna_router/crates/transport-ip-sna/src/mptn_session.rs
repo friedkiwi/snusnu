@@ -11,6 +11,8 @@ use router_core::fid2_bind::{classify_bind, BindClass};
 
 use crate::{
     anynet::{TcpKind, TcpRecord, MAX_RECORD},
+    mptn_bind_negotiation::validate_positive_response,
+    mptn_compensations::{required_from_connect, CompensationSet},
     mptn_connect::{Address, Connect, Direction},
     mptn_gateway::{mptn_normal_to_native, native_normal_to_mptn, NativeSessionAddress},
 };
@@ -52,6 +54,7 @@ enum State {
 
 pub struct GatewaySession {
     policy: BindPolicy,
+    available_compensations: CompensationSet,
     state: State,
     pending_tcp: usize,
     pending_native: usize,
@@ -107,7 +110,9 @@ fn reserve(pending: &mut usize, limit: usize, bytes: usize) -> io::Result<()> {
 }
 
 impl GatewaySession {
-    pub fn new(policy: BindPolicy) -> io::Result<Self> {
+    /// `available_compensations` must describe implemented transport handlers,
+    /// rather than options requested by the peer or operator configuration.
+    pub fn new(policy: BindPolicy, available_compensations: CompensationSet) -> io::Result<Self> {
         encode_lu_name(&policy.plu)?;
         encode_lu_name(&policy.slu)?;
         if let Some(mode) = &policy.mode {
@@ -131,6 +136,7 @@ impl GatewaySession {
         }
         Ok(Self {
             policy,
+            available_compensations,
             state: State::Idle,
             pending_tcp: 0,
             pending_native: 0,
@@ -183,6 +189,17 @@ impl GatewaySession {
                 "MPTN Connect addresses or direction do not match BIND",
             ));
         }
+        let required = required_from_connect(&template)
+            .map_err(|_| invalid("MPTN Connect lacks valid required compensations"))?;
+        if !required.is_complete_tcp62()
+            || !required
+                .missing_from(self.available_compensations)
+                .is_empty()
+        {
+            return Err(invalid(
+                "MPTN Connect requires unavailable compensation handlers",
+            ));
+        }
         let data = piu
             .get(4..)
             .ok_or_else(|| invalid("truncated native BIND header"))?;
@@ -233,6 +250,15 @@ impl GatewaySession {
                 "MPTN peer rejected BIND",
             ));
         }
+        let required = required_from_connect(&response)
+            .map_err(|_| invalid("MPTN response lacks valid required compensations"))?;
+        if !required.is_complete_tcp62()
+            || !required
+                .missing_from(self.available_compensations)
+                .is_empty()
+        {
+            return Err(invalid("MPTN response requests unavailable compensations"));
+        }
         let data = response.connection_data();
         if data.len() < 6
             || data[2] & 0xe0 != 0xe0
@@ -241,6 +267,8 @@ impl GatewaySession {
         {
             return Err(invalid("MPTN Connect lacks supported RSP(BIND)"));
         }
+        validate_positive_response(request.connection_data(), data)
+            .map_err(|_| invalid("MPTN BIND response does not negotiate the requested session"))?;
         let mut piu = Vec::with_capacity(data.len() + 4);
         piu.extend_from_slice(&[
             0x2d | (u8::from(native.odai) << 1),
@@ -327,7 +355,27 @@ impl GatewaySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mptn_compensations::TCP62_REQUIRED;
     use crate::mptn_connect::{OptionalField, TransportRequirements};
+
+    fn full_capabilities() -> CompensationSet {
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap()
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn captured_user_bind() -> Vec<u8> {
+        // V4R4 user BIND p71, with only FID2 addresses/ODAI normalized for
+        // this synthetic session. No application data follows the BIND.
+        let mut piu = vec![0x2d, 0, 1, 2];
+        piu.extend(hex("00006b850031001307b0b051330383c7c78303060200000000000000944340000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301235069de6780000c04e2d6d3d5c5e34be2d5c1c10a1300b0235069de678000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e3"));
+        piu
+    }
 
     fn test_policy() -> BindPolicy {
         BindPolicy {
@@ -372,11 +420,18 @@ mod tests {
                 max_expedited: 256,
                 max_termination: 256,
             },
-            options: vec![OptionalField {
-                kind: 0x0a,
-                processing: 0x02,
-                value: vec![0x31],
-            }],
+            options: vec![
+                OptionalField {
+                    kind: 0x0a,
+                    processing: 0x02,
+                    value: vec![0x31],
+                },
+                OptionalField {
+                    kind: 0x19,
+                    processing: 0x0a,
+                    value: vec![0x00, 0x20, 0x01, 0x03, 0x10, 0x83],
+                },
+            ],
         }
     }
 
@@ -384,19 +439,14 @@ mod tests {
         let mut response = request.clone();
         response.direction = Direction::PositiveResponse;
         response.processing = 0x8a;
-        response
-            .options
-            .iter_mut()
-            .find(|option| option.kind == 0x0a)
-            .unwrap()
-            .value = vec![0, 0, 0xeb, 0x80, 0, 0x31, 0];
+        response.options[0].value = hex("0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1");
         TcpRecord::decode(response.encode().unwrap()).unwrap()
     }
 
     #[test]
     fn bind_opens_then_normal_records_use_native_session_addresses() {
-        let mut session = GatewaySession::new(test_policy()).unwrap();
-        let bind = native_bind(&[1, 2]); // Blank mode as observed on user BIND.
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let bind = captured_user_bind(); // Blank mode as observed on user BIND.
         let request = session
             .begin_native_bind(&bind, request_template())
             .unwrap();
@@ -429,7 +479,7 @@ mod tests {
 
     #[test]
     fn management_and_unconfigured_modes_cannot_open_gateway() {
-        let mut session = GatewaySession::new(test_policy()).unwrap();
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
         let management = native_bind(&[9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]);
         assert!(session
             .begin_native_bind(&management, request_template())
@@ -442,17 +492,35 @@ mod tests {
         let mut strict = test_policy();
         strict.allow_blank_mode = false;
         strict.mode = Some("APPTEST".into());
-        let mut session = GatewaySession::new(strict).unwrap();
+        let mut session = GatewaySession::new(strict, full_capabilities()).unwrap();
         assert!(session
             .begin_native_bind(&named, request_template())
             .is_ok());
     }
 
     #[test]
+    fn unavailable_or_unadvertised_compensations_cannot_open_gateway() {
+        let only_normal = CompensationSet::from_codes(&[0x00]).unwrap();
+        let mut session = GatewaySession::new(test_policy(), only_normal).unwrap();
+        assert!(session
+            .begin_native_bind(&captured_user_bind(), request_template())
+            .is_err());
+        assert_eq!(session.phase(), Phase::Idle);
+
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let mut template = request_template();
+        template.options.retain(|option| option.kind != 0x19);
+        assert!(session
+            .begin_native_bind(&captured_user_bind(), template)
+            .is_err());
+        assert_eq!(session.phase(), Phase::Idle);
+    }
+
+    #[test]
     fn stale_or_negative_connect_response_does_not_establish_session() {
-        let mut session = GatewaySession::new(test_policy()).unwrap();
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
         let request = session
-            .begin_native_bind(&native_bind(&[1, 2]), request_template())
+            .begin_native_bind(&captured_user_bind(), request_template())
             .unwrap();
         let decoded = Connect::decode(&request.bytes).unwrap();
         let mut stale = decoded.clone();
@@ -462,6 +530,18 @@ mod tests {
         stale.options[0].value = vec![0, 0, 0xeb, 0x80, 0, 0x31, 0];
         let stale = TcpRecord::decode(stale.encode().unwrap()).unwrap();
         assert!(session.receive_connect_response(&stale).is_err());
+        assert_eq!(session.phase(), Phase::Opening);
+        let mut bad_bind = decoded.clone();
+        bad_bind.direction = Direction::PositiveResponse;
+        bad_bind.processing = 0x8a;
+        let good_response = response_for(&decoded);
+        bad_bind.options[0].value = Connect::decode(&good_response.bytes)
+            .unwrap()
+            .connection_data()
+            .to_vec();
+        *bad_bind.options[0].value.last_mut().unwrap() ^= 1;
+        let bad_bind = TcpRecord::decode(bad_bind.encode().unwrap()).unwrap();
+        assert!(session.receive_connect_response(&bad_bind).is_err());
         assert_eq!(session.phase(), Phase::Opening);
         let mut negative = decoded.clone();
         negative.direction = Direction::NegativeResponse;
@@ -474,9 +554,9 @@ mod tests {
 
     #[test]
     fn credit_and_unsupported_record_types_are_enforced() {
-        let mut session = GatewaySession::new(test_policy()).unwrap();
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
         let request = session
-            .begin_native_bind(&native_bind(&[1, 2]), request_template())
+            .begin_native_bind(&captured_user_bind(), request_template())
             .unwrap();
         let decoded = Connect::decode(&request.bytes).unwrap();
         session
