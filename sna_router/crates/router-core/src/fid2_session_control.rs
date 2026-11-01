@@ -18,7 +18,7 @@ const V4R4_MANAGEMENT_REQUEST_FIXED: [u8; 27] = [
 // adaptive-pacing indicators; all remaining supported fixed fields agree.
 const V4R4_MANAGEMENT_RESPONSE_FIXED: [u8; 27] = [
     0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x00, 0x80, 0x86, 0x86, 0x80, 0x00, 0x06, 0x02,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x40, 0x00,
 ];
 const SNASVCMG: [u8; 8] = [0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
 
@@ -152,11 +152,11 @@ impl ManagementBind {
     /// negotiation: other fixed parameter sets, cryptography, and unrecognized
     /// control vectors are rejected. Structured user subfield X'13' is ignored
     /// as required for an unrecognized subfield. The caller must implement
-    /// the selected adaptive IPM or fixed IPR pacing, CNOS, and parallel-
-    /// session behavior before transmitting. Unlike the captured OS/400
-    /// response, byte 23 is
-    /// zero: this peer does not provide conversation security or password
-    /// substitution.
+    /// the selected adaptive IPM or fixed IPR pacing, CNOS, parallel-session
+    /// behavior, and CONFIRM before transmitting. Unlike the captured OS/400
+    /// response, byte 23 is zero because this peer provides no conversation
+    /// security or password substitution; byte 24 negotiates CONFIRM rather
+    /// than claiming SYNCPT/backout support.
     pub fn build_v4r4_positive_response(
         &self,
         request_piu: &[u8],
@@ -432,9 +432,10 @@ mod tests {
             .unwrap();
         // SC31-6808-0 permits the unrecognized X'13' user subfield to be
         // discarded. The 89-byte expectation negotiates adaptive pacing,
-        // advertises no security features, and carries our SLU name/FQPCID.
+        // advertises no security features or SYNCPT/backout, and carries our
+        // SLU name/FQPCID.
         let expected = hex_bytes(concat!(
-            "2f0002010000eb800031001307b0b0513300808686800006020000000000000000434000",
+            "2f0002010000eb800031001307b0b0513300808686800006020000000000000000234000",
             "001b000902e2d5c1e2e5c3d4c70203020c05e2d6d3d5c5e34be2d5c1c2",
             "000060141111111111111111111111111111111111111111"
         ));
@@ -451,6 +452,7 @@ mod tests {
             .unwrap();
         assert_eq!(&fixed[9 + 8..9 + 14], &[7, 1, 0x86, 0x86, 0x81, 7]);
         assert_eq!(fixed[9 + 23], 0); // No local conversation security.
+        assert_eq!(fixed[9 + 24], 0x23); // CONFIRM, parallel sessions, CNOS.
         assert_eq!(bind.correlate_positive_response(&fixed), Ok(()));
         assert_eq!(
             bind.build_v4r4_positive_response(
