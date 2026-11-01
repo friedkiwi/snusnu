@@ -30,7 +30,24 @@ message OriginWithdraw {
 message RouteExport {
   uint64 id = 1;
   uint64 generation = 2;
-  string peer_id = 3; // Operator-assigned identity, independent of wire DLC.
+
+  // SNA identity, independent of LLC, AnyNet, EE, or another local wire DLC.
+  // A CP route is node adjacency; an LU route is one reachable location.
+  oneof resource {
+    SnaName control_point = 3;
+    LuReachability logical_unit = 4;
+  }
+}
+
+// Network-qualified SNA name: each component is 1-8 SNA name characters.
+message SnaName {
+  string netid = 1;
+  string name = 2;
+}
+
+message LuReachability {
+  SnaName lu = 1;
+  SnaName hosting_cp = 2; // Optional when the owning CP is known.
 }
 
 // Included in a circuit OPEN, which also carries its own circuit ID. The

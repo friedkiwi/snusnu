@@ -26,6 +26,8 @@ STRPASTHR RMTLOCNAME(SNAB)  [A]
 
 Use the `CHGNETA` line marked for each guest, not both. Change B's cloned TCP/IP interface address if TCP/IP is enabled; duplicate addresses are unrelated to APPC but interfere with ordinary IP tests.
 
+The lab deliberately gives each guest's control point and default local location the same name. `SOLNET.SNAB` is therefore both B's network-qualified CP and its default LU/location here; these are distinct OS/400 settings. See [OS/400 SNA names](os400-sna-names.md).
+
 Build and start the Rust relay before varying A's controller on:
 
 ```sh
