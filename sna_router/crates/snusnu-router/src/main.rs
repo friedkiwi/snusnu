@@ -19,6 +19,8 @@ mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
 #[cfg(target_os = "linux")]
+mod mptn_gateway_port;
+#[cfg(target_os = "linux")]
 mod mptn_ingress_lab;
 #[cfg(target_os = "linux")]
 mod native_converter_lab;
