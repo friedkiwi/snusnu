@@ -58,6 +58,7 @@ enum Completion {
     ManagementCnos(Vec<u8>),
     ManagementBis(Vec<u8>),
     UserConnect,
+    UserRecord,
 }
 
 struct Association {
@@ -75,6 +76,7 @@ pub(crate) struct MptnGatewayPort {
     udp: UdpSocket,
     active: Option<Association>,
     management_ready: bool,
+    completed_user_records: usize,
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -103,6 +105,7 @@ impl MptnGatewayPort {
             udp,
             active: None,
             management_ready: false,
+            completed_user_records: 0,
         })
     }
 
@@ -197,6 +200,9 @@ impl MptnGatewayPort {
                 }
                 (SessionState::UserResponseQueued(offer), Completion::UserConnect) => {
                     association.state = SessionState::UserActive(offer.clone());
+                }
+                (SessionState::UserActive(_), Completion::UserRecord) => {
+                    self.completed_user_records += 1;
                 }
                 _ => return Err(invalid("TCP62 write completed in wrong gateway phase")),
             }
@@ -390,6 +396,34 @@ impl MptnGatewayPort {
         association.user_inflight = false;
         Ok(())
     }
+
+    /// Queue one fully converted outbound TCP62 user record. A `false`
+    /// result consumes no native/WS credit. Completion is reported only
+    /// after the socket accepts the record's final byte.
+    pub(crate) fn queue_user_record(&mut self, record: &TcpRecord) -> io::Result<bool> {
+        let association = self
+            .active
+            .as_mut()
+            .ok_or_else(|| invalid("no TCP62 user association"))?;
+        if !matches!(association.state, SessionState::UserActive(_))
+            || record.kind == TcpKind::Connect
+            || TcpRecord::decode(record.bytes.clone())?.kind != record.kind
+        {
+            return Err(invalid("outbound TCP62 user record is not admissible"));
+        }
+        if association.writes.len() >= MAX_WRITES || !association.tcp.has_capacity() {
+            return Ok(false);
+        }
+        match Self::queue(association, record.bytes.clone(), Completion::UserRecord) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn take_completed_user_records(&mut self) -> usize {
+        std::mem::take(&mut self.completed_user_records)
+    }
 }
 
 fn fresh_token() -> io::Result<[u8; 7]> {
@@ -472,5 +506,63 @@ mod tests {
         assert!(rejected);
         assert!(!port.management_ready());
         assert!(port.active.is_none());
+    }
+
+    #[test]
+    fn outbound_user_credit_waits_for_socket_write_completion() {
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::default(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+        })
+        .unwrap();
+        let address = port.listener.local_addr().unwrap();
+        let mut client = peer_socket(address);
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (stream, _) = port.listener.accept().unwrap();
+        let mut ingress = IngressSession::new(IngressPolicy {
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            user_mode: None,
+            allow_blank_user_mode: false,
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            forbidden_fqpcid: None,
+        })
+        .unwrap();
+        // The offer is only a state placeholder here; this test isolates
+        // actual TCP delivery credit from BIND conversion.
+        let offer = ingress
+            .receive(request().connect_request())
+            .unwrap()
+            .clone();
+        port.active = Some(Association {
+            tcp: TcpSession::new(stream).unwrap(),
+            state: SessionState::UserActive(offer),
+            incoming: VecDeque::new(),
+            incoming_bytes: 0,
+            writes: VecDeque::new(),
+            user_inflight: false,
+        });
+        let record = TcpRecord::decode(vec![0, 0, 0, 8, 0, 0, 1, 2]).unwrap();
+        assert!(port.queue_user_record(&record).unwrap());
+        assert_eq!(port.take_completed_user_records(), 0);
+        port.poll_once(true).unwrap();
+        assert_eq!(port.take_completed_user_records(), 1);
+        assert_eq!(port.take_completed_user_records(), 0);
+        let mut received = [0u8; 8];
+        use std::io::Read;
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(received, record.bytes.as_slice());
     }
 }
