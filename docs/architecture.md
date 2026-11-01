@@ -20,7 +20,7 @@ The Rust `router-core` owns the initial LLC parser and LLC2 state machine. The f
 
 Every circuit needs a bounded queue, explicit credit accounting, and a scheduler that gives independent circuits fair service. Exhausted credit or a full queue applies backpressure rather than allowing unlimited buffering. A connection generation changes on reconnect; messages from earlier generations must be rejected so an old close, reset, or data message cannot affect a replacement connection. Route changes or lost connections reset affected circuits rather than silently moving a live LLC2 association.
 
-WSS server authentication and site authentication will protect the transport. Authorization must be checked independently for MAC/SAP claims and circuit opens. Payload and circuit limits, strict parsing, and redacted diagnostics form further boundaries. Authentication, authorization and WSS are design requirements, not current features.
+WSS server authentication and concentrator-owned [router identity](router-identity.md) will protect remote transport. Authorization must be checked independently for CP/LU reachability claims and circuit opens. Payload and circuit limits, strict parsing, and redacted diagnostics form further boundaries. Authentication, authorization and WSS are design requirements, not current features.
 
 ## Stages
 

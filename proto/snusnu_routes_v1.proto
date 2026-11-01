@@ -4,24 +4,30 @@ package snusnu.control.v1;
 
 option go_package = "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1;routesv1";
 
+// Sent by the concentrator after authenticating the WebSocket. The Rust
+// router displays/logs this stable server-owned UUID but never proposes it.
+message RouterWelcome {
+  bytes router_id = 1; // Exactly 16 UUID bytes.
+}
+
 // Sent by a Rust router to the concentrator after authentication and whenever
-// its exported reachability changes. The sender cannot supply its origin ID.
+// its exported reachability changes. The sender cannot supply its router ID.
 message RouteSnapshot {
   bytes epoch = 1;                 // Exactly 16 bytes; new on each connection.
   uint64 revision = 2;             // Starts at 1; increases within an epoch.
   repeated RouteExport routes = 3; // Complete replacement, including empty.
 }
 
-// Sent by the concentrator to authorized Rust peers. Origin is taken from the
-// authenticated upstream connection, never from a publisher-controlled field.
+// Sent by the concentrator to authorized Rust peers. Router ID is taken from
+// the authenticated upstream connection, never from a publisher field.
 message OriginRouteSnapshot {
-  string origin = 1;
+  bytes router_id = 1; // Exactly 16 UUID bytes.
   RouteSnapshot snapshot = 2;
 }
 
 // Sent by the concentrator on disconnect, replacement, or policy withdrawal.
 message OriginWithdraw {
-  string origin = 1;
+  bytes router_id = 1; // Exactly 16 UUID bytes.
   bytes epoch = 2;
 }
 
@@ -53,7 +59,7 @@ message LuReachability {
 // Included in a circuit OPEN, which also carries its own circuit ID. The
 // origin checks the reference against its current export and authorization.
 message RouteReference {
-  string origin = 1;
+  bytes router_id = 1; // Exactly 16 UUID bytes.
   bytes epoch = 2;
   uint64 route_id = 3;
   uint64 route_generation = 4;
