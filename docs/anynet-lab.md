@@ -243,3 +243,25 @@ meaning of that second PIU and B's first response still need protocol-level
 validation before accepting it as ordinary pacing. The private captures are
 `native-sustained2-sol5.pcap` and `native-sustained2-sol7.pcap` in the same
 lab directories; both devices were varied off afterward.
+
+A third local sustained run forwarded B's first FMD positive response and
+V4's separate user IPR and positive response across the LLC/AnyNet boundary.
+B then sent a 525-byte TCP62 normal record whose SNA body began with an RQE1
+and definite-response request. The Rust diagnostic stopped with
+`TCP62 definite response request is unsupported or outstanding` before that
+record reached V4. The V4 workstation did not reach remote Sign On. Private
+captures are `native-sustained3-sol5.pcap` and
+`native-sustained3-sol7.pcap` in the same lab directories.
+
+After adding the bounded RQE1/definite-response handling, a fourth local
+run reached V5R4 B's remote Sign On screen from the V4R4 A workstation.
+The screen identified B's system and virtual display; no credentials were
+entered. The Sign On stayed stable until the Rust diagnostic was stopped
+cleanly. The private `native-sustained4-sol5.pcap` and
+`native-sustained4-sol7.pcap` captures contain 60 and 26 packets respectively,
+with zero capture drops. Attempts to invoke System Request from the remote
+Sign On did not produce a visible menu, so normal application `ENDPASTHR`
+teardown was not verified in this run. After stopping the diagnostic, V4's
+`SNAB` controller and device and B's `SNAA00` device were varied off. This
+run verifies local LLC2-to-AnyNet conversion through remote Sign On; it does
+not exercise the concentrator or WebSocket route.
