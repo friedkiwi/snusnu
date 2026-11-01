@@ -219,21 +219,24 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
                     )?;
                     tracing::info!("TCP62 user BIND offered to virtual native link");
                 }
-                GatewayEvent::UserNormal(record) | GatewayEvent::UserExpedited(record) => {
+                GatewayEvent::UserNormal(record)
+                | GatewayEvent::UserExpedited(record)
+                | GatewayEvent::UserAbort(record) => {
                     if virtual_port.submit_tcp_user_record(&record)? {
                         tcp.complete_user_record()?;
                     } else {
                         pending_user_input = Some(record);
                     }
                 }
-                GatewayEvent::UserAbort(_) => {
-                    return Err(invalid("TCP62 user Abort handling unavailable"))
-                }
                 GatewayEvent::Closed => {
+                    if virtual_port.user_closed() {
+                        tracing::info!("TCP62 user session closed after native teardown");
+                        return Ok(());
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "TCP62 peer closed",
-                    ))
+                    ));
                 }
                 GatewayEvent::Rejected(reason) => {
                     return Err(invalid(format!("TCP62 peer rejected: {reason}")))
@@ -247,7 +250,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
                 }
             }
         }
-        let _ = tcp.take_completed_user_records();
+        virtual_port.complete_tcp_user_records(tcp.take_completed_user_records())?;
         thread::sleep(Duration::from_micros(200));
     }
     if STOP.load(Ordering::Relaxed) {
