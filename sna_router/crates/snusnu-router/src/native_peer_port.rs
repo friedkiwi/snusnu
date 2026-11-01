@@ -723,6 +723,7 @@ fn validate_converter_bind(
     management: &router_core::fid2_session_control::ManagementBind,
     plu: &str,
     slu: &str,
+    management_closed: bool,
 ) -> io::Result<UserBindOffer> {
     // A complete supported FID2 BIND is at most a 256-byte RU plus TH/RH.
     // Bound the one deferred offer before copying it into session state.
@@ -732,11 +733,12 @@ fn validate_converter_bind(
             "converter user BIND exceeds bounded PIU",
         ));
     }
-    let offer = UserBindOffer::from_request_with_policy(
-        piu,
-        management,
-        UserBindPolicy { plu, slu, mode: "" },
-    )
+    let policy = UserBindPolicy { plu, slu, mode: "" };
+    let offer = if management_closed {
+        UserBindOffer::from_request_after_management(piu, management, policy)
+    } else {
+        UserBindOffer::from_request_with_policy(piu, management, policy)
+    }
     .map_err(management_error)?;
     offer.build_fixed_response(1).map_err(management_error)?;
     Ok(offer)
@@ -768,7 +770,8 @@ fn queue_converter_bind(
             "duplicate converter user BIND",
         ));
     }
-    let validated = validate_converter_bind(piu, management, plu, slu)?;
+    let validated =
+        validate_converter_bind(piu, management, plu, slu, phase == ManagementPhase::Closed)?;
     tracing::info!(
         daf = validated.daf,
         oaf = validated.oaf,
@@ -943,7 +946,8 @@ mod completion_tests {
 
     #[test]
     fn user_bind_after_management_unbind_is_published_immediately() {
-        let (management, piu) = bind_pair();
+        let (management, mut piu) = bind_pair();
+        piu[2] = 1; // OS/400 can reuse the retired management DAF.
         let mut offer = None;
         let mut pending = false;
         let mut events = VecDeque::new();

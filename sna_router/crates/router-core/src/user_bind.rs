@@ -91,6 +91,25 @@ impl UserBindOffer {
         management: &ManagementBind,
         policy: UserBindPolicy<'_>,
     ) -> Result<Self, UserBindError> {
+        Self::from_request_with_policy_internal(piu, management, policy, false)
+    }
+
+    /// A completed management session may release its local address pair.
+    /// The caller must have observed its UNBIND before using this constructor.
+    pub fn from_request_after_management(
+        piu: &[u8],
+        management: &ManagementBind,
+        policy: UserBindPolicy<'_>,
+    ) -> Result<Self, UserBindError> {
+        Self::from_request_with_policy_internal(piu, management, policy, true)
+    }
+
+    fn from_request_with_policy_internal(
+        piu: &[u8],
+        management: &ManagementBind,
+        policy: UserBindPolicy<'_>,
+        management_closed: bool,
+    ) -> Result<Self, UserBindError> {
         let info = classify_bind(piu)
             .map_err(UserBindError::Invalid)?
             .ok_or(UserBindError::WrongMode)?;
@@ -108,7 +127,7 @@ impl UserBindOffer {
             || !matches!(&piu[6..9], [0x6b, 0x80, 0] | [0x6b, 0x85, 0])
             || info.daf == 0
             || info.oaf == 0
-            || (info.daf, info.oaf) == management.request_addresses()
+            || (!management_closed && (info.daf, info.oaf) == management.request_addresses())
         {
             return Err(UserBindError::WrongSession);
         }
@@ -251,6 +270,17 @@ mod tests {
             UserBindOffer::from_request(&same_address, &mgmt, ""),
             Err(UserBindError::WrongSession)
         );
+        let reused = UserBindOffer::from_request_after_management(
+            &same_address,
+            &mgmt,
+            UserBindPolicy {
+                plu: "SOLNET.SNAA",
+                slu: "SOLNET.SNAB",
+                mode: "",
+            },
+        )
+        .unwrap();
+        assert_eq!((reused.daf, reused.oaf), mgmt.request_addresses());
         let mut same_instance = piu;
         let offset = same_instance
             .windows(2)
