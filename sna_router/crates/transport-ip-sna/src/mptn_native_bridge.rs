@@ -78,6 +78,10 @@ impl Bridge {
         self.phase
     }
 
+    pub fn pending_bytes(&self) -> (usize, usize) {
+        self.gateway.pending_bytes()
+    }
+
     pub fn begin_native_bind(&mut self, piu: &[u8], template: Connect) -> io::Result<TcpRecord> {
         if self.phase != Phase::Idle {
             return Err(wrong_phase());

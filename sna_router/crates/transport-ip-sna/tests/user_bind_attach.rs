@@ -3,13 +3,16 @@
 
 use router_core::fid2_session_control::ManagementBind;
 use std::{
-    io::Read,
+    collections::VecDeque,
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
+    time::{Duration, Instant},
 };
 use transport_ip_sna::{
     anynet::{TcpKind, TcpRecord, TcpSession, MAX_RECORD},
     mptn_compensations::{CompensationSet, TCP62_REQUIRED},
     mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
+    mptn_gateway_edge::{GatewayEdge, NativeEvent, NativeLeg},
     mptn_native_bridge::{Bridge, Phase as BridgePhase},
     mptn_session::{BindPolicy, GatewaySession, Phase},
 };
@@ -284,4 +287,109 @@ fn gateway_tcp_credit_releases_after_complete_socket_write() {
         .flush_with_completion(|bytes| completed.push(bytes))
         .unwrap();
     assert_eq!(completed.len(), 1);
+}
+
+#[derive(Default)]
+struct MockNative {
+    events: VecDeque<NativeEvent>,
+    sent: Vec<Vec<u8>>,
+    accepts: bool,
+    closed: bool,
+}
+
+impl NativeLeg for MockNative {
+    fn receive_once(&mut self) -> io::Result<Option<NativeEvent>> {
+        Ok(self.events.pop_front())
+    }
+    fn enqueue(&mut self, piu: &[u8]) -> io::Result<bool> {
+        if self.accepts {
+            self.sent.push(piu.to_vec());
+        }
+        Ok(self.accepts)
+    }
+    fn available_slots(&self) -> usize {
+        usize::from(self.accepts)
+    }
+    fn close(&mut self) -> io::Result<()> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+fn read_record(stream: &mut TcpStream) -> Vec<u8> {
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let len = u32::from_be_bytes(prefix) as usize;
+    let mut bytes = vec![0; len];
+    bytes[..4].copy_from_slice(&prefix);
+    stream.read_exact(&mut bytes[4..]).unwrap();
+    bytes
+}
+
+#[test]
+fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let mut native = MockNative {
+        accepts: true,
+        ..Default::default()
+    };
+    native.events.push_back(NativeEvent::UserBind(user_bind()));
+    let mut edge = GatewayEdge::new(native, TcpSession::new(sender).unwrap(), bridge, template());
+
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.phase(), BridgePhase::AwaitConnect);
+    edge.flush_tcp().unwrap();
+    let connect = Connect::decode(&read_record(&mut peer)).unwrap();
+    peer.write_all(&positive_response(&connect).bytes).unwrap();
+    edge.native_mut().accepts = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.phase() == BridgePhase::AwaitConnect && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(edge.phase(), BridgePhase::NativeBindPrepared);
+    assert!(edge.native_mut().sent.is_empty()); // Native backpressure.
+    edge.native_mut().accepts = true;
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.phase(), BridgePhase::AwaitNativeBindAck);
+    assert_eq!(edge.native_mut().sent.len(), 1);
+
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::BindResponseAck(1));
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.phase(), BridgePhase::Active);
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::FirstAttach(first_user_attach()));
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.pending_gateway_bytes(), (243, 0));
+    assert_eq!(edge.native_mut().sent[1], hex("2d0002010000830100"));
+    edge.flush_tcp().unwrap();
+    assert_eq!(edge.pending_gateway_bytes(), (0, 0));
+    let normal = TcpRecord::decode(read_record(&mut peer)).unwrap();
+    assert_eq!(normal.kind, TcpKind::Normal);
+    assert_eq!(normal.bytes.len(), 243);
+
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    assert!(edge.poll_native_once().is_err()); // Duplicate ACK aborts the edge.
+    assert!(edge.is_closed());
+    assert!(edge.native_mut().closed);
 }
