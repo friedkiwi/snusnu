@@ -39,7 +39,7 @@ struct PendingOpen {
 }
 
 struct Broker {
-    outbound: [mpsc::Sender<Body>; 2],
+    outbound: [mpsc::SyncSender<Body>; 2],
     routes: [Option<wire::RouteSnapshot>; 2],
     pending: Option<PendingOpen>,
     active: bool,
@@ -48,8 +48,8 @@ struct Broker {
 impl Broker {
     fn send(&self, side: usize, body: Body) -> io::Result<()> {
         self.outbound[side]
-            .send(body)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "router disconnected"))
+            .try_send(body)
+            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "router queue full or closed"))
     }
 
     fn handle(&mut self, side: usize, body: Body) -> io::Result<()> {
@@ -232,7 +232,7 @@ fn worker(
     side: usize,
     mut socket: WebSocket<TcpStream>,
     outbound: mpsc::Receiver<Body>,
-    incoming: mpsc::Sender<Incoming>,
+    incoming: mpsc::SyncSender<Incoming>,
 ) {
     let _ = socket
         .get_mut()
@@ -321,9 +321,9 @@ fn main() -> io::Result<()> {
             Err(error) => eprintln!("broker: rejected connection: {error}"),
         }
     }
-    let (incoming_tx, incoming_rx) = mpsc::channel();
-    let (send_a, receive_a) = mpsc::channel();
-    let (send_b, receive_b) = mpsc::channel();
+    let (incoming_tx, incoming_rx) = mpsc::sync_channel(128);
+    let (send_a, receive_a) = mpsc::sync_channel(64);
+    let (send_b, receive_b) = mpsc::sync_channel(64);
     for (side, outbound) in [receive_a, receive_b].into_iter().enumerate() {
         let socket = sockets[side].take().unwrap();
         let incoming = incoming_tx.clone();
