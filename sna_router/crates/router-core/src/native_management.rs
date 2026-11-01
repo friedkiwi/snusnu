@@ -89,6 +89,9 @@ pub struct ManagementSession {
     attach_acks: usize,
     bis: Option<BisPeer>,
     pending_unbind: Option<[u8; 10]>,
+    pending_bis_ipr: Option<[u8; 9]>,
+    bis_ipr_enqueued: bool,
+    bis_acks: usize,
 }
 
 impl ManagementSession {
@@ -109,6 +112,9 @@ impl ManagementSession {
             attach_acks: 0,
             bis: None,
             pending_unbind: None,
+            pending_bis_ipr: None,
+            bis_ipr_enqueued: false,
+            bis_acks: 0,
         }
     }
 
@@ -342,22 +348,47 @@ impl ManagementSession {
         Ok(())
     }
 
-    pub fn observe_remote_bis(&mut self, piu: &[u8]) -> Result<(), ManagementError> {
+    pub fn observe_remote_bis(&mut self, piu: &[u8]) -> Result<&[u8], ManagementError> {
         if self.phase != Phase::CnosComplete {
             return Err(ManagementError::UnexpectedState);
         }
+        let mut pacing = self
+            .pacing
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?
+            .clone();
+        pacing.receive_request(piu.get(7).copied().unwrap_or(0) & PACING_INDICATOR != 0)?;
+        pacing.grant_receive_window()?;
         self.bis
             .as_mut()
             .ok_or(ManagementError::UnexpectedState)?
             .observe_remote_bis(piu)?;
-        if self.bis.as_ref().unwrap().complete() {
-            self.phase = Phase::BisComplete;
+        let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
+        let request = self
+            .request
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?;
+        let (daf, oaf) = bind.request_addresses();
+        self.pending_bis_ipr = Some([
+            request[0], 0, oaf, daf, 0, 0, IPR_RH[0], IPR_RH[1], IPR_RH[2],
+        ]);
+        self.pacing = Some(pacing);
+        Ok(self.pending_bis_ipr.as_ref().unwrap())
+    }
+
+    pub fn mark_bis_ipr_enqueued(&mut self, piu: &[u8]) -> Result<(), ManagementError> {
+        if self.phase != Phase::CnosComplete
+            || self.bis_ipr_enqueued
+            || self.pending_bis_ipr.as_ref().map(<[u8; 9]>::as_slice) != Some(piu)
+        {
+            return Err(ManagementError::WrongEgress);
         }
+        self.bis_ipr_enqueued = true;
         Ok(())
     }
 
     pub fn prepare_local_bis(&mut self, bracket_free: bool) -> Result<&[u8], ManagementError> {
-        if self.phase != Phase::CnosComplete {
+        if self.phase != Phase::CnosComplete || !self.bis_ipr_enqueued {
             return Err(ManagementError::UnexpectedState);
         }
         if self.bis.as_ref().and_then(BisPeer::remote).is_none() {
@@ -366,11 +397,19 @@ impl ManagementSession {
             // has no separate local initiation timer or bracket scheduler.
             return Err(ManagementError::UnexpectedState);
         }
-        Ok(self
+        let mut pacing = self
+            .pacing
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?
+            .clone();
+        let pi = pacing.send_request()?;
+        let bis = self
             .bis
             .as_mut()
             .ok_or(ManagementError::UnexpectedState)?
-            .prepare_local_bis(bracket_free)?)
+            .prepare_local_bis_with_pi(bracket_free, pi)?;
+        self.pacing = Some(pacing);
+        Ok(bis)
     }
 
     pub fn mark_local_bis_enqueued(&mut self, piu: &[u8]) -> Result<(), ManagementError> {
@@ -384,9 +423,17 @@ impl ManagementSession {
     }
 
     pub fn acknowledge_bis(&mut self, completed_information: usize) -> Result<(), ManagementError> {
-        if self.phase != Phase::AwaitBisAck || completed_information != 1 {
+        if self.phase != Phase::AwaitBisAck
+            || completed_information == 0
+            || self.bis_acks + completed_information > 2
+        {
             return Err(ManagementError::UnexpectedState);
         }
+        self.bis_acks += completed_information;
+        if self.bis_acks < 2 {
+            return Ok(());
+        }
+        self.pending_bis_ipr = None;
         self.phase = Phase::BisComplete;
         Ok(())
     }
@@ -563,14 +610,18 @@ mod tests {
         assert_eq!(session.phase(), Phase::CnosComplete);
         assert_eq!(session.pacing().unwrap().send_remaining(), 6);
         let remote_bis = [0x2c, 0, 1, 2, 0, 2, 0x4b, 0x91, 0, 0x70];
-        session.observe_remote_bis(&remote_bis).unwrap();
+        let bis_ipr = session.observe_remote_bis(&remote_bis).unwrap().to_vec();
+        assert_eq!(bis_ipr, [0x2d, 0, 2, 1, 0, 0, 0x83, 1, 0]);
+        session.mark_bis_ipr_enqueued(&bis_ipr).unwrap();
         assert_eq!(
             session.prepare_local_bis(false),
             Err(ManagementError::Bis(BisError::BracketBusy))
         );
         let local_bis = session.prepare_local_bis(true).unwrap().to_vec();
-        assert_eq!(local_bis, [0x2c, 0, 2, 1, 0, 2, 0x4b, 0xb1, 0, 0x70]);
+        assert_eq!(local_bis, [0x2c, 0, 2, 1, 0, 2, 0x4b, 0xb0, 0, 0x70]);
         session.mark_local_bis_enqueued(&local_bis).unwrap();
+        assert_eq!(session.phase(), Phase::AwaitBisAck);
+        session.acknowledge_bis(1).unwrap();
         assert_eq!(session.phase(), Phase::AwaitBisAck);
         session.acknowledge_bis(1).unwrap();
         assert_eq!(session.phase(), Phase::BisComplete);

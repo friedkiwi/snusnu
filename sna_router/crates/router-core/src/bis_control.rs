@@ -111,6 +111,17 @@ impl BisPeer {
     /// Build our independent BIS request only once local bracket and waiting
     /// allocation work has drained. It may precede the remote BIS.
     pub fn prepare_local_bis(&mut self, bracket_free: bool) -> Result<&[u8], BisError> {
+        self.prepare_local_bis_with_pi(bracket_free, true)
+    }
+
+    /// The fixed-pacing caller supplies PI for this normal-flow DFC request.
+    /// Adaptive V4R4 captures used PI=1; a second request in a seven-frame
+    /// fixed local window uses PI=0.
+    pub fn prepare_local_bis_with_pi(
+        &mut self,
+        bracket_free: bool,
+        pi: bool,
+    ) -> Result<&[u8], BisError> {
         if self.local_sent || self.pending_local.is_some() {
             return Err(BisError::UnexpectedState);
         }
@@ -126,7 +137,7 @@ impl BisPeer {
             high,
             low,
             0x4b,
-            0xb1,
+            if pi { 0xb1 } else { 0xb0 },
             0,
             0x70,
         ]);

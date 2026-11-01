@@ -252,8 +252,24 @@ impl NativePeerPort {
                 );
             }
             ManagementPhase::CnosComplete => {
-                management
+                if self.endpoint.available_receive_slots() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native BIS needs two LLC egress slots",
+                    ));
+                }
+                let ipr = management
                     .observe_remote_bis(&piu)
+                    .map_err(management_error)?
+                    .to_vec();
+                if !self.endpoint.queue_information(ipr.clone())? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native BIS IPR queue full",
+                    ));
+                }
+                management
+                    .mark_bis_ipr_enqueued(&ipr)
                     .map_err(management_error)?;
                 let local_bis = management
                     .prepare_local_bis(true)
