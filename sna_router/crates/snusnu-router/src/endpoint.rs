@@ -127,6 +127,7 @@ pub(crate) struct Endpoint {
     guest_mac: [u8; 6],
     proxy_mac: [u8; 6],
     llc: Llc2,
+    connect_allowed: bool,
     queued: VecDeque<Vec<u8>>,
     deadline: Option<Instant>,
     connect_after: Option<Instant>,
@@ -151,6 +152,7 @@ impl Endpoint {
             guest_mac,
             proxy_mac,
             llc: Llc2::new(SNA_SAP, SNA_SAP),
+            connect_allowed: true,
             queued: VecDeque::new(),
             deadline: None,
             connect_after: None,
@@ -160,6 +162,19 @@ impl Endpoint {
 
     pub(crate) fn state(&self) -> State {
         self.llc.state()
+    }
+
+    /// Native APPN peers may defer LLC2 contact until XID3 role negotiation
+    /// has completed. Existing relay endpoints keep this gate open.
+    pub(crate) fn set_connect_allowed(&mut self, allowed: bool) -> io::Result<()> {
+        if !allowed && self.llc.state() != State::Disconnected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cannot close LLC connect gate while associated",
+            ));
+        }
+        self.connect_allowed = allowed;
+        Ok(())
     }
 
     /// Apply a concentrator-assigned address before an LLC association is
@@ -244,6 +259,11 @@ impl Endpoint {
             return Ok(vec![Event::Type1(
                 bytes[14..17 + frame.information.len()].to_vec(),
             )]);
+        }
+        if let Some(response) = blocked_sabme_response(&frame, self.connect_allowed) {
+            tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), "SABME rejected before APPN XID3 activation");
+            self.send_llc(&response)?;
+            return Ok(Vec::new());
         }
         let pending_before = self.llc.has_pending_information();
         let effects = self
@@ -426,6 +446,21 @@ fn is_type1(frame: &LlcFrame<'_>) -> bool {
     matches!(frame.control, Control::Unnumbered { byte } if matches!(byte & !0x10, 0xaf | 0xe3))
 }
 
+fn blocked_sabme_response(frame: &LlcFrame<'_>, connect_allowed: bool) -> Option<[u8; 3]> {
+    if connect_allowed {
+        return None;
+    }
+    let Control::Unnumbered { byte } = frame.control else {
+        return None;
+    };
+    if frame.is_response() || byte & !0x10 != 0x6f {
+        return None;
+    }
+    // DM is the architected disconnected-mode response to SABME. Preserve
+    // the command's Poll bit in the response Final bit.
+    Some([frame.ssap, frame.dsap | 1, 0x0f | (byte & 0x10)])
+}
+
 fn llc_error(error: LlcError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("LLC2: {error:?}"))
 }
@@ -433,6 +468,26 @@ fn llc_error(error: LlcError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_early_sabme_with_dm_but_never_responds_to_ua() {
+        let command = LlcFrame {
+            destination: [2, 0, 0, 0, 0, 1],
+            source: [2, 0, 0, 0, 0, 2],
+            dsap: SNA_SAP,
+            ssap: SNA_SAP,
+            control: Control::Unnumbered { byte: 0x7f },
+            information: &[],
+        };
+        assert_eq!(blocked_sabme_response(&command, false), Some([4, 5, 0x1f]));
+        assert_eq!(blocked_sabme_response(&command, true), None);
+        let response = LlcFrame {
+            ssap: SNA_SAP | 1,
+            control: Control::Unnumbered { byte: 0x73 },
+            ..command
+        };
+        assert_eq!(blocked_sabme_response(&response, false), None);
+    }
 
     #[test]
     fn registry_allows_distinct_associations_on_one_interface() {
