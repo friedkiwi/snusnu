@@ -276,6 +276,64 @@ impl Router {
         Ok(())
     }
 
+    /// A managed MAC changes the LLC endpoint's destination address and its
+    /// source association selector. Validate the route table before touching
+    /// the endpoint so a rejected update cannot leave the two out of sync.
+    fn prepare_managed_mac_rebind(
+        &self,
+        peer: &PortId,
+        mac: [u8; 6],
+    ) -> io::Result<Option<(RouteAddress, PortId)>> {
+        let Some(old @ RouteAddress::Mac(_)) = self.destinations.get(peer) else {
+            return Ok(None);
+        };
+        let new = RouteAddress::Mac(mac);
+        if old == &new {
+            return Ok(None);
+        }
+        if self
+            .destinations
+            .iter()
+            .any(|(other, address)| other != peer && address == &new)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("managed MAC {new} is already bound to another port"),
+            ));
+        }
+        let route_target = self
+            .address_routes
+            .get(&(peer.clone(), old.clone()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bound MAC route is absent"))?
+            .clone();
+        if self
+            .address_routes
+            .get(&(peer.clone(), new.clone()))
+            .is_some_and(|target| target != &route_target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("managed MAC {new} already selects another route"),
+            ));
+        }
+        Ok(Some((old.clone(), route_target)))
+    }
+
+    fn finish_managed_mac_rebind(
+        &mut self,
+        peer: &PortId,
+        mac: [u8; 6],
+        old: RouteAddress,
+        route_target: PortId,
+    ) {
+        let new = RouteAddress::Mac(mac);
+        self.address_routes.remove(&(peer.clone(), old.clone()));
+        self.address_routes
+            .insert((peer.clone(), new.clone()), route_target);
+        self.destinations.insert(peer.clone(), new.clone());
+        tracing::info!(port = %peer.0, old_mac = %old, managed_mac = %new, "managed MAC route rebound");
+    }
+
     fn release_completed(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
         let completed = self.port_mut(target)?.take_completed_information_count();
         if completed != 0 {
@@ -326,8 +384,12 @@ impl Router {
                     }
                 }
                 RouterEvent::ManagedMac(mac) => {
+                    let rebind = self.prepare_managed_mac_rebind(&target, mac)?;
                     tracing::info!(source_port = %source.0, target_port = %target.0, mac = %RouteAddress::Mac(mac), "managed MAC routed");
                     self.port_mut(&target)?.on_managed_mac(mac)?;
+                    if let Some((old, route_target)) = rebind {
+                        self.finish_managed_mac_rebind(&target, mac, old, route_target);
+                    }
                 }
                 RouterEvent::Ready => {
                     tracing::info!(source_port = %source.0, target_port = %target.0, "route source ready");
@@ -360,6 +422,7 @@ mod tests {
         credited: usize,
         free_slots: usize,
         managed_macs: Vec<[u8; 6]>,
+        reject_managed_mac: bool,
     }
 
     struct FakePort(Rc<RefCell<State>>);
@@ -394,6 +457,9 @@ mod tests {
             Ok(())
         }
         fn on_managed_mac(&mut self, mac: [u8; 6]) -> io::Result<()> {
+            if self.0.borrow().reject_managed_mac {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "MAC rejected"));
+            }
             self.0.borrow_mut().managed_macs.push(mac);
             Ok(())
         }
@@ -565,11 +631,90 @@ mod tests {
             )
             .unwrap();
         router.bind_destination(&source, cp).unwrap();
+        let initial = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        router
+            .add_address_route(&a_id, initial.clone(), &source)
+            .unwrap();
+        router.bind_destination(&a_id, initial.clone()).unwrap();
         let mac = [0x02, 0x53, 0x4e, 0, 0, 7];
         router
             .dispatch(&source, vec![RouterEvent::ManagedMac(mac)])
             .unwrap();
         assert_eq!(a.borrow().managed_macs, vec![mac]);
         assert!(b.borrow().managed_macs.is_empty());
+        assert_eq!(
+            router.destinations.get(&a_id),
+            Some(&RouteAddress::Mac(mac))
+        );
+        assert_eq!(router.target(&a_id).unwrap(), &source);
+        assert!(!router.address_routes.contains_key(&(a_id.clone(), initial)));
+    }
+
+    #[test]
+    fn managed_mac_collision_is_rejected_before_endpoint_change() {
+        let mut router = Router::new();
+        let remote = fake_port(&mut router, "remote");
+        let target_state = Rc::new(RefCell::new(State::default()));
+        let target = PortId::new("target");
+        router
+            .register_port(target.clone(), Box::new(FakePort(target_state.clone())))
+            .unwrap();
+        let other = fake_port(&mut router, "other-llc");
+        let cp = RouteAddress::ControlPoint {
+            netid: "NET".into(),
+            name: "CPA".into(),
+        };
+        router
+            .add_address_route(&remote, cp.clone(), &target)
+            .unwrap();
+        router.bind_destination(&remote, cp).unwrap();
+        let initial = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        let occupied = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 7]);
+        router
+            .add_address_route(&target, initial.clone(), &remote)
+            .unwrap();
+        router.bind_destination(&target, initial.clone()).unwrap();
+        router
+            .add_address_route(&other, occupied.clone(), &remote)
+            .unwrap();
+        router.bind_destination(&other, occupied).unwrap();
+        let error = router
+            .dispatch(
+                &remote,
+                vec![RouterEvent::ManagedMac([0x02, 0x53, 0x4e, 0, 0, 7])],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(target_state.borrow().managed_macs.is_empty());
+        assert_eq!(router.destinations.get(&target), Some(&initial));
+    }
+
+    #[test]
+    fn endpoint_rejection_keeps_old_mac_route_bound() {
+        let mut router = Router::new();
+        let remote = fake_port(&mut router, "remote");
+        let target_state = Rc::new(RefCell::new(State {
+            reject_managed_mac: true,
+            ..State::default()
+        }));
+        let target = PortId::new("target");
+        router
+            .register_port(target.clone(), Box::new(FakePort(target_state)))
+            .unwrap();
+        router.add_route(&remote, &target).unwrap();
+        let initial = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        router
+            .add_address_route(&target, initial.clone(), &remote)
+            .unwrap();
+        router.bind_destination(&target, initial.clone()).unwrap();
+        let error = router
+            .dispatch(
+                &remote,
+                vec![RouterEvent::ManagedMac([0x02, 0x53, 0x4e, 0, 0, 7])],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(router.destinations.get(&target), Some(&initial));
+        assert_eq!(router.target(&target).unwrap(), &remote);
     }
 }
