@@ -1,8 +1,8 @@
-# AnyNet Solstice baseline
+# AnyNet V5R4 baseline
 
 Two V5R4 OS/400 guests completed a direct AnyNet pass-through and a second pass-through through the Rust AnyNet↔AnyNet proxy on 2026-11-01. A's `STRPASTHR RMTLOCNAME(SNAB)` reached B's remote Sign On and Main Menu; `ENDPASTHR` returned to A in both runs. These are TCP62 peer baselines and do not demonstrate LLC2↔AnyNet conversion.
 
-The guests were writable clones of `solstice/machine-v5r4-net`, booted with the custom Solstice build at commit `8f89217`. They had distinct Ethernet MACs and IP addresses: A `SOLNET.SNAA` / `10.99.4.2` on `sol6`, B `SOLNET.SNAB` / `10.99.4.3` on `sol7`. Only these two TAPs were connected by an isolated `br-ip-sna` bridge. See the [EE lab](ee-lab.md) for the clone identity and IP setup; HPRIP controllers were varied off for this AnyNet run.
+The guests were writable clones of a private V5R4 network template. They had distinct Ethernet MACs and IP addresses: A `SOLNET.SNAA` / `10.99.4.2` on `sol6`, B `SOLNET.SNAB` / `10.99.4.3` on `sol7`. Only these two TAPs were connected by an isolated `br-ip-sna` bridge. See the [EE lab](ee-lab.md) for the clone identity and IP setup; HPRIP controllers were varied off for this AnyNet run.
 
 Both guests had `CHGNETA ALWANYNET(*YES)` and their matching `LCLNETID`, `LCLCPNAME`, and `LCLLOCNAME` values. The host table mapped the remote SNA location alias to its IP address:
 
@@ -18,7 +18,7 @@ CRTCTLAPPC CTLD(ANYTOB) LINKTYPE(*ANYNW) RMTNETID(SOLNET) RMTCPNAME(SNAB)  [A]
 CRTCTLAPPC CTLD(ANYTOA) LINKTYPE(*ANYNW) RMTNETID(SOLNET) RMTCPNAME(SNAA)  [B]
 ```
 
-The unfiltered `sol6` capture showed a TCP connection from A to B port 397, a 230-byte `MPTN_Connect` request, a 189-byte positive response, normal records, expedited records, and expedited acknowledgements. The Connect request carried BIND and the response carried RSP(BIND). A separate idle session emitted a UDP/397 node-pair keepalive after about four minutes: a `0x84` request and `0x84` response, each with both peer IPv4 addresses embedded in its payload. A proxy that changes outer source IPs must translate this address pair or terminate and reoriginate the keepalive. Solstice emits IP in 802.3 SNAP frames, so a conventional `tcpdump udp` or `tcpdump tcp` capture filter on the TAP missed traffic; capture without a filter and inspect offline. Raw captures and application payloads stay outside this repository.
+The unfiltered `sol6` capture showed a TCP connection from A to B port 397, a 230-byte `MPTN_Connect` request, a 189-byte positive response, normal records, expedited records, and expedited acknowledgements. The Connect request carried BIND and the response carried RSP(BIND). A separate idle session emitted a UDP/397 node-pair keepalive after about four minutes: a `0x84` request and `0x84` response, each with both peer IPv4 addresses embedded in its payload. A proxy that changes outer source IPs must translate this address pair or terminate and reoriginate the keepalive. The lab emulator emits IP in 802.3 SNAP frames, so a conventional `tcpdump udp` or `tcpdump tcp` capture filter on the TAP missed traffic; capture without a filter and inspect offline. Raw captures and application payloads stay outside this repository.
 
 The Rust [TCP62 codec](../sna_router/crates/transport-ip-sna/src/mptn_connect.rs) now accepts both observed Connect headers. Its BIND-to-FID2 converter is limited to complete normal PIUs after session establishment. The full LLC2↔AnyNet gateway still needs APPN control handling, BIND/session correlation, pacing, expedited traffic, segmentation, UDP keepalive, and teardown behavior.
 
@@ -97,7 +97,7 @@ sudo ip route replace 10.99.4.3/32 dev sol7 src 10.99.4.10
 ```
 
 The writable B clone's `.2` host-table entry contained both
-`S1054504.SOLSTICE.LOCAL` and `SNAA.SOLNET.SNA.IBM.COM`. To preserve B's
+`S1054504.LABHOST.LOCAL` and `SNAA.SOLNET.SNA.IBM.COM`. To preserve B's
 system hostname, the mixed-lab setup moved only the second name:
 
 ```text
@@ -219,3 +219,16 @@ The private captures are
 After the run, B's `SNAA00` device and V4's `SNAB` controller/device were
 varied off. B's `.10` alias, host route, and isolated sol7 topology remain
 ready for a sustained-flow test.
+
+The first sustained-flow diagnostic advanced one record further. After
+Rust sent A's 242-byte FMH-5 Attach to B, B returned an 83-byte TCP62 normal
+record; Rust forwarded its 82-byte SNA body to A. A acknowledged the LLC
+I-frame and sent its own nine-byte pacing IPR PIU
+`2c0001020000830100`. Rust had previously sent A an IPR
+`2d0002010000830100`, which A also acknowledged. The diagnostic then
+rejected A's IPR as violating session pacing and sent DISC. The failure is
+in the Rust pacing state after a valid peer response, before remote sign-on.
+V4 displayed APPC failure `E022000BA2100000`. Private captures are
+`/tmp/snusnu-v4r4-regression/native-sustained-sol5.pcap` and
+`/tmp/snusnu-v5r4-ip-lab/native-sustained-sol7.pcap`; both guest devices
+were varied off after the run.
