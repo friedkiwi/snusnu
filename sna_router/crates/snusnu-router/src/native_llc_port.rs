@@ -91,6 +91,10 @@ impl NativeLeg for NativeLlcPort {
         NativeLlcPort::available_slots(self)
     }
 
+    fn management_closed(&self) -> bool {
+        self.inner.management_complete()
+    }
+
     fn close(&mut self) -> io::Result<()> {
         NativeLlcPort::close(self)
     }

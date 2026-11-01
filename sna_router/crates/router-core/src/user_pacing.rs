@@ -102,7 +102,25 @@ impl UserPacingSession {
         management: &ManagementBind,
         local_receive_window: u8,
     ) -> Result<Self, UserPacingError> {
-        if (offer.daf, offer.oaf) == management.request_addresses()
+        Self::new_internal(offer, management, local_receive_window, false)
+    }
+
+    /// Caller has completed management UNBIND, releasing its address pair.
+    pub fn new_after_management(
+        offer: &UserBindOffer,
+        management: &ManagementBind,
+        local_receive_window: u8,
+    ) -> Result<Self, UserPacingError> {
+        Self::new_internal(offer, management, local_receive_window, true)
+    }
+
+    fn new_internal(
+        offer: &UserBindOffer,
+        management: &ManagementBind,
+        local_receive_window: u8,
+        management_closed: bool,
+    ) -> Result<Self, UserPacingError> {
+        if (!management_closed && (offer.daf, offer.oaf) == management.request_addresses())
             || &offer.fqpcid == management.fqpcid()
             || offer.request()[0] & 0x08 == 0
         {
@@ -599,6 +617,7 @@ mod tests {
             UserPacingSession::new(&alias, &management, 1),
             Err(UserPacingError::WrongSession)
         ));
+        assert!(UserPacingSession::new_after_management(&alias, &management, 1).is_ok());
         alias = offer;
         alias.fqpcid = *management.fqpcid();
         assert!(matches!(

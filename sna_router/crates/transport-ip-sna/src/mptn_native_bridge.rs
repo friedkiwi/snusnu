@@ -92,13 +92,43 @@ impl Bridge {
     }
 
     pub fn begin_native_bind(&mut self, piu: &[u8], template: Connect) -> io::Result<TcpRecord> {
+        self.begin_native_bind_internal(piu, template, false)
+    }
+
+    pub fn begin_native_bind_after_management(
+        &mut self,
+        piu: &[u8],
+        template: Connect,
+    ) -> io::Result<TcpRecord> {
+        self.begin_native_bind_internal(piu, template, true)
+    }
+
+    fn begin_native_bind_internal(
+        &mut self,
+        piu: &[u8],
+        template: Connect,
+        management_closed: bool,
+    ) -> io::Result<TcpRecord> {
         if self.phase != Phase::Idle {
             return Err(wrong_phase());
         }
-        let offer = UserBindOffer::from_request(piu, &self.management, &self.mode)
-            .map_err(|_| invalid("native user BIND does not match route policy"))?;
-        let pacing = UserPacingSession::new(&offer, &self.management, self.window)
-            .map_err(|_| invalid("native user BIND cannot negotiate fixed pacing"))?;
+        let policy = router_core::user_bind::UserBindPolicy {
+            plu: self.management.plu(),
+            slu: self.management.slu(),
+            mode: &self.mode,
+        };
+        let offer = if management_closed {
+            UserBindOffer::from_request_after_management(piu, &self.management, policy)
+        } else {
+            UserBindOffer::from_request_with_policy(piu, &self.management, policy)
+        }
+        .map_err(|_| invalid("native user BIND does not match route policy"))?;
+        let pacing = if management_closed {
+            UserPacingSession::new_after_management(&offer, &self.management, self.window)
+        } else {
+            UserPacingSession::new(&offer, &self.management, self.window)
+        }
+        .map_err(|_| invalid("native user BIND cannot negotiate fixed pacing"))?;
         // GatewaySession checks the full required X'19' capability set here.
         let record = self.gateway.begin_native_bind(piu, template)?;
         self.offer = Some(offer);

@@ -26,6 +26,9 @@ pub trait NativeLeg {
     fn receive_once(&mut self, can_accept_information: bool) -> io::Result<Option<NativeEvent>>;
     fn enqueue(&mut self, piu: &[u8]) -> io::Result<bool>;
     fn available_slots(&self) -> usize;
+    fn management_closed(&self) -> bool {
+        false
+    }
     fn close(&mut self) -> io::Result<()>;
 }
 
@@ -140,7 +143,12 @@ impl<L: NativeLeg> GatewayEdge<L> {
                         .template
                         .take()
                         .ok_or_else(|| invalid("duplicate user BIND"))?;
-                    self.connect = Some(self.bridge.begin_native_bind(&piu, template)?);
+                    self.connect = Some(if self.native.management_closed() {
+                        self.bridge
+                            .begin_native_bind_after_management(&piu, template)?
+                    } else {
+                        self.bridge.begin_native_bind(&piu, template)?
+                    });
                 }
                 NativeEvent::BindResponseAck(n) => self.bridge.acknowledge_native_bind(n)?,
                 NativeEvent::FirstAttach(piu) => {

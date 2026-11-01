@@ -254,6 +254,28 @@ fn pure_bridge_waits_for_remote_bind_and_native_ack_before_attach() {
 }
 
 #[test]
+fn pure_bridge_reuses_management_address_only_after_teardown() {
+    let mut bind = user_bind();
+    bind[2..4].copy_from_slice(&[3, 4]);
+    let make_bridge = || {
+        Bridge::new(
+            policy(),
+            CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+            management_bind(),
+            [0x30, 0xf0, 0xf0, 0xf5],
+            1,
+        )
+        .unwrap()
+    };
+    let mut early = make_bridge();
+    assert!(early.begin_native_bind(&bind, template()).is_err());
+    let mut retired = make_bridge();
+    assert!(retired
+        .begin_native_bind_after_management(&bind, template())
+        .is_ok());
+}
+
+#[test]
 fn pure_bridge_rejects_unavailable_oob_before_opening() {
     let mut bridge = Bridge::new(
         policy(),
