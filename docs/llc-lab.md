@@ -357,5 +357,16 @@ Menu with APPC failure `E022000BA2100000`. This run does not establish that
 the Attach reached a usable TCP62 peer or that a conversation completed.
 The private unfiltered capture
 `/tmp/snusnu-v4r4-regression/native-converter-mock-sol5.pcap` contains 53
-frames with no capture drops. The mock lifecycle needs repair before this
-acceptance check is repeated.
+frames with no capture drops. This exposed a mock TCP lifecycle defect.
+
+With that defect fixed, a second isolated V4R4 A run reached the same first
+242-byte FMH-5 Attach. Rust produced one 243-byte TCP62 normal record, and
+the in-process loopback mock received it. Rust then sent the nine-byte native
+user IPR, which A acknowledged with LLC RR `N(R)=8`. The harness exited
+successfully and deliberately sent DISC without an application reply. A
+returned to Main Menu with APPC failure `E022000BA2100000`, as expected for
+this bounded test. The private unfiltered capture
+`/tmp/snusnu-v4r4-regression/native-converter-mock2-sol5.pcap` contains 52
+frames with no capture drops. This establishes the first user Attach crossing
+the native LLC2-to-TCP62 boundary in the mock harness, while a real V5R4
+AnyNet peer and completed conversation remain untested.
