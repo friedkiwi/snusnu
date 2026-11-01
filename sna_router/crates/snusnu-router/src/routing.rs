@@ -193,6 +193,8 @@ impl Router {
 
     /// Select the addressed route for a source association. A missing exact
     /// route is an error even when a legacy default route is also configured.
+    /// A source cannot switch destinations in place: an earlier target may
+    /// still own queued information and LLC acknowledgements for that source.
     pub(crate) fn bind_destination(
         &mut self,
         source: &PortId,
@@ -206,6 +208,15 @@ impl Router {
                 io::ErrorKind::NotFound,
                 format!("no route from {} to {address}", source.0),
             ));
+        }
+        if let Some(current) = self.destinations.get(source) {
+            if current != &address {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("destination for {} is already bound to {current}", source.0),
+                ));
+            }
+            return Ok(());
         }
         tracing::info!(source_port = %source.0, destination = %address, "route destination bound");
         self.destinations.insert(source.clone(), address);
@@ -672,6 +683,59 @@ mod tests {
         assert_eq!(ingress_state.borrow().credited, 1);
     }
 
+    #[test]
+    fn destination_rebind_cannot_move_in_flight_credit_to_another_target() {
+        let ingress_state = Rc::new(RefCell::new(State::default()));
+        let first_state = Rc::new(RefCell::new(State {
+            completions: 1,
+            ..State::default()
+        }));
+        let second_state = Rc::new(RefCell::new(State {
+            completions: 1,
+            ..State::default()
+        }));
+        let mut router = Router::new();
+        let ingress = PortId::new("ingress");
+        let first = PortId::new("first");
+        let second = PortId::new("second");
+        for (id, state) in [
+            (&ingress, &ingress_state),
+            (&first, &first_state),
+            (&second, &second_state),
+        ] {
+            router
+                .register_port(id.clone(), Box::new(FakePort(state.clone())))
+                .unwrap();
+        }
+        let first_mac = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        let second_mac = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 2]);
+        router
+            .add_address_route(&ingress, first_mac.clone(), &first)
+            .unwrap();
+        router
+            .add_address_route(&ingress, second_mac.clone(), &second)
+            .unwrap();
+        router
+            .bind_destination(&ingress, first_mac.clone())
+            .unwrap();
+        // Repeating the original binding is safe; moving to the second
+        // target would misattribute the first target's pending completion.
+        router.bind_destination(&ingress, first_mac).unwrap();
+        assert_eq!(
+            router
+                .bind_destination(&ingress, second_mac)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let target = router.target(&ingress).unwrap().clone();
+        assert_eq!(target, first);
+        router.release_completed(&ingress, &target).unwrap();
+        assert_eq!(ingress_state.borrow().credited, 1);
+        assert_eq!(first_state.borrow().completions, 0);
+        assert_eq!(second_state.borrow().completions, 1);
+    }
+
     fn fake_port(router: &mut Router, name: &str) -> PortId {
         let id = PortId::new(name);
         router
@@ -783,8 +847,20 @@ mod tests {
             .bind_destination(&source, unknown_lu.clone())
             .unwrap();
         assert_eq!(router.target(&source).unwrap(), &unknown);
-        router.bind_destination(&source, known_lu.clone()).unwrap();
-        assert_eq!(router.target(&source).unwrap(), &known);
+        assert_eq!(
+            router
+                .bind_destination(&source, known_lu.clone())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(router.target(&source).unwrap(), &unknown);
+        assert_eq!(
+            router
+                .address_routes
+                .get(&(source.clone(), known_lu.clone())),
+            Some(&known)
+        );
         assert_eq!(known_lu.to_string(), "NET.CPA.LU1");
         assert_eq!(unknown_lu.to_string(), "NET.LU1");
     }
