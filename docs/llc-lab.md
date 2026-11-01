@@ -247,6 +247,13 @@ closed before responding to UNBIND, and OS/400 reported an APPC failure. The
 LLC ACK and UNBIND order do not establish user-session acceptance; the next
 probe must answer the management teardown and observe the following user PIU.
 
+The direct two-OS/400 baseline continues after management UNBIND with a
+242-byte user-session FMH-5 Attach (`RH 0b9120`, 36-byte FMH-5 header), then
+an 82-byte user-session reply (`RH 03a100`). A read-only Rust parser now
+recognizes the first Attach header and leaves its application data opaque.
+The reply semantics still need the next live probe and APPC conversation
+implementation before Rust can generate a response.
+
 In the isolated V4R4 A run on 2026-11-01, the probe sent its 89-byte candidate
 user +RSP(BIND), and A acknowledged the LLC I-frame with RR `N(R)=6`. About
 14 ms later A sent a 37-byte PIU with TH `2d 00 01 02 00 00`, RH `6b 80 00`,
