@@ -1263,7 +1263,8 @@ pub(crate) fn local_route_snapshot(
     })
 }
 
-// FNV-1a with a resource-kind prefix and component separators. A collision
+// FNV-1a with a resource-kind prefix and component separators. Go persists
+// IDs in a signed SQLite INTEGER, so reserve the high bit. A zero or collision
 // is rejected above rather than allowing a circuit to reach another route.
 fn stable_route_id(kind: u8, name: &wire::SnaName) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -1276,7 +1277,7 @@ fn stable_route_id(kind: u8, name: &wire::SnaName) -> u64 {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    hash
+    hash & i64::MAX as u64
 }
 
 fn accept_managed_revision(last: &mut u64, next: u64) -> io::Result<()> {
@@ -1976,6 +1977,29 @@ mod tests {
             &r.resource,
             Some(wire::route_export::Resource::LogicalUnit(value)) if value == &lu
         )));
+    }
+
+    #[test]
+    fn qa_cross_netid_lu_ids_fit_concentrator_signed_storage() {
+        for (netid, cp) in [("QAALICE", "SNAA"), ("QABOB", "SNAB")] {
+            let local = name(netid, cp);
+            let snapshot = local_route_snapshot(
+                &[8; 16],
+                1,
+                &local,
+                &[],
+                &[wire::LuReachability {
+                    lu: Some(local.clone()),
+                    hosting_cp: Some(local.clone()),
+                    supported_types: vec![wire::LuType::LuType62 as i32],
+                }],
+            )
+            .unwrap();
+            assert_eq!(snapshot.routes.len(), 2);
+            assert!(snapshot.routes[1].id > 0);
+            assert!(snapshot.routes[1].id <= i64::MAX as u64);
+            assert_ne!(snapshot.routes[1].id, snapshot.routes[0].id);
+        }
     }
 
     #[test]
