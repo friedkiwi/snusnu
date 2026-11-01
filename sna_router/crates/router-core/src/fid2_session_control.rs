@@ -1,7 +1,7 @@
 //! Narrow FID2 session-control checks for a native LU 6.2 management peer.
 //!
-//! IBM *SNA Formats* GA27-3136 describes BIND responses and isolated pacing
-//! responses (IPRs); *LU 6.2 Reference: Peer Protocols* SC31-6808-0 §4
+//! IBM *SNA Formats* GA27-3136 describes BIND responses and adaptive isolated
+//! pacing messages (IPMs); *LU 6.2 Reference: Peer Protocols* SC31-6808-0 §4
 //! requires an SLU to negotiate a positive BIND response before using the
 //! session. This module correlates headers and identities. It does not derive
 //! the negotiated BIND parameters or declare a session active.
@@ -88,8 +88,9 @@ impl ManagementBind {
 
     /// Check a candidate positive response's session-control envelope. The
     /// result means only that its FID2 addresses and LU 6.2 fixed profile
-    /// correlate with this request; it does not validate negotiable fields,
-    /// other negotiable fields. Those are required before transmission.
+    /// correlate with this request. The captured V4R4 response omits both LU
+    /// names; the FQPCID and reversed FID2 addresses tie it to the request.
+    /// Remaining negotiable fields need validation before transmission.
     pub fn correlate_positive_response(&self, piu: &[u8]) -> Result<(), SessionControlError> {
         if piu.len() < 9 + 28 {
             return Err(SessionControlError::TruncatedResponse);
@@ -148,6 +149,9 @@ fn response_mode_and_fqpcid(ru: &[u8]) -> Result<(bool, [u8; 22]), SessionContro
     // V4R4 negotiable response: fixed 27 bytes, PLU length/name, structured
     // user data, URC length/data, SLU length/name, then the FQPCID vector.
     let plu_len = *ru.get(27).ok_or(SessionControlError::TruncatedResponse)? as usize;
+    if plu_len != 0 {
+        return Err(SessionControlError::UnsupportedResponse);
+    }
     let user_len_offset = 28 + plu_len;
     let user_len = *ru
         .get(user_len_offset)
@@ -180,6 +184,9 @@ fn response_mode_and_fqpcid(ru: &[u8]) -> Result<(bool, [u8; 22]), SessionContro
     let slu_len = *ru
         .get(slu_len_offset)
         .ok_or(SessionControlError::TruncatedResponse)? as usize;
+    if slu_len != 0 {
+        return Err(SessionControlError::UnsupportedResponse);
+    }
     let fqpcid_offset = slu_len_offset + 1 + slu_len;
     let vector = ru
         .get(fqpcid_offset..fqpcid_offset + 22)
@@ -274,6 +281,18 @@ mod tests {
         );
         wrong = response();
         wrong[0] = 0x2d;
+        assert_eq!(
+            gate.correlate_positive_response(&wrong),
+            Err(SessionControlError::UnsupportedResponse)
+        );
+        wrong = response();
+        wrong[9 + 27] = 1; // V4R4 +RSP omits the PLU name.
+        assert_eq!(
+            gate.correlate_positive_response(&wrong),
+            Err(SessionControlError::UnsupportedResponse)
+        );
+        wrong = response();
+        wrong[9 + 68] = 1; // V4R4 +RSP omits the SLU name.
         assert_eq!(
             gate.correlate_positive_response(&wrong),
             Err(SessionControlError::UnsupportedResponse)
