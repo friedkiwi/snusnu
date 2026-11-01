@@ -72,8 +72,7 @@ sudo --preserve-env=SNUSNU_ROUTER_TOKEN target/debug/snusnu-router --remote-link
   SOLNET.SNAA SOLNET.SNAB wss://concentrator.example/router/v1/ws
 ```
 
-A second router uses B's TAP and reversed CP/MAC values. The WebSocket path
-awaits the Go `/router/v1/ws` handler before the two-router OS/400 test.
+A second router uses B's TAP and reversed CP/MAC values.
 
 The Rust WebSocket path was also verified with two separate router processes
 and the loopback lab broker, using these same configured V4R4 guests. Start
@@ -95,5 +94,20 @@ bidirectional XID/TEST, link-ready events, SNA information, and credit. The
 first attempt after reboot sent no Ethernet frames until both OS/400 APPC
 controllers were varied on again. A complete session then succeeded.
 
-The Go concentrator still needs its `/router/v1/ws` handler before this exact
-test can run through the production service.
+## Go QA concentrator interoperability
+
+On 2026-11-01, two separate `--remote-link` Rust routers attached to the
+same V4R4 guests through the Go QA concentrator's real `/router/v1/ws`
+handler. The QA process listened on its default `:8081` address and used
+the seeded Alice and Bob router credentials described in
+[QA.md](../concentrator/QA.md). Each router published its local CP and
+received the other's managed CP binding and live route reference.
+
+A issued `STRPASTHR RMTLOCNAME(SNAB)` at 16:32:07 local time, reached B's
+remote Sign On at 16:32:22, signed in to B's Main Menu at 16:32:49, and
+issued `ENDPASTHR` at 16:32:52. A returned to its Main Menu immediately.
+The QA database retained both live CP advertisements and 178 symmetric
+traffic records at the inspection point: 68 Type 1, 100 SNA information,
+and 10 link-ready records. No Rust router warnings or errors were observed.
+The APPC controllers had to be varied on after guest IPL before initiating
+the pass-through session.
