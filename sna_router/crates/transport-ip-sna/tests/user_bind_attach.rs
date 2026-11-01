@@ -563,6 +563,25 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
         .push_back(NativeEvent::EgressAck(1));
     edge.poll_native_once().unwrap();
     assert_eq!(edge.pending_gateway_bytes(), (0, 0));
+
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::UserInformation(next_user_normal()));
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.native_mut().ingress_capacity.last(), Some(&true));
+    assert_eq!(edge.pending_gateway_bytes(), (11, 0));
+    assert_eq!(edge.native_mut().sent[4], hex("2d0002010000830100"));
+    assert!(edge.ipr_ack_outstanding());
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.native_mut().ingress_capacity.last(), Some(&false));
+    edge.flush_tcp().unwrap();
+    assert_eq!(read_record(&mut peer), hex("0000000b000002039020c1"));
+    assert_eq!(edge.pending_gateway_bytes(), (0, 0));
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    assert!(!edge.ipr_ack_outstanding());
     edge.native_mut()
         .events
         .push_back(NativeEvent::EgressAck(1));

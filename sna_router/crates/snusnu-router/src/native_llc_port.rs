@@ -78,12 +78,7 @@ impl NativeLeg for NativeLlcPort {
             Some(NativeLlcEvent::FirstAttach(piu)) => Some(NativeEvent::FirstAttach(piu)),
             Some(NativeLlcEvent::EgressAck(count)) => Some(NativeEvent::EgressAck(count)),
             Some(NativeLlcEvent::Closed) => Some(NativeEvent::Closed),
-            Some(NativeLlcEvent::UserInformation(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "later native APPC PIU needs gateway handler",
-                ));
-            }
+            Some(NativeLlcEvent::UserInformation(piu)) => Some(NativeEvent::UserInformation(piu)),
             None => None,
         })
     }

@@ -13,6 +13,7 @@ pub enum NativeEvent {
     UserBind(Vec<u8>),
     BindResponseAck(usize),
     FirstAttach(Vec<u8>),
+    UserInformation(Vec<u8>),
     EgressAck(usize),
     Closed,
 }
@@ -44,6 +45,7 @@ pub struct GatewayEdge<L: NativeLeg> {
     native_reply: Option<(NativeReply, Vec<u8>)>,
     connect: Option<TcpRecord>,
     attach: Option<(TcpRecord, bool)>,
+    normal: Option<(TcpRecord, bool)>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
     /// TCP queue order and whether GatewaySession charged this record.
@@ -69,6 +71,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             native_reply: None,
             connect: None,
             attach: None,
+            normal: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
@@ -116,12 +119,21 @@ impl<L: NativeLeg> GatewayEdge<L> {
         if self.closed {
             return Err(invalid("gateway edge is closed"));
         }
-        // This edge supports one user Attach. Hold subsequent native I-frames
-        // at LLC2 until a later APPC flow handler owns their TCP credit.
-        let attach_in_flight = self.attach.is_some()
-            || self.attach_fully_sent
-            || self.writes.iter().any(|(_, charged)| *charged);
-        if let Some(event) = self.native.receive_once(!attach_in_flight)? {
+        // After Attach, consume at most one native I-frame per TCP delivery
+        // and local pacing grant. The LLC receive window supplies backpressure
+        // while any converted record or IPR is outstanding.
+        let charged_write = self.writes.iter().any(|(_, charged)| *charged);
+        let can_accept_information = if self.attach_fully_sent {
+            self.first_attach_delivery_complete()
+                && self.bridge.phase() == Phase::Active
+                && self.normal.is_none()
+                && self.native_reply.is_none()
+                && !self.ipr_ack_outstanding
+                && !charged_write
+        } else {
+            self.attach.is_none() && !charged_write
+        };
+        if let Some(event) = self.native.receive_once(can_accept_information)? {
             match event {
                 NativeEvent::UserBind(piu) => {
                     let template = self
@@ -137,6 +149,13 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     }
                     let (record, _) = self.bridge.first_attach(&piu)?;
                     self.attach = Some((record, false));
+                }
+                NativeEvent::UserInformation(piu) => {
+                    if !can_accept_information || !self.first_attach_delivery_complete() {
+                        return Err(invalid("native user data before gateway credit"));
+                    }
+                    let (record, _) = self.bridge.next_native_normal(&piu)?;
+                    self.normal = Some((record, false));
                 }
                 NativeEvent::EgressAck(n) => {
                     if n != 1 {
@@ -328,6 +347,31 @@ impl<L: NativeLeg> GatewayEdge<L> {
             // pending and no pacing credit is granted.
             self.drive_queues()?;
         }
+        if let Some((record, queued)) = self.normal.take() {
+            if !queued {
+                match self.tcp.as_mut().unwrap().queue(record.clone()) {
+                    Ok(()) => self.writes.push_back((record.bytes.len(), true)),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        self.normal = Some((record, false));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            match self
+                .bridge
+                .mark_normal_enqueued(&record, self.native.available_slots())
+            {
+                Ok(Some(ipr)) => self.native_reply = Some((NativeReply::Ipr, ipr)),
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.normal = Some((record, true));
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+            self.drive_queues()?;
+        }
         Ok(())
     }
 
@@ -338,6 +382,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.native_reply = None;
             self.connect = None;
             self.attach = None;
+            self.normal = None;
             self.incoming.clear();
             self.incoming_bytes = 0;
             self.writes.clear();
