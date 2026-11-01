@@ -7,9 +7,9 @@
 //! UNBIND, and the user-session gateway separately.
 
 use crate::{
-    appn_control::{CnosAttach, ControlError},
+    appn_control::{CnosAttach, ControlError, ControlResponder},
     fid2_session_control::{ManagementBind, ManagementPacing, SessionControlError},
-    fixed_pacing::{FixedPacing, PacingError},
+    fixed_pacing::{FixedPacing, PacingError, IPR_RH, PACING_INDICATOR},
 };
 use std::{error::Error, fmt};
 
@@ -55,6 +55,9 @@ pub enum Phase {
     BindResponsePrepared,
     AwaitBindAck,
     AwaitAttach,
+    AttachRepliesPrepared,
+    AwaitCnosAck,
+    CnosComplete,
 }
 
 pub struct ManagementSession {
@@ -66,6 +69,10 @@ pub struct ManagementSession {
     pending_response: Option<Vec<u8>>,
     early_attach: Option<Vec<u8>>,
     pacing: Option<FixedPacing>,
+    cnos: Option<ControlResponder>,
+    pending_ipr: Option<[u8; 9]>,
+    pending_cnos: Option<Vec<u8>>,
+    attach_acks: usize,
 }
 
 impl ManagementSession {
@@ -79,6 +86,10 @@ impl ManagementSession {
             pending_response: None,
             early_attach: None,
             pacing: None,
+            cnos: None,
+            pending_ipr: None,
+            pending_cnos: None,
+            attach_acks: 0,
         }
     }
 
@@ -187,6 +198,104 @@ impl ManagementSession {
             .then(|| self.early_attach.take())
             .flatten()
     }
+
+    /// Validate one complete CNOS Attach, including the management session
+    /// address pair and ODAI. Reserve a receive-window grant before preparing
+    /// the IPR, and charge the reply against the outbound send window.
+    /// Nothing is considered transmitted until the caller confirms egress.
+    pub fn observe_attach(&mut self, piu: &[u8]) -> Result<(&[u8], &[u8]), ManagementError> {
+        if self.phase != Phase::AwaitAttach || piu.len() > 1496 {
+            return Err(ManagementError::UnexpectedState);
+        }
+        let attach = CnosAttach::decode(piu)?;
+        let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
+        let (daf, oaf) = bind.request_addresses();
+        let bind_request = self
+            .request
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?;
+        if attach.address.daf != daf
+            || attach.address.oaf != oaf
+            || piu[0] & 0x02 != bind_request[0] & 0x02
+        {
+            return Err(ManagementError::UnexpectedState);
+        }
+        // Build in temporary state so a malformed Attach cannot consume a
+        // receive window or advance the CNOS conversation.
+        let mut pacing = self
+            .pacing
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?
+            .clone();
+        pacing.receive_request(piu[7] & PACING_INDICATOR != 0)?;
+        pacing.grant_receive_window()?;
+        let mut cnos = ControlResponder::new(String::new(), 8)?;
+        let reply = cnos.accept_attach(piu)?.to_vec();
+        if !pacing.send_request()? || reply[7] & PACING_INDICATOR == 0 {
+            return Err(ManagementError::UnexpectedState);
+        }
+        let ipr = [
+            bind_request[0],
+            0,
+            oaf,
+            daf,
+            0,
+            0,
+            IPR_RH[0],
+            IPR_RH[1],
+            IPR_RH[2],
+        ];
+        self.pacing = Some(pacing);
+        self.cnos = Some(cnos);
+        self.pending_ipr = Some(ipr);
+        self.pending_cnos = Some(reply);
+        self.phase = Phase::AttachRepliesPrepared;
+        Ok((
+            self.pending_ipr.as_ref().unwrap(),
+            self.pending_cnos.as_deref().unwrap(),
+        ))
+    }
+
+    pub fn mark_attach_replies_enqueued(
+        &mut self,
+        ipr: &[u8],
+        cnos: &[u8],
+    ) -> Result<(), ManagementError> {
+        if self.phase != Phase::AttachRepliesPrepared
+            || self.pending_ipr.as_ref().map(<[u8; 9]>::as_slice) != Some(ipr)
+            || self.pending_cnos.as_deref() != Some(cnos)
+        {
+            return Err(ManagementError::WrongEgress);
+        }
+        self.cnos
+            .as_mut()
+            .ok_or(ManagementError::UnexpectedState)?
+            .mark_reply_transmitted(cnos)?;
+        self.phase = Phase::AwaitCnosAck;
+        Ok(())
+    }
+
+    /// Both IPR and CNOS reply are queued in this order. Two LLC completions
+    /// close the bounded CNOS bracket; no user route is ready.
+    pub fn acknowledge_attach_replies(
+        &mut self,
+        completed_information: usize,
+    ) -> Result<(), ManagementError> {
+        if self.phase != Phase::AwaitCnosAck
+            || completed_information == 0
+            || self.attach_acks + completed_information > 2
+        {
+            return Err(ManagementError::UnexpectedState);
+        }
+        self.attach_acks += completed_information;
+        if self.attach_acks < 2 {
+            return Ok(());
+        }
+        self.pending_ipr = None;
+        self.pending_cnos = None;
+        self.phase = Phase::CnosComplete;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +385,30 @@ mod tests {
         session.acknowledge_bind(1).unwrap();
         assert_eq!(session.take_early_attach(), Some(attach.to_vec()));
         assert!(session.take_early_attach().is_none());
+    }
+
+    #[test]
+    fn cnos_attach_prepares_correlated_ipr_and_bounded_reply() {
+        let attach = [
+            0x2c, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20, 0x0c, 0x05, 0x02, 0xff, 0, 3, 0xd0, 0, 0, 2,
+            0x06, 0xf1, 0, 25, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 8, 0, 4, 0, 4, 0, 8, 0x40, 0x40, 0x40,
+            0x40, 0x40, 0x40, 0x40, 0x40,
+        ];
+        let mut session = ManagementSession::new("SOLNET.SNAA".into(), "SOLNET.SNAB".into());
+        session.observe_bind(&live_shape_bind()).unwrap();
+        let bind_reply = session.prepare_bind_response().unwrap().to_vec();
+        session.mark_bind_enqueued(&bind_reply).unwrap();
+        session.acknowledge_bind(1).unwrap();
+        let (ipr, reply) = session.observe_attach(&attach).unwrap();
+        assert_eq!(ipr, &[0x2d, 0, 2, 1, 0, 0, 0x83, 1, 0]);
+        assert_eq!(&reply[..9], &[0x2c, 0, 2, 1, 0, 1, 3, 0x91, 1]);
+        let (ipr, reply) = (ipr.to_vec(), reply.to_vec());
+        assert_eq!(session.phase(), Phase::AttachRepliesPrepared);
+        assert_eq!(session.mark_attach_replies_enqueued(&ipr, &reply), Ok(()));
+        assert_eq!(session.acknowledge_attach_replies(1), Ok(()));
+        assert_eq!(session.phase(), Phase::AwaitCnosAck);
+        assert_eq!(session.acknowledge_attach_replies(1), Ok(()));
+        assert_eq!(session.phase(), Phase::CnosComplete);
+        assert_eq!(session.pacing().unwrap().send_remaining(), 6);
     }
 }
