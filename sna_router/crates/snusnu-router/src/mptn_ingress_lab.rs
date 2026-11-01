@@ -252,22 +252,20 @@ mod tests {
         udp.set_nonblocking(true).unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve(stream, &udp, "QAALICE.SNAA", "QABOB.SNAB")
+            serve(stream, &udp, "QABOB.SNAB", "QAALICE.SNAA")
         });
         let mut client = TcpStream::connect(listen_addr).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let source = [
-            0xd8, 0xc1, 0xc1, 0xd3, 0xc9, 0xc3, 0xc5, 0x4b, 0xe2, 0xd5, 0xc1, 0xc1,
-        ];
-        let mut fqpcid = vec![0x60, 21];
+        let source = [0xd8, 0xc1, 0xc2, 0xd6, 0xc2, 0x4b, 0xe2, 0xd5, 0xc1, 0xc2];
+        let mut fqpcid = vec![0x60, 19];
         fqpcid.extend_from_slice(&[0x22; 8]);
-        fqpcid.push(12);
+        fqpcid.push(10);
         fqpcid.extend_from_slice(&source);
         let initiator = ManagementInitiator::new(
-            "QAALICE.SNAA",
             "QABOB.SNAB",
+            "QAALICE.SNAA",
             fqpcid.clone(),
             [0x11; 8],
             [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
@@ -334,18 +332,16 @@ mod tests {
         udp.set_nonblocking(true).unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve(stream, &udp, "QAALICE.SNAA", "QABOB.SNAB")
+            serve(stream, &udp, "QABOB.SNAB", "QAALICE.SNAA")
         });
-        let source = [
-            0xd8, 0xc1, 0xc1, 0xd3, 0xc9, 0xc3, 0xc5, 0x4b, 0xe2, 0xd5, 0xc1, 0xc1,
-        ];
-        let mut fqpcid = vec![0x60, 21];
+        let source = [0xd8, 0xc1, 0xc2, 0xd6, 0xc2, 0x4b, 0xe2, 0xd5, 0xc1, 0xc2];
+        let mut fqpcid = vec![0x60, 19];
         fqpcid.extend_from_slice(&[0x22; 8]);
-        fqpcid.push(12);
+        fqpcid.push(10);
         fqpcid.extend_from_slice(&source);
         let management = ManagementInitiator::new(
-            "QAALICE.SNAA",
             "QABOB.SNAB",
+            "QAALICE.SNAA",
             fqpcid,
             [0x11; 8],
             [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
