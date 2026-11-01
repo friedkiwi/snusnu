@@ -14,5 +14,6 @@ pub mod mptn_native_bridge;
 pub mod mptn_oob;
 pub mod mptn_oob_fallback;
 pub mod mptn_oob_sequence;
+pub mod mptn_reverse_management;
 pub mod mptn_segments;
 pub mod mptn_session;
