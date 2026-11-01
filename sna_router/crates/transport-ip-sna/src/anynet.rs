@@ -283,6 +283,6 @@ mod tests {
     #[test]
     fn connect_record_uses_strict_mptn_validation() {
         // Lengths are consistent, but no addresses, correlator or BIND.
-        assert!(TcpRecord::decode(vec![0, 0, 0, 11, 0x80, 0x0a, 0, 0, 0, 7, 8]).is_err());
+        assert!(TcpRecord::decode(vec![0, 0, 0, 9, 0x80, 0x0a, 0, 5, 8]).is_err());
     }
 }

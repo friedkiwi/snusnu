@@ -164,7 +164,7 @@ fn validate_optional(field: &OptionalField, direction: Direction) -> io::Result<
 
 impl Connect {
     pub fn decode(record: &[u8]) -> io::Result<Self> {
-        if record.len() < 39 || record.len() > MAX_RECORD {
+        if record.len() < 37 || record.len() > MAX_RECORD {
             return Err(invalid("MPTN Connect record size is invalid"));
         }
         let declared = u32::from_be_bytes(record[..4].try_into().unwrap()) as usize;
@@ -172,15 +172,17 @@ impl Connect {
             return Err(invalid("MPTN Connect record length or type is invalid"));
         }
         let direction = validate_processing(record[5])?;
-        let command_length = u32::from_be_bytes(record[6..10].try_into().unwrap()) as usize;
+        // The common command prefix has a two-byte length at offsets 6–7.
+        // The 4-byte size in draft 5.3.1 names the whole prefix.
+        let command_length = u16::from_be_bytes(record[6..8].try_into().unwrap()) as usize;
         if command_length + 4 != record.len() {
             return Err(invalid("MPTN Connect command length mismatch"));
         }
-        let ttl = record[10];
+        let ttl = record[8];
         if ttl == 0 {
             return Err(invalid("MPTN Connect TTL exhausted"));
         }
-        let mut cursor = 11;
+        let mut cursor = 9;
         let destination = address(record, &mut cursor)?;
         let source = address(record, &mut cursor)?;
         let suffix_len = take(record, &mut cursor, 1)?[0] as usize;
@@ -260,7 +262,7 @@ impl Connect {
             return Err(invalid("invalid MPTN Connect fields"));
         }
         let mut record = vec![0; 4];
-        record.extend_from_slice(&[CONNECT, self.processing, 0, 0, 0, 0, self.ttl]);
+        record.extend_from_slice(&[CONNECT, self.processing, 0, 0, self.ttl]);
         for address in [&self.destination, &self.source] {
             record.extend_from_slice(&[0x0b, 0x01, (address.node.len() + 1) as u8]);
             record.extend_from_slice(&address.node);
@@ -297,7 +299,9 @@ impl Connect {
         }
         let total = u32::try_from(record.len()).map_err(|_| invalid("MPTN record too large"))?;
         record[..4].copy_from_slice(&total.to_be_bytes());
-        record[6..10].copy_from_slice(&(total - 4).to_be_bytes());
+        let command_length =
+            u16::try_from(total - 4).map_err(|_| invalid("MPTN command too large"))?;
+        record[6..8].copy_from_slice(&command_length.to_be_bytes());
         Ok(record)
     }
 
@@ -325,10 +329,10 @@ mod tests {
     // Hand-built from TCP62 draft 5.3.1: SOLNET.SNAB -> SOLNET.SNAA
     // EBCDIC LU addresses, correlator 12 34, fixed requirements, BIND RU.
     const REQUEST: &[u8] = &[
-        0, 0, 0, 66, 0x80, 0x0a, 0, 0, 0, 62, 8, 0x0b, 1, 12, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3,
-        0x4b, 0xe2, 0xd5, 0xc1, 0xc2, 1, 0x0b, 1, 12, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b,
-        0xe2, 0xd5, 0xc1, 0xc1, 1, 3, 0x12, 0x34, 15, 0, 0, 0x10, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0x20,
-        0, 0x0a, 0x02, 0, 7, 0x31, 0x00, 0x13,
+        0, 0, 0, 64, 0x80, 0x0a, 0, 60, 8, 0x0b, 1, 12, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b,
+        0xe2, 0xd5, 0xc1, 0xc2, 1, 0x0b, 1, 12, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b, 0xe2,
+        0xd5, 0xc1, 0xc1, 1, 3, 0x12, 0x34, 15, 0, 0, 0x10, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0x20, 0,
+        0x0a, 0x02, 0, 7, 0x31, 0x00, 0x13,
     ];
 
     #[test]
@@ -382,22 +386,22 @@ mod tests {
         bytes[5] = 0x4a; // Negative marker without response bit.
         assert!(Connect::decode(&bytes).is_err());
         bytes = REQUEST.to_vec();
-        bytes[13] = 0x00; // Wrong address family.
+        bytes[9] = 0x00; // Wrong address family.
         assert!(Connect::decode(&bytes).is_err());
         bytes = REQUEST.to_vec();
-        bytes[6..10].copy_from_slice(&1u32.to_be_bytes());
+        bytes[6..8].copy_from_slice(&1u16.to_be_bytes());
         assert!(Connect::decode(&bytes).is_err());
         bytes = REQUEST.to_vec();
-        bytes[59] = 0x99; // Unknown optional field.
+        bytes[57] = 0x99; // Unknown optional field.
         assert!(Connect::decode(&bytes).is_err());
         bytes = REQUEST.to_vec();
-        bytes[41] = 1; // Correlator must contain at least one value byte.
+        bytes[39] = 1; // Correlator must contain at least one value byte.
         assert!(Connect::decode(&bytes).is_err());
         bytes = REQUEST.to_vec();
-        bytes[10] = 0; // TTL exhausted.
+        bytes[8] = 0; // TTL exhausted.
         assert!(Connect::decode(&bytes).is_err());
         bytes = REQUEST.to_vec();
-        bytes[59] = 0x19; // Wrong processing flags for required compensations.
+        bytes[57] = 0x19; // Wrong processing flags for required compensations.
         assert!(Connect::decode(&bytes).is_err());
     }
 }
