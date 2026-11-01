@@ -69,3 +69,5 @@ to = "ee_b"
 ```
 
 EE↔EE relays EE datagrams. The loader rejects LLC↔EE routes and does not translate LLC2 PIUs into AnyNet MPTN or HPR records. Those profiles require explicit protocol converters.
+
+The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this configuration on two isolated TAPs.
