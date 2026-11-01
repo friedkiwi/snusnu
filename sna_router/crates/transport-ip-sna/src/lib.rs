@@ -6,6 +6,7 @@ pub mod ee;
 pub mod mptn_bind_negotiation;
 pub mod mptn_compensations;
 pub mod mptn_connect;
+pub mod mptn_expedited;
 pub mod mptn_gateway;
 pub mod mptn_keepalive;
 pub mod mptn_session;
