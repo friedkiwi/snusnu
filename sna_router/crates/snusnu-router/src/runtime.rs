@@ -317,6 +317,11 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                         bearer: bearer.clone(),
                         local_cp: config::parse_cp(&entry.local_cp)?,
                         target_cp: config::parse_cp(&entry.target_cp)?,
+                        target_lu: entry
+                            .target_lu
+                            .as_deref()
+                            .map(config::parse_cp)
+                            .transpose()?,
                     })
                 })
                 .collect::<io::Result<Vec<_>>>()?;

@@ -251,6 +251,7 @@ fn run() -> io::Result<()> {
                 bearer,
                 local_cp,
                 target_cp,
+                target_lu: None,
             },
         );
     }

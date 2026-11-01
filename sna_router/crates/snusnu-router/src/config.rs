@@ -92,6 +92,7 @@ pub(crate) struct RemoteConfig {
     pub(crate) url: String,
     pub(crate) local_cp: String,
     pub(crate) target_cp: String,
+    pub(crate) target_lu: Option<String>,
     #[serde(default)]
     pub(crate) lus: Vec<String>,
     #[serde(default)]
@@ -311,7 +312,17 @@ impl RouterConfig {
                     remote.local_cp
                 )));
             }
-            parse_cp(&remote.target_cp)?;
+            let target_cp = parse_cp(&remote.target_cp)?;
+            if let Some(target_lu) = &remote.target_lu {
+                let target_lu = parse_cp(target_lu)?;
+                if target_lu.netid != target_cp.netid {
+                    return Err(invalid(format!(
+                        "target LU {} has a different NETID from target CP {}",
+                        remote.target_lu.as_deref().unwrap_or_default(),
+                        remote.target_cp
+                    )));
+                }
+            }
             for lu in &remote.lus {
                 let lu_name = parse_cp(lu)?;
                 if !exported_lus.insert((lu_name.netid, lu_name.name)) {
@@ -715,6 +726,22 @@ to = "upstream"
         assert_eq!(
             configured.remote[0].lu_types["SOLNET.LUA"],
             vec![ConfiguredLuType::Lu6_2]
+        );
+        let cross_netid = remote.replace(
+            "target_cp = \"SOLNET.SNAB\"",
+            "target_cp = \"DSTNET.SNAB\"\ntarget_lu = \"DSTNET.PAYROLL\"",
+        );
+        parse(&cross_netid).validate().unwrap();
+        assert_eq!(
+            parse(&cross_netid).remote[0].target_lu.as_deref(),
+            Some("DSTNET.PAYROLL")
+        );
+        assert!(
+            parse(&cross_netid.replace("DSTNET.PAYROLL", "SOLNET.PAYROLL"))
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("different NETID")
         );
         assert!(parse(&remote.replace("02:53:4e", "02:00:4e"))
             .validate()
