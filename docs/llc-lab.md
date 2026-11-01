@@ -108,6 +108,11 @@ remote Sign On at 16:32:22, signed in to B's Main Menu at 16:32:49, and
 issued `ENDPASTHR` at 16:32:52. A returned to its Main Menu immediately.
 The QA database retained both live CP advertisements and 178 symmetric
 traffic records at the inspection point: 68 Type 1, 100 SNA information,
-and 10 link-ready records. No Rust router warnings or errors were observed.
+and 10 link-ready records. The pass-through completed before a likely teardown race:
+Go logged `unknown or pending circuit` after forwarding A's close, then
+closed B's WebSocket. B reconnected with a fresh epoch and republished its
+route. The session result was unaffected. Go should tolerate messages that
+were already in flight from an authenticated circuit participant when the
+other participant closed the circuit.
 The APPC controllers had to be varied on after guest IPL before initiating
 the pass-through session.
