@@ -34,7 +34,7 @@ func TestUpgradeFromVersionOne(t *testing.T) {
 	}
 	defer s.DB.Close()
 	var version int
-	if err = s.Row(ctx, "SELECT version FROM schema_migrations WHERE version=2").Scan(&version); err != nil || version != 2 {
+	if err = s.Row(ctx, "SELECT version FROM schema_migrations WHERE version=5").Scan(&version); err != nil || version != 5 {
 		t.Fatalf("migration version: %d %v", version, err)
 	}
 	var count int
@@ -244,6 +244,13 @@ func TestBackends(t *testing.T) {
 			if _, err = s.Session(context.Background(), session); err != nil {
 				t.Fatal(err)
 			}
+			rememberToken, remembered, err := s.NewSessionWithRemember(context.Background(), id, "full", true)
+			if err != nil || !remembered.Remember {
+				t.Fatalf("remembered session creation: %+v %v", remembered, err)
+			}
+			if loaded, err := s.Session(context.Background(), rememberToken); err != nil || !loaded.Remember {
+				t.Fatalf("remembered session lookup: %+v %v", loaded, err)
+			}
 			if _, err = s.Exec(context.Background(), "UPDATE users SET username=?,picture=?,picture_type=? WHERE id=?", "backend-"+id[:8], []byte{1, 2, 3}, "image/png", id); err != nil {
 				t.Fatal(err)
 			}
@@ -286,6 +293,9 @@ func TestBackends(t *testing.T) {
 			}
 			if err := s.CompletePasswordReset(context.Background(), id, "123456", "new-hash"); err != nil {
 				t.Fatal(err)
+			}
+			if err := s.DeleteUser(context.Background(), id); err != nil {
+				t.Fatalf("delete user: %v", err)
 			}
 		})
 	}

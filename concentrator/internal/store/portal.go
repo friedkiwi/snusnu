@@ -97,6 +97,35 @@ func (s *Store) IsBlocked(ctx context.Context, ownerID, blockedID string) (bool,
 	return count > 0, err
 }
 
+type BlockEntry struct {
+	OwnerID, OwnerEmail, BlockedID, BlockedEmail string
+	CreatedAt                                    int64
+}
+
+func (s *Store) ListBlocks(ctx context.Context, ownerID string) ([]BlockEntry, error) {
+	query := "SELECT b.owner_id,o.email,b.blocked_user_id,u.email,b.created_at FROM user_blocks b JOIN users o ON o.id=b.owner_id JOIN users u ON u.id=b.blocked_user_id"
+	args := []any{}
+	if ownerID != "" {
+		query += " WHERE b.owner_id=?"
+		args = append(args, ownerID)
+	}
+	query += " ORDER BY o.email,u.email"
+	rows, err := s.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BlockEntry
+	for rows.Next() {
+		var item BlockEntry
+		if err := rows.Scan(&item.OwnerID, &item.OwnerEmail, &item.BlockedID, &item.BlockedEmail, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 type LogEntry struct {
 	ID, RouterID, OwnerID, PeerUserID, Direction, Level, EventType, NetID, NodeName, SourceIP, Summary, DetailsJSON string
 	OccurredAt                                                                                                      int64
@@ -133,14 +162,22 @@ func (s *Store) AppendRouterLog(ctx context.Context, x LogEntry) error {
 	return err
 }
 func (s *Store) SearchRouterLogs(ctx context.Context, routerID, q string) ([]LogEntry, error) {
-	return s.searchLogs(ctx, "l.router_id=?", routerID, q)
+	return s.searchLogs(ctx, "l.router_id=?", []any{routerID}, q)
 }
 func (s *Store) SearchInboundFlows(ctx context.Context, ownerID, q string) ([]LogEntry, error) {
-	return s.searchLogs(ctx, "l.owner_id=? AND l.direction='inbound' AND l.peer_user_id IS NOT NULL AND l.peer_user_id<>l.owner_id", ownerID, q)
+	return s.searchLogs(ctx, "l.owner_id=? AND l.direction='inbound' AND l.peer_user_id IS NOT NULL AND l.peer_user_id<>l.owner_id", []any{ownerID}, q)
 }
-func (s *Store) searchLogs(ctx context.Context, filter, arg, q string) ([]LogEntry, error) {
+func (s *Store) SearchFlows(ctx context.Context, ownerID, q string) ([]LogEntry, error) {
+	filter := "l.direction IN ('inbound','outbound') AND l.peer_user_id IS NOT NULL"
+	args := []any{}
+	if ownerID != "" {
+		filter += " AND l.owner_id=?"
+		args = append(args, ownerID)
+	}
+	return s.searchLogs(ctx, filter, args, q)
+}
+func (s *Store) searchLogs(ctx context.Context, filter string, args []any, q string) ([]LogEntry, error) {
 	query := "SELECT l.id,l.router_id,l.owner_id,COALESCE(l.peer_user_id,''),l.direction,l.level,l.event_type,l.netid,l.node_name,l.source_ip,l.summary,l.details_json,l.occurred_at FROM router_logs l WHERE " + filter
-	args := []any{arg}
 	if q = strings.TrimSpace(q); q != "" {
 		if len(q) > 100 {
 			q = q[:100]

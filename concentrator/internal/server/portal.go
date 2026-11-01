@@ -157,12 +157,44 @@ func (a *App) adminRouters(w http.ResponseWriter, r *http.Request, u store.User,
 }
 func (a *App) flows(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	logs, err := a.DB.SearchInboundFlows(r.Context(), u.ID, q)
+	ownerID := u.ID
+	if u.Role == "admin" {
+		ownerID = ""
+	}
+	logs, err := a.DB.SearchFlows(r.Context(), ownerID, q)
 	if err != nil {
 		dbError(w, err)
 		return
 	}
-	a.render(w, "flows", map[string]any{"User": u, "CSRF": s.CSRF, "Logs": logs, "Search": q})
+	a.render(w, "flows", map[string]any{"User": u, "CSRF": s.CSRF, "Logs": logs, "Search": q, "All": u.Role == "admin"})
+}
+func (a *App) blocks(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	items, err := a.DB.ListBlocks(r.Context(), u.ID)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "blocks", map[string]any{"User": u, "CSRF": s.CSRF, "Items": items})
+}
+func (a *App) adminBlocks(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	items, err := a.DB.ListBlocks(r.Context(), "")
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	a.render(w, "admin_blocks", map[string]any{"User": u, "CSRF": s.CSRF, "Items": items})
+}
+func (a *App) removeBlock(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	id := r.PathValue("id")
+	if id == u.ID {
+		http.Error(w, "cannot block yourself", 400)
+		return
+	}
+	if err := a.DB.SetBlock(r.Context(), u.ID, id, false); err != nil {
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/blocks", 303)
 }
 func (a *App) profileEditPage(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	a.render(w, "profile_edit", map[string]any{"User": u, "CSRF": s.CSRF})

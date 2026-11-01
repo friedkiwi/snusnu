@@ -101,6 +101,9 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /llc-macs/{id}/retire", a.full(a.managedCPRetire))
 	m.HandleFunc("GET /admin/llc-macs", a.admin(a.adminManagedCPPage))
 	m.HandleFunc("GET /flows", a.full(a.flows))
+	m.HandleFunc("GET /blocks", a.full(a.blocks))
+	m.HandleFunc("POST /blocks/{id}/remove", a.full(a.removeBlock))
+	m.HandleFunc("GET /admin/blocks", a.admin(a.adminBlocks))
 	m.HandleFunc("GET /profile/edit", a.full(a.profileEditPage))
 	m.HandleFunc("POST /profile/edit", a.full(a.profileEdit))
 	m.HandleFunc("POST /profile/picture", a.full(a.profilePictureUpload))
@@ -109,6 +112,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /profiles/{id}/picture", a.full(a.profilePicture))
 	m.HandleFunc("POST /profiles/{id}/block", a.full(a.profileBlock))
 	m.HandleFunc("GET /settings", a.full(a.settings))
+	m.HandleFunc("GET /settings/delete", a.full(a.deleteOwnAccountPage))
+	m.HandleFunc("POST /settings/delete", a.full(a.deleteOwnAccount))
 	m.HandleFunc("POST /settings/password", a.full(a.changePassword))
 	m.HandleFunc("POST /settings/totp/begin", a.full(a.totpBegin))
 	m.HandleFunc("POST /settings/totp/finish", a.full(a.totpFinish))
@@ -123,6 +128,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /planning-directory", a.admin(a.directory))
 	m.HandleFunc("GET /connections", a.full(a.connections))
 	m.HandleFunc("GET /admin/users", a.admin(a.users))
+	m.HandleFunc("GET /admin/users/{id}/delete", a.admin(a.adminDeleteUserPage))
+	m.HandleFunc("POST /admin/users/{id}/delete", a.admin(a.adminDeleteUser))
 	m.HandleFunc("GET /admin/routers", a.admin(a.adminRouters))
 	m.HandleFunc("POST /admin/users/role", a.admin(a.setRole))
 	m.HandleFunc("POST /admin/users/reset-password", a.admin(a.adminResetPassword))
@@ -220,8 +227,12 @@ func (a *App) admin(h handler) http.HandlerFunc {
 		h(w, r, u, s)
 	})
 }
-func (a *App) setSession(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{Name: "snusnu_session", Value: token, Path: "/", HttpOnly: true, Secure: strings.HasPrefix(a.Config.Origin, "https://"), SameSite: http.SameSiteLaxMode, MaxAge: 12 * 3600})
+func (a *App) setSession(w http.ResponseWriter, token string, remember bool) {
+	cookie := &http.Cookie{Name: "snusnu_session", Value: token, Path: "/", HttpOnly: true, Secure: strings.HasPrefix(a.Config.Origin, "https://"), SameSite: http.SameSiteLaxMode}
+	if remember {
+		cookie.MaxAge = 30 * 24 * 3600
+	}
+	http.SetCookie(w, cookie)
 }
 func (a *App) clearSession(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: "snusnu_session", Path: "/", MaxAge: -1, HttpOnly: true})
@@ -509,12 +520,13 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	} else if u.RemindAfter <= store.Now() {
 		state = "enroll"
 	}
-	token, _, err := a.DB.NewSession(r.Context(), u.ID, state)
+	remember := r.FormValue("remember") == "1"
+	token, _, err := a.DB.NewSessionWithRemember(r.Context(), u.ID, state, remember)
 	if err != nil {
 		http.Error(w, "server error", 500)
 		return
 	}
-	a.setSession(w, token)
+	a.setSession(w, token, remember)
 	if state == "full" {
 		http.Redirect(w, r, "/dashboard", 303)
 	} else {

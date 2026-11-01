@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -17,8 +18,8 @@ type Connection struct {
 	CreatedAt                                                int64
 }
 type Account struct {
-	ID, Email, Role string
-	VerifiedAt      int64
+	ID, Email, Username, Role string
+	VerifiedAt                int64
 }
 
 func (a *App) dashboard(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -233,7 +234,19 @@ func (a *App) updateConnection(w http.ResponseWriter, r *http.Request, u store.U
 	http.Redirect(w, r, "/connections", 303)
 }
 func (a *App) users(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
-	rows, err := a.DB.Query(r.Context(), "SELECT id,email,role,verified_at FROM users ORDER BY email")
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len(q) > 100 {
+		q = q[:100]
+	}
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+	if page > 10000 {
+		page = 10000
+	}
+	filter := "%" + strings.ToLower(q) + "%"
+	rows, err := a.DB.Query(r.Context(), "SELECT id,email,username,role,verified_at FROM users WHERE LOWER(email) LIKE ? OR LOWER(username) LIKE ? ORDER BY email,id LIMIT 26 OFFSET ?", filter, filter, (page-1)*25)
 	if err != nil {
 		dbError(w, err)
 		return
@@ -242,13 +255,21 @@ func (a *App) users(w http.ResponseWriter, r *http.Request, u store.User, s stor
 	var items []Account
 	for rows.Next() {
 		var x Account
-		if err = rows.Scan(&x.ID, &x.Email, &x.Role, &x.VerifiedAt); err != nil {
+		if err = rows.Scan(&x.ID, &x.Email, &x.Username, &x.Role, &x.VerifiedAt); err != nil {
 			dbError(w, err)
 			return
 		}
 		items = append(items, x)
 	}
-	a.render(w, "users", map[string]any{"User": u, "CSRF": s.CSRF, "Items": items})
+	if err = rows.Err(); err != nil {
+		dbError(w, err)
+		return
+	}
+	hasNext := len(items) > 25
+	if hasNext {
+		items = items[:25]
+	}
+	a.render(w, "users", map[string]any{"User": u, "CSRF": s.CSRF, "Items": items, "Search": q, "Page": page, "PrevPage": page - 1, "NextPage": page + 1, "HasPrev": page > 1, "HasNext": hasNext})
 }
 func (a *App) setRole(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	id := r.FormValue("id")

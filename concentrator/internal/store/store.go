@@ -166,14 +166,20 @@ func (s *Store) UserByID(ctx context.Context, id string) (User, error) {
 type Session struct {
 	ID, UserID, CSRF, State string
 	Expires                 int64
+	Remember                bool
 }
 
 func (s *Store) Session(ctx context.Context, token string) (Session, error) {
 	var v Session
-	err := s.Row(ctx, "SELECT id,user_id,csrf,state,expires_at FROM sessions WHERE id=? AND expires_at>?", Hash(token), Now()).Scan(&v.ID, &v.UserID, &v.CSRF, &v.State, &v.Expires)
+	var remember int
+	err := s.Row(ctx, "SELECT id,user_id,csrf,state,expires_at,remember FROM sessions WHERE id=? AND expires_at>?", Hash(token), Now()).Scan(&v.ID, &v.UserID, &v.CSRF, &v.State, &v.Expires, &remember)
+	v.Remember = remember != 0
 	return v, err
 }
 func (s *Store) NewSession(ctx context.Context, userID, state string) (string, Session, error) {
+	return s.NewSessionWithRemember(ctx, userID, state, false)
+}
+func (s *Store) NewSessionWithRemember(ctx context.Context, userID, state string, remember bool) (string, Session, error) {
 	token, err := Random()
 	if err != nil {
 		return "", Session{}, err
@@ -182,8 +188,14 @@ func (s *Store) NewSession(ctx context.Context, userID, state string) (string, S
 	if err != nil {
 		return "", Session{}, err
 	}
-	v := Session{ID: Hash(token), UserID: userID, CSRF: csrf, State: state, Expires: Now() + 12*3600}
-	_, err = s.Exec(ctx, "INSERT INTO sessions(id,user_id,csrf,state,expires_at) VALUES(?,?,?,?,?)", v.ID, v.UserID, v.CSRF, v.State, v.Expires)
+	duration := int64(12 * 3600)
+	rememberValue := 0
+	if remember {
+		duration = 30 * 24 * 3600
+		rememberValue = 1
+	}
+	v := Session{ID: Hash(token), UserID: userID, CSRF: csrf, State: state, Expires: Now() + duration, Remember: remember}
+	_, err = s.Exec(ctx, "INSERT INTO sessions(id,user_id,csrf,state,expires_at,remember) VALUES(?,?,?,?,?,?)", v.ID, v.UserID, v.CSRF, v.State, v.Expires, rememberValue)
 	return token, v, err
 }
 
@@ -191,7 +203,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -268,6 +280,10 @@ var schemaV3 = []string{
 
 var schemaV4 = []string{
 	`CREATE TABLE password_reset_tokens (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, code_hash TEXT NOT NULL, expires_at BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`,
+}
+
+var schemaV5 = []string{
+	`ALTER TABLE sessions ADD COLUMN remember INTEGER NOT NULL DEFAULT 0`,
 }
 
 var ErrNotFound = errors.New("not found")
