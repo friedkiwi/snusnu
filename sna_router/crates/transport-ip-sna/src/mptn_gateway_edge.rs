@@ -208,6 +208,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     self.drive_queues()?;
                 }
                 TcpKind::Normal | TcpKind::Segmented => {
+                    if self.bridge.phase() == Phase::AwaitConnect {
+                        return Err(invalid("TCP62 application data before Connect response"));
+                    }
                     // A remote application may send soon after Connect.
                     // Retain its bounded records until the native user BIND,
                     // first Attach, and native IPR are all completed.

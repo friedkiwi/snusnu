@@ -623,3 +623,46 @@ fn gateway_rejects_connect_response_before_request_reaches_socket() {
     assert!(edge.native_mut().closed);
     assert!(edge.native_mut().sent.is_empty());
 }
+
+#[test]
+fn gateway_rejects_application_data_before_connect_response() {
+    use transport_ip_sna::mptn_gateway::native_normal_to_mptn;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let mut native = MockNative {
+        accepts: true,
+        ..Default::default()
+    };
+    native.events.push_back(NativeEvent::UserBind(user_bind()));
+    let mut edge = GatewayEdge::new(native, TcpSession::new(sender).unwrap(), bridge, template());
+    edge.poll_native_once().unwrap();
+    edge.flush_tcp().unwrap();
+    let _connect = read_record(&mut peer);
+    peer.write_all(
+        &native_normal_to_mptn(&first_application_reply())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let error = loop {
+        match edge.poll_tcp_once() {
+            Err(error) => break error,
+            Ok(()) => assert!(Instant::now() < deadline, "early data was not rejected"),
+        }
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(edge.is_closed());
+    assert!(edge.native_mut().closed);
+}
