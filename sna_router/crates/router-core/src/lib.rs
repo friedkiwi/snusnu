@@ -9,6 +9,7 @@ pub mod fixed_pacing;
 pub mod hpr_lan;
 pub mod hpr_setmode;
 pub mod hpr_xid_evidence;
+pub mod hpr_xid_leg;
 pub mod llc;
 pub mod llc2;
 pub mod llc_type1;
