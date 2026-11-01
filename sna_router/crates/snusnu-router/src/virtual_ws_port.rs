@@ -21,6 +21,8 @@ use transport_ip_sna::{
     mptn_ingress::IngressOffer,
     mptn_reverse_user_bind::{NativeAddress, Phase as UserBindPhase, ReverseUserBind},
     mptn_reverse_user_flow::{NativeInput, ReverseUserFlow},
+    mptn_reverse_user_native_close::NativeUserClose,
+    mptn_reverse_user_teardown::{AbortAction, Phase as TeardownPhase, ReverseUserTeardown},
 };
 
 #[derive(Clone, Copy)]
@@ -28,6 +30,8 @@ enum NativeUserOutputKind {
     Normal,
     Grant,
     Expedited,
+    TeardownUnbind,
+    NativeCloseResponse,
 }
 
 #[derive(Clone, Copy)]
@@ -35,6 +39,7 @@ enum TcpUserOutputKind {
     Normal,
     Expedited,
     ExpeditedAck,
+    NativeAbort,
 }
 
 #[derive(Clone, Copy)]
@@ -72,7 +77,12 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     native_user_input: Option<Vec<u8>>,
     tcp_user_output: Option<TcpRecord>,
     tcp_user_output_kind: Option<TcpUserOutputKind>,
+    tcp_user_output_queued: bool,
     expedited_ack: Option<TcpRecord>,
+    user_teardown: Option<ReverseUserTeardown>,
+    native_user_close: Option<NativeUserClose>,
+    tcp_user_writes: VecDeque<TcpUserOutputKind>,
+    user_closed: bool,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -109,7 +119,12 @@ impl<P: RoutePort> VirtualWsPort<P> {
             native_user_input: None,
             tcp_user_output: None,
             tcp_user_output_kind: None,
+            tcp_user_output_queued: false,
             expedited_ack: None,
+            user_teardown: None,
+            native_user_close: None,
+            tcp_user_writes: VecDeque::new(),
+            user_closed: false,
         })
     }
 
@@ -155,6 +170,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
         }
         self.user_bind = Some(ReverseUserBind::after_management(offer, address)?);
         self.user_address = Some(address);
+        self.user_teardown = Some(ReverseUserTeardown::from_user_offer(offer, address)?);
+        self.native_user_close = Some(NativeUserClose::from_user_offer(offer, address)?);
         Ok(())
     }
 
@@ -195,6 +212,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
     /// The native PIU is prepared and sent by subsequent poll/tick calls.
     pub(crate) fn submit_tcp_user_record(&mut self, record: &TcpRecord) -> io::Result<bool> {
         if self.user_flow.is_none()
+            || self.user_closed
             || self.tcp_user_input.is_some()
             || self.native_user_output.is_some()
             || self.deferred_user_normal
@@ -204,7 +222,11 @@ impl<P: RoutePort> VirtualWsPort<P> {
         }
         if !matches!(
             record.kind,
-            TcpKind::Normal | TcpKind::Segmented | TcpKind::Expedited | TcpKind::ExpeditedAck
+            TcpKind::Normal
+                | TcpKind::Segmented
+                | TcpKind::Expedited
+                | TcpKind::ExpeditedAck
+                | TcpKind::Abort
         ) {
             return Err(protocol(
                 "virtual user flow does not accept this TCP62 record kind",
@@ -215,7 +237,40 @@ impl<P: RoutePort> VirtualWsPort<P> {
     }
 
     pub(crate) fn tcp_user_record(&self) -> Option<&TcpRecord> {
-        self.tcp_user_output.as_ref()
+        (!self.tcp_user_output_queued)
+            .then_some(self.tcp_user_output.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn user_closed(&self) -> bool {
+        self.user_closed
+    }
+
+    /// The gateway calls this only after the final byte of each queued user
+    /// TCP record was written, in queue order.
+    pub(crate) fn complete_tcp_user_records(&mut self, completed: usize) -> io::Result<()> {
+        for _ in 0..completed {
+            let kind = self
+                .tcp_user_writes
+                .pop_front()
+                .ok_or_else(|| protocol("untracked TCP62 user write completion"))?;
+            if matches!(kind, TcpUserOutputKind::NativeAbort) {
+                let close = self
+                    .native_user_close
+                    .as_mut()
+                    .ok_or_else(|| protocol("native user close absent"))?;
+                let abort = self
+                    .tcp_user_output
+                    .as_ref()
+                    .ok_or_else(|| protocol("native TCP62 Abort missing"))?;
+                let response = close.mark_tcp_abort_written(abort)?.to_vec();
+                self.native_user_output = Some(response);
+                self.native_user_output_kind = Some(NativeUserOutputKind::NativeCloseResponse);
+                self.tcp_user_output = None;
+                self.tcp_user_output_queued = false;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn mark_tcp_user_record_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
@@ -226,18 +281,23 @@ impl<P: RoutePort> VirtualWsPort<P> {
             .user_flow
             .as_mut()
             .ok_or_else(|| protocol("virtual user flow absent"))?;
-        match self
+        let kind = self
             .tcp_user_output_kind
             .take()
-            .ok_or_else(|| protocol("TCP62 user output kind missing"))?
-        {
+            .ok_or_else(|| protocol("TCP62 user output kind missing"))?;
+        match kind {
             TcpUserOutputKind::Normal => flow.mark_tcp_enqueued(record)?,
             TcpUserOutputKind::Expedited => flow.mark_expedited_tcp_enqueued(record)?,
             TcpUserOutputKind::ExpeditedAck => {}
+            TcpUserOutputKind::NativeAbort => {
+                self.tcp_user_output_queued = true;
+                self.tcp_user_writes.push_back(kind);
+                return Ok(());
+            }
         }
+        self.tcp_user_writes.push_back(kind);
         self.tcp_user_output = None;
-        self.tcp_user_output_kind = None;
-        self.expedited_ack = None;
+        self.tcp_user_output_queued = false;
         Ok(())
     }
 
@@ -266,6 +326,13 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.native_user_output_queued = false;
         self.native_user_input = None;
         self.tcp_user_output = None;
+        self.tcp_user_output_queued = false;
+        self.tcp_user_output_kind = None;
+        self.expedited_ack = None;
+        self.user_teardown = None;
+        self.native_user_close = None;
+        self.tcp_user_writes.clear();
+        self.user_closed = false;
         if self.management.take().is_some() {
             // FQPCID and BIND token must be freshly minted on the next
             // circuit. A caller must construct a new virtual session.
@@ -402,6 +469,19 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     flow.mark_expedited_native_enqueued(&piu)?;
                     self.tcp_user_output = self.expedited_ack.take();
                     self.tcp_user_output_kind = Some(TcpUserOutputKind::ExpeditedAck);
+                }
+                NativeUserOutputKind::TeardownUnbind => self
+                    .user_teardown
+                    .as_mut()
+                    .ok_or_else(|| protocol("TCP62 user teardown absent"))?
+                    .mark_native_unbind_enqueued(&piu)?,
+                NativeUserOutputKind::NativeCloseResponse => {
+                    self.native_user_close
+                        .as_mut()
+                        .ok_or_else(|| protocol("native user close absent"))?
+                        .mark_native_response_enqueued(&piu)?;
+                    self.user_closed = true;
+                    flow.close();
                 }
             }
             self.native_user_output_queued = false;
@@ -554,7 +634,28 @@ impl<P: RoutePort> VirtualWsPort<P> {
         };
         if self.tcp_user_output.is_none() && self.native_user_output.is_none() {
             if let Some(piu) = self.native_user_input.take() {
-                if piu.len() >= 9
+                if self
+                    .user_teardown
+                    .as_ref()
+                    .is_some_and(|teardown| teardown.phase() == TeardownPhase::AwaitNativeResponse)
+                {
+                    self.user_teardown
+                        .as_mut()
+                        .unwrap()
+                        .accept_native_response(&piu)?;
+                    flow.close();
+                    self.user_closed = true;
+                } else if piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32 {
+                    self.tcp_user_output = Some(
+                        self.native_user_close
+                            .as_mut()
+                            .ok_or_else(|| protocol("native user close absent"))?
+                            .accept_native_unbind(&piu)?
+                            .clone(),
+                    );
+                    self.tcp_user_output_kind = Some(TcpUserOutputKind::NativeAbort);
+                    flow.close();
+                } else if piu.len() >= 9
                     && piu[0] & 1 != 0
                     && !(piu.len() == 9 && is_canonical_ipr(&piu[6..9], &piu[9..]))
                 {
@@ -593,6 +694,25 @@ impl<P: RoutePort> VirtualWsPort<P> {
                         self.expedited_ack = Some(ack);
                     }
                     TcpKind::ExpeditedAck => flow.accept_tcp_expedited_ack(&record)?,
+                    TcpKind::Abort => {
+                        let teardown = self
+                            .user_teardown
+                            .as_mut()
+                            .ok_or_else(|| protocol("TCP62 user teardown absent"))?;
+                        match teardown.accept_abort(&record)? {
+                            AbortAction::HardClose => {
+                                flow.close();
+                                self.user_closed = true;
+                                self.inner.disconnect()?;
+                            }
+                            AbortAction::NativeUnbind(piu) => {
+                                self.native_user_output = Some(piu.to_vec());
+                                self.native_user_output_kind =
+                                    Some(NativeUserOutputKind::TeardownUnbind);
+                                flow.close();
+                            }
+                        }
+                    }
                     TcpKind::Normal | TcpKind::Segmented => {
                         match flow.prepare_tcp_normal(&record) {
                             Ok(Some(piu)) => {
@@ -1206,6 +1326,35 @@ mod tests {
         let expedited_ack = port.tcp_user_record().unwrap().clone();
         assert_eq!(expedited_ack.bytes, hex("0000000503"));
         port.mark_tcp_user_record_enqueued(&expedited_ack).unwrap();
+
+        let mut native_unbind = hex("2d00010200006b8000320100000000");
+        native_unbind.extend_from_slice(user_offer().fqpcid());
+        port.inner
+            .incoming
+            .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(native_unbind)));
+        port.poll(false).unwrap();
+        let abort = port.tcp_user_record().unwrap().clone();
+        assert_eq!(abort.kind, TcpKind::Abort);
+        port.mark_tcp_user_record_enqueued(&abort).unwrap();
+        assert!(port.tcp_user_record().is_none());
+        assert!(!port.user_closed());
+        port.complete_tcp_user_records(1).unwrap(); // Prior normal reply.
+        port.complete_tcp_user_records(1).unwrap(); // Prior native request.
+        port.complete_tcp_user_records(1).unwrap(); // Expedited ACK.
+        assert_eq!(
+            port.inner.information.last().unwrap(),
+            &hex("2d0002010002030000cc")
+        );
+        port.complete_tcp_user_records(1).unwrap(); // Abort is fully written.
+        port.poll(false).unwrap();
+        assert_eq!(
+            port.inner.information.last().unwrap(),
+            &hex("2d0002010000eb800032")
+        );
+        assert!(!port.user_closed());
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        assert!(port.user_closed());
     }
 
     #[test]
