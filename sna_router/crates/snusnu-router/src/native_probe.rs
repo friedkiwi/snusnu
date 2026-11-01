@@ -94,14 +94,18 @@ impl ProbeConfig {
 }
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
-    run_with_mode(path, false)
+    run_with_mode(path, false, false)
 }
 
 pub(crate) fn run_management(path: &Path) -> io::Result<()> {
-    run_with_mode(path, true)
+    run_with_mode(path, true, false)
 }
 
-fn run_with_mode(path: &Path, management: bool) -> io::Result<()> {
+pub(crate) fn run_user_bind(path: &Path) -> io::Result<()> {
+    run_with_mode(path, true, true)
+}
+
+fn run_with_mode(path: &Path, management: bool, user_bind: bool) -> io::Result<()> {
     let config = ProbeConfig::load(path)?;
     let profile = config.profile()?;
     let xid = profile
@@ -131,14 +135,18 @@ fn run_with_mode(path: &Path, management: bool) -> io::Result<()> {
             .remote_cp
             .clone()
             .ok_or_else(|| invalid("remote_cp required for management probe"))?;
-        NativePeerPort::open_management(peer, xid, remote_cp, config.local_cp.clone())?
+        if user_bind {
+            NativePeerPort::open_user_bind_probe(peer, xid, remote_cp, config.local_cp.clone())?
+        } else {
+            NativePeerPort::open_management(peer, xid, remote_cp, config.local_cp.clone())?
+        }
     } else {
         NativePeerPort::open(peer, xid)?
     };
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
     while !STOP.load(Ordering::Relaxed) {
         let had_frame = port.poll(true)?.is_some();
-        if management && port.management_complete() {
+        if management && !user_bind && port.management_complete() {
             tracing::info!("native management probe completed bounded UNBIND exchange; user routing remains disabled");
             return Ok(());
         }
@@ -150,7 +158,9 @@ fn run_with_mode(path: &Path, management: bool) -> io::Result<()> {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                if management {
+                if user_bind {
+                    "native user BIND probe timed out before peer follow-up"
+                } else if management {
                     "native management probe timed out before UNBIND completion"
                 } else {
                     "native probe timed out before SNASVCMG BIND"

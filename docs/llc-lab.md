@@ -226,3 +226,15 @@ BIS; this run did not reach management UNBIND or a user session. The guest's
 display remained at pass-through initialization until the writable clone was
 stopped. The private capture is outside the repository and was not used as an
 application-data fixture.
+
+### Experimental user BIND response probe
+
+`--native-user-bind-probe` uses the same isolated configuration and follows
+the validated management BIND, CNOS, and BIS exchanges. It accepts only the
+captured blank/default-mode user BIND for the configured CP pair, then sends
+one fixed-window candidate +RSP(BIND). It waits for the LLC acknowledgement
+and sends DISC on the next user PIU, logging its TH/RH and packet dump at
+debug level. This experiment cannot carry an application conversation or
+advertise a route. It exits with status 1 on the deliberate unsupported
+follow-up or a timeout; inspect the capture to judge whether OS/400 accepted
+the response. Run it only on an isolated TAP with an expendable guest.

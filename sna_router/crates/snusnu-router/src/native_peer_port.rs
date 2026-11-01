@@ -29,6 +29,15 @@ pub(crate) struct NativePeerPort {
     activation_announced: bool,
     reached_management_bind: bool,
     management: Option<ManagementSession>,
+    user_probe: UserProbeState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserProbeState {
+    Off,
+    AwaitBind,
+    AwaitResponseAck,
+    AwaitFollowup,
 }
 
 impl NativePeerPort {
@@ -48,6 +57,7 @@ impl NativePeerPort {
             activation_announced: false,
             reached_management_bind: false,
             management: None,
+            user_probe: UserProbeState::Off,
         })
     }
 
@@ -69,6 +79,17 @@ impl NativePeerPort {
         )
     }
 
+    pub(crate) fn open_user_bind_probe(
+        peer: LlcPeer<'_>,
+        local_xid: Xid3,
+        remote_plu: String,
+        local_slu: String,
+    ) -> io::Result<Self> {
+        let mut port = Self::open_management(peer, local_xid, remote_plu, local_slu)?;
+        port.user_probe = UserProbeState::AwaitBind;
+        Ok(port)
+    }
+
     pub(crate) fn reached_management_bind(&self) -> bool {
         self.reached_management_bind
     }
@@ -76,26 +97,31 @@ impl NativePeerPort {
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
         if let Some(management) = self.management.as_mut() {
             let completed = self.endpoint.take_completed_information_count();
-            match management.phase() {
-                ManagementPhase::AwaitBindAck if completed != 0 => management
-                    .acknowledge_bind(completed)
-                    .map_err(management_error)?,
-                ManagementPhase::AwaitCnosAck if completed != 0 => management
-                    .acknowledge_attach_replies(completed)
-                    .map_err(management_error)?,
-                ManagementPhase::AwaitBisAck if completed != 0 => management
-                    .acknowledge_bis(completed)
-                    .map_err(management_error)?,
-                ManagementPhase::AwaitUnbindAck if completed != 0 => management
-                    .acknowledge_unbind(completed)
-                    .map_err(management_error)?,
-                _ if completed != 0 => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected native LLC completion",
-                    ))
+            if self.user_probe == UserProbeState::AwaitResponseAck && completed == 1 {
+                self.user_probe = UserProbeState::AwaitFollowup;
+                tracing::info!("experimental native user BIND response acknowledged by LLC2; awaiting peer follow-up");
+            } else {
+                match management.phase() {
+                    ManagementPhase::AwaitBindAck if completed != 0 => management
+                        .acknowledge_bind(completed)
+                        .map_err(management_error)?,
+                    ManagementPhase::AwaitCnosAck if completed != 0 => management
+                        .acknowledge_attach_replies(completed)
+                        .map_err(management_error)?,
+                    ManagementPhase::AwaitBisAck if completed != 0 => management
+                        .acknowledge_bis(completed)
+                        .map_err(management_error)?,
+                    ManagementPhase::AwaitUnbindAck if completed != 0 => management
+                        .acknowledge_unbind(completed)
+                        .map_err(management_error)?,
+                    _ if completed != 0 => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected native LLC completion",
+                        ))
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             if let Some(attach) = management.take_early_attach() {
                 if let Err(error) = self.process_management_piu(attach) {
@@ -192,6 +218,16 @@ impl NativePeerPort {
 
     fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
         let management = self.management.as_mut().expect("management mode");
+        if matches!(
+            self.user_probe,
+            UserProbeState::AwaitResponseAck | UserProbeState::AwaitFollowup
+        ) {
+            tracing::warn!(bytes = piu.len(), th = ?piu.get(..6), rh = ?piu.get(6..9), "native user BIND probe reached peer follow-up; closing before unsupported user traffic");
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native user session follow-up is not implemented",
+            ));
+        }
         if piu.len() >= 9 && piu[6] == 0x83 {
             management.observe_ipr(&piu).map_err(management_error)?;
             tracing::debug!("native management fixed pacing IPR accepted");
@@ -299,7 +335,19 @@ impl NativePeerPort {
                         "",
                     )
                     .map_err(management_error)?;
-                    tracing::warn!(plu = %offer.plu, slu = %offer.slu, daf = offer.daf, oaf = offer.oaf, mode = %offer.mode, bytes = offer.request().len(), "native user BIND offer validated; gateway unavailable, disconnecting");
+                    tracing::warn!(plu = %offer.plu, slu = %offer.slu, daf = offer.daf, oaf = offer.oaf, mode = %offer.mode, bytes = offer.request().len(), experimental_response = self.user_probe == UserProbeState::AwaitBind, "native user BIND offer validated; user gateway unavailable");
+                    if self.user_probe == UserProbeState::AwaitBind {
+                        let response = offer.build_fixed_response(1).map_err(management_error)?;
+                        if !self.endpoint.queue_information(response)? {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "native user BIND response queue full",
+                            ));
+                        }
+                        self.user_probe = UserProbeState::AwaitResponseAck;
+                        tracing::warn!("experimental fixed-window native user BIND response queued; no user gateway active");
+                        return Ok(());
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "native user BIND gateway is not implemented",
