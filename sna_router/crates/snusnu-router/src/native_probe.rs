@@ -21,6 +21,8 @@ struct ProbeConfig {
     guest_mac: String,
     proxy_mac: String,
     local_cp: String,
+    #[serde(default)]
+    remote_cp: Option<String>,
     local_station: String,
     local_node_id: String,
     tg_number: u8,
@@ -92,6 +94,14 @@ impl ProbeConfig {
 }
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
+    run_with_mode(path, false)
+}
+
+pub(crate) fn run_management(path: &Path) -> io::Result<()> {
+    run_with_mode(path, true)
+}
+
+fn run_with_mode(path: &Path, management: bool) -> io::Result<()> {
     let config = ProbeConfig::load(path)?;
     let profile = config.profile()?;
     let xid = profile
@@ -111,18 +121,28 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         timeout_seconds = config.timeout_seconds,
         "native APPN one-shot probe starting"
     );
-    let mut port = NativePeerPort::open(
-        LlcPeer {
-            interface: &config.interface,
-            guest_mac,
-            proxy_mac,
-        },
-        xid,
-    )?;
+    let peer = LlcPeer {
+        interface: &config.interface,
+        guest_mac,
+        proxy_mac,
+    };
+    let mut port = if management {
+        let remote_cp = config
+            .remote_cp
+            .clone()
+            .ok_or_else(|| invalid("remote_cp required for management probe"))?;
+        NativePeerPort::open_management(peer, xid, remote_cp, config.local_cp.clone())?
+    } else {
+        NativePeerPort::open(peer, xid)?
+    };
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
     while !STOP.load(Ordering::Relaxed) {
         let had_frame = port.poll(true)?.is_some();
-        if port.reached_management_bind() {
+        if management && port.management_complete() {
+            tracing::info!("native management probe completed bounded CNOS exchange; user routing remains disabled");
+            return Ok(());
+        }
+        if !management && port.reached_management_bind() {
             tracing::info!("native probe reached SNASVCMG BIND after LLC2 contact; stopped before unsupported response");
             return Ok(());
         }
@@ -130,7 +150,11 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "native probe timed out before SNASVCMG BIND",
+                if management {
+                    "native management probe timed out before CNOS completion"
+                } else {
+                    "native probe timed out before SNASVCMG BIND"
+                },
             ));
         }
         if !had_frame {

@@ -155,7 +155,7 @@ local_station = "SNAB"
 local_node_id = "fff12345"
 tg_number = 1
 role = "secondary"
-timeout_seconds = 180
+timeout_seconds = 600
 ```
 
 The node ID must be a locally assigned eight-digit hexadecimal value in the
@@ -184,3 +184,16 @@ baseline used `2f0001020000` and `6b8500`. A management responder must
 validate this variation before it can send a positive BIND response. The
 capture remains outside the repository because it may include application
 data.
+
+### Bounded management-session probe
+
+`--native-management-probe` uses the same isolated-link configuration with
+`remote_cp = "SOLNET.SNAA"` added. It validates the guest's SNASVCMG BIND
+against the configured LU pair, sends a fixed one-stage +RSP(BIND), accounts
+for the LLC acknowledgement, then handles one CNOS Attach with a pacing grant
+and an accepted-pending CEB reply. A received isolated pacing response must
+match the management session. Exit status 0 means those bounded management
+replies were acknowledged by LLC2. The probe does not accept a user BIND,
+advertise a ready route, or carry routed traffic. Link loss, unsupported
+management PIUs, and timeout exit with status 1. Keep `timeout_seconds = 600`
+for a full V4R4 IPL and manual `STRPASTHR` activation.

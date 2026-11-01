@@ -9,7 +9,7 @@
 use crate::{
     appn_control::{CnosAttach, ControlError, ControlResponder},
     fid2_session_control::{ManagementBind, ManagementPacing, SessionControlError},
-    fixed_pacing::{FixedPacing, PacingError, IPR_RH, PACING_INDICATOR},
+    fixed_pacing::{is_canonical_ipr, FixedPacing, PacingError, IPR_RH, PACING_INDICATOR},
 };
 use std::{error::Error, fmt};
 
@@ -296,6 +296,33 @@ impl ManagementSession {
         self.phase = Phase::CnosComplete;
         Ok(())
     }
+
+    /// A peer's isolated pacing response grants the next outbound CNOS
+    /// window. It is independent of the LLC acknowledgement for our reply.
+    pub fn observe_ipr(&mut self, piu: &[u8]) -> Result<(), ManagementError> {
+        if !matches!(self.phase, Phase::AwaitCnosAck | Phase::CnosComplete) || piu.len() != 9 {
+            return Err(ManagementError::UnexpectedState);
+        }
+        let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
+        let request = self
+            .request
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?;
+        let (daf, oaf) = bind.request_addresses();
+        if piu[0] != request[0]
+            || piu[1] != 0
+            || piu[2] != daf
+            || piu[3] != oaf
+            || !is_canonical_ipr(&piu[6..9], &piu[9..])
+        {
+            return Err(ManagementError::UnexpectedState);
+        }
+        self.pacing
+            .as_mut()
+            .ok_or(ManagementError::UnexpectedState)?
+            .receive_pacing_response()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +432,14 @@ mod tests {
         let (ipr, reply) = (ipr.to_vec(), reply.to_vec());
         assert_eq!(session.phase(), Phase::AttachRepliesPrepared);
         assert_eq!(session.mark_attach_replies_enqueued(&ipr, &reply), Ok(()));
+        let peer_ipr = [0x2d, 0, 1, 2, 0, 0, 0x83, 1, 0];
+        assert_eq!(session.observe_ipr(&peer_ipr), Ok(()));
+        assert_eq!(
+            session.observe_ipr(&peer_ipr),
+            Err(ManagementError::Pacing(
+                PacingError::DuplicatePacingResponse
+            ))
+        );
         assert_eq!(session.acknowledge_attach_replies(1), Ok(()));
         assert_eq!(session.phase(), Phase::AwaitCnosAck);
         assert_eq!(session.acknowledge_attach_replies(1), Ok(()));

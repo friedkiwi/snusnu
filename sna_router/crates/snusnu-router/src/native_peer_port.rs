@@ -15,6 +15,7 @@ use crate::{
 use router_core::{
     fid2_bind::{classify_bind, BindClass},
     llc2::State,
+    native_management::{ManagementSession, Phase as ManagementPhase},
     xid3::{Role, Xid3},
     xid3_activation::Phase,
 };
@@ -26,6 +27,7 @@ pub(crate) struct NativePeerPort {
     local_xid: Xid3,
     activation_announced: bool,
     reached_management_bind: bool,
+    management: Option<ManagementSession>,
 }
 
 impl NativePeerPort {
@@ -44,7 +46,26 @@ impl NativePeerPort {
             local_xid,
             activation_announced: false,
             reached_management_bind: false,
+            management: None,
         })
+    }
+
+    pub(crate) fn open_management(
+        peer: LlcPeer<'_>,
+        local_xid: Xid3,
+        remote_plu: String,
+        local_slu: String,
+    ) -> io::Result<Self> {
+        let mut port = Self::open(peer, local_xid)?;
+        port.management = Some(ManagementSession::new(remote_plu, local_slu));
+        Ok(port)
+    }
+
+    pub(crate) fn management_complete(&self) -> bool {
+        matches!(
+            self.management.as_ref().map(ManagementSession::phase),
+            Some(ManagementPhase::CnosComplete)
+        )
     }
 
     pub(crate) fn reached_management_bind(&self) -> bool {
@@ -52,6 +73,27 @@ impl NativePeerPort {
     }
 
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
+        if let Some(management) = self.management.as_mut() {
+            let completed = self.endpoint.take_completed_information_count();
+            match management.phase() {
+                ManagementPhase::AwaitBindAck if completed != 0 => management
+                    .acknowledge_bind(completed)
+                    .map_err(management_error)?,
+                ManagementPhase::AwaitCnosAck if completed != 0 => management
+                    .acknowledge_attach_replies(completed)
+                    .map_err(management_error)?,
+                _ if completed != 0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected native LLC completion",
+                    ))
+                }
+                _ => {}
+            }
+            if let Some(attach) = management.take_early_attach() {
+                self.process_management_piu(attach)?;
+            }
+        }
         for event in events {
             match event {
                 Event::Type1(pdu) => {
@@ -82,6 +124,10 @@ impl NativePeerPort {
                     tracing::info!(peer_cp = ?self.type1.peer_name(), "native APPN LLC2 contact established; awaiting management BIND");
                 }
                 Event::Information(piu) => {
+                    if self.management.is_some() {
+                        self.process_management_piu(piu)?;
+                        continue;
+                    }
                     let bind = match classify_bind(&piu) {
                         Ok(bind) => bind,
                         Err(error) => {
@@ -112,6 +158,12 @@ impl NativePeerPort {
                     self.endpoint.disconnect()?;
                 }
                 Event::Disconnected | Event::TimedOut => {
+                    if self.management.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "native management probe lost LLC association",
+                        ));
+                    }
                     if self.endpoint.state() == State::Disconnected {
                         self.endpoint.set_connect_allowed(false)?;
                         self.type1 = NativeType1::new(self.local_xid.clone())?;
@@ -124,6 +176,82 @@ impl NativePeerPort {
         // BIND/CNOS and a gateway session are implemented.
         Ok(Vec::new())
     }
+
+    fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
+        let management = self.management.as_mut().expect("management mode");
+        if piu.len() >= 9 && piu[6] == 0x83 {
+            management.observe_ipr(&piu).map_err(management_error)?;
+            tracing::debug!("native management fixed pacing IPR accepted");
+            return Ok(());
+        }
+        match management.phase() {
+            ManagementPhase::AwaitBind => {
+                let bind = management.observe_bind(&piu).map_err(management_error)?;
+                let (daf, oaf) = bind.request_addresses();
+                tracing::info!(
+                    daf,
+                    oaf,
+                    bytes = piu.len(),
+                    "native SNASVCMG BIND validated"
+                );
+                let response = management
+                    .prepare_bind_response()
+                    .map_err(management_error)?
+                    .to_vec();
+                if !self.endpoint.queue_information(response.clone())? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native BIND response queue full",
+                    ));
+                }
+                management
+                    .mark_bind_enqueued(&response)
+                    .map_err(management_error)?;
+                self.reached_management_bind = true;
+            }
+            ManagementPhase::AwaitBindAck => management
+                .buffer_early_attach(&piu)
+                .map_err(management_error)?,
+            ManagementPhase::AwaitAttach => {
+                // Both responses must fit before pacing is consumed. If an
+                // I/O error occurs after enqueue, this one-shot probe exits
+                // and the entire LLC association is discarded.
+                if self.endpoint.available_receive_slots() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native CNOS needs two LLC egress slots",
+                    ));
+                }
+                let (ipr, cnos) = management.observe_attach(&piu).map_err(management_error)?;
+                let (ipr, cnos) = (ipr.to_vec(), cnos.to_vec());
+                for reply in [&ipr, &cnos] {
+                    if !self.endpoint.queue_information(reply.clone())? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "native CNOS response queue full",
+                        ));
+                    }
+                }
+                management
+                    .mark_attach_replies_enqueued(&ipr, &cnos)
+                    .map_err(management_error)?;
+                tracing::info!(
+                    "native CNOS accepted-pending response queued; no user route active"
+                );
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported native management PIU",
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+fn management_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 impl RoutePort for NativePeerPort {
