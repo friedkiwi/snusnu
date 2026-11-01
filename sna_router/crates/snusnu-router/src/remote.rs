@@ -47,6 +47,42 @@ struct SharedWs {
 }
 
 impl SharedWs {
+    fn dequeue(&mut self, index: usize) -> io::Result<Option<wire::ws_envelope::Body>> {
+        use wire::ws_envelope::Body;
+        while let Some(body) = self.inbox[index].pop_front() {
+            let circuit_id = match &body {
+                Body::OpenReady(value) => Some(value.circuit_id.as_slice()),
+                Body::CircuitEvent(value) => Some(value.circuit_id.as_slice()),
+                Body::CircuitCredit(value) => Some(value.circuit_id.as_slice()),
+                Body::CircuitClose(value) => Some(value.circuit_id.as_slice()),
+                Body::CircuitReset(value) => Some(value.circuit_id.as_slice()),
+                _ => None,
+            };
+            if circuit_id.is_some_and(|id| {
+                !self.circuit_owners.contains_key(id)
+                    && self.closed_circuits.iter().any(|closed| closed == id)
+            }) {
+                continue;
+            }
+            if let Body::OpenResult(result) = &body {
+                if !self.request_owners.contains_key(&result.request_id)
+                    && self.closed_requests.contains(&result.request_id)
+                {
+                    if result.accepted && result.circuit_id.len() == 16 {
+                        self.client
+                            .send(envelope(Body::CircuitClose(wire::CircuitClose {
+                                circuit_id: result.circuit_id.clone(),
+                            })))
+                            .map_err(io_error)?;
+                    }
+                    continue;
+                }
+            }
+            return Ok(Some(body));
+        }
+        Ok(None)
+    }
+
     fn receive_once(&mut self) -> io::Result<bool> {
         let Some(message) = self
             .client
@@ -81,7 +117,15 @@ impl SharedWs {
             Body::OpenResult(result) => {
                 if let Some(owner) = self.request_owners.get(&result.request_id).copied() {
                     self.inbox[owner].push_back(body);
-                } else if !self.closed_requests.contains(&result.request_id) {
+                } else if self.closed_requests.contains(&result.request_id) {
+                    if result.accepted && result.circuit_id.len() == 16 {
+                        self.client
+                            .send(envelope(Body::CircuitClose(wire::CircuitClose {
+                                circuit_id: result.circuit_id.clone(),
+                            })))
+                            .map_err(io_error)?;
+                    }
+                } else {
                     return Err(protocol("unknown open request ID"));
                 }
             }
@@ -145,6 +189,9 @@ pub(crate) struct WsRoutePort {
     local_route_ids: HashSet<u64>,
     target_cp: wire::SnaName,
     target: Option<wire::RouteReference>,
+    require_managed_binding: bool,
+    managed_binding_seen: bool,
+    managed_mac: Option<[u8; 6]>,
     circuit: Option<Circuit>,
     opening: bool,
     local_ready: bool,
@@ -158,12 +205,20 @@ pub(crate) struct WsRoutePort {
 
 impl WsRoutePort {
     pub(crate) fn connect(config: Config) -> io::Result<Self> {
-        Ok(Self::connect_many(vec![config], vec![])?.remove(0))
+        Ok(Self::connect_many_with_mode(vec![config], vec![], false)?.remove(0))
     }
 
     pub(crate) fn connect_many(
         configs: Vec<Config>,
         logical_units: Vec<wire::LuReachability>,
+    ) -> io::Result<Vec<Self>> {
+        Self::connect_many_with_mode(configs, logical_units, true)
+    }
+
+    fn connect_many_with_mode(
+        configs: Vec<Config>,
+        logical_units: Vec<wire::LuReachability>,
+        require_managed_binding: bool,
     ) -> io::Result<Vec<Self>> {
         let primary = configs
             .first()
@@ -265,6 +320,9 @@ impl WsRoutePort {
                 local_route_ids,
                 target_cp: config.target_cp,
                 target: None,
+                require_managed_binding,
+                managed_binding_seen: false,
+                managed_mac: None,
                 circuit: None,
                 opening: false,
                 local_ready: false,
@@ -285,7 +343,11 @@ impl WsRoutePort {
     }
 
     fn maybe_open(&mut self) -> io::Result<()> {
-        if self.circuit.is_some() || self.opening || self.pending_type1.is_empty() {
+        if self.circuit.is_some()
+            || self.opening
+            || self.pending_type1.is_empty()
+            || (self.require_managed_binding && self.managed_mac.is_none())
+        {
             return Ok(());
         }
         let Some(target) = self.target.clone() else {
@@ -367,6 +429,11 @@ impl WsRoutePort {
                 if snapshot.epoch.len() != 16 {
                     return Err(protocol("invalid route epoch"));
                 }
+                if self.managed_binding_seen
+                    && (self.require_managed_binding || self.managed_mac.is_some())
+                {
+                    return Ok(Vec::new());
+                }
                 if let Some(route) = snapshot.routes.into_iter().find(|route| {
                     matches!(&route.resource, Some(wire::route_export::Resource::ControlPoint(cp))
                         if *cp == self.target_cp)
@@ -393,6 +460,9 @@ impl WsRoutePort {
                         self.disconnect()?;
                         return Ok(vec![RouterEvent::Closed]);
                     }
+                    if retargeted && self.opening {
+                        self.clear_circuit();
+                    }
                     self.maybe_open()?;
                 } else if self
                     .target
@@ -409,9 +479,17 @@ impl WsRoutePort {
                         self.disconnect()?;
                         return Ok(vec![RouterEvent::Closed]);
                     }
+                    if self.opening {
+                        self.clear_circuit();
+                    }
                 }
             }
             Body::OriginWithdraw(withdraw) => {
+                if self.managed_binding_seen
+                    && (self.require_managed_binding || self.managed_mac.is_some())
+                {
+                    return Ok(Vec::new());
+                }
                 if self
                     .target
                     .as_ref()
@@ -428,6 +506,9 @@ impl WsRoutePort {
                         self.disconnect()?;
                         return Ok(vec![RouterEvent::Closed]);
                     }
+                    if self.opening {
+                        self.clear_circuit();
+                    }
                 }
             }
             Body::ManagedCpBindings(bindings) => {
@@ -437,6 +518,7 @@ impl WsRoutePort {
                     return Err(protocol("invalid managed CP binding snapshot"));
                 }
                 validate_managed_bindings(&bindings.bindings)?;
+                self.managed_binding_seen = true;
                 debug!(
                     revision = bindings.revision,
                     binding_count = bindings.bindings.len(),
@@ -458,9 +540,29 @@ impl WsRoutePort {
                         candidate_count = binding.candidates.len(),
                         "selected managed CP binding"
                     );
-                    self.target = binding.candidates.into_iter().next();
-                    self.maybe_open()?;
+                    let next_target = binding.candidates.into_iter().next();
+                    let changed = self.target != next_target || self.managed_mac != Some(mac);
+                    self.target = next_target;
+                    self.managed_mac = Some(mac);
+                    if changed && self.opening {
+                        self.clear_circuit();
+                    }
+                    if changed && self.circuit.is_some() {
+                        self.disconnect()?;
+                        return Ok(vec![RouterEvent::Closed, RouterEvent::ManagedMac(mac)]);
+                    }
                     return Ok(vec![RouterEvent::ManagedMac(mac)]);
+                }
+                if self.require_managed_binding || self.managed_mac.is_some() {
+                    self.target = None;
+                    self.managed_mac = None;
+                    if self.opening {
+                        self.clear_circuit();
+                    }
+                    if self.circuit.is_some() {
+                        self.disconnect()?;
+                        return Ok(vec![RouterEvent::Closed]);
+                    }
                 }
             }
             Body::IncomingOpen(incoming) => self.incoming_open(incoming)?,
@@ -717,7 +819,7 @@ impl RoutePort for WsRoutePort {
             if shared.inbox[self.index].is_empty() {
                 shared.receive_once()?;
             }
-            shared.inbox[self.index].pop_front()
+            shared.dequeue(self.index)?
         };
         let Some(body) = body else {
             return Ok(None);
@@ -1122,6 +1224,24 @@ mod tests {
                 }
             }
             assert_eq!(cp_ids.len(), 2);
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::ManagedCpBindings(wire::ManagedCpBindingSnapshot {
+                    schema_version: 1,
+                    recipient_epoch: vec![8; 16],
+                    revision: 1,
+                    bindings: ["PEERA", "PEERB"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, cp)| wire::ManagedCpBinding {
+                            address_id: vec![(index + 1) as u8; 16],
+                            control_point: Some(name("SOLNET", cp)),
+                            virtual_mac: vec![0x02, 0x53, 0x4e, 0, 0, (index + 1) as u8],
+                            candidates: vec![],
+                        })
+                        .collect(),
+                }),
+            );
             for (index, cp) in ["SNAA", "SNAB"].into_iter().enumerate() {
                 send(
                     &mut socket,
@@ -1170,6 +1290,29 @@ mod tests {
                 );
             }
             done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitClose(wire::CircuitClose {
+                    circuit_id: vec![1; 16],
+                }),
+            );
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitCredit(wire::CircuitCredit {
+                    circuit_id: vec![1; 16],
+                    allowance_bytes: 1600,
+                }),
+            );
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitEvent(wire::CircuitEvent {
+                    circuit_id: vec![2; 16],
+                    event: Some(wire::circuit_event::Event::Type1(
+                        encode_type1(&[4, 4, 0xaf, 0x33]).unwrap(),
+                    )),
+                }),
+            );
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         });
         let configs = ["SNAA", "SNAB"]
             .into_iter()
@@ -1189,20 +1332,139 @@ mod tests {
         )
         .unwrap();
         let mut received = [None, None];
+        let mut managed_macs = [None, None];
         let deadline = Instant::now() + Duration::from_secs(2);
-        while received.iter().any(Option::is_none) && Instant::now() < deadline {
+        while (received.iter().any(Option::is_none) || managed_macs.iter().any(Option::is_none))
+            && Instant::now() < deadline
+        {
             for (index, port) in ports.iter_mut().enumerate() {
                 if let Some(events) = port.poll(true).unwrap() {
                     for event in events {
-                        if let RouterEvent::Unit(RoutedUnit::DlcType1(pdu)) = event {
-                            received[index] = Some(pdu[3]);
+                        match event {
+                            RouterEvent::Unit(RoutedUnit::DlcType1(pdu)) => {
+                                received[index] = Some(pdu[3]);
+                            }
+                            RouterEvent::ManagedMac(mac) => managed_macs[index] = Some(mac),
+                            _ => {}
                         }
                     }
                 }
             }
         }
         assert_eq!(received, [Some(0x11), Some(0x22)]);
+        assert_eq!(
+            managed_macs,
+            [
+                Some([0x02, 0x53, 0x4e, 0, 0, 1]),
+                Some([0x02, 0x53, 0x4e, 0, 0, 2]),
+            ]
+        );
         done_tx.send(()).unwrap();
+        // Pump both frames for circuit 1 through the other logical port,
+        // then retire circuit 1. Its queued late credit must be discarded.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut second_marker = None;
+        while second_marker.is_none() && Instant::now() < deadline {
+            if let Some(events) = ports[1].poll(true).unwrap() {
+                for event in events {
+                    if let RouterEvent::Unit(RoutedUnit::DlcType1(pdu)) = event {
+                        second_marker = Some(pdu[3]);
+                    }
+                }
+            }
+        }
+        assert_eq!(second_marker, Some(0x33));
+        assert!(matches!(
+            ports[0].poll(true).unwrap(),
+            Some(events) if matches!(events.as_slice(), [RouterEvent::Closed])
+        ));
+        assert!(ports[0].poll(true).unwrap().is_none());
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_remote_uses_origin_route_after_empty_managed_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |_: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, body| {
+                socket
+                    .send(WsMessage::Binary(envelope(body).encode_to_vec().into()))
+                    .unwrap();
+            };
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                    router_id: vec![7; 16],
+                    connection_epoch: vec![8; 16],
+                    max_message_bytes: 65536,
+                    max_circuits: 4,
+                    display_name: "legacy test".into(),
+                }),
+            );
+            let _snapshot = socket.read().unwrap();
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::ManagedCpBindings(wire::ManagedCpBindingSnapshot {
+                    schema_version: 1,
+                    recipient_epoch: vec![8; 16],
+                    revision: 1,
+                    bindings: vec![],
+                }),
+            );
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16],
+                        revision: 1,
+                        routes: vec![wire::RouteExport {
+                            id: 99,
+                            generation: 1,
+                            resource: Some(wire::route_export::Resource::ControlPoint(name(
+                                "SOLNET", "PEERB",
+                            ))),
+                        }],
+                    }),
+                }),
+            );
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("expected open request");
+            };
+            let request = wire::WsEnvelope::decode(payload).unwrap();
+            let Some(wire::ws_envelope::Body::OpenRequest(request)) = request.body else {
+                panic!("expected open request");
+            };
+            assert_eq!(request.target.unwrap().route_id, 99);
+        });
+        let mut port = WsRoutePort::connect(Config {
+            url,
+            bearer: "test-token".into(),
+            local_cp: name("SOLNET", "SNAA"),
+            target_cp: name("SOLNET", "PEERB"),
+        })
+        .unwrap();
+        port.send(RoutedUnit::DlcType1(vec![4, 4, 0xaf])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !port.opening && Instant::now() < deadline {
+            port.poll(true).unwrap();
+        }
+        assert!(port.opening);
         server.join().unwrap();
     }
 
