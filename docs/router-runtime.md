@@ -1,6 +1,6 @@
 # Standalone Rust routing runtime
 
-The Rust executable is the router. It must be able to bind two local endpoints and pass traffic between them without a Go process, WebSocket connection or concentrator. Remote links are optional next hops selected by the same route table. This is a target design, not an implemented feature: today `--lab-link` joins exactly two TAPs, `--site-id` only waits for shutdown, and `transport-ws` contains a placeholder trait.
+The Rust executable is the router. It must be able to bind two local endpoints and pass traffic between them without a Go process, WebSocket connection or concentrator. Remote links are optional next hops selected by the same route table. Locally reachable destinations exported over that hop use the [route advertisement format](route-advertisements.md). This is a target design, not an implemented feature: today `--lab-link` joins exactly two TAPs, `--site-id` only waits for shutdown, and `transport-ws` contains a placeholder trait.
 
 ## Three separate jobs
 
