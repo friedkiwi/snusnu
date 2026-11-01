@@ -393,3 +393,55 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
     assert!(edge.is_closed());
     assert!(edge.native_mut().closed);
 }
+
+#[test]
+fn gateway_rejects_connect_response_before_request_reaches_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut independent_gateway = GatewaySession::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+    )
+    .unwrap();
+    let expected_connect = independent_gateway
+        .begin_native_bind(&user_bind(), template())
+        .unwrap();
+    let response = positive_response(&Connect::decode(&expected_connect.bytes).unwrap());
+    let bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let mut native = MockNative {
+        accepts: true,
+        ..Default::default()
+    };
+    native.events.push_back(NativeEvent::UserBind(user_bind()));
+    let mut edge = GatewayEdge::new(native, TcpSession::new(sender).unwrap(), bridge, template());
+    edge.poll_native_once().unwrap(); // Queues Connect, but does not write it.
+    assert_eq!(edge.phase(), BridgePhase::AwaitConnect);
+    let mut scratch = [0; 1];
+    assert!(matches!(
+        peer.read(&mut scratch).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+
+    peer.write_all(&response.bytes).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let error = loop {
+        match edge.poll_tcp_once() {
+            Err(error) => break error,
+            Ok(()) => assert!(Instant::now() < deadline, "early response was not rejected"),
+        }
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(edge.is_closed());
+    assert!(edge.native_mut().closed);
+    assert!(edge.native_mut().sent.is_empty());
+}

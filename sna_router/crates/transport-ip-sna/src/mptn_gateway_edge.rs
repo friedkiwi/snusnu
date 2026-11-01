@@ -41,6 +41,7 @@ pub struct GatewayEdge<L: NativeLeg> {
     attach: Option<(TcpRecord, bool)>,
     /// TCP queue order and whether GatewaySession charged this record.
     writes: VecDeque<(usize, bool)>,
+    connect_fully_sent: bool,
     ipr_ack_outstanding: bool,
     closed: bool,
 }
@@ -60,6 +61,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             connect: None,
             attach: None,
             writes: VecDeque::new(),
+            connect_fully_sent: false,
             ipr_ack_outstanding: false,
             closed: false,
         }
@@ -142,6 +144,11 @@ impl<L: NativeLeg> GatewayEdge<L> {
                 self.close()?;
                 return Err(invalid("TCP62 record outside supported BIND phase"));
             }
+            if !self.connect_fully_sent {
+                return Err(invalid(
+                    "TCP62 Connect response before request write completed",
+                ));
+            }
             let response = self.bridge.accept_connect_response(&record)?;
             self.native_reply = Some((NativeReply::Bind, response));
         }
@@ -180,6 +187,11 @@ impl<L: NativeLeg> GatewayEdge<L> {
             }
             if charged {
                 self.bridge.complete_tcp_delivery(len)?;
+            } else if self.connect_fully_sent {
+                self.close()?;
+                return Err(invalid("duplicate TCP62 Connect write completion"));
+            } else {
+                self.connect_fully_sent = true;
             }
         }
         result
@@ -246,6 +258,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.connect = None;
             self.attach = None;
             self.writes.clear();
+            self.connect_fully_sent = false;
             self.ipr_ack_outstanding = false;
             self.native.close()?;
         }
