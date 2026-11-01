@@ -1,5 +1,7 @@
 //! Platform-independent circuit domain foundation.
 
+pub mod llc;
+
 use std::num::NonZeroU64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

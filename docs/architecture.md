@@ -24,9 +24,9 @@ WSS server authentication and site authentication will protect the transport. Au
 
 ## Stages
 
-1. Specify the byte format and state rules, then share encode/decode/rejection vectors between Go and Rust.
-2. Implement trace-tested local LLC2 handling and a minimal authenticated WSS circuit path with bounded flow control.
-3. Add authorized DLC reachability, fault/reconnect tests, and operational facilities; test with genuine APPN nodes.
+1. Build local 802.3/802.2 capture and replay, then collect TEST, XID and LLC2 traces from genuine SNA equipment. Keep SNA information fields opaque while validating DLC behavior.
+2. Implement trace-tested LLC Type 1 handling and the local LLC2 endpoint, including timers, sequencing and bounded buffering. Test against scripted peers and captured traffic.
+3. Specify the cross-language circuit protocol and shared vectors, then add the authenticated WSS path, authorized DLC reachability, fault/reconnect tests and operational facilities. Test with genuine APPN nodes.
 
 ## References and status
 
