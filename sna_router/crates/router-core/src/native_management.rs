@@ -496,6 +496,47 @@ impl ManagementSession {
 mod tests {
     use super::*;
 
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn reciprocal_qa_management_bind_uses_its_own_fqpcid_and_pacing() {
+        // Alice's independent BIND after Bob's CNOS/BIS, captured on the
+        // QAALICE/QABOB virtual native circuit. Its 23-byte FQPCID names
+        // QAALICE.SNAA; Bob's earlier outbound FQPCID is a separate token.
+        let request = hex(concat!(
+            "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
+            "0cd8c1c1d3c9c3c54be2d5c1c12e000902e2d5c1e2e5c3d4c7",
+            "09030123f4fd39d800000d04d8c1c1d3c9c3c54be2d5c1c1",
+            "0a1300b023f4fd39d80000000ad8c1c2d6c24be2d5c1c2",
+            "6015d8e7221f0a531d820cd8c1c1d3c9c3c54be2d5c1c1",
+            "2c0a04087bc3d6d5d5c5c3e3"
+        ));
+        assert_eq!(request.len(), 143);
+        let mut session = ManagementSession::new("QAALICE.SNAA".into(), "QABOB.SNAB".into());
+        let bind = session.observe_bind(&request).unwrap();
+        assert_eq!(bind.request_addresses(), (1, 2));
+        assert_eq!(bind.fqpcid().len(), 23);
+        assert_eq!(
+            &bind.fqpcid()[..10],
+            &[0x60, 0x15, 0xd8, 0xe7, 0x22, 0x1f, 0x0a, 0x53, 0x1d, 0x82]
+        );
+        let response = session.prepare_bind_response().unwrap().to_vec();
+        assert_eq!(&response[..9], &[0x2d, 0, 2, 1, 0, 0, 0xeb, 0x80, 0]);
+        assert_eq!(
+            &response[response.len() - 23..],
+            session.bind().unwrap().fqpcid()
+        );
+        session.mark_bind_enqueued(&response).unwrap();
+        session.acknowledge_bind(1).unwrap();
+        assert_eq!(session.phase(), Phase::AwaitAttach);
+    }
+
     fn live_shape_bind() -> Vec<u8> {
         // Sanitized live V4R4 probe BIND: FQPCID and COS tokens replaced.
         let hex = concat!(
