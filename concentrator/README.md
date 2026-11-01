@@ -1,5 +1,7 @@
 # Concentrator web service
 
+For a ready-to-run isolated database with test accounts and router clients, use the [QA binary](QA.md).
+
 The Go binary contains the HTML templates, passkey browser code, and Bootstrap 5.3.8 CSS/JS. It serves them from `/assets/`; no CDN is needed. If reCAPTCHA is enabled, its widget still loads Google's live script, as required by the [reCAPTCHA v2 integration](https://developers.google.com/recaptcha/docs/display).
 
 ## Local development
@@ -44,7 +46,7 @@ Use TLS at the reverse proxy and set `SNUSNU_ORIGIN` to its HTTPS origin. The ap
 
 ## Roles and current records
 
-New accounts have the `user` role and must verify email before login. The dashboard shows the user's named sna_router clients and their live CP/LU exports. Users can onboard a router, name it, pause or resume it, rotate its bearer credential, or remove it. Router credentials are separate from user API client credentials and are hashed at rest. The onboarding page shows the reserved `wss://<host>/router/v1/ws` URL and the token once; router downloads are placeholders. Pausing and token rotation revoke the current connection epoch and withdraw its exports in the database. The future transport must close active sockets and call the policy gate for traffic.
+New accounts have the `user` role and must verify email before login. The dashboard shows the user's named sna_router clients and their live CP/LU exports. Users can onboard a router, name it, pause or resume it, rotate its bearer credential, or remove it. Router credentials are separate from user API client credentials and are hashed at rest. The onboarding page shows the `wss://<host>/router/v1/ws` URL and the token once; router downloads are placeholders. Pausing and token rotation revoke the current connection epoch and withdraw its exports. The WebSocket service closes the affected socket on its next policy check.
 
 Users can reset their own password from the sign-in page using a six-digit code sent to their verified email address. Codes expire after 10 minutes and allow five attempts; reset requests are rate limited and require reCAPTCHA when configured. Development mode logs the password reset code, as it does verification codes. Admins can reset a user's password from the Users page or profile: a random temporary password is displayed once to the admin. Both reset paths revoke the user's browser sessions, preserve enrolled MFA, and require the new password for the next sign-in. Admins always see user email addresses, even when a profile has private email visibility.
 
@@ -52,8 +54,8 @@ The global directory lists live exports, with owner profile links. Profiles supp
 
 The **My LLC MACs** page lets users allocate a managed virtual address only for a named CP that needs an LLC-facing address. The address book is owned by the server and allocates unique addresses from `02:53:4E:00:00:01` through `02:53:4E:FF:FF:FF`. It shows both colon format and the 12-hex-digit OS/400 `ADPTADR` value. LUs show their hosting CP and have no separate allocation. Assignments survive route withdrawal and disconnect. Retiring a CP tombstones its address; addresses are never automatically reused. An admin can inspect all assignments. The `02:53:4E` prefix validates an address format, not the identity of a router.
 
-The router detail page has an explicit **LLC-facing** setting. The store can build versioned, server-stamped binding snapshots for active, authorized LLC-facing recipients only; the snapshots omit blocked peers and withdrawn routes. Rust-published route snapshots remain MAC-free. The Go WebSocket publisher is still pending, so the binding snapshots are not yet sent over a live connection. The first two-V4R4 WebSocket test can continue using configured MACs independently of this address book.
+The router detail page has an explicit **LLC-facing** setting. The WebSocket service sends versioned, server-stamped binding snapshots to active, authorized LLC-facing recipients only; the snapshots omit blocked peers and withdrawn routes. Rust-published route snapshots remain MAC-free. The first two-V4R4 WebSocket test can continue using configured MACs independently of this address book.
 
-Router detail pages and the inbound-flow page search the most recent 100 diagnostic entries by event, node, summary or source IP. The log store accepts structured decoded fields, timestamps, direction, severity and peer identity; records expire after 30 days. No wire decoder or live transport is connected yet, so these pages have no live traffic records. Live route snapshots are validated and replaced atomically by epoch and revision through the store API, but no WebSocket handler calls it yet.
+Router detail pages and the inbound-flow page search the most recent 100 diagnostic entries by event, node, summary or source IP. The WebSocket relay records bounded event summaries, timestamps, direction, peer identity and source IP; records expire after 30 days. Local LLC packet decoding remains with Rust. Live route snapshots are validated and replaced atomically by epoch and revision.
 
 MFA enrollment is optional. Users without an enrolled factor are prompted after login and may defer the reminder for 30 days. Once TOTP or a passkey is enrolled, it is required after the password on each login. User API clients receive a bearer token once at creation; only its SHA-256 hash is stored. Current API access is read-only at `/api/v1/directory` and `/api/v1/connections`. The directory API returns live exports; the connections API remains the older planning-record view.
