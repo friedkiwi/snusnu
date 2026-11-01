@@ -37,16 +37,13 @@ impl NativeType1 {
         })
     }
 
-    /// Start a single fixed-primary XID exchange with a passive APPN peer.
+    /// Start a single XID exchange with a passive APPN peer.
     /// The null poll is committed only after Endpoint accepts it for send.
     pub(crate) fn prepare_active_null_xid(&self) -> io::Result<OutboundType1> {
-        if self.activation.local_role() != Role::Primary
-            || self.active_started
-            || self.phase() != Phase::Exchanging
-        {
+        if self.active_started || self.phase() != Phase::Exchanging {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "active native XID requires an unstarted fixed-primary link",
+                "active native XID requires an unstarted fixed-role link",
             ));
         }
         Ok(OutboundType1 {
@@ -240,10 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn fixed_primary_starts_passive_peer_with_null_then_owned_xid3() {
+    fn fixed_secondary_starts_passive_peer_with_null_then_owned_xid3() {
         let local = xid(
             "SOLNET.ROUTER",
-            Role::Primary,
+            Role::Secondary,
             ExchangeState::Prenegotiation,
         );
         let mut handler = NativeType1::new(local).unwrap();
@@ -261,7 +258,7 @@ mod tests {
         assert_eq!(&first.pdu[..3], &[4, 4, 0xbf]);
         let sent = Xid3::decode(&first.pdu[3..]).unwrap();
         assert_eq!(sent.cp_name().unwrap(), "SOLNET.ROUTER");
-        assert_eq!(sent.role(), Ok(Role::Primary));
+        assert_eq!(sent.role(), Ok(Role::Secondary));
         assert_eq!(sent.exchange_state(), ExchangeState::Prenegotiation);
         assert_eq!(handler.confirm_sent(&first).unwrap(), Phase::Exchanging);
         assert!(handler.on_pdu(&[4, 5, 0xbf]).unwrap().is_none());
@@ -279,7 +276,7 @@ mod tests {
             handler.confirm_sent(&proceeding).unwrap(),
             Phase::Exchanging
         );
-        peer.set_role(Role::Secondary);
+        peer.set_role(Role::Primary);
         peer.set_exchange_state(ExchangeState::NegotiationProceeding);
         response.truncate(3);
         response.extend(peer.encode().unwrap());
@@ -288,15 +285,19 @@ mod tests {
     }
 
     #[test]
-    fn fixed_secondary_cannot_start_active_null_xid() {
+    fn fixed_primary_can_start_active_null_xid_when_peer_is_secondary() {
         let local = xid(
             "SOLNET.ROUTER",
-            Role::Secondary,
+            Role::Primary,
             ExchangeState::Prenegotiation,
         );
-        assert!(NativeType1::new(local)
-            .unwrap()
-            .prepare_active_null_xid()
-            .is_err());
+        assert_eq!(
+            NativeType1::new(local)
+                .unwrap()
+                .prepare_active_null_xid()
+                .unwrap()
+                .pdu,
+            [4, 4, 0xbf]
+        );
     }
 }

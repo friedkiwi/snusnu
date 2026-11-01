@@ -181,7 +181,7 @@ impl NativePeerPort {
         self.converter_events.pop_front()
     }
 
-    /// Begin a fixed-primary link toward a passive OS/400 LAN controller.
+    /// Begin XID from this fixed-role link toward a passive OS/400 controller.
     /// The caller must enable this explicitly for an inbound routed session;
     /// a responder-only port continues waiting for the guest's first XID.
     pub(crate) fn begin_active_xid(&mut self) -> io::Result<()> {
