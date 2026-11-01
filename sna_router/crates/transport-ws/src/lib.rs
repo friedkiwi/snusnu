@@ -20,6 +20,7 @@ pub mod wire {
 }
 
 pub const SUBPROTOCOL: &str = "snusnu.v1";
+pub const SUBPROTOCOL_V2: &str = "snusnu.v2";
 pub const MAX_V1_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -86,6 +87,7 @@ impl From<prost::DecodeError> for Error {
 pub struct WsClient {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     max_message_bytes: usize,
+    subprotocol: &'static str,
 }
 
 impl WsClient {
@@ -105,6 +107,24 @@ impl WsClient {
     /// Connect using an HTTP Authorization header. A plaintext `ws` URL is
     /// accepted only for loopback development servers.
     pub fn connect(url: &str, bearer: &str) -> Result<(Self, wire::RouterWelcome), Error> {
+        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL)
+    }
+
+    /// Connect with source-LU authenticated circuit opens. Both circuit ends
+    /// must select v2 before the server will relay an LU gateway open.
+    pub fn connect_v2(url: &str, bearer: &str) -> Result<(Self, wire::RouterWelcome), Error> {
+        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL_V2)
+    }
+
+    pub fn subprotocol(&self) -> &'static str {
+        self.subprotocol
+    }
+
+    fn connect_with_subprotocol(
+        url: &str,
+        bearer: &str,
+        subprotocol: &'static str,
+    ) -> Result<(Self, wire::RouterWelcome), Error> {
         validate_url(url)?;
         if bearer.is_empty() {
             return Err(Error::InvalidBearer);
@@ -115,20 +135,23 @@ impl WsClient {
         request.headers_mut().insert(AUTHORIZATION, auth);
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static(SUBPROTOCOL),
+            HeaderValue::from_static(subprotocol),
         );
         let (socket, response) = connect(request)?;
         if response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
             .and_then(|value| value.to_str().ok())
-            != Some(SUBPROTOCOL)
+            != Some(subprotocol)
         {
-            return Err(Error::Handshake("server did not select snusnu.v1"));
+            return Err(Error::Handshake(
+                "server selected a different snusnu subprotocol",
+            ));
         }
         let mut client = Self {
             socket,
             max_message_bytes: MAX_V1_MESSAGE_BYTES,
+            subprotocol,
         };
         client.socket.set_config(|config| {
             config.max_message_size = Some(MAX_V1_MESSAGE_BYTES);
@@ -382,6 +405,31 @@ mod tests {
                 )),
             })
             .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn v2_handshake_requires_explicit_v2_selection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            tungstenite::accept_hdr(
+                tcp,
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    assert_eq!(request.headers()[SEC_WEBSOCKET_PROTOCOL], SUBPROTOCOL_V2);
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+        });
+        let url = format!("ws://{address}/router/v1/ws");
+        assert!(WsClient::connect_v2(&url, "test-token").is_err());
         server.join().unwrap();
     }
 

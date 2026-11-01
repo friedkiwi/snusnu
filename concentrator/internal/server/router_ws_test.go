@@ -15,8 +15,11 @@ import (
 )
 
 func connectTestRouter(t *testing.T, url, token string) (*websocket.Conn, *wire.RouterWelcome) {
+	return connectTestRouterVersion(t, url, token, "snusnu.v1")
+}
+func connectTestRouterVersion(t *testing.T, url, token, version string) (*websocket.Conn, *wire.RouterWelcome) {
 	t.Helper()
-	headers := http.Header{"Authorization": []string{"Bearer " + token}, "Sec-WebSocket-Protocol": []string{"snusnu.v1"}}
+	headers := http.Header{"Authorization": []string{"Bearer " + token}, "Sec-WebSocket-Protocol": []string{version}}
 	conn, response, err := websocket.DefaultDialer.Dial(url, headers)
 	if err != nil {
 		if response != nil {
@@ -25,6 +28,9 @@ func connectTestRouter(t *testing.T, url, token string) (*websocket.Conn, *wire.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
+	if conn.Subprotocol() != version {
+		t.Fatalf("selected subprotocol %q, wanted %q", conn.Subprotocol(), version)
+	}
 	envelope := readTestEnvelope(t, conn)
 	welcome := envelope.GetWelcome()
 	if welcome == nil || len(welcome.RouterId) != 16 || len(welcome.ConnectionEpoch) != 16 || welcome.DisplayName == "" || !store.ValidNetID(welcome.AllowedNetid) {
@@ -319,4 +325,81 @@ func TestRouterWebSocketRejectsUnownedNETID(t *testing.T) {
 	if err = a.DB.Row(ctx, "SELECT COUNT(*) FROM router_advertisements WHERE router_id=?", router.ID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("unowned advertisement persisted: %d %v", count, err)
 	}
+}
+
+func TestRouterWebSocketV2SourceLUBinding(t *testing.T) {
+	a := testApp(t)
+	ctx := context.Background()
+	owners := []string{store.RandomUUID(), store.RandomUUID()}
+	tokens := make([]string, 2)
+	for i, owner := range owners {
+		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, []string{"v2-a@example.com", "v2-b@example.com"}[i], "unused", store.Now(), []string{"NETA", "NETB"}[i]); err != nil {
+			t.Fatal(err)
+		}
+		_, token, err := a.DB.CreateRouter(ctx, owner, "V2 router")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens[i] = token
+	}
+	srv := httptest.NewServer(a.Handler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/router/v1/ws"
+	ca, wa := connectTestRouterVersion(t, url, tokens[0], "snusnu.v2")
+	cb, wb := connectTestRouterVersion(t, url, tokens[1], "snusnu.v2")
+	name := func(netid, value string) *wire.SnaName { return &wire.SnaName{Netid: netid, Name: value} }
+	snapshot := func(epoch []byte, netid, cp, lu string) *wire.RouteSnapshot {
+		return &wire.RouteSnapshot{Epoch: epoch, Revision: 1, Routes: []*wire.RouteExport{
+			{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: name(netid, cp)}},
+			{Id: 2, Generation: 1, Resource: &wire.RouteExport_LogicalUnit{LogicalUnit: &wire.LuReachability{Lu: name(netid, lu), HostingCp: name(netid, cp), SupportedTypes: []wire.LuType{wire.LuType_LU_TYPE_6_2}}}},
+		}}
+	}
+	sendTestEnvelope(t, ca, &wire.WsEnvelope_PublishRoutes{PublishRoutes: snapshot(wa.ConnectionEpoch, "NETA", "SNAA", "LUA")})
+	sendTestEnvelope(t, cb, &wire.WsEnvelope_PublishRoutes{PublishRoutes: snapshot(wb.ConnectionEpoch, "NETB", "SNAB", "LUB")})
+	expectTestBody(t, ca, "routes")
+	expectTestBody(t, cb, "routes")
+	source := &wire.RouteReference{RouterId: wa.RouterId, Epoch: wa.ConnectionEpoch, RouteId: 2, RouteGeneration: 1}
+	target := &wire.RouteReference{RouterId: wb.RouterId, Epoch: wb.ConnectionEpoch, RouteId: 2, RouteGeneration: 1}
+	open := func(id uint64, ref *wire.RouteReference) {
+		sendTestEnvelope(t, ca, &wire.WsEnvelope_OpenRequest{OpenRequest: &wire.OpenRequest{RequestId: id, Target: target, SourceRoute: ref, ReceiveAllowanceBytes: 1500}})
+	}
+	for id, forged := range []*wire.RouteReference{
+		{RouterId: wb.RouterId, Epoch: wa.ConnectionEpoch, RouteId: 2, RouteGeneration: 1},
+		{RouterId: wa.RouterId, Epoch: make([]byte, 16), RouteId: 2, RouteGeneration: 1},
+		{RouterId: wa.RouterId, Epoch: wa.ConnectionEpoch, RouteId: 1, RouteGeneration: 1},
+	} {
+		open(uint64(id+1), forged)
+		result := expectTestBody(t, ca, "result").GetOpenResult()
+		if result.Accepted || result.Reason != wire.OpenFailure_OPEN_FAILURE_FORBIDDEN {
+			t.Fatalf("forged source %d accepted: %+v", id, result)
+		}
+	}
+	open(4, source)
+	incoming := expectTestBody(t, cb, "open").GetIncomingOpen()
+	if !proto.Equal(incoming.SourceRoute, source) || !proto.Equal(incoming.Target, target) || string(incoming.SourceRouterId) != string(wa.RouterId) {
+		t.Fatalf("v2 source LU was not server stamped and relayed: %+v", incoming)
+	}
+	sendTestEnvelope(t, cb, &wire.WsEnvelope_OpenDecision{OpenDecision: &wire.OpenDecision{CircuitId: incoming.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500}})
+	expectTestBody(t, cb, "ready")
+	if !expectTestBody(t, ca, "result").GetOpenResult().Accepted {
+		t.Fatal("valid v2 LU circuit rejected")
+	}
+	// Withdrawal of the exact source LU invalidates the established circuit.
+	sendTestEnvelope(t, ca, &wire.WsEnvelope_PublishRoutes{PublishRoutes: &wire.RouteSnapshot{
+		Epoch: wa.ConnectionEpoch, Revision: 2,
+		Routes: []*wire.RouteExport{{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: name("NETA", "SNAA")}}},
+	}})
+	for i := 0; i < 3; i++ {
+		message := readTestEnvelope(t, cb)
+		if message.GetCircuitReset() != nil {
+			if message.GetCircuitReset().Reason != wire.ResetReason_RESET_REASON_ROUTE_GONE {
+				t.Fatalf("wrong source withdrawal reset: %+v", message.GetCircuitReset())
+			}
+			return
+		}
+		if message.GetOriginRoutes() == nil {
+			t.Fatalf("unexpected source withdrawal message: %T", message.Body)
+		}
+	}
+	t.Fatal("source LU withdrawal did not reset v2 circuit")
 }

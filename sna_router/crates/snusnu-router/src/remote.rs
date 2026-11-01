@@ -198,6 +198,7 @@ pub(crate) struct WsRoutePort {
     target_cp: wire::SnaName,
     target_lu: Option<wire::SnaName>,
     target: Option<wire::RouteReference>,
+    source_route: Option<wire::RouteReference>,
     require_managed_binding: bool,
     managed_binding_seen: bool,
     managed_mac: Option<[u8; 6]>,
@@ -214,24 +215,60 @@ pub(crate) struct WsRoutePort {
 
 impl WsRoutePort {
     pub(crate) fn connect(config: Config) -> io::Result<Self> {
-        Ok(Self::connect_many_with_mode(vec![config], vec![], false)?.remove(0))
+        Ok(Self::connect_many_with_mode(vec![config], vec![], false, None)?.remove(0))
     }
 
     pub(crate) fn connect_many(
         configs: Vec<Config>,
         logical_units: Vec<wire::LuReachability>,
     ) -> io::Result<Vec<Self>> {
-        Self::connect_many_with_mode(configs, logical_units, true)
+        Self::connect_many_with_mode(configs, logical_units, true, None)
+    }
+
+    /// One virtual native gateway circuit. The source LU must be a locally
+    /// published export; the server validates its live reference at OPEN.
+    pub(crate) fn connect_gateway_v2(
+        config: Config,
+        logical_units: Vec<wire::LuReachability>,
+        source_lu: wire::SnaName,
+    ) -> io::Result<Self> {
+        Ok(Self::connect_many_with_mode(
+            vec![config],
+            logical_units,
+            false,
+            Some(vec![Some(source_lu)]),
+        )?
+        .remove(0))
+    }
+
+    /// LLC-facing v2 ports may receive source-LU authenticated opens while
+    /// still requiring the managed CP address binding on their local link.
+    pub(crate) fn connect_many_v2(
+        configs: Vec<Config>,
+        logical_units: Vec<wire::LuReachability>,
+        source_lus: Vec<Option<wire::SnaName>>,
+    ) -> io::Result<Vec<Self>> {
+        Self::connect_many_with_mode(configs, logical_units, true, Some(source_lus))
     }
 
     fn connect_many_with_mode(
         configs: Vec<Config>,
         logical_units: Vec<wire::LuReachability>,
         require_managed_binding: bool,
+        source_lus: Option<Vec<Option<wire::SnaName>>>,
     ) -> io::Result<Vec<Self>> {
         let primary = configs
             .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no remote routes"))?;
+        if source_lus
+            .as_ref()
+            .is_some_and(|lus| lus.len() != configs.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source LU count differs from remote routes",
+            ));
+        }
         for config in &configs {
             validate_name(&config.local_cp)?;
             validate_name(&config.target_cp)?;
@@ -251,8 +288,12 @@ impl WsRoutePort {
                 ));
             }
         }
-        let (mut client, welcome) =
-            WsClient::connect(&primary.url, &primary.bearer).map_err(io_error)?;
+        let (mut client, welcome) = if source_lus.is_some() {
+            WsClient::connect_v2(&primary.url, &primary.bearer)
+        } else {
+            WsClient::connect(&primary.url, &primary.bearer)
+        }
+        .map_err(io_error)?;
         if configs
             .iter()
             .any(|config| config.local_cp.netid != welcome.allowed_netid)
@@ -297,6 +338,22 @@ impl WsRoutePort {
                 .collect::<Vec<_>>(),
             &logical_units,
         )?;
+        let source_routes = source_lus.as_ref().map(|lus| {
+            lus.iter().zip(&configs).map(|(lu, config)| {
+                let Some(lu) = lu else { return Ok(None) };
+                validate_name(lu)?;
+                let route = snapshot.routes.iter().find(|route| {
+                    matches!(route.resource.as_ref(), Some(wire::route_export::Resource::LogicalUnit(export))
+                        if export.lu.as_ref() == Some(lu) && export.hosting_cp.as_ref() == Some(&config.local_cp))
+                }).ok_or_else(|| protocol("v2 source LU must be exported under local CP"))?;
+                Ok(Some(wire::RouteReference {
+                    router_id: welcome.router_id.clone(),
+                    epoch: welcome.connection_epoch.clone(),
+                    route_id: route.id,
+                    route_generation: route.generation,
+                }))
+            }).collect::<io::Result<Vec<_>>>()
+        }).transpose()?;
         let mut route_owners = HashMap::new();
         let mut local_route_ids = vec![HashSet::new(); configs.len()];
         for route in &snapshot.routes {
@@ -355,6 +412,9 @@ impl WsRoutePort {
                 target_cp: config.target_cp,
                 target_lu: config.target_lu,
                 target: None,
+                source_route: source_routes
+                    .as_ref()
+                    .and_then(|routes| routes[index].clone()),
                 require_managed_binding,
                 managed_binding_seen: false,
                 managed_mac: None,
@@ -378,6 +438,11 @@ impl WsRoutePort {
     }
 
     fn maybe_open(&mut self) -> io::Result<()> {
+        if self.shared.borrow().client.subprotocol() == transport_ws::SUBPROTOCOL_V2
+            && self.source_route.is_none()
+        {
+            return Ok(());
+        }
         if self.circuit.is_some()
             || self.opening
             || self.pending_type1.is_empty()
@@ -410,7 +475,7 @@ impl WsRoutePort {
             request_id: self.request_id,
             target: Some(target),
             receive_allowance_bytes: INITIAL_ALLOWANCE,
-            source_route: None,
+            source_route: self.source_route.clone(),
         }))
     }
 
@@ -691,12 +756,26 @@ impl WsRoutePort {
                 && self.local_route_ids.contains(&r.route_id)
                 && r.route_generation == 1
         });
+        let v2 = self.shared.borrow().client.subprotocol() == transport_ws::SUBPROTOCOL_V2;
+        let source_ok = if v2 {
+            self.target_lu.is_some()
+                && incoming.source_route.as_ref() == self.target.as_ref()
+                && incoming
+                    .source_route
+                    .as_ref()
+                    .is_some_and(|r| r.router_id == incoming.source_router_id)
+        } else {
+            incoming.source_route.is_none()
+        };
         let accept = target_ok
+            && source_ok
             && self.circuit.is_none()
             && !self.opening
             && (!self.require_managed_binding || self.managed_mac.is_some());
         let reason = if accept {
             wire::OpenFailure::Unspecified
+        } else if !source_ok {
+            wire::OpenFailure::Forbidden
         } else if target_ok {
             wire::OpenFailure::Busy
         } else {
