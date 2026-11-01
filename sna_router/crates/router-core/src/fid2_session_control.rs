@@ -109,6 +109,10 @@ impl ManagementBind {
         (self.request_daf, self.request_oaf)
     }
 
+    pub fn fqpcid(&self) -> &[u8; 22] {
+        &self.fqpcid
+    }
+
     /// Check a candidate positive response's session-control envelope. The
     /// result means only that its FID2 addresses and LU 6.2 fixed profile
     /// correlate with this request. The captured V4R4 response omits both LU

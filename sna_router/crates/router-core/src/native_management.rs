@@ -67,6 +67,9 @@ pub enum Phase {
     AwaitCnosAck,
     CnosComplete,
     BisComplete,
+    UnbindResponsePrepared,
+    AwaitUnbindAck,
+    Closed,
 }
 
 pub struct ManagementSession {
@@ -83,6 +86,7 @@ pub struct ManagementSession {
     pending_cnos: Option<Vec<u8>>,
     attach_acks: usize,
     bis: Option<BisPeer>,
+    pending_unbind: Option<[u8; 10]>,
 }
 
 impl ManagementSession {
@@ -101,6 +105,7 @@ impl ManagementSession {
             pending_cnos: None,
             attach_acks: 0,
             bis: None,
+            pending_unbind: None,
         }
     }
 
@@ -373,6 +378,56 @@ impl ManagementSession {
         }
         Ok(())
     }
+
+    /// Accept the captured no-retry reason X'01' only after both BIS halves.
+    /// The FQPCID ties the UNBIND to this BIND instance; no opaque tail is
+    /// echoed. A different reason or session instance fails closed.
+    pub fn prepare_unbind_response(&mut self, piu: &[u8]) -> Result<&[u8], ManagementError> {
+        if self.phase != Phase::BisComplete || piu.len() != 37 {
+            return Err(ManagementError::UnexpectedState);
+        }
+        let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
+        let request = self
+            .request
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?;
+        let (daf, oaf) = bind.request_addresses();
+        if piu[0] != request[0]
+            || piu[1] != 0
+            || piu[2] != daf
+            || piu[3] != oaf
+            || piu[4..9] != [0, 0, 0x6b, 0x80, 0]
+            || piu[9..15] != [0x32, 1, 0, 0, 0, 0]
+            || piu[15..37] != *bind.fqpcid()
+        {
+            return Err(ManagementError::UnexpectedState);
+        }
+        self.pending_unbind = Some([piu[0], 0, oaf, daf, 0, 0, 0xeb, 0x80, 0, 0x32]);
+        self.phase = Phase::UnbindResponsePrepared;
+        Ok(self.pending_unbind.as_ref().unwrap())
+    }
+
+    pub fn mark_unbind_enqueued(&mut self, piu: &[u8]) -> Result<(), ManagementError> {
+        if self.phase != Phase::UnbindResponsePrepared
+            || self.pending_unbind.as_ref().map(<[u8; 10]>::as_slice) != Some(piu)
+        {
+            return Err(ManagementError::WrongEgress);
+        }
+        self.phase = Phase::AwaitUnbindAck;
+        Ok(())
+    }
+
+    pub fn acknowledge_unbind(
+        &mut self,
+        completed_information: usize,
+    ) -> Result<(), ManagementError> {
+        if self.phase != Phase::AwaitUnbindAck || completed_information != 1 {
+            return Err(ManagementError::UnexpectedState);
+        }
+        self.pending_unbind = None;
+        self.phase = Phase::Closed;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +560,19 @@ mod tests {
         assert_eq!(local_bis, [0x2c, 0, 2, 1, 0, 2, 0x4b, 0xb1, 0, 0x70]);
         session.mark_local_bis_enqueued(&local_bis).unwrap();
         assert_eq!(session.phase(), Phase::BisComplete);
+        let mut unbind = vec![0x2d, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0];
+        unbind.extend_from_slice(session.bind().unwrap().fqpcid());
+        let mut wrong = unbind.clone();
+        wrong[20] ^= 1;
+        assert_eq!(
+            session.prepare_unbind_response(&wrong),
+            Err(ManagementError::UnexpectedState)
+        );
+        let response = session.prepare_unbind_response(&unbind).unwrap().to_vec();
+        assert_eq!(response, [0x2d, 0, 2, 1, 0, 0, 0xeb, 0x80, 0, 0x32]);
+        session.mark_unbind_enqueued(&response).unwrap();
+        session.acknowledge_unbind(1).unwrap();
+        assert_eq!(session.phase(), Phase::Closed);
     }
 
     #[test]
