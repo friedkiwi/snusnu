@@ -211,6 +211,12 @@ impl NativePeerPort {
         self.endpoint.available_receive_slots()
     }
 
+    pub(crate) fn converter_management_bind(
+        &self,
+    ) -> Option<&router_core::fid2_session_control::ManagementBind> {
+        self.management.as_ref().and_then(ManagementSession::bind)
+    }
+
     pub(crate) fn reached_management_bind(&self) -> bool {
         self.reached_management_bind
     }

@@ -16,30 +16,30 @@ use std::{
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProbeConfig {
-    interface: String,
-    guest_mac: String,
-    proxy_mac: String,
-    local_cp: String,
+pub(crate) struct ProbeConfig {
+    pub(crate) interface: String,
+    pub(crate) guest_mac: String,
+    pub(crate) proxy_mac: String,
+    pub(crate) local_cp: String,
     #[serde(default)]
-    remote_cp: Option<String>,
+    pub(crate) remote_cp: Option<String>,
     #[serde(default)]
-    user_plu: Option<String>,
+    pub(crate) user_plu: Option<String>,
     #[serde(default)]
-    user_slu: Option<String>,
+    pub(crate) user_slu: Option<String>,
     #[serde(default)]
-    user_tp_hex: Option<String>,
-    local_station: String,
-    local_node_id: String,
-    tg_number: u8,
-    role: ProbeRole,
+    pub(crate) user_tp_hex: Option<String>,
+    pub(crate) local_station: String,
+    pub(crate) local_node_id: String,
+    pub(crate) tg_number: u8,
+    pub(crate) role: ProbeRole,
     #[serde(default = "default_timeout")]
-    timeout_seconds: u64,
+    pub(crate) timeout_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ProbeRole {
+pub(crate) enum ProbeRole {
     Primary,
     Secondary,
 }
@@ -70,7 +70,7 @@ fn parse_node_id(value: &str) -> io::Result<[u8; 4]> {
         .to_be_bytes())
 }
 
-fn parse_tp(value: &str) -> io::Result<[u8; 4]> {
+pub(crate) fn parse_tp(value: &str) -> io::Result<[u8; 4]> {
     if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid("user_tp_hex must be eight hexadecimal digits"));
     }
@@ -80,7 +80,7 @@ fn parse_tp(value: &str) -> io::Result<[u8; 4]> {
 }
 
 impl ProbeConfig {
-    fn load(path: &Path) -> io::Result<Self> {
+    pub(crate) fn load(path: &Path) -> io::Result<Self> {
         let content = fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)
             .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
@@ -92,7 +92,7 @@ impl ProbeConfig {
         Ok(config)
     }
 
-    fn profile(&self) -> io::Result<LocalLlcProfile> {
+    pub(crate) fn profile(&self) -> io::Result<LocalLlcProfile> {
         Ok(LocalLlcProfile {
             cp_name: self.local_cp.clone(),
             station_name: self.local_station.clone(),

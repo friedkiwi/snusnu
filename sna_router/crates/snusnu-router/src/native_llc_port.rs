@@ -11,6 +11,7 @@ use crate::{
     routing::RoutePort,
     runtime::LlcPeer,
 };
+use router_core::fid2_session_control::ManagementBind;
 use router_core::xid3::Xid3;
 use std::io;
 use transport_ip_sna::mptn_gateway_edge::{NativeEvent, NativeLeg};
@@ -54,6 +55,10 @@ impl NativeLlcPort {
 
     pub(crate) fn close(&mut self) -> io::Result<()> {
         self.inner.disconnect()
+    }
+
+    pub(crate) fn management_bind(&self) -> Option<&ManagementBind> {
+        self.inner.converter_management_bind()
     }
 }
 

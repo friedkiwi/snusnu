@@ -321,3 +321,29 @@ conversation was attempted. This verifies delivery of the IPR frame, while
 leaving its higher-level acceptance and the necessary Attach reply unproven.
 The private capture `/tmp/snusnu-v4r4-regression/native-attach-ipr-sol5.pcap`
 has 58 frames and no capture drops.
+
+## Isolated native-to-TCP62 mock converter
+
+`--native-converter-mock-lab FILE` starts the same dynamic XID3, LLC2, and
+APPN management peer as the one-shot probes. It accepts the first validated
+V4R4 user BIND, opens an in-process TCP62 mock on loopback, relays a derived
+Connect request and response, and forwards the first validated user FMH-5
+Attach as one TCP62 normal record. It sends the correlated native user IPR
+only after reserving a receive slot and queuing the TCP record. The harness
+stops after the mock receives that record and the native IPR is acknowledged.
+It does not send an application reply or expose a production route.
+
+Use the same isolated `--native-user-pacing-probe` TOML file, including
+`user_plu`, `user_slu`, `user_tp_hex`, and `timeout_seconds = 600` for V4R4 IPL:
+
+```sh
+cargo run -p snusnu-router -- --native-converter-mock-lab /path/to/native-probe.toml
+```
+
+For this fixture the configured user LU pair must match the management CP
+pair. The mock alone advertises the six TCP62 compensation codes needed by
+the converter test. Those codes are unavailable in the normal route loader
+until UDP X'83' and later APPC handlers exist. A successful harness exit
+means one Attach crossed the LLC-to-TCP62 boundary and its local pacing
+response was acknowledged; it does not mean the application conversation
+completed.
