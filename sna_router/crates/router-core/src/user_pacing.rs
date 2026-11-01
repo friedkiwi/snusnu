@@ -325,7 +325,11 @@ impl UserPacingSession {
     pub fn observe_ipr(&mut self, piu: &[u8]) -> Result<(), UserPacingError> {
         self.require_active_idle()?;
         if piu.len() != 9
-            || piu[0] != self.expedited_th0
+            // An isolated IPR may use either flow. The live V4R4 user IPR
+            // uses normal TH0 0x2c after an expedited 0x2d user BIND, while
+            // the management IPR used expedited flow. Keep every other TH0
+            // bit, including ODAI, tied to this session.
+            || piu[0] & !0x01 != self.expedited_th0 & !0x01
             || piu[1] != 0
             || piu[2] != self.daf
             || piu[3] != self.oaf
@@ -579,9 +583,15 @@ mod tests {
             session.observe_ipr(&hex("2d000202000083010000")),
             Err(UserPacingError::WrongSession)
         );
-        session.observe_ipr(&hex("2d0002020000830100")).unwrap();
         assert_eq!(
-            session.observe_ipr(&hex("2d0002020000830100")),
+            session.observe_ipr(&hex("2e0002020000830100")),
+            Err(UserPacingError::WrongSession)
+        );
+        // Live V4R4 sustained flow: A's IPR is normal-flow 0x2c even though
+        // its user BIND used expedited-flow 0x2d.
+        session.observe_ipr(&hex("2c0002020000830100")).unwrap();
+        assert_eq!(
+            session.observe_ipr(&hex("2c0002020000830100")),
             Err(UserPacingError::Pacing(
                 PacingError::DuplicatePacingResponse
             ))
@@ -596,6 +606,8 @@ mod tests {
         let next_window = session.prepare_normal_send(&outbound).unwrap().to_vec();
         assert_eq!(next_window[7], 0x81);
         session.mark_egress_enqueued(&next_window).unwrap();
+        // The same isolated IPR also remains legal on the expedited flow.
+        session.observe_ipr(&hex("2d0002020000830100")).unwrap();
         session.close();
         assert_eq!(session.phase(), UserPacingPhase::Closed);
         assert_eq!(
