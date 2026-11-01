@@ -158,3 +158,35 @@ capture contains no user BIND response. This demonstrates that the writable
 V4R4 guest can reuse address `0x01` for the user session after management
 teardown. The private capture is `native-converter-v5-third-sol5.pcap` in
 the V4 lab directory.
+
+## Fresh direct management baseline
+
+To resolve the mixed lab's reverse management Connect, both writable V5R4
+clones were connected directly after stopping the Rust diagnostic and keeping
+the V4 controller off. A's `ETHLIN` initially referenced missing hardware
+resource `CMN01`; `WRKHDWRSC TYPE(*CMN)` showed `CMN02` operational, so the
+writable A clone used `CHGLINETH LIND(ETHLIN) RSRCNAME(CMN02)`, then varied
+`ETHLIN` on. Its TCP/IP interface `.2`, `ETHLINET` controller, and `ETHLITCP`
+device became active. A ping to B `.3` produced four request/reply pairs.
+For this direct run only, B's SNAA host alias moved from `.10` back to `.2`;
+the host route and address `.10/32` were left intact. Captures started before
+the sol6/sol7 bridge was connected.
+
+The direct pass-through reached B's remote Sign On. On the private `sol7`
+capture, frame 61 was A `.2` to B `.3:397` with a 230-byte MPTN Connect
+request containing a 137-byte `SNASVCMG` BIND. Frame 62, 66 ms later, was
+B's 189-byte positive Connect response with a 96-byte positive BIND response
+and the same correlator. Both carried options `0x05`, `0x0A`, `0x18`, `0x19`,
+and `0x1A` (`0x84` keepalive). Frames 63–66 were the CNOS Attach/reply and
+BIS exchange in normal records; frame 67 was an Abort ending the management
+session. Frames 74–76 then opened and accepted the user Connect and carried
+the first FMH-5 Attach. B did not initiate a reverse TCP Connect during this
+clean direct startup. The private captures are
+`/tmp/snusnu-v5r4-ip-lab/direct-management-sol6.pcap` and
+`direct-management-sol7.pcap`; no raw capture or application data is in this
+repository.
+
+After `ENDPASTHR` returned normally, A was stopped and the bridge removed.
+B's host table was restored to `.2` containing only its system hostname and
+`.10` containing only `SNAA.SOLNET.SNA.IBM.COM`; B's `SNAA00` device was
+varied off. The original host `.10/32` route to B `.3` again passed two pings.
