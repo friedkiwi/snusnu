@@ -2,13 +2,18 @@
 //! does on a local LLC port; only this module knows the concentrator protocol.
 
 use crate::routing::{RoutePort, RoutedUnit, RouterEvent};
-use std::{collections::VecDeque, io, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    time::Duration,
+};
 use transport_ws::{wire, WsClient};
 
 const INITIAL_ALLOWANCE: u64 = 1500;
 const MAX_PENDING_EVENTS: usize = INITIAL_ALLOWANCE as usize;
 const MAX_PENDING_TYPE1: usize = 16;
 
+#[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) url: String,
     pub(crate) bearer: String,
@@ -193,6 +198,7 @@ impl WsRoutePort {
                 {
                     return Err(protocol("invalid managed CP binding snapshot"));
                 }
+                validate_managed_bindings(&bindings.bindings)?;
                 if let Some(binding) = bindings
                     .bindings
                     .into_iter()
@@ -493,6 +499,19 @@ fn validate_name(name: &wire::SnaName) -> io::Result<()> {
     }
 }
 
+fn validate_managed_bindings(bindings: &[wire::ManagedCpBinding]) -> io::Result<()> {
+    let mut addresses = HashSet::new();
+    for binding in bindings {
+        if binding.virtual_mac.len() != 6
+            || binding.virtual_mac[..3] != [0x02, 0x53, 0x4e]
+            || !addresses.insert(binding.virtual_mac.as_slice())
+        {
+            return Err(protocol("invalid or duplicate managed virtual MAC"));
+        }
+    }
+    Ok(())
+}
+
 fn encode_type1(pdu: &[u8]) -> io::Result<wire::DlcType1> {
     if pdu.len() < 3 || pdu[0] != 4 || pdu[1] & !1 != 4 {
         return Err(protocol("invalid Type1 PDU"));
@@ -575,5 +594,19 @@ mod tests {
             name: "SNAA".into()
         })
         .is_err());
+    }
+
+    #[test]
+    fn validates_managed_virtual_mac_namespace_and_uniqueness() {
+        let binding = |mac: &[u8]| wire::ManagedCpBinding {
+            address_id: vec![1; 16],
+            control_point: None,
+            virtual_mac: mac.to_vec(),
+            candidates: vec![],
+        };
+        let valid = binding(&[0x02, 0x53, 0x4e, 0, 0, 1]);
+        assert!(validate_managed_bindings(&[valid.clone()]).is_ok());
+        assert!(validate_managed_bindings(&[valid.clone(), valid]).is_err());
+        assert!(validate_managed_bindings(&[binding(&[0x02, 0x53, 0x4f, 0, 0, 1])]).is_err());
     }
 }

@@ -128,6 +128,12 @@ impl Router {
         Ok(())
     }
 
+    /// End a local association before a failed transport is discarded. This
+    /// gives an LLC peer a DISC instead of leaving it linked to a dead route.
+    pub(crate) fn disconnect_port(&mut self, id: &PortId) -> io::Result<()> {
+        self.port_mut(id)?.disconnect()
+    }
+
     fn target(&self, source: &PortId) -> io::Result<&PortId> {
         self.routes.get(source).ok_or_else(|| {
             io::Error::new(

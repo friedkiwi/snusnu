@@ -6,10 +6,16 @@ use crate::{
     routing::{PortId, RoutePort, RoutedUnit, Router, RouterEvent},
 };
 use router_core::llc2::State;
-use std::{io, time::Duration};
+use std::{
+    io,
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, Instant},
+};
 
 const CONNECT_BARRIER: Duration = Duration::from_millis(200);
 
+#[derive(Clone, Copy)]
 pub(crate) struct LlcPeer<'a> {
     pub(crate) interface: &'a str,
     pub(crate) guest_mac: [u8; 6],
@@ -109,12 +115,78 @@ pub(crate) fn run(a: LlcPeer<'_>, b: LlcPeer<'_>) -> io::Result<()> {
 }
 
 pub(crate) fn run_remote(local: LlcPeer<'_>, config: RemoteConfig) -> io::Result<()> {
-    let mut router = Router::new();
-    let local_id = PortId::new("local-llc");
-    let remote_id = PortId::new("concentrator");
-    router.register_port(local_id.clone(), Box::new(LlcPort::open(local)?))?;
-    router.register_port(remote_id.clone(), Box::new(WsRoutePort::connect(config)?))?;
-    router.add_route(&local_id, &remote_id)?;
-    router.add_route(&remote_id, &local_id)?;
-    router.run()
+    const FIRST_RETRY: Duration = Duration::from_millis(500);
+    const MAX_RETRY: Duration = Duration::from_secs(30);
+    let mut delay = FIRST_RETRY;
+    while !crate::STOP.load(Ordering::Relaxed) {
+        let remote = match WsRoutePort::connect(config.clone()) {
+            Ok(port) => port,
+            Err(error) if retryable_remote_error(&error) => {
+                eprintln!("concentrator connection failed: {error}; retrying in {delay:?}");
+                wait_or_stop(delay);
+                delay = delay.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let connected_at = Instant::now();
+        let local_id = PortId::new("local-llc");
+        let remote_id = PortId::new("concentrator");
+        let mut router = Router::new();
+        router.register_port(local_id.clone(), Box::new(LlcPort::open(local)?))?;
+        router.register_port(remote_id.clone(), Box::new(remote))?;
+        router.add_route(&local_id, &remote_id)?;
+        router.add_route(&remote_id, &local_id)?;
+        match router.run() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // The old server epoch and circuit cannot be reused. Notify
+                // the OS/400 LLC peer before constructing a fresh router.
+                router.disconnect_port(&local_id)?;
+                if !retryable_remote_error(&error) {
+                    return Err(error);
+                }
+                if connected_at.elapsed() >= MAX_RETRY {
+                    delay = FIRST_RETRY;
+                }
+                eprintln!("concentrator link lost: {error}; reconnecting in {delay:?}");
+                wait_or_stop(delay);
+                delay = delay.saturating_mul(2).min(MAX_RETRY);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retryable_remote_error(error: &io::Error) -> bool {
+    use transport_ws::Error as WsError;
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<WsError>())
+        .is_some_and(WsError::is_retryable)
+}
+
+fn wait_or_stop(delay: Duration) {
+    let mut remaining = delay;
+    while !remaining.is_zero() && !crate::STOP.load(Ordering::Relaxed) {
+        let step = remaining.min(Duration::from_millis(100));
+        thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_permanent_router_protocol_errors() {
+        let invalid = io::Error::other(transport_ws::Error::InvalidBearer);
+        assert!(!retryable_remote_error(&invalid));
+        let closed = io::Error::other(transport_ws::Error::Protocol("server closed connection"));
+        assert!(retryable_remote_error(&closed));
+        assert!(!retryable_remote_error(&io::Error::other(
+            "local TAP failed"
+        )));
+    }
 }

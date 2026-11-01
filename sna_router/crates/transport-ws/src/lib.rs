@@ -51,6 +51,26 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether a fresh connection may succeed without changing local
+    /// configuration. A missing handler (404) may become available while the
+    /// concentrator is deployed; rejected credentials must fail promptly.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::WebSocket(tungstenite::Error::Http(response)) => {
+                !matches!(response.status().as_u16(), 400 | 401 | 403 | 426)
+            }
+            Self::WebSocket(
+                tungstenite::Error::ConnectionClosed
+                | tungstenite::Error::Io(_)
+                | tungstenite::Error::WriteBufferFull(_),
+            ) => true,
+            Self::Protocol("server closed connection") => true,
+            _ => false,
+        }
+    }
+}
+
 impl From<tungstenite::Error> for Error {
     fn from(value: tungstenite::Error) -> Self {
         Self::WebSocket(value)
@@ -390,5 +410,21 @@ mod tests {
             Some(wire::ws_envelope::Body::IdentityUpdate(_))
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn retry_policy_distinguishes_credentials_from_pending_deployment() {
+        let rejection = |status| {
+            Error::WebSocket(tungstenite::Error::Http(Box::new(
+                tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(None)
+                    .unwrap(),
+            )))
+        };
+        assert!(!rejection(401).is_retryable());
+        assert!(!rejection(403).is_retryable());
+        assert!(rejection(404).is_retryable());
+        assert!(rejection(503).is_retryable());
     }
 }
