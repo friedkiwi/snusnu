@@ -328,6 +328,13 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                         Ok(transport_ws::wire::LuReachability {
                             lu: Some(config::parse_cp(name)?),
                             hosting_cp: Some(config::parse_cp(&entry.local_cp)?),
+                            supported_types: entry
+                                .lu_types
+                                .get(name)
+                                .into_iter()
+                                .flatten()
+                                .map(|lu_type| lu_type.wire_value())
+                                .collect(),
                         })
                     })
                 })

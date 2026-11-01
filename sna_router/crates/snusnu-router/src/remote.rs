@@ -1369,6 +1369,7 @@ mod tests {
             vec![wire::LuReachability {
                 lu: Some(name("SOLNET", "USER1")),
                 hosting_cp: Some(name("SOLNET", "SNAB")),
+                supported_types: Vec::new(),
             }],
         )
         .unwrap();
@@ -1527,6 +1528,7 @@ mod tests {
         let lu = wire::LuReachability {
             lu: Some(name("SOLNET", "USER1")),
             hosting_cp: Some(cp_b.clone()),
+            supported_types: Vec::new(),
         };
         let first = local_route_snapshot(
             &[7; 16],
@@ -1568,6 +1570,7 @@ mod tests {
         let lu = wire::LuReachability {
             lu: Some(name("SOLNET", "USER1")),
             hosting_cp: None,
+            supported_types: Vec::new(),
         };
         assert!(local_route_snapshot(&[0; 15], 1, &primary, &[], &[]).is_err());
         assert!(local_route_snapshot(&[0; 16], 0, &primary, &[], &[]).is_err());
@@ -1584,6 +1587,7 @@ mod tests {
             &[wire::LuReachability {
                 lu: None,
                 hosting_cp: None,
+                supported_types: Vec::new(),
             }]
         )
         .is_err());
