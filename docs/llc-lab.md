@@ -274,6 +274,14 @@ on the next user PIU. It never sends an APPC Attach reply or advertises a
 ready route. Use only the isolated V4R4 guest and expect exit status 1 at the
 intentional unsupported user-data boundary.
 
+In the next isolated V4R4 run, the guest sent the same 242-byte first user
+FMH-5 Attach after Rust acknowledged management UNBIND. Rust validated and
+buffered it, sent a nine-byte user IPR (`2d0002020000830100`), and the guest
+acknowledged that IPR at LLC2 N(R)=8. No further user PIU arrived during the
+observation window. The direct two-OS/400 trace sends an application GDS
+reply at that point; this pacing probe deliberately has no APPC reply or
+application target. The link is still not a usable user gateway.
+
 In the isolated V4R4 A run on 2026-11-01, the probe sent its 89-byte candidate
 user +RSP(BIND), and A acknowledged the LLC I-frame with RR `N(R)=6`. About
 14 ms later A sent a 37-byte PIU with TH `2d 00 01 02 00 00`, RH `6b 80 00`,
