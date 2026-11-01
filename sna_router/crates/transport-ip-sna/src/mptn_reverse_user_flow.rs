@@ -9,7 +9,8 @@ use std::io;
 use router_core::fixed_pacing::{is_canonical_ipr, FixedPacing};
 
 use crate::{
-    anynet::{TcpKind, TcpRecord},
+    anynet::{TcpKind, TcpRecord, MAX_RECORD},
+    mptn_expedited::{Flow as ExpeditedFlow, Inbound as ExpeditedInbound},
     mptn_gateway::{mptn_normal_to_native, native_normal_to_mptn, NativeSessionAddress},
     mptn_reverse_user_bind::NativeAddress,
     mptn_segments::Reassembler,
@@ -40,6 +41,9 @@ pub struct ReverseUserFlow {
     pending_tcp: Option<PendingTcp>,
     grant_pending: bool,
     grant: Option<(Vec<u8>, FixedPacing)>,
+    expedited: ExpeditedFlow,
+    pending_expedited_native: Option<(Vec<u8>, usize)>,
+    pending_expedited_tcp: Option<TcpRecord>,
     closed: bool,
 }
 
@@ -71,6 +75,9 @@ impl ReverseUserFlow {
             pending_tcp: None,
             grant_pending: false,
             grant: None,
+            expedited: ExpeditedFlow::new(MAX_RECORD * 2)?,
+            pending_expedited_native: None,
+            pending_expedited_tcp: None,
             closed: false,
         })
     }
@@ -79,7 +86,11 @@ impl ReverseUserFlow {
     /// complete FM request gets the native first-window PI locally; TCP62
     /// must not supply PI. Native queue failure leaves pacing unchanged.
     pub fn prepare_tcp_normal(&mut self, record: &TcpRecord) -> io::Result<Option<&[u8]>> {
-        if self.closed || self.pending_native.is_some() || self.grant.is_some() {
+        if self.closed
+            || self.pending_native.is_some()
+            || self.grant.is_some()
+            || !self.expedited.inbound_normal_may_pass()
+        {
             return Err(blocked());
         }
         if !matches!(record.kind, TcpKind::Normal | TcpKind::Segmented) {
@@ -118,6 +129,92 @@ impl ReverseUserFlow {
             return Err(invalid("native user egress differs from prepared PIU"));
         }
         self.pacing = pending.pacing_after;
+        Ok(())
+    }
+
+    /// TCP62 expedited data has an immediate five-byte ACK. The returned
+    /// native PIU must still enter its own bounded queue before later normal
+    /// data can pass. The ACK belongs on the same TCP stream.
+    pub fn prepare_tcp_expedited(&mut self, record: &TcpRecord) -> io::Result<(&[u8], TcpRecord)> {
+        if self.closed || self.pending_expedited_native.is_some() {
+            return Err(blocked());
+        }
+        let ExpeditedInbound::Expedited { ack } = self.expedited.receive(record)? else {
+            return Err(invalid("expected TCP62 expedited data"));
+        };
+        let mut normal = record.clone();
+        normal.kind = TcpKind::Normal;
+        normal.bytes[4] = 0;
+        let mut piu = match mptn_normal_to_native(
+            &normal,
+            NativeSessionAddress {
+                daf: self.address.daf,
+                oaf: self.address.oaf,
+                odai: self.address.odai,
+            },
+        ) {
+            Ok(piu) => piu,
+            Err(error) => {
+                self.close();
+                return Err(error);
+            }
+        };
+        piu[0] |= 1; // expedited FID2 flow, never normal pacing
+        self.pending_expedited_native = Some((piu, record.bytes.len() - 5));
+        Ok((&self.pending_expedited_native.as_ref().unwrap().0, ack))
+    }
+
+    pub fn mark_expedited_native_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {
+        let Some((prepared, bytes)) = self.pending_expedited_native.take() else {
+            return Err(blocked());
+        };
+        if prepared != piu {
+            self.pending_expedited_native = Some((prepared, bytes));
+            return Err(invalid("native expedited egress differs from prepared PIU"));
+        }
+        self.expedited.complete_native_delivery(bytes)
+    }
+
+    /// Queue one native expedited PIU on TCP and wait for its exact X'03'
+    /// acknowledgement. Duplicate outbound expedited data is backpressured.
+    pub fn prepare_native_expedited(&mut self, piu: &[u8]) -> io::Result<&TcpRecord> {
+        if self.closed
+            || self.pending_expedited_tcp.is_some()
+            || piu.len() < 9
+            || piu[0] != (0x2d | (u8::from(self.address.odai) << 1))
+            || piu[1] != 0
+            || piu[2..4] != [self.address.oaf, self.address.daf]
+        {
+            return Err(blocked());
+        }
+        let mut normalized = piu.to_vec();
+        normalized[0] &= !1;
+        let translated = native_normal_to_mptn(&normalized)?;
+        if translated.native_pacing_requested {
+            return Err(invalid("native expedited PIU requests normal pacing"));
+        }
+        let record = self.expedited.send_expedited(&translated.bytes[5..])?;
+        self.pending_expedited_tcp = Some(record);
+        Ok(self.pending_expedited_tcp.as_ref().unwrap())
+    }
+
+    pub fn mark_expedited_tcp_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.pending_expedited_tcp.as_ref() != Some(record) {
+            return Err(invalid(
+                "TCP62 expedited egress differs from prepared record",
+            ));
+        }
+        self.pending_expedited_tcp = None;
+        Ok(())
+    }
+
+    pub fn accept_tcp_expedited_ack(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.closed
+            || self.pending_expedited_tcp.is_some()
+            || self.expedited.receive(record)? != ExpeditedInbound::Acked
+        {
+            return Err(invalid("unexpected TCP62 expedited ACK"));
+        }
         Ok(())
     }
 
@@ -228,6 +325,8 @@ impl ReverseUserFlow {
         self.pending_tcp = None;
         self.grant = None;
         self.grant_pending = false;
+        self.pending_expedited_native = None;
+        self.pending_expedited_tcp = None;
     }
 }
 
@@ -304,5 +403,49 @@ mod tests {
         assert_eq!(grant, [0x2d, 0, 2, 1, 0, 0, 0x83, 1, 0]);
         flow.mark_native_grant_enqueued(&grant).unwrap();
         assert!(flow.prepare_native_grant(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn captured_expedited_shapes_hold_normal_until_native_queue_accepts() {
+        let mut flow = ReverseUserFlow::new(address(), 1, 1).unwrap();
+        let inbound = TcpRecord::decode(vec![
+            0, 0, 0, 15, 1, 0x80, 0, 0x4b, 0x80, 0, 0xc9, 0, 1, 0, 1,
+        ])
+        .unwrap();
+        let (piu, ack) = flow.prepare_tcp_expedited(&inbound).unwrap();
+        let piu = piu.to_vec();
+        assert_eq!(
+            piu,
+            [0x2d, 0, 2, 1, 0x80, 0, 0x4b, 0x80, 0, 0xc9, 0, 1, 0, 1]
+        );
+        assert_eq!(ack.bytes, [0, 0, 0, 5, 3]);
+        assert_eq!(
+            flow.prepare_tcp_normal(&normal(1, [3, 0, 0], &[0xaa]))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        flow.mark_expedited_native_enqueued(&piu).unwrap();
+        assert!(flow
+            .prepare_tcp_normal(&normal(1, [3, 0, 0], &[0xaa]))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn native_expedited_waits_for_exact_tcp_ack() {
+        let mut flow = ReverseUserFlow::new(address(), 1, 1).unwrap();
+        let native = [0x2d, 0, 1, 2, 0x80, 0, 0xcb, 0x80, 0, 0xc9];
+        let record = flow.prepare_native_expedited(&native).unwrap().clone();
+        assert_eq!(record.bytes, [0, 0, 0, 11, 1, 0x80, 0, 0xcb, 0x80, 0, 0xc9]);
+        assert!(flow
+            .accept_tcp_expedited_ack(&TcpRecord::decode(vec![0, 0, 0, 5, 3]).unwrap())
+            .is_err());
+        flow.mark_expedited_tcp_enqueued(&record).unwrap();
+        flow.accept_tcp_expedited_ack(&TcpRecord::decode(vec![0, 0, 0, 5, 3]).unwrap())
+            .unwrap();
+        assert!(flow
+            .accept_tcp_expedited_ack(&TcpRecord::decode(vec![0, 0, 0, 5, 3]).unwrap())
+            .is_err());
     }
 }
