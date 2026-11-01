@@ -1,6 +1,7 @@
 //! LLC adapter and local route configuration.
 
 use crate::{
+    anynet_port::AnyNetPort,
     config::{self, RouterConfig},
     endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
     ip_ports::EePort,
@@ -213,6 +214,12 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
             router.register_port(
                 PortId::new(&peer.id),
                 Box::new(EePort::open(peer.local_ip, peer.peer_ip)?),
+            )?;
+        }
+        for peer in &config.anynet {
+            router.register_port(
+                PortId::new(&peer.id),
+                Box::new(AnyNetPort::open(peer.local_ip, peer.peer_ip)?),
             )?;
         }
         if let Some(remote_ports) = remote_ports {

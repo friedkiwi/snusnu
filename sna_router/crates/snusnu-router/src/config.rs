@@ -18,6 +18,8 @@ pub(crate) struct RouterConfig {
     #[serde(default)]
     pub(crate) ee: Vec<EeConfig>,
     #[serde(default)]
+    pub(crate) anynet: Vec<AnyNetConfig>,
+    #[serde(default)]
     pub(crate) route: Vec<RouteConfig>,
     #[serde(default)]
     pub(crate) remote: Vec<RemoteConfig>,
@@ -26,6 +28,14 @@ pub(crate) struct RouterConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EeConfig {
+    pub(crate) id: String,
+    pub(crate) local_ip: IpAddr,
+    pub(crate) peer_ip: IpAddr,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnyNetConfig {
     pub(crate) id: String,
     pub(crate) local_ip: IpAddr,
     pub(crate) peer_ip: IpAddr,
@@ -78,8 +88,10 @@ pub(crate) fn load(path: &Path) -> io::Result<RouterConfig> {
 
 impl RouterConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.llc.is_empty() && self.ee.is_empty() {
-            return Err(invalid("at least one [[llc]] or [[ee]] peer is required"));
+        if self.llc.is_empty() && self.ee.is_empty() && self.anynet.is_empty() {
+            return Err(invalid(
+                "at least one [[llc]], [[ee]] or [[anynet]] peer is required",
+            ));
         }
         let mut peers = HashSet::new();
         let mut ids = HashSet::new();
@@ -119,6 +131,7 @@ impl RouterConfig {
             }
             kinds.insert(&peer.id, "ee");
             if peer.local_ip == peer.peer_ip
+                || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
                 || peer.local_ip.is_unspecified()
                 || peer.peer_ip.is_unspecified()
             {
@@ -127,6 +140,27 @@ impl RouterConfig {
             if !ee_listeners.insert(peer.local_ip) {
                 return Err(invalid(format!(
                     "duplicate EE UDP listener IP {}",
+                    peer.local_ip
+                )));
+            }
+        }
+        let mut anynet_listeners = HashSet::new();
+        for peer in &self.anynet {
+            validate_id(&peer.id)?;
+            if !ids.insert(peer.id.as_str()) {
+                return Err(invalid(format!("duplicate port ID {}", peer.id)));
+            }
+            kinds.insert(&peer.id, "anynet");
+            if peer.local_ip == peer.peer_ip
+                || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
+                || peer.local_ip.is_unspecified()
+                || peer.peer_ip.is_unspecified()
+            {
+                return Err(invalid(format!("invalid AnyNet IP pair for {}", peer.id)));
+            }
+            if !anynet_listeners.insert(peer.local_ip) {
+                return Err(invalid(format!(
+                    "duplicate AnyNet TCP/UDP listener IP {}",
                     peer.local_ip
                 )));
             }
@@ -179,7 +213,11 @@ impl RouterConfig {
             let target_kind = kinds[route.to.as_str()];
             if !matches!(
                 (source_kind, target_kind),
-                ("llc", "llc") | ("llc", "remote") | ("remote", "llc") | ("ee", "ee")
+                ("llc", "llc")
+                    | ("llc", "remote")
+                    | ("remote", "llc")
+                    | ("ee", "ee")
+                    | ("anynet", "anynet")
             ) {
                 return Err(invalid(format!(
                     "unsupported route {} ({source_kind}) -> {} ({target_kind})",
@@ -457,5 +495,43 @@ to = "upstream"
         assert!(parse(&remote.replace("SOLNET.LUA", "bad.lu"))
             .validate()
             .is_err());
+    }
+
+    #[test]
+    fn anynet_only_route_is_valid_and_mixed_profile_is_rejected() {
+        let anynet = r#"
+[[anynet]]
+id = "east"
+local_ip = "127.0.0.2"
+peer_ip = "127.0.0.3"
+[[anynet]]
+id = "west"
+local_ip = "127.0.0.4"
+peer_ip = "127.0.0.5"
+[[route]]
+from = "east"
+to = "west"
+"#;
+        parse(anynet).validate().unwrap();
+        let duplicate_listener = anynet.replace("127.0.0.4", "127.0.0.2");
+        assert!(parse(&duplicate_listener).validate().is_err());
+        let mixed = r#"
+[[anynet]]
+id = "mptn"
+local_ip = "127.0.0.2"
+peer_ip = "127.0.0.3"
+[[ee]]
+id = "hpr"
+local_ip = "127.0.0.4"
+peer_ip = "127.0.0.5"
+[[route]]
+from = "mptn"
+to = "hpr"
+"#;
+        assert!(parse(mixed)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported route"));
     }
 }

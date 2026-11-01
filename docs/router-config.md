@@ -70,4 +70,26 @@ to = "ee_b"
 
 EE↔EE relays EE datagrams. The loader rejects LLC↔EE routes and does not translate LLC2 PIUs into AnyNet MPTN or HPR records. Those profiles require explicit protocol converters.
 
+## Constrained AnyNet TCP62 relay
+
+Two `[[anynet]]` ports can form a standalone AnyNet↔AnyNet route. Each port binds TCP and UDP port 397 on its `local_ip` and accepts only the configured `peer_ip`. The current adapter handles **one TCP62 LU6.2 session at a time** and validates complete MPTN records before forwarding them. It closes the TCP session if UDP/397 traffic appears, because out-of-band MPTN addresses and keepalives are not yet translated. This mode is useful for controlled TCP-only interoperability experiments; it is not a general AnyNet gateway.
+
+```toml
+[[anynet]]
+id = "mptn_a"
+local_ip = "192.0.2.1"
+peer_ip = "192.0.2.11"
+
+[[anynet]]
+id = "mptn_b"
+local_ip = "192.0.2.2"
+peer_ip = "192.0.2.12"
+
+[[route]]
+from = "mptn_a"
+to = "mptn_b"
+```
+
+Each `local_ip` must already be assigned on the host. The loader rejects duplicate AnyNet listener IPs and routes between AnyNet and LLC, EE or WebSocket profiles until a session converter is implemented. IBM's AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
+
 The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this configuration on two isolated TAPs.
