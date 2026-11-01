@@ -344,7 +344,17 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                     })
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            match WsRoutePort::connect_many(options, logical_units) {
+            let connected = if config.remote[0].source_lu.is_some() {
+                let source_lus = config
+                    .remote
+                    .iter()
+                    .map(|entry| entry.source_lu.as_deref().map(config::parse_cp).transpose())
+                    .collect::<io::Result<Vec<_>>>()?;
+                WsRoutePort::connect_many_v2(options, logical_units, source_lus)
+            } else {
+                WsRoutePort::connect_many(options, logical_units)
+            };
+            match connected {
                 Ok(ports) => Some(ports),
                 Err(error) if retryable_remote_error(&error) => {
                     tracing::warn!(upstream = upstream_authority(&remote.url), error = %error, retry_ms = delay.as_millis(), "concentrator connection failed");

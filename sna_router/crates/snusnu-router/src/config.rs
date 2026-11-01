@@ -93,6 +93,9 @@ pub(crate) struct RemoteConfig {
     pub(crate) local_cp: String,
     pub(crate) target_cp: String,
     pub(crate) target_lu: Option<String>,
+    /// A locally exported LU used as the authenticated source of v2 opens.
+    /// Omit for legacy v1 native LLC circuits.
+    pub(crate) source_lu: Option<String>,
     #[serde(default)]
     pub(crate) lus: Vec<String>,
     #[serde(default)]
@@ -323,6 +326,21 @@ impl RouterConfig {
                     )));
                 }
             }
+            if let Some(source_lu) = &remote.source_lu {
+                let source_lu = parse_cp(source_lu)?;
+                if source_lu.netid != local_cp.netid
+                    || remote.target_lu.is_none()
+                    || !remote
+                        .lus
+                        .iter()
+                        .any(|lu| parse_cp(lu).ok().as_ref() == Some(&source_lu))
+                {
+                    return Err(invalid(format!(
+                        "remote {} v2 source LU must be a local exported LU with a target LU",
+                        remote.id
+                    )));
+                }
+            }
             for lu in &remote.lus {
                 let lu_name = parse_cp(lu)?;
                 if !exported_lus.insert((lu_name.netid, lu_name.name)) {
@@ -349,6 +367,13 @@ impl RouterConfig {
             .any(|pair| pair[0].url != pair[1].url)
         {
             return Err(invalid("all remote circuits must share one WebSocket URL"));
+        }
+        if self.remote.iter().any(|remote| remote.source_lu.is_some())
+            && self.remote.iter().any(|remote| remote.source_lu.is_none())
+        {
+            return Err(invalid(
+                "all remote circuits on one WebSocket must use the same protocol version",
+            ));
         }
         let mut directed = HashMap::<&str, &str>::new();
         for route in &self.route {
@@ -736,6 +761,24 @@ to = "upstream"
             parse(&cross_netid).remote[0].target_lu.as_deref(),
             Some("DSTNET.PAYROLL")
         );
+        let v2 = cross_netid.replace(
+            "target_lu = \"DSTNET.PAYROLL\"",
+            "target_lu = \"DSTNET.PAYROLL\"\nsource_lu = \"SOLNET.LUA\"",
+        );
+        parse(&v2).validate().unwrap();
+        assert!(
+            parse(&v2.replace("source_lu = \"SOLNET.LUA\"", "source_lu = \"OTHER.LUA\""))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(&v2.replace("source_lu = \"SOLNET.LUA\"", "source_lu = \"SOLNET.OTHER\""))
+                .validate()
+                .is_err()
+        );
+        assert!(parse(&v2.replace("target_lu = \"DSTNET.PAYROLL\"\n", ""))
+            .validate()
+            .is_err());
         assert!(
             parse(&cross_netid.replace("DSTNET.PAYROLL", "SOLNET.PAYROLL"))
                 .validate()
