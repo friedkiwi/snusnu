@@ -267,3 +267,18 @@ An LLC RR proves frame receipt, not acceptance of the candidate BIND response
 or establishment of a usable user session. The private unfiltered capture is
 `/tmp/snusnu-v4r4-regression/native-userbind-sol5.pcap`; no raw application
 payload is included here.
+
+The follow-up isolated V4R4 run used the probe that also replies to the
+correlated management UNBIND. The observed order was SNASVCMG BIND and
++RSP(BIND), CNOS Attach and replies, bilateral BIS, user BIND and the candidate
+89-byte +RSP(BIND), management UNBIND (SON `0x01`) and +RSP(UNBIND), then A's
+first user-session FMH-5 Attach. That next PIU was 242 bytes, with TH
+`2c 00 02 02 00 01`, RH `0b 91 20`, and a 36-byte FMH-5 header; its 197-byte
+tail remains opaque. This progression is evidence that A advanced past the
+candidate user BIND response and management teardown to user traffic. The
+probe then deliberately sent DISC without answering the Attach. A returned
+to Main Menu with APPC failure `E022000BA2100000`; no remote Sign On or user
+conversation completed. The private capture
+`/tmp/snusnu-v4r4-regression/native-userbind2-sol5.pcap` has 50 frames and
+no capture drops. The next native milestone is a valid user FMH-5 reply and
+conversation handling, with the opaque tail treated as application data.
