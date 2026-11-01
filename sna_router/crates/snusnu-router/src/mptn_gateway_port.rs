@@ -17,6 +17,7 @@ use transport_ip_sna::{
     mptn_compensations::CompensationSet,
     mptn_connect::{Connect, Direction},
     mptn_ingress::{IngressKind, IngressOffer, IngressPolicy, IngressSession},
+    mptn_keepalive::{Keepalive, Kind as KeepaliveKind},
     mptn_management_responder::{ManagementResponder, Phase as ManagementPhase, V5Options},
     mptn_reverse_management::classify_reverse_management_connect,
 };
@@ -168,9 +169,25 @@ impl MptnGatewayPort {
         let mut bytes = [0u8; MAX_RECORD];
         match self.udp.recv_from(&mut bytes) {
             Ok((_, peer)) if peer.ip() != self.config.peer_ip => Ok(()),
+            Ok((len, peer)) if bytes.get(4) == Some(&0x84) => {
+                let keepalive = Keepalive::decode(&bytes[..len])?;
+                keepalive.validate_ingress(peer.ip(), self.config.local.ip())?;
+                if keepalive.kind != KeepaliveKind::Request {
+                    return Err(invalid("unsolicited TCP62 keepalive response"));
+                }
+                let response = Keepalive {
+                    kind: KeepaliveKind::Response,
+                    ..keepalive
+                }
+                .encode();
+                if self.udp.send_to(&response, peer)? != response.len() {
+                    return Err(invalid("partial TCP62 keepalive response"));
+                }
+                Ok(())
+            }
             Ok((_, _)) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "TCP62 UDP/397 compensation handler unavailable",
+                "TCP62 UDP/397 X'83' compensation handler unavailable",
             )),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(error) => Err(error),
@@ -448,7 +465,7 @@ mod tests {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::{
         io::Write,
-        net::{Ipv4Addr, TcpStream},
+        net::{Ipv4Addr, TcpStream, UdpSocket},
         thread,
         time::Duration,
     };
@@ -479,6 +496,44 @@ mod tests {
             .unwrap();
         socket.connect(&address.into()).unwrap();
         socket.into()
+    }
+
+    #[test]
+    fn captured_shape_keepalive_replies_only_to_configured_pair() {
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::default(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: true,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+        })
+        .unwrap();
+        let peer = UdpSocket::bind("127.0.0.2:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let request = Keepalive {
+            kind: KeepaliveKind::Request,
+            source: Ipv4Addr::new(127, 0, 0, 2),
+            destination: Ipv4Addr::LOCALHOST,
+        }
+        .encode();
+        peer.send_to(&request, port.udp.local_addr().unwrap())
+            .unwrap();
+        port.poll_once(false).unwrap();
+        let mut response = [0u8; 24];
+        let (len, from) = peer.recv_from(&mut response).unwrap();
+        assert_eq!(len, 24);
+        assert_eq!(from, port.udp.local_addr().unwrap());
+        assert_eq!(
+            Keepalive::decode(&response).unwrap().kind,
+            KeepaliveKind::Response
+        );
+        assert!(!port.management_ready());
     }
 
     #[test]
