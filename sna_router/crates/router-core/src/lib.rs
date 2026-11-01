@@ -7,6 +7,7 @@ pub mod fid2_bind;
 pub mod fid2_session_control;
 pub mod fixed_pacing;
 pub mod hpr_lan;
+pub mod hpr_rtp;
 pub mod hpr_setmode;
 pub mod hpr_xid_evidence;
 pub mod hpr_xid_leg;
