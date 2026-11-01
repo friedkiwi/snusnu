@@ -63,6 +63,7 @@ pub struct Llc2 {
     send_next: u8,
     receive_next: u8,
     remote_busy: bool,
+    local_busy: bool,
     pending: Option<Pending>,
     connect_retries: u8,
 }
@@ -76,6 +77,7 @@ impl Llc2 {
             send_next: 0,
             receive_next: 0,
             remote_busy: false,
+            local_busy: false,
             pending: None,
             connect_retries: 0,
         }
@@ -89,6 +91,17 @@ impl Llc2 {
         self.pending.is_some()
     }
 
+    /// Advertise whether the caller can accept another information field.
+    /// A transition sends RNR or RR so a peer can stop or resume without
+    /// waiting for its next frame. The caller sends the returned LLC PDU.
+    pub fn set_local_busy(&mut self, busy: bool) -> Option<Vec<u8>> {
+        if self.state != State::Connected || self.local_busy == busy {
+            return None;
+        }
+        self.local_busy = busy;
+        Some(self.supervisory(if busy { RNR } else { RR }, false, false))
+    }
+
     /// Tear down this local leg after its circuit target is lost. A connected
     /// peer receives DISC; a connection still being established is cancelled.
     pub fn disconnect(&mut self) -> Option<Vec<u8>> {
@@ -98,6 +111,18 @@ impl Llc2 {
     }
 
     pub fn receive<'a>(&mut self, frame: &LlcFrame<'a>) -> Result<Vec<Effect<'a>>, Error> {
+        self.receive_with_capacity(frame, true)
+    }
+
+    /// Process a frame with explicit downstream admission. When capacity is
+    /// unavailable, an in-order I-frame is rejected with RNR without advancing
+    /// N(R) or delivering its information. Call `set_local_busy(false)` after
+    /// capacity returns so the peer can retry that same sequence number.
+    pub fn receive_with_capacity<'a>(
+        &mut self,
+        frame: &LlcFrame<'a>,
+        can_accept_information: bool,
+    ) -> Result<Vec<Effect<'a>>, Error> {
         if frame.dsap != self.local_sap || frame.ssap & !1 != self.remote_sap {
             return Err(Error::WrongSap);
         }
@@ -136,11 +161,20 @@ impl Llc2 {
             } if self.state == State::Connected => {
                 self.acknowledge(receive_sequence)?;
                 let mut effects = Vec::with_capacity(2);
-                if send_sequence == self.receive_next {
+                if !can_accept_information {
+                    self.local_busy = true;
+                }
+                if send_sequence == self.receive_next && !self.local_busy {
                     self.receive_next = self.receive_next.wrapping_add(1) & 0x7f;
                     effects.push(Effect::Deliver(frame.information));
                     effects.push(Effect::Send(self.supervisory(
                         RR,
+                        !response,
+                        poll_final && !response,
+                    )));
+                } else if self.local_busy {
+                    effects.push(Effect::Send(self.supervisory(
+                        RNR,
                         !response,
                         poll_final && !response,
                     )));
@@ -183,7 +217,11 @@ impl Llc2 {
                     }
                 }
                 if poll_final && !response {
-                    effects.push(Effect::Send(self.supervisory(RR, true, true)));
+                    effects.push(Effect::Send(self.supervisory(
+                        if self.local_busy { RNR } else { RR },
+                        true,
+                        true,
+                    )));
                 }
                 effects
             }
@@ -277,6 +315,7 @@ impl Llc2 {
         self.send_next = 0;
         self.receive_next = 0;
         self.remote_busy = false;
+        self.local_busy = false;
         self.pending = None;
         self.connect_retries = 0;
     }
@@ -285,6 +324,7 @@ impl Llc2 {
         self.state = State::Disconnected;
         self.pending = None;
         self.remote_busy = false;
+        self.local_busy = false;
         self.connect_retries = 0;
     }
 
@@ -324,12 +364,21 @@ mod tests {
     use crate::llc::parse_8023;
 
     fn receive<'a>(link: &mut Llc2, payload: &'a [u8]) -> Vec<Effect<'a>> {
+        receive_with_capacity(link, payload, true)
+    }
+
+    fn receive_with_capacity<'a>(
+        link: &mut Llc2,
+        payload: &'a [u8],
+        can_accept_information: bool,
+    ) -> Vec<Effect<'a>> {
         let mut frame = vec![0; 14];
         frame[12..14].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         frame.extend_from_slice(payload);
         // Hold the frame alive for `Effect::Deliver` by leaking this test-only buffer.
         let frame = Box::leak(frame.into_boxed_slice());
-        link.receive(&parse_8023(frame).unwrap()).unwrap()
+        link.receive_with_capacity(&parse_8023(frame).unwrap(), can_accept_information)
+            .unwrap()
     }
 
     #[test]
@@ -448,5 +497,44 @@ mod tests {
         assert_eq!(link.state(), State::Disconnected);
         assert!(!link.has_pending_information());
         assert_eq!(link.disconnect(), None);
+    }
+
+    #[test]
+    fn full_downstream_does_not_ack_or_deliver_information() {
+        let mut link = Llc2::new(4, 4);
+        receive(&mut link, &[4, 4, 0x7f]);
+        assert_eq!(
+            receive_with_capacity(&mut link, &[4, 4, 0, 0, 0xaa], false),
+            vec![Effect::Send(vec![4, 5, 5, 0])]
+        );
+        assert_eq!(
+            receive(&mut link, &[4, 4, 0, 1, 0xaa]),
+            vec![Effect::Send(vec![4, 5, 5, 1])]
+        );
+        assert_eq!(link.set_local_busy(false), Some(vec![4, 4, 1, 0]));
+        assert_eq!(
+            receive(&mut link, &[4, 4, 0, 0, 0xaa]),
+            vec![Effect::Deliver(&[0xaa]), Effect::Send(vec![4, 5, 1, 2])]
+        );
+    }
+
+    #[test]
+    fn local_busy_advertisement_and_poll_response() {
+        let mut link = Llc2::new(4, 4);
+        assert_eq!(link.set_local_busy(true), None);
+        receive(&mut link, &[4, 4, 0x7f]);
+        assert_eq!(link.set_local_busy(true), Some(vec![4, 4, 5, 0]));
+        assert_eq!(link.set_local_busy(true), None);
+        assert_eq!(
+            receive(&mut link, &[4, 4, 1, 1]),
+            vec![Effect::Send(vec![4, 5, 5, 1])]
+        );
+        assert_eq!(link.set_local_busy(false), Some(vec![4, 4, 1, 0]));
+        assert_eq!(link.set_local_busy(false), None);
+        assert_eq!(
+            receive(&mut link, &[4, 4, 0x53]),
+            vec![Effect::Send(vec![4, 5, 0x73]), Effect::Disconnected]
+        );
+        assert_eq!(link.set_local_busy(true), None);
     }
 }
