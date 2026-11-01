@@ -1,10 +1,10 @@
 //! Unregistered LLC↔TCP62 converter edge prototype. The runtime route loader
-//! still rejects this converter. UDP X'83' and later APPC flows are absent.
+//! still rejects this converter. UDP X'83' and APPC session control are absent.
 
 use std::{collections::VecDeque, io};
 
 use crate::{
-    anynet::{TcpKind, TcpRecord, TcpSession},
+    anynet::{TcpKind, TcpRecord, TcpSession, MAX_RECORD},
     mptn_connect::Connect,
     mptn_native_bridge::{Bridge, Phase},
 };
@@ -31,7 +31,10 @@ pub trait NativeLeg {
 enum NativeReply {
     Bind,
     Ipr,
+    UserNormal,
 }
+
+const MAX_INCOMING_BYTES: usize = MAX_RECORD * 2;
 
 pub struct GatewayEdge<L: NativeLeg> {
     native: L,
@@ -41,6 +44,8 @@ pub struct GatewayEdge<L: NativeLeg> {
     native_reply: Option<(NativeReply, Vec<u8>)>,
     connect: Option<TcpRecord>,
     attach: Option<(TcpRecord, bool)>,
+    incoming: VecDeque<TcpRecord>,
+    incoming_bytes: usize,
     /// TCP queue order and whether GatewaySession charged this record.
     writes: VecDeque<(usize, bool)>,
     connect_fully_sent: bool,
@@ -64,6 +69,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             native_reply: None,
             connect: None,
             attach: None,
+            incoming: VecDeque::new(),
+            incoming_bytes: 0,
             writes: VecDeque::new(),
             connect_fully_sent: false,
             ipr_ack_outstanding: false,
@@ -132,16 +139,23 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     self.attach = Some((record, false));
                 }
                 NativeEvent::EgressAck(n) => {
-                    if n != 1 || !self.ipr_ack_outstanding {
+                    if n != 1 {
+                        return Err(invalid("unexpected native user egress ACK count"));
+                    }
+                    if self.ipr_ack_outstanding {
+                        self.ipr_ack_outstanding = false;
+                        self.ipr_ack_received = true;
+                    } else if self.bridge.phase() == Phase::AwaitNativeNormalAck {
+                        self.bridge.acknowledge_native_normal(n)?;
+                    } else {
                         return Err(invalid("unexpected native user egress ACK"));
                     }
-                    self.ipr_ack_outstanding = false;
-                    self.ipr_ack_received = true;
                 }
                 NativeEvent::Closed => return self.close(),
             }
         }
-        self.drive_queues()
+        self.drive_queues()?;
+        self.drive_incoming()
     }
 
     pub fn poll_tcp_once(&mut self) -> io::Result<()> {
@@ -156,6 +170,10 @@ impl<L: NativeLeg> GatewayEdge<L> {
         if self.closed {
             return Err(invalid("gateway edge is closed"));
         }
+        self.drive_incoming()?;
+        if !self.incoming.is_empty() {
+            return Ok(());
+        }
         for record in self
             .tcp
             .as_mut()
@@ -163,25 +181,60 @@ impl<L: NativeLeg> GatewayEdge<L> {
             .receive_once()?
             .unwrap_or_default()
         {
-            if record.kind != TcpKind::Connect || self.bridge.phase() != Phase::AwaitConnect {
-                self.close()?;
-                return Err(invalid("TCP62 record outside supported BIND phase"));
+            let next = self
+                .incoming_bytes
+                .checked_add(record.bytes.len())
+                .ok_or_else(|| invalid("TCP62 incoming queue overflow"))?;
+            if next > MAX_INCOMING_BYTES {
+                return Err(invalid("TCP62 incoming queue full"));
             }
-            if !self.connect_fully_sent {
-                return Err(invalid(
-                    "TCP62 Connect response before request write completed",
-                ));
-            }
-            let response = self.bridge.accept_connect_response(&record)?;
-            self.native_reply = Some((NativeReply::Bind, response));
+            self.incoming_bytes = next;
+            self.incoming.push_back(record);
         }
-        self.drive_queues()
+        self.drive_incoming()
+    }
+
+    fn drive_incoming(&mut self) -> io::Result<()> {
+        while let Some(record) = self.incoming.front() {
+            match record.kind {
+                TcpKind::Connect => {
+                    if self.bridge.phase() != Phase::AwaitConnect || !self.connect_fully_sent {
+                        return Err(invalid("TCP62 Connect response before completed request"));
+                    }
+                    let record = self.incoming.pop_front().unwrap();
+                    self.incoming_bytes -= record.bytes.len();
+                    let response = self.bridge.accept_connect_response(&record)?;
+                    self.native_reply = Some((NativeReply::Bind, response));
+                    self.drive_queues()?;
+                }
+                TcpKind::Normal | TcpKind::Segmented => {
+                    // A remote application may send soon after Connect.
+                    // Retain its bounded records until the native user BIND,
+                    // first Attach, and native IPR are all completed.
+                    if !self.first_attach_delivery_complete()
+                        || self.bridge.phase() != Phase::Active
+                        || self.native_reply.is_some()
+                    {
+                        return Ok(());
+                    }
+                    let record = self.incoming.pop_front().unwrap();
+                    self.incoming_bytes -= record.bytes.len();
+                    if let Some(piu) = self.bridge.next_mptn_normal(&record)? {
+                        self.native_reply = Some((NativeReply::UserNormal, piu));
+                        self.drive_queues()?;
+                        return Ok(()); // one LLC I-frame is outstanding
+                    }
+                }
+                _ => return Err(invalid("unsupported TCP62 record on native gateway")),
+            }
+        }
+        Ok(())
     }
 
     /// Release gateway byte credit only after the socket accepted the final
     /// byte of each charged record. Connect completions are uncharged.
     pub fn flush_tcp(&mut self) -> io::Result<()> {
-        let result = self.flush_tcp_inner();
+        let result = self.flush_tcp_inner().and_then(|()| self.drive_incoming());
         if result.is_err() {
             let _ = self.close();
         }
@@ -233,6 +286,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     self.bridge.mark_ipr_enqueued(&piu)?;
                     self.ipr_ack_outstanding = true;
                 }
+                NativeReply::UserNormal => self.bridge.mark_native_normal_enqueued(&piu)?,
             }
         }
         if let Some(record) = self.connect.take() {
@@ -281,6 +335,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.native_reply = None;
             self.connect = None;
             self.attach = None;
+            self.incoming.clear();
+            self.incoming_bytes = 0;
             self.writes.clear();
             self.connect_fully_sent = false;
             self.ipr_ack_outstanding = false;

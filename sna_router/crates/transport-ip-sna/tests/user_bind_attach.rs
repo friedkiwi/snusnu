@@ -350,6 +350,15 @@ fn tcp62_application_record_waits_for_exact_native_llc_ack() {
     bridge.mark_ipr_enqueued(&ipr).unwrap();
     bridge.complete_tcp_delivery(attach.bytes.len()).unwrap();
 
+    let mut dfc = reply.clone();
+    dfc[6] |= 0x40;
+    let dfc = TcpRecord::decode(native_normal_to_mptn(&dfc).unwrap().bytes).unwrap();
+    assert!(bridge.next_mptn_normal(&dfc).is_err());
+    let mut response = tcp.clone();
+    response.bytes[7] |= 0x80;
+    assert!(bridge.next_mptn_normal(&response).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+
     let prepared = bridge.next_mptn_normal(&tcp).unwrap().unwrap();
     assert_eq!(prepared, reply);
     assert_eq!(bridge.pending_bytes(), (0, reply.len()));
@@ -515,6 +524,45 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
     edge.poll_native_once().unwrap();
     assert!(!edge.ipr_ack_outstanding());
     assert!(edge.first_attach_delivery_complete());
+
+    // Both application records may arrive in one socket read. Only one
+    // native LLC frame may be outstanding, and each exact ACK retires its
+    // own reserved gateway bytes before the next record is enqueued.
+    use transport_ip_sna::mptn_gateway::native_normal_to_mptn;
+    let first = first_application_reply();
+    let mut second = first.clone();
+    second[5] = 2;
+    let first_record = native_normal_to_mptn(&first).unwrap().bytes;
+    let second_record = native_normal_to_mptn(&second).unwrap().bytes;
+    peer.write_all(&first_record).unwrap();
+    peer.write_all(&second_record).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.native_mut().sent.len() < 3 && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(edge.native_mut().sent[2], first);
+    assert_eq!(edge.native_mut().sent.len(), 3);
+    assert_eq!(edge.pending_gateway_bytes(), (0, first.len()));
+
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.native_mut().sent.len() < 4 && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(edge.native_mut().sent.len(), 4);
+    second[7] &= !1; // The next native send is inside the current window.
+    assert_eq!(edge.native_mut().sent[3], second);
+    assert_eq!(edge.pending_gateway_bytes(), (0, second.len()));
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    assert_eq!(edge.pending_gateway_bytes(), (0, 0));
     edge.native_mut()
         .events
         .push_back(NativeEvent::EgressAck(1));
