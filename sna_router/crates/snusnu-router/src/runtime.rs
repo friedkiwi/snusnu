@@ -241,6 +241,12 @@ impl RoutePort for LlcPort {
 /// leave a partially attached router running.
 pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     config.validate()?;
+    if !config.mptn_gateway.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TCP62 gateway runtime is not yet attached to the native WebSocket session",
+        ));
+    }
     const FIRST_RETRY: Duration = Duration::from_millis(500);
     const MAX_RETRY: Duration = Duration::from_secs(30);
     let mut delay = FIRST_RETRY;

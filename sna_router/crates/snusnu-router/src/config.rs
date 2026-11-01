@@ -20,6 +20,8 @@ pub(crate) struct RouterConfig {
     #[serde(default)]
     pub(crate) anynet: Vec<AnyNetConfig>,
     #[serde(default)]
+    pub(crate) mptn_gateway: Vec<MptnGatewayConfig>,
+    #[serde(default)]
     pub(crate) hpr_lan: Vec<HprLanConfig>,
     #[serde(default)]
     pub(crate) route: Vec<RouteConfig>,
@@ -43,6 +45,23 @@ pub(crate) struct AnyNetConfig {
     pub(crate) peer_ip: IpAddr,
     pub(crate) local_lu: Option<String>,
     pub(crate) remote_lu: Option<String>,
+}
+
+/// One TCP62 ingress converted to a native WebSocket circuit. The local CP
+/// speaks for the source LU; the peer CP names the remote LLC-facing system.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MptnGatewayConfig {
+    pub(crate) id: String,
+    pub(crate) local_ip: IpAddr,
+    pub(crate) peer_ip: IpAddr,
+    pub(crate) local_cp: String,
+    pub(crate) peer_cp: String,
+    pub(crate) source_lu: String,
+    pub(crate) destination_lu: String,
+    pub(crate) local_station: String,
+    pub(crate) local_node_id: String,
+    pub(crate) tg_number: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,10 +168,11 @@ impl RouterConfig {
         if self.llc.is_empty()
             && self.ee.is_empty()
             && self.anynet.is_empty()
+            && self.mptn_gateway.is_empty()
             && self.hpr_lan.is_empty()
         {
             return Err(invalid(
-                "at least one [[llc]], [[ee]], [[anynet]] or [[hpr_lan]] peer is required",
+                "at least one [[llc]], [[ee]], [[anynet]], [[mptn_gateway]] or [[hpr_lan]] peer is required",
             ));
         }
         let mut peers = HashSet::new();
@@ -297,6 +317,44 @@ impl RouterConfig {
                 }
             }
         }
+        for peer in &self.mptn_gateway {
+            validate_id(&peer.id)?;
+            if !ids.insert(peer.id.as_str()) {
+                return Err(invalid(format!("duplicate port ID {}", peer.id)));
+            }
+            kinds.insert(&peer.id, "mptn_gateway");
+            if peer.local_ip == peer.peer_ip
+                || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
+                || peer.local_ip.is_unspecified()
+                || peer.peer_ip.is_unspecified()
+                || !anynet_listeners.insert(peer.local_ip)
+            {
+                return Err(invalid(format!(
+                    "invalid TCP62 ingress IP pair for {}",
+                    peer.id
+                )));
+            }
+            let local_cp = parse_cp(&peer.local_cp)?;
+            let peer_cp = parse_cp(&peer.peer_cp)?;
+            let source_lu = parse_cp(&peer.source_lu)?;
+            let destination_lu = parse_cp(&peer.destination_lu)?;
+            if local_cp.netid != source_lu.netid
+                || peer_cp.netid != destination_lu.netid
+                || source_lu == destination_lu
+                || !valid_sna_name(&peer.local_station)
+                || peer.local_node_id.len() != 8
+                || !peer
+                    .local_node_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || peer.tg_number == 0
+            {
+                return Err(invalid(format!(
+                    "invalid TCP62 gateway identity for {}",
+                    peer.id
+                )));
+            }
+        }
         let mut exported_cps = HashSet::new();
         let mut exported_lus = HashSet::new();
         for remote in &self.remote {
@@ -391,6 +449,17 @@ impl RouterConfig {
             if let Some(converter) = route.converter {
                 if matches!(
                     (source_kind, target_kind),
+                    ("mptn_gateway", "remote") | ("remote", "mptn_gateway")
+                ) && matches!(converter, RouteConverter::MptnLu62)
+                {
+                    add_directed(&mut directed, &route.from, &route.to)?;
+                    if route.bidirectional {
+                        add_directed(&mut directed, &route.to, &route.from)?;
+                    }
+                    continue;
+                }
+                if matches!(
+                    (source_kind, target_kind),
                     ("llc", "anynet") | ("anynet", "llc")
                 ) && matches!(converter, RouteConverter::MptnLu62)
                 {
@@ -451,10 +520,24 @@ impl RouterConfig {
                 .count();
             if attached != 1 || !directed.contains_key(remote.id.as_str()) {
                 return Err(invalid(
-                    "remote requires exactly one local LLC route in each direction",
+                    "remote requires exactly one local route in each direction",
                 ));
             }
             let local_id = directed[remote.id.as_str()];
+            if let Some(gateway) = self.mptn_gateway.iter().find(|peer| peer.id == local_id) {
+                if parse_cp(&remote.local_cp)? != parse_cp(&gateway.local_cp)?
+                    || parse_cp(&remote.target_cp)? != parse_cp(&gateway.peer_cp)?
+                    || remote.source_lu.as_deref() != Some(gateway.source_lu.as_str())
+                    || remote.target_lu.as_deref() != Some(gateway.destination_lu.as_str())
+                    || !remote.lus.contains(&gateway.source_lu)
+                {
+                    return Err(invalid(format!(
+                        "remote {} does not match TCP62 gateway {} LU and CP route",
+                        remote.id, gateway.id
+                    )));
+                }
+                continue;
+            }
             let peer = self
                 .llc
                 .iter()
@@ -826,6 +909,52 @@ to = "upstream"
         .unwrap_err()
         .to_string()
         .contains("unexported LU"));
+    }
+
+    #[test]
+    fn tcp62_gateway_requires_explicit_converter_and_matching_v2_lu_exports() {
+        let gateway = r#"
+[[mptn_gateway]]
+id = "bob"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+destination_lu = "QAALICE.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+[[remote]]
+id = "upstream"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+local_cp = "QABOB.SNAB"
+target_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+target_lu = "QAALICE.SNAA"
+lus = ["QABOB.SNAB"]
+lu_types = { "QABOB.SNAB" = ["lu_6_2"] }
+[[route]]
+from = "bob"
+to = "upstream"
+converter = "mptn_lu62"
+"#;
+        parse(gateway).validate().unwrap();
+        assert!(parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
+            .validate()
+            .is_err());
+        assert!(parse(&gateway.replace(
+            "target_lu = \"QAALICE.SNAA\"",
+            "target_lu = \"QAALICE.OTHER\""
+        ))
+        .validate()
+        .is_err());
+        assert!(parse(&gateway.replace(
+            "source_lu = \"QABOB.SNAB\"\ntarget_lu",
+            "source_lu = \"QABOB.OTHER\"\ntarget_lu"
+        ))
+        .validate()
+        .is_err());
     }
 
     #[test]
