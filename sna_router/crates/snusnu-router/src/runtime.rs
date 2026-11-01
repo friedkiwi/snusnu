@@ -142,51 +142,6 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     const MAX_RETRY: Duration = Duration::from_secs(30);
     let mut delay = FIRST_RETRY;
     while !crate::STOP.load(Ordering::Relaxed) {
-        let remote_ports = if let Some(remote) = config.remote.first() {
-            let bearer = std::env::var("SNUSNU_ROUTER_TOKEN").map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SNUSNU_ROUTER_TOKEN is required",
-                )
-            })?;
-            let options = config
-                .remote
-                .iter()
-                .map(|entry| {
-                    Ok(RemoteConfig {
-                        url: entry.url.clone(),
-                        bearer: bearer.clone(),
-                        local_cp: config::parse_cp(&entry.local_cp)?,
-                        target_cp: config::parse_cp(&entry.target_cp)?,
-                    })
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let logical_units = config
-                .remote
-                .iter()
-                .flat_map(|entry| {
-                    entry.lus.iter().map(|name| {
-                        Ok(transport_ws::wire::LuReachability {
-                            lu: Some(config::parse_cp(name)?),
-                            hosting_cp: Some(config::parse_cp(&entry.local_cp)?),
-                        })
-                    })
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            match WsRoutePort::connect_many(options, logical_units) {
-                Ok(ports) => Some(ports),
-                Err(error) if retryable_remote_error(&error) => {
-                    tracing::warn!(upstream = upstream_authority(&remote.url), error = %error, retry_ms = delay.as_millis(), "concentrator connection failed");
-                    wait_or_stop(delay);
-                    delay = delay.saturating_mul(2).min(MAX_RETRY);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            None
-        };
-        let connected_at = Instant::now();
         let mut registry = EndpointRegistry::default();
         for peer in &config.llc {
             registry.register(
@@ -240,6 +195,53 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                 )?),
             )?;
         }
+        // Opening the WebSocket publishes local CP/LU routes immediately.
+        // Keep that publication behind successful local port initialization.
+        let remote_ports = if let Some(remote) = config.remote.first() {
+            let bearer = std::env::var("SNUSNU_ROUTER_TOKEN").map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SNUSNU_ROUTER_TOKEN is required",
+                )
+            })?;
+            let options = config
+                .remote
+                .iter()
+                .map(|entry| {
+                    Ok(RemoteConfig {
+                        url: entry.url.clone(),
+                        bearer: bearer.clone(),
+                        local_cp: config::parse_cp(&entry.local_cp)?,
+                        target_cp: config::parse_cp(&entry.target_cp)?,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let logical_units = config
+                .remote
+                .iter()
+                .flat_map(|entry| {
+                    entry.lus.iter().map(|name| {
+                        Ok(transport_ws::wire::LuReachability {
+                            lu: Some(config::parse_cp(name)?),
+                            hosting_cp: Some(config::parse_cp(&entry.local_cp)?),
+                        })
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            match WsRoutePort::connect_many(options, logical_units) {
+                Ok(ports) => Some(ports),
+                Err(error) if retryable_remote_error(&error) => {
+                    tracing::warn!(upstream = upstream_authority(&remote.url), error = %error, retry_ms = delay.as_millis(), "concentrator connection failed");
+                    wait_or_stop(delay);
+                    delay = delay.saturating_mul(2).min(MAX_RETRY);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let connected_at = Instant::now();
         if let Some(remote_ports) = remote_ports {
             for (remote, port) in config.remote.iter().zip(remote_ports) {
                 router.register_port(PortId::new(&remote.id), Box::new(port))?;
