@@ -671,10 +671,22 @@ mod diagnostic_test {
         octets.try_into().expect("MAC must have six octets")
     }
 
+    fn allow_empty_xid(payload: &[u8], now: Instant, last: &mut Option<Instant>) -> bool {
+        if !matches!(payload, [4, 4 | 5, 0xaf | 0xbf]) {
+            return false;
+        }
+        if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(2)) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
     fn forward_control(
         unit: RoutedUnit,
         destination: &mut dyn RoutePort,
         direction: &str,
+        last_empty_xid: &mut Option<Instant>,
     ) -> io::Result<()> {
         let RoutedUnit::EeDatagram {
             priority,
@@ -691,12 +703,19 @@ mod diagnostic_test {
             return Ok(());
         }
         if datagram.kind == LdlcKind::Xid {
-            let xid = Xid3::decode(&payload[3..]);
-            match xid {
+            if payload.len() == 3 {
+                if !allow_empty_xid(payload, Instant::now(), last_empty_xid) {
+                    return Ok(());
+                }
+                eprintln!("{direction}: bounded empty XID probe");
+            } else {
+                let xid = Xid3::decode(&payload[3..]);
+                match xid {
                 Ok(xid) => eprintln!("{direction}: XID3 length={} node_id={:02x?} role={:?} exchange={:?} abm={} btu={} cv61_sap={:?}", payload.len()-3, xid.node_id(), xid.role(), xid.exchange_state(), xid.abm_capable(), xid.max_receive_btu(), hpr_lan::advertised_hpr_sap(&payload[3..], if direction == "LAN to EE" { HprMedium::Lan } else { HprMedium::EnterpriseExtender })),
                 Err(error) => {
                     eprintln!("{direction}: XID control length={} XID3 rejected={error:?}", payload.len()-3);
                     return Ok(());
+                }
                 }
             }
         } else {
@@ -738,15 +757,17 @@ mod diagnostic_test {
             ));
         }
         let deadline = Instant::now() + Duration::from_secs(seconds);
+        let mut lan_last_empty_xid = None;
+        let mut ee_last_empty_xid = None;
         while Instant::now() < deadline {
             for event in lan.poll(true)?.unwrap_or_default() {
                 if let RouterEvent::Unit(unit) = event {
-                    forward_control(unit, &mut ee, "LAN to EE")?;
+                    forward_control(unit, &mut ee, "LAN to EE", &mut lan_last_empty_xid)?;
                 }
             }
             for event in ee.poll(true)?.unwrap_or_default() {
                 if let RouterEvent::Unit(unit) = event {
-                    forward_control(unit, &mut lan, "EE to LAN")?;
+                    forward_control(unit, &mut lan, "EE to LAN", &mut ee_last_empty_xid)?;
                 }
             }
             lan.tick()?;
@@ -754,5 +775,24 @@ mod diagnostic_test {
             thread::sleep(Duration::from_millis(2));
         }
         Ok(())
+    }
+
+    #[test]
+    fn empty_xid_bootstrap_is_exact_and_rate_bounded() {
+        let start = Instant::now();
+        let mut last = None;
+        assert!(!allow_empty_xid(&[4, 4, 3], start, &mut last));
+        assert!(!allow_empty_xid(&[4, 6, 0xaf], start, &mut last));
+        assert!(allow_empty_xid(&[4, 4, 0xbf], start, &mut last));
+        assert!(!allow_empty_xid(
+            &[4, 5, 0xaf],
+            start + Duration::from_secs(1),
+            &mut last
+        ));
+        assert!(allow_empty_xid(
+            &[4, 5, 0xaf],
+            start + Duration::from_secs(2),
+            &mut last
+        ));
     }
 }
