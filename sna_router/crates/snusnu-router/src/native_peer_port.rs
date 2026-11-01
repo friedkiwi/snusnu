@@ -23,6 +23,7 @@ pub(crate) struct NativePeerPort {
     endpoint: Endpoint,
     type1: NativeType1,
     local_xid: Xid3,
+    activation_announced: bool,
     reached_information: bool,
 }
 
@@ -40,6 +41,7 @@ impl NativePeerPort {
             endpoint,
             type1,
             local_xid,
+            activation_announced: false,
             reached_information: false,
         })
     }
@@ -54,13 +56,16 @@ impl NativePeerPort {
                 Event::Type1(pdu) => {
                     if let Some(outbound) = self.type1.on_pdu(&pdu)? {
                         self.endpoint.send_type1(&outbound.pdu)?;
-                        if self.type1.confirm_sent(&outbound)? == Phase::ReadyForSabme {
+                        if self.type1.confirm_sent(&outbound)? == Phase::ReadyForSabme
+                            && !self.activation_announced
+                        {
                             self.endpoint.set_connect_allowed(true)?;
                             if self.type1.local_role() == Role::Primary {
                                 // Let any crossed final XID command/response
                                 // settle before the primary sets LLC2 mode.
                                 self.endpoint.begin_connect_after(Duration::from_millis(50));
                             }
+                            self.activation_announced = true;
                             tracing::info!(peer_cp = ?self.type1.peer_name(), local_role = ?self.type1.local_role(), "APPN XID3 negotiation complete; SABME permitted");
                         }
                     }
@@ -85,6 +90,7 @@ impl NativePeerPort {
                     if self.endpoint.state() == State::Disconnected {
                         self.endpoint.set_connect_allowed(false)?;
                         self.type1 = NativeType1::new(self.local_xid.clone())?;
+                        self.activation_announced = false;
                     }
                 }
             }
