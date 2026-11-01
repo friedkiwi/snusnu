@@ -20,7 +20,7 @@ For a native LLC2 circuit, useful events are `Type1(XID|TEST, bytes)`, `Connecte
 | --- | --- | --- |
 | Native LLC2 ↔ native LLC2 | Relay Type 1 and PIU events while terminating LLC2 independently | Configured multi-peer runtime; V4R4 pass-through completed through `--config` |
 | Native LLC2 ↔ AnyNet | MPTN gateway for a configured LU6.2 session; native APPN CP/TG and IP-side MPTN behavior both matter | Research and captures needed |
-| AnyNet ↔ AnyNet | Session-level forwarding with full MPTN state, or ordinary IP routing when no conversion is wanted | Bounded TCP62 codecs and sockets; no configured route yet |
+| AnyNet ↔ AnyNet | Configured TCP62 session forwarding and IPv4 UDP node-pair keepalive translation | V5R4 pass-through completed through Rust TCP proxy; live UDP relay test pending |
 | EE ↔ EE | Preserve LDLC/HPR UDP payloads and priority ports between configured peers | Configured UDP relay completed V5R4 pass-through through separate TAPs |
 | EE ↔ native HPR LAN | Possible HPR media conversion with per-leg XID/link state and both LAN SAP paths; verify with paired traces | Unverified |
 | EE ↔ legacy LLC2 APPC | APPN/HPR network-node behavior or a genuine dual-attached node | Not implemented |
