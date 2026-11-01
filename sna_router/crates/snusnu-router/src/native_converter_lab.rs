@@ -17,7 +17,7 @@ use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -94,7 +94,9 @@ fn mock_peer(
     mut stream: TcpStream,
     management: router_core::fid2_session_control::ManagementBind,
     timeout: Duration,
-) -> io::Result<usize> {
+    delivered: mpsc::Sender<usize>,
+    shutdown: mpsc::Receiver<()>,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(timeout))?;
     let request = Connect::decode(&read_record(&mut stream)?)?;
     if request.direction != Direction::Request || request.connection_data().len() < 9 {
@@ -132,7 +134,16 @@ fn mock_peer(
     {
         return Err(invalid("mock expected first 242-byte APPC FMH5 Attach"));
     }
-    Ok(normal.bytes.len())
+    delivered
+        .send(normal.bytes.len())
+        .map_err(|_| invalid("mock delivery receiver closed"))?;
+    // Keep TCP62 connected until the native LLC egress ACK is observed.
+    // Dropping this socket immediately after read races GatewayEdge's
+    // final `poll_tcp_once` and makes a successful Attach look like EOF.
+    shutdown
+        .recv_timeout(timeout)
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mock shutdown timed out"))?;
+    Ok(())
 }
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
@@ -210,7 +221,10 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     let sender = TcpStream::connect(listener.local_addr()?)?;
     let (peer, _) = listener.accept()?;
     let timeout = Duration::from_secs(config.timeout_seconds);
-    let mut mock = Some(thread::spawn(move || mock_peer(peer, management, timeout)));
+    let (delivered_tx, delivered_rx) = mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let mock =
+        thread::spawn(move || mock_peer(peer, management, timeout, delivered_tx, shutdown_rx));
     let mut mock_bytes = None;
     // All six codes are injected only because this peer is an in-process
     // mock on loopback. Never derive production handler availability here.
@@ -238,13 +252,12 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         edge.poll_native_once()?;
         edge.poll_tcp_once()?;
         edge.flush_tcp()?;
-        if mock.as_ref().is_some_and(|handle| handle.is_finished()) {
-            mock_bytes = Some(
-                mock.take()
-                    .unwrap()
-                    .join()
-                    .map_err(|_| invalid("mock TCP62 peer panicked"))??,
-            );
+        if let Ok(bytes) = delivered_rx.try_recv() {
+            mock_bytes = Some(bytes);
+        } else if mock.is_finished() && mock_bytes.is_none() {
+            mock.join()
+                .map_err(|_| invalid("mock TCP62 peer panicked"))??;
+            return Err(invalid("mock closed before first APPC Attach"));
         }
         if mock_bytes.is_some() && edge.first_attach_delivery_complete() {
             break;
@@ -253,6 +266,8 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     }
     if !edge.first_attach_delivery_complete() || mock_bytes.is_none() {
         edge.close()?;
+        let _ = shutdown_tx.send(());
+        let _ = mock.join();
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "mock Attach delivery or native IPR acknowledgement incomplete",
@@ -264,5 +279,82 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         "first native user Attach reached in-process TCP62 mock; route remains disabled"
     );
     edge.close()?;
+    shutdown_tx
+        .send(())
+        .map_err(|_| invalid("mock shutdown receiver closed"))?;
+    mock.join()
+        .map_err(|_| invalid("mock TCP62 peer panicked"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use router_core::fid2_session_control::ManagementBind;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn mock_keeps_tcp_open_after_attach_until_native_completion_gate() {
+        let management_piu = hex(concat!(
+            "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
+            "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030100000000000000",
+            "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
+            "0be2d6d3d5c5e34be2d5c1c260141111111111111111111111111111111111111111",
+            "2c0a00000000000000000000"
+        ));
+        let management =
+            ManagementBind::from_request(&management_piu, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
+        let user_piu = hex(concat!(
+            "2d00020200006b800031001307b0b051330383c7c7830306020000000000000094434000",
+            "0be2d6d3d5c5e34be2d5c1c12d000902404040404040404009030100000000000000",
+            "0c04e2d6d3d5c5e34be2d5c1c10a1300000000000000000000",
+            "0be2d6d3d5c5e34be2d5c1c260142222222222222222222222222222222222222222",
+            "2c0a01087bc3d6d5d5c5c3e3"
+        ));
+        let mut connect = template("SOLNET.SNAA", "SOLNET.SNAB").unwrap();
+        connect.options[0].value = user_piu[4..].to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let (delivered_tx, delivered_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let mock = thread::spawn(move || {
+            mock_peer(
+                peer,
+                management,
+                Duration::from_secs(2),
+                delivered_tx,
+                shutdown_rx,
+            )
+        });
+        client.write_all(&connect.encode().unwrap()).unwrap();
+        let response = Connect::decode(&read_record(&mut client).unwrap()).unwrap();
+        assert_eq!(response.direction, Direction::PositiveResponse);
+        let mut normal = vec![0; 243];
+        normal[..4].copy_from_slice(&243u32.to_be_bytes());
+        normal[5..12].copy_from_slice(&[0, 1, 0x0b, 0x90, 0x20, 0x24, 0x05]);
+        client.write_all(&normal).unwrap();
+        assert_eq!(
+            delivered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            243
+        );
+        client
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let mut byte = [0];
+        assert!(matches!(
+            client.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        shutdown_tx.send(()).unwrap();
+        mock.join().unwrap().unwrap();
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    }
 }
