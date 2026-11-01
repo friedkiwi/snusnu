@@ -12,6 +12,7 @@ pub mod mptn_gateway_edge;
 pub mod mptn_ingress;
 pub mod mptn_keepalive;
 pub mod mptn_management_initiator;
+pub mod mptn_management_responder;
 pub mod mptn_native_bridge;
 pub mod mptn_oob;
 pub mod mptn_oob_fallback;
