@@ -7,6 +7,7 @@
 //! UNBIND, and the user-session gateway separately.
 
 use crate::{
+    appn_control::{CnosAttach, ControlError},
     fid2_session_control::{ManagementBind, ManagementPacing, SessionControlError},
     fixed_pacing::{FixedPacing, PacingError},
 };
@@ -16,6 +17,7 @@ use std::{error::Error, fmt};
 pub enum ManagementError {
     Bind(SessionControlError),
     Pacing(PacingError),
+    Control(ControlError),
     UnexpectedState,
     WrongEgress,
 }
@@ -40,6 +42,12 @@ impl From<PacingError> for ManagementError {
     }
 }
 
+impl From<ControlError> for ManagementError {
+    fn from(value: ControlError) -> Self {
+        Self::Control(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     AwaitBind,
@@ -56,6 +64,7 @@ pub struct ManagementSession {
     bind: Option<ManagementBind>,
     request: Option<Vec<u8>>,
     pending_response: Option<Vec<u8>>,
+    early_attach: Option<Vec<u8>>,
     pacing: Option<FixedPacing>,
 }
 
@@ -68,6 +77,7 @@ impl ManagementSession {
             bind: None,
             request: None,
             pending_response: None,
+            early_attach: None,
             pacing: None,
         }
     }
@@ -146,6 +156,37 @@ impl ManagementSession {
         self.phase = Phase::AwaitAttach;
         Ok(())
     }
+
+    /// A peer may piggyback its LLC ACK on the Attach I-frame. The endpoint
+    /// normally reports that ACK first, but retain one complete Attach if the
+    /// event reaches this state before the completion callback. Do not run
+    /// the CNOS conversation until the BIND response is acknowledged.
+    pub fn buffer_early_attach(&mut self, piu: &[u8]) -> Result<(), ManagementError> {
+        if self.phase != Phase::AwaitBindAck || self.early_attach.is_some() {
+            return Err(ManagementError::UnexpectedState);
+        }
+        let attach = CnosAttach::decode(piu)?;
+        let bind = self.bind.as_ref().ok_or(ManagementError::UnexpectedState)?;
+        let (daf, oaf) = bind.request_addresses();
+        let request = self
+            .request
+            .as_ref()
+            .ok_or(ManagementError::UnexpectedState)?;
+        if attach.address.daf != daf
+            || attach.address.oaf != oaf
+            || piu[0] & 0x02 != request[0] & 0x02
+        {
+            return Err(ManagementError::UnexpectedState);
+        }
+        self.early_attach = Some(piu.to_vec());
+        Ok(())
+    }
+
+    pub fn take_early_attach(&mut self) -> Option<Vec<u8>> {
+        (self.phase == Phase::AwaitAttach)
+            .then(|| self.early_attach.take())
+            .flatten()
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +253,28 @@ mod tests {
             session.prepare_bind_response(),
             Err(ManagementError::UnexpectedState)
         );
+    }
+
+    #[test]
+    fn buffers_one_correlated_attach_until_bind_ack() {
+        // Sanitized CNOS Attach from the same V4R4 management session.
+        let attach = [
+            0x2c, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20, 0x0c, 0x05, 0x02, 0xff, 0, 3, 0xd0, 0, 0, 2,
+            0x06, 0xf1, 0, 25, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 8, 0, 4, 0, 4, 0, 8, 0x40, 0x40, 0x40,
+            0x40, 0x40, 0x40, 0x40, 0x40,
+        ];
+        let mut session = ManagementSession::new("SOLNET.SNAA".into(), "SOLNET.SNAB".into());
+        session.observe_bind(&live_shape_bind()).unwrap();
+        let response = session.prepare_bind_response().unwrap().to_vec();
+        session.mark_bind_enqueued(&response).unwrap();
+        session.buffer_early_attach(&attach).unwrap();
+        assert_eq!(
+            session.buffer_early_attach(&attach),
+            Err(ManagementError::UnexpectedState)
+        );
+        assert!(session.take_early_attach().is_none());
+        session.acknowledge_bind(1).unwrap();
+        assert_eq!(session.take_early_attach(), Some(attach.to_vec()));
+        assert!(session.take_early_attach().is_none());
     }
 }
