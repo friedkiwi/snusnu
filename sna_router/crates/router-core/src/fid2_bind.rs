@@ -11,11 +11,21 @@ use std::{error::Error, fmt};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindClass {
     /// IBM-reserved management mode; never forward to an AnyNet LU session.
-    Management { mode: String, daf: u8, oaf: u8 },
+    Management { mode: String },
     /// A named non-management mode. Policy must still check both LU names.
-    NamedLu62 { mode: String, daf: u8, oaf: u8 },
+    NamedLu62 { mode: String },
     /// No usable mode was present. Policy must reject until identity is known.
-    Undetermined { daf: u8, oaf: u8 },
+    Undetermined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindInfo {
+    pub class: BindClass,
+    pub daf: u8,
+    pub oaf: u8,
+    /// Network-qualified when the BIND supplies a network ID.
+    pub plu: String,
+    pub slu: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +46,7 @@ impl Error for BindError {}
 
 /// Returns `None` for a complete FID2 PIU that is not a BIND request.
 /// Returns an error for a truncated, segmented, or unsupported candidate.
-pub fn classify_bind(piu: &[u8]) -> Result<Option<BindClass>, BindError> {
+pub fn classify_bind(piu: &[u8]) -> Result<Option<BindInfo>, BindError> {
     if piu.len() < 6 {
         return Err(BindError::Truncated);
     }
@@ -71,28 +81,26 @@ pub fn classify_bind(piu: &[u8]) -> Result<Option<BindClass>, BindError> {
     if !(1..=17).contains(&plu_len) {
         return Err(BindError::InvalidStructure);
     }
+    let plu_start = offset + 1;
     offset = offset
         .checked_add(1 + plu_len)
         .filter(|&end| end < ru.len())
         .ok_or(BindError::Truncated)?;
+    let plu = decode_lu_name(&ru[plu_start..offset])?;
     let user_len = usize::from(ru[offset]);
     offset += 1;
-    if user_len == 0 {
-        return Ok(Some(BindClass::Undetermined {
-            daf: piu[2],
-            oaf: piu[3],
-        }));
-    }
     let end = offset
         .checked_add(user_len)
         .filter(|&end| end <= ru.len())
         .ok_or(BindError::Truncated)?;
-    if ru[offset] != 0 {
-        return Err(BindError::UnsupportedBind);
-    }
-    offset += 1;
     let mut mode = None;
     let mut previous_key = None;
+    if user_len > 0 {
+        if ru[offset] != 0 {
+            return Err(BindError::UnsupportedBind);
+        }
+        offset += 1;
+    }
     while offset < end {
         let length = usize::from(ru[offset]);
         if length < 1 || offset + 1 + length > end {
@@ -111,14 +119,42 @@ pub fn classify_bind(piu: &[u8]) -> Result<Option<BindClass>, BindError> {
         }
         offset += 1 + length;
     }
-    let daf = piu[2];
-    let oaf = piu[3];
-    Ok(Some(match mode.filter(|name| !name.is_empty()) {
+    // A negotiable BIND carries URC length followed by secondary LU name.
+    // This parser requires both identities before allowing route selection.
+    if end >= ru.len() {
+        return Err(BindError::Truncated);
+    }
+    let urc_len = usize::from(ru[end]);
+    if urc_len > 12 {
+        return Err(BindError::InvalidStructure);
+    }
+    let slu_len_offset = end
+        .checked_add(1 + urc_len)
+        .filter(|&offset| offset < ru.len())
+        .ok_or(BindError::Truncated)?;
+    let slu_len = usize::from(ru[slu_len_offset]);
+    if !(1..=17).contains(&slu_len) {
+        return Err(BindError::InvalidStructure);
+    }
+    let slu_start = slu_len_offset + 1;
+    let slu_end = slu_start
+        .checked_add(slu_len)
+        .filter(|&end| end <= ru.len())
+        .ok_or(BindError::Truncated)?;
+    let slu = decode_lu_name(&ru[slu_start..slu_end])?;
+    let class = match mode.filter(|name| !name.is_empty()) {
         Some(mode) if matches!(mode.as_str(), "SNASVCMG" | "CPSVCMG" | "CPSVCMGR") => {
-            BindClass::Management { mode, daf, oaf }
+            BindClass::Management { mode }
         }
-        Some(mode) => BindClass::NamedLu62 { mode, daf, oaf },
-        None => BindClass::Undetermined { daf, oaf },
+        Some(mode) => BindClass::NamedLu62 { mode },
+        None => BindClass::Undetermined,
+    };
+    Ok(Some(BindInfo {
+        class,
+        daf: piu[2],
+        oaf: piu[3],
+        plu,
+        slu,
     }))
 }
 
@@ -148,13 +184,43 @@ fn decode_mode(bytes: &[u8]) -> Result<String, BindError> {
     Ok(name)
 }
 
+fn decode_lu_name(bytes: &[u8]) -> Result<String, BindError> {
+    let mut name = String::new();
+    let mut padding = false;
+    for &byte in bytes {
+        if byte == 0x40 {
+            padding = true;
+            continue;
+        }
+        if padding {
+            return Err(BindError::InvalidStructure);
+        }
+        if byte == 0x4b {
+            name.push('.');
+        } else {
+            name.push(decode_mode(&[byte])?.chars().next().unwrap());
+        }
+    }
+    let mut parts = name.split('.');
+    let first = parts.next().unwrap_or("");
+    let second = parts.next();
+    if first.is_empty()
+        || first.len() > 8
+        || second.is_some_and(|part| part.is_empty() || part.len() > 8)
+        || parts.next().is_some()
+    {
+        return Err(BindError::InvalidStructure);
+    }
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bind_with_mode(subfield: &[u8]) -> Vec<u8> {
         // Sanitized form of the V4R4 LU6.2 BIND shape: synthetic PLU `ABC`,
-        // with only the mode subfield retained from structured User Data.
+        // SLU `DEF`, with only the mode subfield retained from User Data.
         let mut piu = vec![0x2d, 0, 1, 2, 0, 0, 0x6b, 0x85, 0];
         let mut ru = vec![0; 27];
         ru[..4].copy_from_slice(&[0x31, 0, 0x13, 7]);
@@ -164,6 +230,7 @@ mod tests {
         ru.push((1 + subfield.len()) as u8);
         ru.push(0); // structured User Data key
         ru.extend_from_slice(subfield);
+        ru.extend_from_slice(&[0, 3, 0xc4, 0xc5, 0xc6]); // URC, SLU `DEF`
         piu.extend(ru);
         piu
     }
@@ -173,10 +240,14 @@ mod tests {
         let piu = bind_with_mode(&[9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]);
         assert_eq!(
             classify_bind(&piu),
-            Ok(Some(BindClass::Management {
-                mode: "SNASVCMG".into(),
+            Ok(Some(BindInfo {
+                class: BindClass::Management {
+                    mode: "SNASVCMG".into(),
+                },
                 daf: 1,
                 oaf: 2,
+                plu: "ABC".into(),
+                slu: "DEF".into(),
             }))
         );
     }
@@ -186,13 +257,24 @@ mod tests {
         let blank = bind_with_mode(&[1, 2]);
         assert_eq!(
             classify_bind(&blank),
-            Ok(Some(BindClass::Undetermined { daf: 1, oaf: 2 }))
+            Ok(Some(BindInfo {
+                class: BindClass::Undetermined,
+                daf: 1,
+                oaf: 2,
+                plu: "ABC".into(),
+                slu: "DEF".into(),
+            }))
         );
-        let mut missing = bind_with_mode(&[]);
-        missing[9 + 31] = 0;
+        let missing = bind_with_mode(&[]);
         assert_eq!(
             classify_bind(&missing),
-            Ok(Some(BindClass::Undetermined { daf: 1, oaf: 2 }))
+            Ok(Some(BindInfo {
+                class: BindClass::Undetermined,
+                daf: 1,
+                oaf: 2,
+                plu: "ABC".into(),
+                slu: "DEF".into(),
+            }))
         );
     }
 
@@ -201,10 +283,14 @@ mod tests {
         let piu = bind_with_mode(&[8, 2, 0xc1, 0xd7, 0xd7, 0xe3, 0xc5, 0xe2, 0xe3]);
         assert_eq!(
             classify_bind(&piu),
-            Ok(Some(BindClass::NamedLu62 {
-                mode: "APPTEST".into(),
+            Ok(Some(BindInfo {
+                class: BindClass::NamedLu62 {
+                    mode: "APPTEST".into(),
+                },
                 daf: 1,
                 oaf: 2,
+                plu: "ABC".into(),
+                slu: "DEF".into(),
             }))
         );
     }
@@ -232,5 +318,23 @@ mod tests {
         let mut unbind = bind_with_mode(&[1, 2]);
         unbind[9] = 0x32;
         assert_eq!(classify_bind(&unbind), Ok(None));
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_lu_identity() {
+        let piu = bind_with_mode(&[1, 2]);
+        let mut missing_slu = piu.clone();
+        let slu_length_offset = missing_slu.len() - 4;
+        missing_slu[slu_length_offset] = 0;
+        assert_eq!(
+            classify_bind(&missing_slu),
+            Err(BindError::InvalidStructure)
+        );
+        let mut invalid_plu = piu;
+        invalid_plu[9 + 28] = 0xff;
+        assert_eq!(
+            classify_bind(&invalid_plu),
+            Err(BindError::InvalidStructure)
+        );
     }
 }
