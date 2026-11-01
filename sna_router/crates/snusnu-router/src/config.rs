@@ -20,6 +20,8 @@ pub(crate) struct RouterConfig {
     #[serde(default)]
     pub(crate) anynet: Vec<AnyNetConfig>,
     #[serde(default)]
+    pub(crate) hpr_lan: Vec<HprLanConfig>,
+    #[serde(default)]
     pub(crate) route: Vec<RouteConfig>,
     #[serde(default)]
     pub(crate) remote: Vec<RemoteConfig>,
@@ -41,6 +43,16 @@ pub(crate) struct AnyNetConfig {
     pub(crate) peer_ip: IpAddr,
     pub(crate) local_lu: Option<String>,
     pub(crate) remote_lu: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HprLanConfig {
+    pub(crate) id: String,
+    pub(crate) interface: String,
+    pub(crate) guest_mac: String,
+    pub(crate) proxy_mac: String,
+    pub(crate) experimental: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,9 +102,13 @@ pub(crate) fn load(path: &Path) -> io::Result<RouterConfig> {
 
 impl RouterConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.llc.is_empty() && self.ee.is_empty() && self.anynet.is_empty() {
+        if self.llc.is_empty()
+            && self.ee.is_empty()
+            && self.anynet.is_empty()
+            && self.hpr_lan.is_empty()
+        {
             return Err(invalid(
-                "at least one [[llc]], [[ee]] or [[anynet]] peer is required",
+                "at least one [[llc]], [[ee]], [[anynet]] or [[hpr_lan]] peer is required",
             ));
         }
         let mut peers = HashSet::new();
@@ -121,6 +137,39 @@ impl RouterConfig {
             if !peers.insert((peer.interface.as_str(), guest, proxy)) {
                 return Err(invalid(format!(
                     "duplicate LLC association on {}",
+                    peer.interface
+                )));
+            }
+        }
+        for peer in &self.hpr_lan {
+            validate_id(&peer.id)?;
+            if !peer.experimental {
+                return Err(invalid(format!(
+                    "HPR LAN peer {} requires experimental = true",
+                    peer.id
+                )));
+            }
+            if peer.interface.is_empty() {
+                return Err(invalid(format!(
+                    "HPR LAN peer {} has an empty interface",
+                    peer.id
+                )));
+            }
+            if !ids.insert(peer.id.as_str()) {
+                return Err(invalid(format!("duplicate port ID {}", peer.id)));
+            }
+            kinds.insert(&peer.id, "hpr_lan");
+            let guest = parse_mac(&peer.guest_mac)?;
+            let proxy = parse_mac(&peer.proxy_mac)?;
+            if guest == proxy {
+                return Err(invalid(format!(
+                    "HPR LAN peer {} has equal guest and proxy MACs",
+                    peer.id
+                )));
+            }
+            if !peers.insert((peer.interface.as_str(), guest, proxy)) {
+                return Err(invalid(format!(
+                    "duplicate LAN association on {}",
                     peer.interface
                 )));
             }
@@ -238,6 +287,8 @@ impl RouterConfig {
                     | ("llc", "remote")
                     | ("remote", "llc")
                     | ("ee", "ee")
+                    | ("hpr_lan", "ee")
+                    | ("ee", "hpr_lan")
                     | ("anynet", "anynet")
             ) {
                 return Err(invalid(format!(
@@ -305,6 +356,12 @@ impl RouterConfig {
                     )));
                 }
             }
+        }
+        if !self.hpr_lan.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "HPR LAN to EE is experimental and awaits cross-medium XID3/TG validation before SETMODE",
+            ));
         }
         Ok(())
     }
@@ -607,5 +664,41 @@ to = "west"
             .unwrap_err()
             .to_string()
             .contains("requires both"));
+    }
+
+    #[test]
+    fn hpr_lan_requires_explicit_experiment_and_ee_target() {
+        let mixed = r#"
+[[hpr_lan]]
+id = "lan"
+interface = "sol6"
+guest_mac = "02:04:ac:05:45:04"
+proxy_mac = "02:53:4e:00:00:04"
+experimental = true
+[[ee]]
+id = "ip"
+local_ip = "127.0.0.2"
+peer_ip = "127.0.0.3"
+[[route]]
+from = "lan"
+to = "ip"
+"#;
+        assert_eq!(
+            parse(mixed).validate().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(
+            parse(&mixed.replace("experimental = true", "experimental = false"))
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("experimental")
+        );
+        assert!(parse(&mixed.replace("to = \"ip\"", "to = \"lan\""))
+            .validate()
+            .is_err());
+        assert!(parse(&mixed.replace("[[ee]]", "[[anynet]]"))
+            .validate()
+            .is_err());
     }
 }

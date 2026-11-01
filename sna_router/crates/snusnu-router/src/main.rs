@@ -13,7 +13,6 @@ mod config;
 #[cfg(target_os = "linux")]
 mod endpoint;
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // Prototype stays unconfigured until paired HPR LAN/EE capture.
 mod hpr_lan_port;
 #[cfg(target_os = "linux")]
 mod ip_ports;

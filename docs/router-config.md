@@ -72,6 +72,30 @@ EE↔EE relays EE datagrams. The loader rejects LLC↔EE routes and does not tra
 
 The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this EE configuration on two isolated TAPs.
 
+## Experimental HPR LAN to EE media route
+
+`[[hpr_lan]]` describes one HPR-capable OS/400 Ethernet peer through AF_PACKET. Its `proxy_mac` is the remote adapter address configured on that guest. Pair it with one `[[ee]]` port on an IP address assigned to the host. The media adapter code translates HPR LAN UI framing and EE UDP framing while preserving HPR NLP bytes. **The runtime currently rejects this configuration as unsupported** until it can validate XID3 transmission-group agreement across both media before SETMODE. The example records the intended configuration shape for that integration test.
+
+```toml
+[[hpr_lan]]
+id = "lan_a"
+interface = "sol6"
+guest_mac = "02:04:ac:05:45:04"
+proxy_mac = "02:04:ac:05:45:05"
+experimental = true
+
+[[ee]]
+id = "ee_b"
+local_ip = "192.0.2.2"
+peer_ip = "192.0.2.12"
+
+[[route]]
+from = "lan_a"
+to = "ee_b"
+```
+
+The loader requires `experimental = true` and rejects HPR LAN routes to LLC, AnyNet, WebSocket or another HPR LAN port. It still returns an explicit unsupported error for the HPR LAN to EE pair. The HPR LAN adapter negotiates its HPR SAP from XID3; no fixed `0xC8` SAP is configured. The [direct V5R4 HPR LAN baseline](hpr-lan-lab.md) documents the guest configuration used to validate the adapter.
+
 ## Constrained AnyNet relay
 
 Two `[[anynet]]` ports can form a standalone AnyNet↔AnyNet route. Each port binds TCP and UDP port 397 on its `local_ip` and accepts only the configured `peer_ip`. The adapter handles **one TCP62 LU6.2 session at a time** and validates complete MPTN records before forwarding them. It also validates and rewrites IPv4 UDP/397 node-pair keepalives (`0x84`), including response correlation. UDP/397 expedited traffic (`0x83`) and unknown datagrams close the routed session because their session semantics are not yet supported. This is a constrained AnyNet relay, not a general MPTN gateway.

@@ -4,6 +4,7 @@ use crate::{
     anynet_port::AnyNetPort,
     config::{self, RouterConfig},
     endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
+    hpr_lan_port::HprLanPort,
     ip_ports::EePort,
     remote::{Config as RemoteConfig, WsRoutePort},
     routing::{PortId, RouteAddress, RoutePort, RoutedUnit, Router, RouterEvent},
@@ -216,6 +217,18 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                 Box::new(EePort::open(peer.local_ip, peer.peer_ip)?),
             )?;
         }
+        for peer in &config.hpr_lan {
+            router.register_port(
+                PortId::new(&peer.id),
+                Box::new(HprLanPort::open(
+                    &peer.interface,
+                    config::parse_mac(&peer.proxy_mac)?,
+                    config::parse_mac(&peer.guest_mac)?,
+                    0x04,
+                    0x04,
+                )?),
+            )?;
+        }
         for peer in &config.anynet {
             router.register_port(
                 PortId::new(&peer.id),
@@ -267,6 +280,8 @@ fn install_config_route(
     target: &PortId,
 ) -> io::Result<()> {
     let address = if let Some(peer) = config.llc.iter().find(|peer| peer.id == source.0) {
+        Some(RouteAddress::Mac(config::parse_mac(&peer.proxy_mac)?))
+    } else if let Some(peer) = config.hpr_lan.iter().find(|peer| peer.id == source.0) {
         Some(RouteAddress::Mac(config::parse_mac(&peer.proxy_mac)?))
     } else if let Some(remote) = config.remote.iter().find(|remote| remote.id == source.0) {
         let cp = config::parse_cp(&remote.local_cp)?;
