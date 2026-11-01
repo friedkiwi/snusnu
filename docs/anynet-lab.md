@@ -148,3 +148,13 @@ DISC. The failed reverse connection and negative response are observed in
 the private captures `native-converter-v5-retry-sol5.pcap` and
 `native-converter-v5-retry-sol7.pcap` in the lab directories above. Their
 causal relationship remains to be tested with a reverse TCP/397 listener.
+
+A subsequent reverse-listener diagnostic stopped before TCP: after a valid
+management UNBIND response, A sent the 141-byte user BIND with DAF `0x01`
+instead of the `0x02` seen in the earlier run. The only other differences
+in the two user BIND PIUs were the session-specific FQPCID and correlator
+bytes. Rust's strict session-address check rejected it and sent DISC; the
+capture contains no user BIND response. This demonstrates that the writable
+V4R4 guest can reuse address `0x01` for the user session after management
+teardown. The private capture is `native-converter-v5-third-sol5.pcap` in
+the V4 lab directory.
