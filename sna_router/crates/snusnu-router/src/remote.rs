@@ -1754,6 +1754,114 @@ mod tests {
     }
 
     #[test]
+    fn v2_gateway_opens_with_local_lu_reference_without_managed_mac() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request.headers()[SEC_WEBSOCKET_PROTOCOL],
+                        transport_ws::SUBPROTOCOL_V2
+                    );
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL_V2),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, body| {
+                socket
+                    .send(WsMessage::Binary(envelope(body).encode_to_vec().into()))
+                    .unwrap();
+            };
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                    router_id: vec![7; 16],
+                    connection_epoch: vec![8; 16],
+                    max_message_bytes: 65536,
+                    max_circuits: 4,
+                    display_name: "v2 gateway".into(),
+                    allowed_netid: "QABOB".into(),
+                }),
+            );
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("expected snapshot")
+            };
+            let published = wire::WsEnvelope::decode(payload).unwrap();
+            let Some(wire::ws_envelope::Body::PublishRoutes(snapshot)) = published.body else {
+                panic!("expected route snapshot")
+            };
+            let source_lu = snapshot.routes.iter().find(|route| matches!(route.resource.as_ref(),
+                Some(wire::route_export::Resource::LogicalUnit(export)) if export.lu.as_ref() == Some(&name("QABOB", "LUB")))).unwrap();
+            let source_id = source_lu.id;
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16],
+                        revision: 1,
+                        routes: vec![wire::RouteExport {
+                            id: 99,
+                            generation: 1,
+                            resource: Some(wire::route_export::Resource::LogicalUnit(
+                                wire::LuReachability {
+                                    lu: Some(name("QAALICE", "LUA")),
+                                    hosting_cp: Some(name("QAALICE", "SNAA")),
+                                    supported_types: vec![wire::LuType::LuType62 as i32],
+                                },
+                            )),
+                        }],
+                    }),
+                }),
+            );
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("expected open")
+            };
+            let opened = wire::WsEnvelope::decode(payload).unwrap();
+            let Some(wire::ws_envelope::Body::OpenRequest(open)) = opened.body else {
+                panic!("expected open request")
+            };
+            assert_eq!(open.target.unwrap().route_id, 99);
+            let source = open.source_route.unwrap();
+            assert_eq!(source.router_id, vec![7; 16]);
+            assert_eq!(source.epoch, vec![8; 16]);
+            assert_eq!(source.route_id, source_id);
+        });
+        let source_lu = name("QABOB", "LUB");
+        let mut port = WsRoutePort::connect_gateway_v2(
+            Config {
+                url,
+                bearer: "test-token".into(),
+                local_cp: name("QABOB", "SNAB"),
+                target_cp: name("QAALICE", "SNAA"),
+                target_lu: Some(name("QAALICE", "LUA")),
+            },
+            vec![wire::LuReachability {
+                lu: Some(source_lu.clone()),
+                hosting_cp: Some(name("QABOB", "SNAB")),
+                supported_types: vec![wire::LuType::LuType62 as i32],
+            }],
+            source_lu,
+        )
+        .unwrap();
+        port.send(RoutedUnit::DlcType1(vec![4, 4, 0xaf])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !port.opening && Instant::now() < deadline {
+            port.poll(true).unwrap();
+        }
+        assert!(port.opening);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn local_snapshot_exports_cp_and_lu_with_stable_distinct_ids() {
         let primary = name("SOLNET", "SNAA");
         let cp_b = name("SOLNET", "SNAB");
