@@ -642,3 +642,114 @@ mod tests {
         assert!(codec.send(3, vec![0xc8, 4, 3, 0xc2]).is_err());
     }
 }
+
+/// Opt-in, ignored diagnostic. It is deliberately outside router configuration
+/// and forwards only EE/LAN LDLC U-controls. SETMODE remains unarmed, so no
+/// HPR UI or LLC2 traffic crosses this experiment.
+#[cfg(all(test, target_os = "linux"))]
+mod diagnostic_test {
+    use super::*;
+    use crate::ip_ports::EePort;
+    use router_core::xid3::Xid3;
+    use std::{
+        env,
+        net::IpAddr,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn setting(name: &str) -> String {
+        env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
+    }
+
+    fn mac(name: &str) -> [u8; 6] {
+        let value = setting(name);
+        let octets: Vec<_> = value
+            .split(':')
+            .map(|part| u8::from_str_radix(part, 16).expect("invalid MAC octet"))
+            .collect();
+        octets.try_into().expect("MAC must have six octets")
+    }
+
+    fn forward_control(
+        unit: RoutedUnit,
+        destination: &mut dyn RoutePort,
+        direction: &str,
+    ) -> io::Result<()> {
+        let RoutedUnit::EeDatagram {
+            priority,
+            ref payload,
+        } = unit
+        else {
+            return Ok(());
+        };
+        if priority != 0 {
+            return Ok(());
+        }
+        let datagram = Datagram::decode(CONTROL_PORT, payload.clone())?;
+        if datagram.kind == LdlcKind::UiNlp {
+            return Ok(());
+        }
+        if datagram.kind == LdlcKind::Xid {
+            let xid = Xid3::decode(&payload[3..]);
+            match xid {
+                Ok(xid) => eprintln!("{direction}: XID3 length={} node_id={:02x?} role={:?} exchange={:?} abm={} btu={} cv61_sap={:?}", payload.len()-3, xid.node_id(), xid.role(), xid.exchange_state(), xid.abm_capable(), xid.max_receive_btu(), hpr_lan::advertised_hpr_sap(&payload[3..], if direction == "LAN to EE" { HprMedium::Lan } else { HprMedium::EnterpriseExtender })),
+                Err(error) => eprintln!("{direction}: XID control length={} XID3 parse={error:?}", payload.len()-3),
+            }
+        } else {
+            eprintln!("{direction}: {:?} control", datagram.kind);
+        }
+        if !destination.send(unit)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "diagnostic destination queue full",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires explicit SNA_DIAG_* environment, CAP_NET_RAW, and an isolated Solstice TAP"]
+    fn mixed_media_xid_only() -> io::Result<()> {
+        let mut lan = HprLanPort::open(
+            &setting("SNA_DIAG_TAP"),
+            mac("SNA_DIAG_PROXY_MAC"),
+            mac("SNA_DIAG_GUEST_MAC"),
+            4,
+            4,
+        )?;
+        let local_ip: IpAddr = setting("SNA_DIAG_LOCAL_IP")
+            .parse()
+            .expect("invalid local IP");
+        let peer_ip: IpAddr = setting("SNA_DIAG_PEER_IP")
+            .parse()
+            .expect("invalid peer IP");
+        let mut ee = EePort::open(local_ip, peer_ip)?;
+        let seconds: u64 = setting("SNA_DIAG_SECONDS")
+            .parse()
+            .expect("invalid seconds");
+        if !(1..=300).contains(&seconds) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic duration outside 1..300 seconds",
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < deadline {
+            for event in lan.poll(true)?.unwrap_or_default() {
+                if let RouterEvent::Unit(unit) = event {
+                    forward_control(unit, &mut ee, "LAN to EE")?;
+                }
+            }
+            for event in ee.poll(true)?.unwrap_or_default() {
+                if let RouterEvent::Unit(unit) = event {
+                    forward_control(unit, &mut lan, "EE to LAN")?;
+                }
+            }
+            lan.tick()?;
+            ee.tick()?;
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
+}
