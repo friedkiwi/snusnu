@@ -61,7 +61,9 @@ preparation.
 
 Both cold copies booted and reached Main Menu on 2026-11-02. Their original
 `SOLNET` guests were powered off during the copies to keep the DASD images
-consistent. On the V4 copy, the following changes succeeded with its APPC
+consistent. The original guests were then restarted from their unchanged
+disks; `DSPNETA` reconfirmed `SOLNET.SNAA` on V4 and `SOLNET.SNAB` on V5.
+On the V4 copy, the following changes succeeded with its APPC
 controllers varied off:
 
 ```text
