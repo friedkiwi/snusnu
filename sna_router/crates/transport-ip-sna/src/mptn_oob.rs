@@ -177,6 +177,38 @@ impl<'a> Datagram<'a> {
             && self.correlator_node == request.source.node
             && self.correlator_suffix == request.correlator
     }
+
+    /// Acknowledge a correlated request after its expedited or abort data
+    /// reached the owning session. Aliases are optional and omitted: the
+    /// original Connect correlator and two-byte sequence remain sufficient.
+    /// This does not itself grant native delivery credit.
+    pub fn positive_response(&self) -> io::Result<Vec<u8>> {
+        if self.kind != Kind::Request || self.compensation.is_none() {
+            return Err(invalid("TCP62 OOB response requires an admitted request"));
+        }
+        let node_len = self.correlator_node.len();
+        let suffix_len = self.correlator_suffix.len();
+        if !(3..=17).contains(&node_len) || !(1..=8).contains(&suffix_len) {
+            return Err(invalid("TCP62 OOB correlator length unsupported"));
+        }
+        let mut bytes = vec![0; 4];
+        bytes.extend_from_slice(&[0x83, 0x82, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&self.sequence.to_be_bytes());
+        bytes.extend_from_slice(&[0x0b, 0x01, (node_len + 1) as u8]);
+        bytes.extend_from_slice(self.correlator_node);
+        bytes.push(0x01);
+        bytes.push((suffix_len + 1) as u8);
+        bytes.extend_from_slice(self.correlator_suffix);
+        let command_len = (bytes.len() - 4) as u32;
+        bytes[6..10].copy_from_slice(&command_len.to_be_bytes());
+        let total_len = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&total_len.to_be_bytes());
+        let checked = Datagram::decode(&bytes)?;
+        if checked.kind != Kind::PositiveResponse || checked.sequence != self.sequence {
+            return Err(invalid("TCP62 OOB response construction failed"));
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +311,11 @@ mod tests {
             options: vec![],
         };
         assert!(parsed.matches_connect(&connect));
+        let acknowledged = parsed.positive_response().unwrap();
+        let acknowledged = Datagram::decode(&acknowledged).unwrap();
+        assert_eq!(acknowledged.kind, Kind::PositiveResponse);
+        assert_eq!(acknowledged.sequence, 7);
+        assert!(acknowledged.matches_connect(&connect));
         let response = message(0x82, 7, &[]);
         assert_eq!(
             Datagram::decode(&response).unwrap().kind,
