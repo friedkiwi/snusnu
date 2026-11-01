@@ -165,9 +165,14 @@ impl ManagementBind {
         if ManagementBind::from_request(request_piu, &self.plu, &self.slu)? != *self {
             return Err(SessionControlError::WrongSession);
         }
+        // GA27-3136-12 RH byte 1: X'80' requests DR1; X'85' additionally
+        // sets the pacing and larger-window indicators. Both occur on the
+        // same V4R4 management BIND profile. The response does not echo PI.
         if request_piu[1] != 0
             || request_piu[4..6] != [0, 0]
-            || request_piu[6..9] != [0x6b, 0x85, 0]
+            || request_piu[6] != 0x6b
+            || !matches!(request_piu[7], 0x80 | 0x85)
+            || request_piu[8] != 0
         {
             return Err(SessionControlError::UnsupportedRequest);
         }
@@ -442,6 +447,29 @@ mod tests {
         assert_eq!(response, expected);
         assert_eq!(bind.correlate_positive_response(&response), Ok(()));
 
+        // Independent one-guest Solstice probe (native-probe-sol5.pcap):
+        // identical 132-byte BIND RU, but ODAI is clear and RH requests DR1
+        // without link BIND pacing. Tokens are sanitized above. Preserve ODAI
+        // in the reply and do not invent a pacing indicator on +RSP(BIND).
+        let mut live = request.clone();
+        live[0] = 0x2d;
+        live[7] = 0x80;
+        let live_bind = ManagementBind::from_request(&live, "SOLNET.SNAA", "SOLNET.SNAB").unwrap();
+        let live_response = live_bind
+            .build_v4r4_positive_response(
+                &live,
+                ManagementPacing::FixedOneStage {
+                    local_receive_window: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(&live_response[..9], &[0x2d, 0, 2, 1, 0, 0, 0xeb, 0x80, 0]);
+        assert_eq!(&live_response[9 + 8..9 + 14], &[7, 1, 0x86, 0x86, 0x81, 7]);
+        assert_eq!(
+            live_bind.correlate_positive_response(&live_response),
+            Ok(())
+        );
+
         let fixed = bind
             .build_v4r4_positive_response(
                 &request,
@@ -466,6 +494,12 @@ mod tests {
 
         let mut unsupported = request.clone();
         unsupported[9 + 9] &= !0x80; // No adaptive pacing in request.
+        assert_eq!(
+            bind.build_v4r4_positive_response(&unsupported, ManagementPacing::Adaptive),
+            Err(SessionControlError::UnsupportedRequest)
+        );
+        unsupported = request.clone();
+        unsupported[7] = 0x81; // PI without the observed larger-window request.
         assert_eq!(
             bind.build_v4r4_positive_response(&unsupported, ManagementPacing::Adaptive),
             Err(SessionControlError::UnsupportedRequest)
