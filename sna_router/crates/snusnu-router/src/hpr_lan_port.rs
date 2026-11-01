@@ -731,7 +731,7 @@ mod diagnostic_test {
     }
 
     #[test]
-    #[ignore = "requires explicit SNA_DIAG_* environment, CAP_NET_RAW, and an isolated Solstice TAP"]
+    #[ignore = "requires explicit SNA_DIAG_* environment, CAP_NET_RAW, and an isolated lab TAP"]
     fn mixed_media_xid_only() -> io::Result<()> {
         let mut lan = HprLanPort::open(
             &setting("SNA_DIAG_TAP"),

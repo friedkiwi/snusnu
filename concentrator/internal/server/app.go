@@ -260,6 +260,11 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid email", 400)
 		return
 	}
+	netid := strings.ToUpper(strings.TrimSpace(r.FormValue("netid")))
+	if !store.ValidNetID(netid) {
+		http.Error(w, "NETID must be 1-8 valid SNA characters", http.StatusBadRequest)
+		return
+	}
 	password := r.FormValue("password")
 	if len(password) < 12 || len(password) > 72 {
 		http.Error(w, "password must be 12-72 characters", 400)
@@ -287,9 +292,9 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, a.DB.Q("INSERT INTO users(id,email,password_hash,role) VALUES(?,?,?,'user')"), id, email, string(hash))
+	_, err = tx.ExecContext(ctx, a.DB.Q("INSERT INTO users(id,email,password_hash,role,netid) VALUES(?,?,?,'user',?)"), id, email, string(hash), netid)
 	if err != nil {
-		http.Error(w, "email already registered", 409)
+		http.Error(w, "email or NETID already registered", 409)
 		return
 	}
 	_, err = tx.ExecContext(ctx, a.DB.Q("INSERT INTO email_tokens(user_id,code_hash,expires_at) VALUES(?,?,?)"), id, store.Hash(id+code), store.Now()+600)
@@ -481,6 +486,15 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 func (a *App) loginPage(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "login", map[string]any{"CaptchaKey": a.Config.CaptchaSiteKey})
 }
+func (a *App) loginError(w http.ResponseWriter, status int, message, email string, remember bool) {
+	w.WriteHeader(status)
+	a.render(w, "login", map[string]any{
+		"CaptchaKey": a.Config.CaptchaSiteKey,
+		"Error":      message,
+		"Email":      email,
+		"Remember":   remember,
+	})
+}
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", 400)
@@ -490,9 +504,10 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
+	remember := r.FormValue("remember") == "1"
 	keys := loginKeys(r, email)
 	if !a.allowed(r, keys, 10) {
-		http.Error(w, "too many attempts; try later", 429)
+		a.loginError(w, http.StatusTooManyRequests, "Too many attempts; try again later.", email, remember)
 		return
 	}
 	u, err := a.DB.UserByEmail(r.Context(), email)
@@ -501,12 +516,12 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 			dbError(w, err)
 			return
 		}
-		http.Error(w, "invalid credentials", 401)
+		a.loginError(w, http.StatusUnauthorized, "The email address or password is incorrect.", email, remember)
 		return
 	}
 	a.clearFailures(r, keys)
 	if u.VerifiedAt == 0 {
-		http.Error(w, "verify your email first", 403)
+		a.loginError(w, http.StatusForbidden, "Verify your email address before signing in.", email, remember)
 		return
 	}
 	var count int
@@ -520,7 +535,6 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	} else if u.RemindAfter <= store.Now() {
 		state = "enroll"
 	}
-	remember := r.FormValue("remember") == "1"
 	token, _, err := a.DB.NewSessionWithRemember(r.Context(), u.ID, state, remember)
 	if err != nil {
 		http.Error(w, "server error", 500)

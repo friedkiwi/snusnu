@@ -2,7 +2,7 @@
 
 `snusnu-router --config FILE` starts multiple independent LLC2 associations and explicit routes. Each `[[llc]]` entry names one guest MAC and the proxy MAC that the guest addresses on one Linux Ethernet interface. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
 
-For the two V4R4 Solstice guests used in [the LLC lab](llc-lab.md), save this as `router.toml`:
+For the two V4R4 guests used in [the LLC lab](llc-lab.md), save this as `router.toml`:
 
 ```toml
 [[llc]]
@@ -51,6 +51,15 @@ to = "upstream"
 Set `SNUSNU_ROUTER_TOKEN` in the environment for a remote route. Do not put bearer tokens in the TOML file. The existing `--local-link`, `--remote-link` and `--lab-link` commands remain available.
 
 Configured `[[remote]]` entries share one authenticated connection and publish one snapshot containing all listed CPs and LUs. Each remote circuit must have one local LLC association. Declare the CP and LUs owned by that guest on its `[[llc]]` entry; `[[remote]] local_cp` must match, and its exported `lus` must be a subset of the peer's declared LUs. Standalone LLC routes can omit those identity fields. A configured remote route with no matching local identity is rejected before connecting or publishing. The configured proxy MAC must be in the `02:53:4e` managed namespace and is updated to the server-assigned virtual MAC while its LLC association is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
+
+An exported LU can optionally declare its supported type for the global directory and remote route metadata. Omitted declarations remain `Unknown`; they are not inferred from the LU name. Keys must also appear in `lus`, and duplicate or empty type lists are rejected:
+
+```toml
+lus = ["SOLNET.PAYROLL"]
+lu_types = { "SOLNET.PAYROLL" = ["lu_6_2"] }
+```
+
+Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, and `lu_6_2`. These values are publisher declarations, not proof of a successful BIND negotiation.
 
 When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the remote route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
 

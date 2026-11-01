@@ -171,13 +171,16 @@ func TestRouterSnapshotEpochFencing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exports := []RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"}, {ID: 2, Generation: 1, Kind: "LU", NetID: "SOLNET", Name: "SNAB", HostingCPNetID: "SOLNET", HostingCPName: "SNAB"}}
+	exports := []RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"}, {ID: 2, Generation: 1, Kind: "LU", NetID: "SOLNET", Name: "SNAB", HostingCPNetID: "SOLNET", HostingCPName: "SNAB", LUTypes: []string{"LU 6.2"}}}
 	if err = s.ReplaceRouterSnapshot(ctx, r.ID, epoch, 1, exports); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.ListExports(ctx, owner)
 	if err != nil || len(got) != 2 {
 		t.Fatalf("distinct CP and LU: %+v %v", got, err)
+	}
+	if len(got[1].LUTypes) != 1 || got[1].LUTypes[0] != "LU 6.2" {
+		t.Fatalf("LU types not preserved: %+v", got[1].LUTypes)
 	}
 	if err = s.ReplaceRouterSnapshot(ctx, r.ID, epoch, 1, exports); !errors.Is(err, ErrStaleEpoch) {
 		t.Fatalf("replayed revision: %v", err)
@@ -211,6 +214,62 @@ func TestRouterSnapshotEpochFencing(t *testing.T) {
 	got, err = s.ListExports(ctx, owner)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("pause did not withdraw: %+v %v", got, err)
+	}
+}
+
+func TestUserNETIDIsUniqueValidatedAndFencesRouters(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, "sqlite", filepath.Join(t.TempDir(), "netid.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.DB.Close()
+	first, second := RandomUUID(), RandomUUID()
+	for _, user := range []struct{ id, email string }{{first, "first@example.com"}, {second, "second@example.com"}} {
+		if _, err = s.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", user.id, user.email, "hash", Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = s.UpdateProfile(ctx, first, "first_user", "", "", "SOLNET", false); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.UpdateProfile(ctx, second, "second_user", "", "", "1BAD", false); err == nil {
+		t.Fatal("invalid NETID accepted")
+	}
+	if err = s.UpdateProfile(ctx, second, "second_user", "", "", "SOLNET", false); err == nil {
+		t.Fatal("duplicate NETID accepted")
+	}
+	router, _, err := s.CreateRouter(ctx, first, "NETID fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := s.BeginRouterEpoch(ctx, router.ID, "192.0.2.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ReplaceRouterSnapshot(ctx, router.ID, epoch, 1, []RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAA"}}); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := s.AllocateManagedCP(ctx, first, "SOLNET", "SNAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.UpdateProfile(ctx, first, "first_user", "", "", "NEWNET", false); err != nil {
+		t.Fatal(err)
+	}
+	var epochs, advertisements int
+	if err = s.Row(ctx, "SELECT COUNT(*) FROM router_epochs WHERE router_id=?", router.ID).Scan(&epochs); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Row(ctx, "SELECT COUNT(*) FROM router_advertisements WHERE router_id=?", router.ID).Scan(&advertisements); err != nil {
+		t.Fatal(err)
+	}
+	if epochs != 0 || advertisements != 0 {
+		t.Fatalf("NETID change left live state: epochs=%d advertisements=%d", epochs, advertisements)
+	}
+	remapped, err := s.ManagedCPByID(ctx, managed.ID)
+	if err != nil || remapped.NetID != "NEWNET" {
+		t.Fatalf("managed CP NETID not remapped: %+v %v", remapped, err)
 	}
 }
 
@@ -269,8 +328,21 @@ func TestBackends(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err = s.ReplaceRouterSnapshot(context.Background(), router.ID, epoch, 1, []RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"}}); err != nil {
+			if err = s.ReplaceRouterSnapshot(context.Background(), router.ID, epoch, 1, []RouteExport{
+				{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"},
+				{ID: 2, Generation: 1, Kind: "LU", NetID: "SOLNET", Name: "PAYROLL", HostingCPNetID: "SOLNET", HostingCPName: "SNAB", LUTypes: []string{"LU 6.2"}},
+			}); err != nil {
 				t.Fatal(err)
+			}
+			exports, err := s.ListExports(context.Background(), id)
+			var luTypes []string
+			for _, export := range exports {
+				if export.Kind == "LU" {
+					luTypes = export.LUTypes
+				}
+			}
+			if err != nil || len(exports) != 2 || len(luTypes) != 1 || luTypes[0] != "LU 6.2" {
+				t.Fatalf("backend LU type round trip: %+v %v", exports, err)
 			}
 			if err = s.AppendRouterLog(context.Background(), LogEntry{RouterID: router.ID, Direction: "system", Level: "info", EventType: "snapshot", SourceIP: "192.0.2.3", Summary: "one route"}); err != nil {
 				t.Fatal(err)

@@ -27,7 +27,7 @@ func connectTestRouter(t *testing.T, url, token string) (*websocket.Conn, *wire.
 	t.Cleanup(func() { conn.Close() })
 	envelope := readTestEnvelope(t, conn)
 	welcome := envelope.GetWelcome()
-	if welcome == nil || len(welcome.RouterId) != 16 || len(welcome.ConnectionEpoch) != 16 || welcome.DisplayName == "" {
+	if welcome == nil || len(welcome.RouterId) != 16 || len(welcome.ConnectionEpoch) != 16 || welcome.DisplayName == "" || !store.ValidNetID(welcome.AllowedNetid) {
 		t.Fatalf("bad welcome: %+v", envelope)
 	}
 	return conn, welcome
@@ -126,7 +126,7 @@ func TestRouterWebSocketTwoPeerCircuit(t *testing.T) {
 	ctx := context.Background()
 	ids := []string{store.RandomUUID(), store.RandomUUID()}
 	for i, id := range ids {
-		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", id, []string{"ws-a@example.com", "ws-b@example.com"}[i], "unused", store.Now()); err != nil {
+		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", id, []string{"ws-a@example.com", "ws-b@example.com"}[i], "unused", store.Now(), []string{"NETA", "NETB"}[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -150,12 +150,12 @@ func TestRouterWebSocketTwoPeerCircuit(t *testing.T) {
 	if string(wa.RouterId) != string(uuidBytes(first.ID)) || string(wb.RouterId) != string(uuidBytes(second.ID)) {
 		t.Fatal("welcome identity mismatch")
 	}
-	cp := func(name string) *wire.SnaName { return &wire.SnaName{Netid: "SOLNET", Name: name} }
-	snapshot := func(epoch []byte, name string) *wire.RouteSnapshot {
-		return &wire.RouteSnapshot{Epoch: epoch, Revision: 1, Routes: []*wire.RouteExport{{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: cp(name)}}}}
+	cp := func(netid, name string) *wire.SnaName { return &wire.SnaName{Netid: netid, Name: name} }
+	snapshot := func(epoch []byte, netid, name string) *wire.RouteSnapshot {
+		return &wire.RouteSnapshot{Epoch: epoch, Revision: 1, Routes: []*wire.RouteExport{{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: cp(netid, name)}}}}
 	}
-	sendTestEnvelope(t, ca, &wire.WsEnvelope_PublishRoutes{PublishRoutes: snapshot(wa.ConnectionEpoch, "SNAA")})
-	sendTestEnvelope(t, cb, &wire.WsEnvelope_PublishRoutes{PublishRoutes: snapshot(wb.ConnectionEpoch, "SNAB")})
+	sendTestEnvelope(t, ca, &wire.WsEnvelope_PublishRoutes{PublishRoutes: snapshot(wa.ConnectionEpoch, "NETA", "SNAA")})
+	sendTestEnvelope(t, cb, &wire.WsEnvelope_PublishRoutes{PublishRoutes: snapshot(wb.ConnectionEpoch, "NETB", "SNAB")})
 	ra := expectTestBody(t, ca, "routes").GetOriginRoutes()
 	rb := expectTestBody(t, cb, "routes").GetOriginRoutes()
 	if string(ra.RouterId) != string(wb.RouterId) || string(rb.RouterId) != string(wa.RouterId) {
@@ -199,8 +199,8 @@ func TestRouterWebSocketManagedBindingsAndRevocation(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()
 	owner, recipientOwner := store.RandomUUID(), store.RandomUUID()
-	for _, x := range []struct{ id, email string }{{owner, "cp-owner@example.com"}, {recipientOwner, "llc-owner@example.com"}} {
-		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", x.id, x.email, "unused", store.Now()); err != nil {
+	for _, x := range []struct{ id, email, netid string }{{owner, "cp-owner@example.com", "SOLNET"}, {recipientOwner, "llc-owner@example.com", "LLCNET"}} {
+		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", x.id, x.email, "unused", store.Now(), x.netid); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -270,7 +270,7 @@ func TestRouterWebSocketRejectsRetargetWithoutGeneration(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()
 	owner := store.RandomUUID()
-	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", owner, "retarget@example.com", "unused", store.Now()); err != nil {
+	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "retarget@example.com", "unused", store.Now(), "SOLNET"); err != nil {
 		t.Fatal(err)
 	}
 	_, token, err := a.DB.CreateRouter(ctx, owner, "Route publisher")
@@ -289,5 +289,34 @@ func TestRouterWebSocketRejectsRetargetWithoutGeneration(t *testing.T) {
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, _, err := conn.ReadMessage(); err == nil {
 		t.Fatal("retargeted route accepted without new generation")
+	}
+}
+
+func TestRouterWebSocketRejectsUnownedNETID(t *testing.T) {
+	a := testApp(t)
+	ctx := context.Background()
+	owner := store.RandomUUID()
+	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "namespace@example.com", "unused", store.Now(), "OWNNET"); err != nil {
+		t.Fatal(err)
+	}
+	router, token, err := a.DB.CreateRouter(ctx, owner, "Namespace publisher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(a.Handler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/router/v1/ws"
+	conn, welcome := connectTestRouter(t, url, token)
+	if welcome.AllowedNetid != "OWNNET" {
+		t.Fatalf("welcome NETID: %q", welcome.AllowedNetid)
+	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_PublishRoutes{PublishRoutes: &wire.RouteSnapshot{Epoch: welcome.ConnectionEpoch, Revision: 1, Routes: []*wire.RouteExport{{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: &wire.SnaName{Netid: "OTHER", Name: "SNAA"}}}}}})
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("unowned NETID publication kept connection open")
+	}
+	var count int
+	if err = a.DB.Row(ctx, "SELECT COUNT(*) FROM router_advertisements WHERE router_id=?", router.ID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("unowned advertisement persisted: %d %v", count, err)
 	}
 }

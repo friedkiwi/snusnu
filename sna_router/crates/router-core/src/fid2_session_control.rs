@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(response, expected);
         assert_eq!(bind.correlate_positive_response(&response), Ok(()));
 
-        // Independent one-guest Solstice probe (native-probe-sol5.pcap):
+        // Independent one-guest emulator probe (native-probe-sol5.pcap):
         // identical 132-byte BIND RU, but ODAI is clear and RH requests DR1
         // without link BIND pacing. Tokens are sanitized above. Preserve ODAI
         // in the reply and do not invent a pacing indicator on +RSP(BIND).

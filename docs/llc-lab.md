@@ -2,9 +2,9 @@
 
 The Rust router's `--lab-link` mode joins two isolated Linux TAP interfaces. It relays LLC TEST and XID frames, terminates LLC2 separately on each interface, and forwards accepted SNA information fields in order. The OS/400 guests own XID3, APPC sessions, and APPN names. This mode is a fixed two-peer test path for local interoperability.
 
-## V4R4 Solstice setup
+## V4R4 emulator setup
 
-The first interoperability run used two writable clones of `solstice-templates/v4r4-advanced36`, each booted with `solstice boot DIR --ipl A --keyswitch N --no-panel`. Keep the template disk untouched. Attach guest A to `sol5` and guest B to `sol4`; leave both TAPs out of any host bridge. The TAPs must be up and owned by the user running Solstice. Give the clones distinct console ports and MAC addresses:
+The first interoperability run used two writable clones of a private V4R4 template, each booted with IPL source A, keyswitch normal, and no virtual panel. Keep the template disk untouched. Attach guest A to `sol5` and guest B to `sol4`; leave both TAPs out of any host bridge. The TAPs must be up and owned by the user running the emulator. Give the clones distinct console ports and MAC addresses:
 
 | Guest | TAP | MAC | Network / control point | IP |
 | --- | --- | --- | --- | --- |
@@ -40,7 +40,7 @@ The packet sockets require `CAP_NET_RAW`. `--lab-link` accepts only the two spec
 
 ## Observed result
 
-On 2026-11-01, V4R4M0 guests on Solstice 0.4.1 reached B's remote Sign On from A through the Rust relay. Signing on to B's virtual display and issuing `ENDPASTHR` returned A to its Main Menu normally. Both TAP captures show XID3, SABME/UA, I frames, and RR acknowledgements; Solstice's trace shows SNA PIUs and BIND. The router logged both LLC2 legs connected and SNA information fields delivered in both directions. The earlier direct-bridge baseline reached the same remote Sign On.
+On 2026-11-01, two emulated V4R4M0 guests reached B's remote Sign On from A through the Rust relay. Signing on to B's virtual display and issuing `ENDPASTHR` returned A to its Main Menu normally. Both TAP captures show XID3, SABME/UA, I frames, and RR acknowledgements; the emulator trace shows SNA PIUs and BIND. The router logged both LLC2 legs connected and SNA information fields delivered in both directions. The earlier direct-bridge baseline reached the same remote Sign On.
 
 The initial relay attempt failed when B received SABME before completing its final XID exchange. A short connection barrier resolved that lab timing race. This is an observed interoperability result for these two guests, not a general LLC2 conformance claim.
 

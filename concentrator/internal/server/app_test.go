@@ -52,9 +52,21 @@ func TestRegistrationVerificationAndMFAEnrollmentReminder(t *testing.T) {
 	original := log.Writer()
 	log.SetOutput(&logs)
 	defer log.SetOutput(original)
-	w := postForm(a, "/register", url.Values{"email": {"alice@example.com"}, "password": {"a-long-test-password"}}, nil)
+	w := postForm(a, "/register", url.Values{"email": {"bad@example.com"}, "netid": {"1BAD"}, "password": {"a-long-test-password"}}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid registration NETID: %d", w.Code)
+	}
+	w = postForm(a, "/register", url.Values{"email": {"alice@example.com"}, "netid": {"alice"}, "password": {"a-long-test-password"}}, nil)
 	if w.Code != 303 {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	registered, err := a.DB.UserByEmail(context.Background(), "alice@example.com")
+	if err != nil || registered.NetID != "ALICE" {
+		t.Fatalf("registered NETID: %+v %v", registered, err)
+	}
+	w = postForm(a, "/register", url.Values{"email": {"other@example.com"}, "netid": {"ALICE"}, "password": {"a-long-test-password"}}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("duplicate registration NETID: %d", w.Code)
 	}
 	code := regexp.MustCompile(`code for alice@example.com: ([0-9]{6})`).FindStringSubmatch(logs.String())
 	if len(code) != 2 {
@@ -106,7 +118,7 @@ func TestPagesRender(t *testing.T) {
 	for _, path := range []string{"/register", "/verify", "/login"} {
 		w := httptest.NewRecorder()
 		a.Handler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
-		if w.Code != 200 || !strings.Contains(w.Body.String(), "/assets/bootstrap.min.css") {
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "/assets/bootstrap.min.css") || !strings.Contains(w.Body.String(), "bg-primary") || strings.Contains(w.Body.String(), "bg-dark") {
 			t.Fatalf("page %s: %d %s", path, w.Code, w.Body.String())
 		}
 	}
@@ -281,8 +293,8 @@ func TestRouterOnboardingProfileAndDirectory(t *testing.T) {
 	ctx := context.Background()
 	owner := store.RandomUUID()
 	viewer := store.RandomUUID()
-	for _, x := range []struct{ id, email string }{{owner, "owner@example.com"}, {viewer, "viewer@example.com"}} {
-		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", x.id, x.email, "unused", store.Now()); err != nil {
+	for _, x := range []struct{ id, email, netid string }{{owner, "owner@example.com", "SOLNET"}, {viewer, "viewer@example.com", "VIEWNET"}} {
+		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", x.id, x.email, "unused", store.Now(), x.netid); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -292,7 +304,7 @@ func TestRouterOnboardingProfileAndDirectory(t *testing.T) {
 	}
 	cookie := &http.Cookie{Name: "snusnu_session", Value: token}
 	w := postForm(a, "/routers", url.Values{"csrf": {s.CSRF}, "name": {"Basement gateway"}}, cookie)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "/router/v1/ws") {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "/router/v1/ws") || !strings.Contains(w.Body.String(), "SOLNET") {
 		t.Fatalf("onboard: %d %s", w.Code, w.Body.String())
 	}
 	var routerID string
@@ -329,7 +341,7 @@ func TestRouterOnboardingProfileAndDirectory(t *testing.T) {
 	if _, err = a.DB.RouterByToken(ctx, secret); err == nil {
 		t.Fatal("old router token accepted")
 	}
-	w = postForm(a, "/profile/edit", url.Values{"csrf": {s.CSRF}, "username": {"basement-user"}, "first_name": {"Alice"}}, cookie)
+	w = postForm(a, "/profile/edit", url.Values{"csrf": {s.CSRF}, "username": {"basement-user"}, "first_name": {"Alice"}, "netid": {"SOLNET"}}, cookie)
 	if w.Code != 303 {
 		t.Fatalf("profile edit: %d %s", w.Code, w.Body.String())
 	}
@@ -371,7 +383,7 @@ func TestRouterOnboardingProfileAndDirectory(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "SOLNET.SNAB") || !strings.Contains(w.Body.String(), "basement-user") {
 		t.Fatalf("directory: %d %s", w.Code, w.Body.String())
 	}
-	w = postForm(a, "/profile/edit", url.Values{"csrf": {s.CSRF}, "username": {"basement-user"}, "public_email": {"1"}}, cookie)
+	w = postForm(a, "/profile/edit", url.Values{"csrf": {s.CSRF}, "username": {"basement-user"}, "public_email": {"1"}, "netid": {"SOLNET"}}, cookie)
 	if w.Code != 303 {
 		t.Fatalf("public email edit: %d", w.Code)
 	}
@@ -419,8 +431,8 @@ func TestManagedCPWebViewsAndOwnership(t *testing.T) {
 	ctx := context.Background()
 	owner := store.RandomUUID()
 	other := store.RandomUUID()
-	for _, x := range []struct{ id, email string }{{owner, "mac-owner@example.com"}, {other, "mac-other@example.com"}} {
-		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", x.id, x.email, "unused", store.Now()); err != nil {
+	for _, x := range []struct{ id, email, netid string }{{owner, "mac-owner@example.com", "SOLNET"}, {other, "mac-other@example.com", "OTHERNET"}} {
+		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", x.id, x.email, "unused", store.Now(), x.netid); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -468,14 +480,14 @@ func TestManagedCPWebViewsAndOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = a.DB.ReplaceRouterSnapshot(ctx, origin.ID, epoch, 1, []store.RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"}, {ID: 2, Generation: 1, Kind: "LU", NetID: "SOLNET", Name: "PAYROLL", HostingCPNetID: "SOLNET", HostingCPName: "SNAB"}}); err != nil {
+	if err = a.DB.ReplaceRouterSnapshot(ctx, origin.ID, epoch, 1, []store.RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"}, {ID: 2, Generation: 1, Kind: "LU", NetID: "SOLNET", Name: "PAYROLL", HostingCPNetID: "SOLNET", HostingCPName: "SNAB", LUTypes: []string{"LU 6.2"}}}); err != nil {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest("GET", "/directory", nil)
 	r.AddCookie(ownerCookie)
 	w = httptest.NewRecorder()
 	a.Handler().ServeHTTP(w, r)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), cp.MACColon()) || !strings.Contains(w.Body.String(), cp.ADPTADR()) || !strings.Contains(w.Body.String(), "Hosted by") {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), cp.MACColon()) || !strings.Contains(w.Body.String(), cp.ADPTADR()) || !strings.Contains(w.Body.String(), "Hosted by") || !strings.Contains(w.Body.String(), "LU 6.2") {
 		t.Fatalf("directory MAC/host CP: %d %s", w.Code, w.Body.String())
 	}
 	w = postForm(a, "/llc-macs/"+cp.ID+"/retire", url.Values{"csrf": {ownerSession.CSRF}}, ownerCookie)

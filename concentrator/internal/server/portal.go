@@ -58,6 +58,10 @@ func (a *App) routerNewPage(w http.ResponseWriter, r *http.Request, u store.User
 	a.render(w, "router_new", map[string]any{"User": u, "CSRF": s.CSRF})
 }
 func (a *App) routerCreate(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	if u.NetID == "" {
+		http.Error(w, "set your user NETID in your profile before onboarding a router", http.StatusConflict)
+		return
+	}
 	name := strings.TrimSpace(r.FormValue("name"))
 	if !validRouterName(name) {
 		http.Error(w, "name must be 1-80 printable characters", 400)
@@ -68,7 +72,7 @@ func (a *App) routerCreate(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
-	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL()})
+	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL(), "NetID": u.NetID})
 }
 func (a *App) routerDetails(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	item, ok := a.routerForUser(w, r, u)
@@ -126,7 +130,7 @@ func (a *App) routerRotate(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
-	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL(), "Rotated": true})
+	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL(), "Rotated": true, "NetID": u.NetID})
 }
 func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	item, ok := a.routerForUser(w, r, u)
@@ -203,7 +207,8 @@ func (a *App) profileEdit(w http.ResponseWriter, r *http.Request, u store.User, 
 	username := strings.ToLower(strings.TrimSpace(r.FormValue("username")))
 	first := strings.TrimSpace(r.FormValue("first_name"))
 	last := strings.TrimSpace(r.FormValue("last_name"))
-	if !usernamePattern.MatchString(username) || utf8.RuneCountInString(first) > 80 || utf8.RuneCountInString(last) > 80 {
+	netid := strings.ToUpper(strings.TrimSpace(r.FormValue("netid")))
+	if !usernamePattern.MatchString(username) || !store.ValidNetID(netid) || utf8.RuneCountInString(first) > 80 || utf8.RuneCountInString(last) > 80 {
 		http.Error(w, "invalid profile fields", 400)
 		return
 	}
@@ -215,12 +220,9 @@ func (a *App) profileEdit(w http.ResponseWriter, r *http.Request, u store.User, 
 			}
 		}
 	}
-	public := 0
-	if r.FormValue("public_email") == "1" {
-		public = 1
-	}
-	if _, err := a.DB.Exec(r.Context(), "UPDATE users SET username=?,first_name=?,last_name=?,public_email=? WHERE id=?", username, first, last, public, u.ID); err != nil {
-		http.Error(w, "username already taken or invalid", 409)
+	public := r.FormValue("public_email") == "1"
+	if err := a.DB.UpdateProfile(r.Context(), u.ID, username, first, last, netid, public); err != nil {
+		http.Error(w, "username or NETID already taken, or profile is invalid", 409)
 		return
 	}
 	http.Redirect(w, r, "/profiles/"+u.ID, 303)

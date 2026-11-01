@@ -242,6 +242,20 @@ impl WsRoutePort {
         }
         let (mut client, welcome) =
             WsClient::connect(&primary.url, &primary.bearer).map_err(io_error)?;
+        if configs
+            .iter()
+            .any(|config| config.local_cp.netid != welcome.allowed_netid)
+            || logical_units.iter().any(|lu| {
+                lu.lu
+                    .as_ref()
+                    .is_some_and(|name| name.netid != welcome.allowed_netid)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "configured route NETID does not match concentrator assignment",
+            ));
+        }
         if configs.len() > welcome.max_circuits as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -258,6 +272,7 @@ impl WsRoutePort {
             router_id = %format_uuid(&welcome.router_id),
             connection_epoch = %format_uuid(&welcome.connection_epoch),
             display_name = %welcome.display_name,
+            allowed_netid = %welcome.allowed_netid,
             local_route_count = configs.len(),
             "connected to concentrator"
         );
@@ -1260,6 +1275,7 @@ mod tests {
                     max_message_bytes: 65536,
                     max_circuits: 4,
                     display_name: "test router".into(),
+                    allowed_netid: "SOLNET".into(),
                 }),
             );
             let WsMessage::Binary(payload) = socket.read().unwrap() else {
@@ -1478,6 +1494,7 @@ mod tests {
                     max_message_bytes: 65536,
                     max_circuits: 4,
                     display_name: "legacy test".into(),
+                    allowed_netid: "SOLNET".into(),
                 }),
             );
             let _snapshot = socket.read().unwrap();
@@ -1603,14 +1620,9 @@ mod tests {
             }]
         )
         .is_err());
-        assert!(local_route_snapshot(
-            &[0; 16],
-            1,
-            &primary,
-            &[name("OTHER", "SNAB")],
-            &[]
-        )
-        .is_err());
+        assert!(
+            local_route_snapshot(&[0; 16], 1, &primary, &[name("OTHER", "SNAB")], &[]).is_err()
+        );
         assert!(local_route_snapshot(
             &[0; 16],
             1,
@@ -1723,6 +1735,7 @@ mod tests {
                         max_message_bytes: 65536,
                         max_circuits: 1,
                         display_name: "test router".into(),
+                        allowed_netid: "SOLNET".into(),
                     }))
                     .encode_to_vec()
                     .into(),

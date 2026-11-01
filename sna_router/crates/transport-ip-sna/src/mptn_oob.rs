@@ -1,7 +1,7 @@
 //! Bounded structural parser and correlation for TCP62 UDP/397 `X'83'`.
 //!
 //! IBM's TCP62 draft section 5.3.3 defines this command. No V5R4 `X'83'`
-//! packet was observed in the direct Solstice captures, so this module does
+//! packet was observed in the direct V5R4 lab captures, so this module does
 //! not generate datagrams, interpret SNA payloads, or enable the required
 //! compensation. A caller still needs a session map, OOB response/retry
 //! timers, and deduplication against expedited data carried on TCP.

@@ -1,4 +1,4 @@
-//! Loopback-only two-router broker for the Solstice V4R4 lab.
+//! Loopback-only two-router broker for the V4R4 lab.
 //!
 //! Run with `cargo run -p transport-ws --example lab_broker -- 127.0.0.1:18743`.
 //! Router A uses token `lab-a`; router B uses token `lab-b`. This intentionally
@@ -311,7 +311,8 @@ fn main() -> io::Result<()> {
                         connection_epoch: EPOCHS[side].to_vec(),
                         max_message_bytes: MAX_MESSAGE_BYTES as u32,
                         max_circuits: 1,
-                        display_name: format!("Solstice lab {}", if side == 0 { "A" } else { "B" }),
+                        display_name: format!("V4R4 lab {}", if side == 0 { "A" } else { "B" }),
+                        allowed_netid: "SOLNET".into(),
                     }),
                 )?;
                 eprintln!("broker: router {side} connected");

@@ -94,6 +94,7 @@ fn welcome(router_id: Vec<u8>, epoch: Vec<u8>, name: &str) -> wire::RouterWelcom
         max_message_bytes: 64 * 1024,
         max_circuits: 4,
         display_name: name.into(),
+        allowed_netid: "SOLNET".into(),
     }
 }
 

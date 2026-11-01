@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -20,6 +21,7 @@ var snaName = regexp.MustCompile(`^[A-Z@#$][A-Z0-9@#$]{0,7}$`)
 type RouteExport struct {
 	ID, Generation                                   uint64
 	Kind, NetID, Name, HostingCPNetID, HostingCPName string
+	LUTypes                                          []string
 }
 
 // BeginRouterEpoch is called only after router-scoped bearer authentication.
@@ -75,6 +77,16 @@ func (s *Store) ReplaceRouterSnapshot(ctx context.Context, routerID, epoch strin
 		if x.HostingCPNetID != "" && (!snaName.MatchString(x.HostingCPNetID) || !snaName.MatchString(x.HostingCPName)) {
 			return errors.New("invalid hosting CP")
 		}
+		if x.Kind == "CP" && len(x.LUTypes) != 0 {
+			return errors.New("CP cannot have LU types")
+		}
+		seenTypes := map[string]bool{}
+		for _, luType := range x.LUTypes {
+			if (luType != "LU 0" && luType != "LU 1" && luType != "LU 2" && luType != "LU 3" && luType != "LU 6.2") || seenTypes[luType] {
+				return errors.New("invalid or duplicate LU type")
+			}
+			seenTypes[luType] = true
+		}
 		resource := x.Kind + ":" + x.NetID + ":" + x.Name
 		if ids[x.ID] || resources[resource] {
 			return errors.New("duplicate route ID or resource")
@@ -99,7 +111,8 @@ func (s *Store) ReplaceRouterSnapshot(ctx context.Context, routerID, epoch strin
 		return err
 	}
 	for _, x := range exports {
-		_, err = tx.ExecContext(ctx, s.Q("INSERT INTO router_advertisements(router_id,route_id,generation,epoch,revision,kind,netid,name,hosting_cp_netid,hosting_cp_name) VALUES(?,?,?,?,?,?,?,?,?,?)"), routerID, int64(x.ID), int64(x.Generation), epoch, int64(revision), x.Kind, x.NetID, x.Name, x.HostingCPNetID, x.HostingCPName)
+		luTypes, _ := json.Marshal(x.LUTypes)
+		_, err = tx.ExecContext(ctx, s.Q("INSERT INTO router_advertisements(router_id,route_id,generation,epoch,revision,kind,netid,name,hosting_cp_netid,hosting_cp_name,lu_types) VALUES(?,?,?,?,?,?,?,?,?,?,?)"), routerID, int64(x.ID), int64(x.Generation), epoch, int64(revision), x.Kind, x.NetID, x.Name, x.HostingCPNetID, x.HostingCPName, string(luTypes))
 		if err != nil {
 			return fmt.Errorf("insert route export: %w", err)
 		}

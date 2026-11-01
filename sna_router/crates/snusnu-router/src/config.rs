@@ -94,6 +94,34 @@ pub(crate) struct RemoteConfig {
     pub(crate) target_cp: String,
     #[serde(default)]
     pub(crate) lus: Vec<String>,
+    #[serde(default)]
+    pub(crate) lu_types: HashMap<String, Vec<ConfiguredLuType>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+pub(crate) enum ConfiguredLuType {
+    #[serde(rename = "lu_0")]
+    Lu0,
+    #[serde(rename = "lu_1")]
+    Lu1,
+    #[serde(rename = "lu_2")]
+    Lu2,
+    #[serde(rename = "lu_3")]
+    Lu3,
+    #[serde(rename = "lu_6_2")]
+    Lu6_2,
+}
+
+impl ConfiguredLuType {
+    pub(crate) fn wire_value(self) -> i32 {
+        match self {
+            Self::Lu0 => wire::LuType::LuType0 as i32,
+            Self::Lu1 => wire::LuType::LuType1 as i32,
+            Self::Lu2 => wire::LuType::LuType2 as i32,
+            Self::Lu3 => wire::LuType::LuType3 as i32,
+            Self::Lu6_2 => wire::LuType::LuType62 as i32,
+        }
+    }
 }
 
 fn default_bidirectional() -> bool {
@@ -288,6 +316,19 @@ impl RouterConfig {
                 let lu_name = parse_cp(lu)?;
                 if !exported_lus.insert((lu_name.netid, lu_name.name)) {
                     return Err(invalid(format!("duplicate exported LU {lu}")));
+                }
+            }
+            for (lu, types) in &remote.lu_types {
+                if !remote.lus.contains(lu) {
+                    return Err(invalid(format!(
+                        "LU type declaration for unexported LU {lu}"
+                    )));
+                }
+                let mut unique = HashSet::new();
+                if types.is_empty() || types.iter().any(|lu_type| !unique.insert(*lu_type)) {
+                    return Err(invalid(format!(
+                        "empty or duplicate LU type declaration for {lu}"
+                    )));
                 }
             }
         }
@@ -664,11 +705,17 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
 local_cp = "SOLNET.SNAA"
 target_cp = "SOLNET.SNAB"
 lus = ["SOLNET.LUA"]
+lu_types = { "SOLNET.LUA" = ["lu_6_2"] }
 [[route]]
 from = "a"
 to = "upstream"
 "#;
-        parse(remote).validate().unwrap();
+        let configured = parse(remote);
+        configured.validate().unwrap();
+        assert_eq!(
+            configured.remote[0].lu_types["SOLNET.LUA"],
+            vec![ConfiguredLuType::Lu6_2]
+        );
         assert!(parse(&remote.replace("02:53:4e", "02:00:4e"))
             .validate()
             .unwrap_err()
@@ -694,13 +741,21 @@ to = "upstream"
         .to_string()
         .contains("not owned"));
         assert!(parse(&remote.replace(
-            "lus = [\"SOLNET.LUA\"]\n[[route]]",
-            "lus = [\"SOLNET.LUB\"]\n[[route]]"
+            "target_cp = \"SOLNET.SNAB\"\nlus = [\"SOLNET.LUA\"]\nlu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
+            "target_cp = \"SOLNET.SNAB\"\nlus = [\"SOLNET.LUB\"]"
         ))
         .validate()
         .unwrap_err()
         .to_string()
         .contains("not owned"));
+        assert!(parse(&remote.replace(
+            "lu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
+            "lu_types = { \"SOLNET.LUB\" = [\"lu_6_2\"] }"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("unexported LU"));
     }
 
     #[test]

@@ -20,7 +20,8 @@ func uiUser(t *testing.T, a *App, email, role, password string) (string, *http.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,remind_after) VALUES(?,?,?,?,?,?)", id, email, string(hash), role, store.Now(), store.Now()+86400); err != nil {
+	netid := "T" + strings.ToUpper(strings.ReplaceAll(id, "-", ""))[:7]
+	if _, err = a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,remind_after,netid) VALUES(?,?,?,?,?,?,?)", id, email, string(hash), role, store.Now(), store.Now()+86400, netid); err != nil {
 		t.Fatal(err)
 	}
 	token, session, err := a.DB.NewSession(ctx, id, "full")
@@ -65,6 +66,33 @@ func TestRememberLoginAndCard(t *testing.T) {
 	w = postForm(a, "/login", url.Values{"email": {"remember@example.com"}, "password": {"remember-password-123"}}, nil)
 	if w.Code != 303 || w.Result().Cookies()[0].MaxAge != 0 {
 		t.Fatalf("nonremembered cookie: %d %+v", w.Code, w.Result().Cookies())
+	}
+}
+
+func TestLoginFailureRendersStyledForm(t *testing.T) {
+	a := testApp(t)
+	w := postForm(a, "/login", url.Values{
+		"email":    {"Admin@Example.com"},
+		"password": {"wrong-password"},
+		"remember": {"1"},
+	}, nil)
+	body := w.Body.String()
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("login failure status: %d", w.Code)
+	}
+	for _, want := range []string{
+		`/assets/bootstrap.min.css`,
+		`class="alert alert-danger"`,
+		`The email address or password is incorrect.`,
+		`value="admin@example.com"`,
+		`name="remember" value="1" checked`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("login failure missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `name="password" value=`) {
+		t.Fatal("login failure repopulated password")
 	}
 }
 func TestFlowsAndBlocklistsAreScoped(t *testing.T) {

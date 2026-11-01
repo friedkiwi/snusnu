@@ -61,7 +61,7 @@ impl NativeType1 {
             })),
             TEST => Ok(None),
             XID if is_response && info.is_empty() => Ok(None),
-            // V4R4 on Solstice answers the initial null poll with a null
+            // The V4R4 lab guest answers the initial null poll with a null
             // response, then sends its own prenegotiation XID3 command.
             // Defer the local identity until that command arrives.
             XID if info.is_empty() => Ok(Some(OutboundType1 {

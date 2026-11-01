@@ -1,6 +1,6 @@
 # Router identity and live SNA resource keys
 
-The concentrator owns each Rust router's identity. On onboarding it generates a stable UUID (`router_id`), records the router's owner and optional administrative site, and issues a separate opaque bearer credential. The owner sets a display name. The Rust executable configures only its bearer credential and local routes. After authenticating its WebSocket, it receives `RouterWelcome.router_id` and `RouterWelcome.display_name` from the concentrator and logs/displays both. It never sends a claimed local router ID or chooses one in configuration. On reconnect or credential rotation, the same router receives the same UUID.
+The concentrator owns each Rust router's identity. During user registration, each account claims one globally unique SNA NETID; migrated accounts without one must set it on their profile. Router onboarding only generates a stable UUID (`router_id`), records the router's owner and display name, and issues a separate opaque bearer credential. The Rust executable configures only its bearer credential and local routes. After authenticating its WebSocket, it receives `RouterWelcome.router_id`, `RouterWelcome.display_name`, and `RouterWelcome.allowed_netid` from the concentrator and logs/displays them. It never sends a claimed local router ID or chooses its allowed namespace in configuration. On reconnect or credential rotation, the same router receives the same UUID.
 
 Authentication resolves `token hash → credential record → router_id`. A router may have more than one credential during rotation; revoking one credential does not rename the router. Each credential has its own creation, expiry/revocation and purpose. Revocation of an active credential closes or revalidates its WebSocket and withdraws its live routes. The concentrator stamps `router_id` on every relayed snapshot and checks it on circuit opens. The bearer token must travel over TLS and must not appear in logs; any holder can use it while valid ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html)).
 
@@ -12,7 +12,7 @@ router_credentials(id, router_id REFERENCES routers(id), secret_hash UNIQUE,
                    created_at, expires_at, revoked_at)
 ```
 
-The Go web service uses versioned migrations for router records, router-scoped credentials, profiles, blocks and diagnostics. The WebSocket endpoint authenticates router bearer tokens before upgrade and sends `RouterWelcome` with the server-owned router UUID, display name and fresh connection epoch.
+The Go web service uses versioned migrations for router records, router-scoped credentials, profiles, blocks and diagnostics. The WebSocket endpoint authenticates router bearer tokens before upgrade and sends `RouterWelcome` with the server-owned router UUID, display name, owner NETID and fresh connection epoch. A snapshot is rejected if a CP, LU, or hosting CP uses any other NETID. Changing the profile NETID fences all of the user's router epochs and withdraws their advertisements.
 
 Internally, keep SNA resource keys as structured fields:
 

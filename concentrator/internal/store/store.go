@@ -142,19 +142,62 @@ func (s *Store) ResetMFA(ctx context.Context, email string) error {
 type User struct {
 	ID, Email, PasswordHash, Role, TOTPSecret, PendingTOTP string
 	VerifiedAt, RemindAfter                                int64
-	Username, FirstName, LastName                          string
+	Username, FirstName, LastName, NetID                   string
 	PublicEmail                                            bool
 }
 
 func scanUser(row *sql.Row) (User, error) {
 	var u User
 	var public int
-	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.VerifiedAt, &u.RemindAfter, &u.TOTPSecret, &u.PendingTOTP, &u.Username, &u.FirstName, &u.LastName, &public)
+	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.VerifiedAt, &u.RemindAfter, &u.TOTPSecret, &u.PendingTOTP, &u.Username, &u.FirstName, &u.LastName, &public, &u.NetID)
 	u.PublicEmail = public != 0
 	return u, err
 }
 
-const userColumns = "id,email,password_hash,role,verified_at,remind_after,totp_secret,pending_totp,username,first_name,last_name,public_email"
+const userColumns = "id,email,password_hash,role,verified_at,remind_after,totp_secret,pending_totp,username,first_name,last_name,public_email,netid"
+
+func ValidNetID(value string) bool { return snaName.MatchString(value) }
+
+// UpdateProfile changes profile fields and fences every owned live router when
+// the NETID changes so no advertisement from the previous namespace survives.
+func (s *Store) UpdateProfile(ctx context.Context, userID, username, first, last, netid string, public bool) error {
+	if !ValidNetID(netid) {
+		return errors.New("invalid NETID")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	publicValue := 0
+	if public {
+		publicValue = 1
+	}
+	var previous string
+	if err = tx.QueryRowContext(ctx, s.Q("SELECT netid FROM users WHERE id=?"), userID).Scan(&previous); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, s.Q("UPDATE users SET username=?,first_name=?,last_name=?,public_email=?,netid=? WHERE id=?"), username, first, last, publicValue, netid, userID)
+	if err != nil {
+		return err
+	}
+	updated, _ := res.RowsAffected()
+	if updated == 0 {
+		return sql.ErrNoRows
+	}
+	if previous != netid {
+		if _, err = tx.ExecContext(ctx, s.Q("DELETE FROM router_advertisements WHERE router_id IN (SELECT id FROM routers WHERE owner_id=?)"), userID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, s.Q("DELETE FROM router_epochs WHERE router_id IN (SELECT id FROM routers WHERE owner_id=?)"), userID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, s.Q("UPDATE managed_cp_addresses SET netid=? WHERE owner_id=?"), netid, userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
 func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
 	return scanUser(s.Row(ctx, "SELECT "+userColumns+" FROM users WHERE email=?", strings.ToLower(email)))
@@ -203,7 +246,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -284,6 +327,15 @@ var schemaV4 = []string{
 
 var schemaV5 = []string{
 	`ALTER TABLE sessions ADD COLUMN remember INTEGER NOT NULL DEFAULT 0`,
+}
+
+var schemaV6 = []string{
+	`ALTER TABLE router_advertisements ADD COLUMN lu_types TEXT NOT NULL DEFAULT '[]'`,
+}
+
+var schemaV7 = []string{
+	`ALTER TABLE users ADD COLUMN netid TEXT NOT NULL DEFAULT ''`,
+	`CREATE UNIQUE INDEX idx_users_netid ON users(netid) WHERE netid<>''`,
 }
 
 var ErrNotFound = errors.New("not found")

@@ -225,6 +225,16 @@ pub fn validate_welcome(welcome: &wire::RouterWelcome) -> Result<(), Error> {
     if !(1..=80).contains(&welcome.display_name.chars().count()) {
         return Err(Error::Protocol("invalid router display name"));
     }
+    let netid = welcome.allowed_netid.as_bytes();
+    if netid.is_empty()
+        || netid.len() > 8
+        || !matches!(netid[0], b'A'..=b'Z' | b'@' | b'#' | b'$')
+        || !netid
+            .iter()
+            .all(|value| matches!(value, b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'#' | b'$'))
+    {
+        return Err(Error::Protocol("invalid allowed NETID"));
+    }
     if welcome.max_message_bytes == 0
         || welcome.max_message_bytes as usize > MAX_V1_MESSAGE_BYTES
         || welcome.max_circuits == 0
@@ -281,8 +291,15 @@ mod tests {
             max_message_bytes: MAX_V1_MESSAGE_BYTES as u32,
             max_circuits: 100,
             display_name: "Lab router".into(),
+            allowed_netid: "SOLNET".into(),
         };
         assert!(validate_welcome(&welcome).is_ok());
+        welcome.allowed_netid = "1BAD".into();
+        assert!(matches!(
+            validate_welcome(&welcome),
+            Err(Error::Protocol(_))
+        ));
+        welcome.allowed_netid = "SOLNET".into();
         welcome.connection_epoch.pop();
         assert!(matches!(
             validate_welcome(&welcome),
@@ -334,6 +351,7 @@ mod tests {
                     max_message_bytes: 1024,
                     max_circuits: 16,
                     display_name: "Test router".into(),
+                    allowed_netid: "SOLNET".into(),
                 })),
             };
             socket
@@ -392,6 +410,7 @@ mod tests {
                     max_message_bytes: 1024,
                     max_circuits: 16,
                     display_name: "Test router".into(),
+                    allowed_netid: "SOLNET".into(),
                 })),
             };
             socket

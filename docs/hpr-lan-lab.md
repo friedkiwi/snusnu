@@ -1,4 +1,4 @@
-# Native HPR LAN Solstice baseline
+# Native HPR LAN baseline
 
 On 2026-11-01, two V5R4 OS/400 guests completed `STRPASTHR`, remote sign-on, and `ENDPASTHR` over native HPR LAN. This establishes a direct peer baseline for evaluating an HPR-LAN↔Enterprise Extender media adapter. It is not a Rust router interoperability result.
 

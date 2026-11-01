@@ -5,7 +5,7 @@ snusnu is an early-stage, stateful DLC circuit service for connecting hobbyist S
 - `concentrator/`: Go web service with SQLite/PostgreSQL storage, accounts, MFA, router onboarding, profiles, a live-export directory scaffold, diagnostics, and read-only client API.
 - `sna_router/`: Rust workspace for the router core, Linux packet adapter, transport boundary, and executable. Its two-TAP lab mode terminates LLC2 and relays SNA data between peers.
 
-**Early development:** the LLC2 lab mode passed a V4R4 Solstice-to-Solstice APPC pass-through test. WSS circuit transport, authentication, and production routing are not implemented yet. Directory and connection records are planning data, not live reachability or transport status.
+**Early development:** the LLC2 lab mode passed a V4R4 guest-to-guest APPC pass-through test. WSS circuit transport, authentication, and production routing are not implemented yet. Directory and connection records are planning data, not live reachability or transport status.
 
 ```sh
 cd concentrator && go build ./... && test -z "$(gofmt -l .)" && go vet ./... && go test ./...

@@ -1,4 +1,4 @@
-//! Frames observed from a V4R4M0 guest on Solstice 0.4.1, TAP sol5.
+//! Frames observed from a V4R4M0 lab guest on TAP sol5.
 //! Only the 802.3 header and declared LLC data are retained; capture padding
 //! and unrelated traffic are excluded.
 
@@ -23,7 +23,7 @@ const TEST_RESPONSE: [u8; 17] = [
 ];
 
 #[test]
-fn solstice_v4r4_ieee_xid_exchange() {
+fn v4r4_ieee_xid_exchange() {
     let command = parse_8023(&XID_COMMAND).unwrap();
     let response = parse_8023(&XID_RESPONSE).unwrap();
     assert!(command.is_sna());
@@ -41,7 +41,7 @@ fn solstice_v4r4_ieee_xid_exchange() {
 }
 
 #[test]
-fn solstice_v4r4_test_exchange() {
+fn v4r4_test_exchange() {
     let command = parse_8023(&TEST_COMMAND).unwrap();
     let response = parse_8023(&TEST_RESPONSE).unwrap();
     assert_eq!(command.control, Control::Unnumbered { byte: 0xe3 });

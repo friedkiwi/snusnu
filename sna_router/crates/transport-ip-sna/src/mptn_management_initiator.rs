@@ -1,6 +1,6 @@
 //! Pure initiator for the isolated V5R4 TCP62 SNASVCMG/CNOS exchange.
 //!
-//! The profile is limited to the direct Solstice V5R4 trace. It does not
+//! The profile is limited to the direct V5R4 lab trace. It does not
 //! operate sockets or authorize normal runtime use: X'83' out-of-band,
 //! SON/keepalive, and negotiated APPC capabilities need live handlers.
 

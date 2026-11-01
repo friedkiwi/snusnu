@@ -8,13 +8,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-type Account struct{ Email, Username, Password, Role string }
+type Account struct{ Email, Username, Password, Role, NetID string }
 type Router struct{ OwnerEmail, Name, Token, CP string }
 
 var Accounts = []Account{
-	{"admin@qa.snusnu.test", "qa_admin", "qa-admin-password-123", "admin"},
-	{"alice@qa.snusnu.test", "qa_alice", "qa-alice-password-123", "user"},
-	{"bob@qa.snusnu.test", "qa_bob", "qa-bob-password-123", "user"},
+	{"admin@qa.snusnu.test", "qa_admin", "qa-admin-password-123", "admin", "QAADMIN"},
+	{"alice@qa.snusnu.test", "qa_alice", "qa-alice-password-123", "user", "QAALICE"},
+	{"bob@qa.snusnu.test", "qa_bob", "qa-bob-password-123", "user", "QABOB"},
 }
 var Routers = []Router{
 	{"alice@qa.snusnu.test", "Alice V4R4", "qa-alice-router-token-1234567890", "SNAA"},
@@ -32,7 +32,7 @@ func Seed(ctx context.Context, db *store.Store) error {
 		if err != nil {
 			return err
 		}
-		_, err = db.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,remind_after,username) VALUES(?,?,?,?,?,?,?)", id, account.Email, string(hash), account.Role, store.Now(), store.Now()+30*24*3600, account.Username)
+		_, err = db.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,remind_after,username,netid) VALUES(?,?,?,?,?,?,?,?)", id, account.Email, string(hash), account.Role, store.Now(), store.Now()+30*24*3600, account.Username, account.NetID)
 		if err != nil {
 			return fmt.Errorf("seed user %s: %w", account.Email, err)
 		}
@@ -49,7 +49,11 @@ func Seed(ctx context.Context, db *store.Store) error {
 		if err != nil {
 			return err
 		}
-		if _, err = db.AllocateManagedCP(ctx, owner, "SOLNET", router.CP); err != nil {
+		var netid string
+		if err = db.Row(ctx, "SELECT netid FROM users WHERE id=?", owner).Scan(&netid); err != nil {
+			return err
+		}
+		if _, err = db.AllocateManagedCP(ctx, owner, netid, router.CP); err != nil {
 			return err
 		}
 	}

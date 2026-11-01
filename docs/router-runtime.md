@@ -39,6 +39,6 @@ The current configuration accepts LLC2↔LLC2, EE↔EE, and LLC2↔WebSocket rou
 
 The direct V4R4 trace continues from a user BIND and FMH-5 Attach to an 82-byte GDS X'12A0' record. Its header matches the 5250 startup record in [IBM-authored RFC 2877 §9](https://www.rfc-editor.org/rfc/rfc2877.html#section-9). It is application data, not an APPC Attach acknowledgment; the observed `I903` response code has no meaning assigned in that RFC. The Rust parser correlates the record for diagnostics only. A native router must forward the Attach to an actual destination LU/transaction program and let that application produce the status record.
 
-The V5R4 Solstice guests completed a direct AnyNet session, a direct EE session, and an EE session through the Rust relay. The V4R4 LLC2 pass-through remains the native DLC interoperability baseline.
+The V5R4 lab guests completed a direct AnyNet session, a direct EE session, and an EE session through the Rust relay. The V4R4 LLC2 pass-through remains the native DLC interoperability baseline.
 
 Protocol background: [RFC 2353, APPN/HPR in IP Networks](https://www.rfc-editor.org/rfc/rfc2353.html); [IBM-authored TCP62 Internet-Draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00); [IBM System i EE configuration](https://www.ibm.com/support/pages/configuring-ee-enterprise-extender-between-two-ibm-system-i-systems). The EE-to-HPR-LAN media-adapter possibility is an inference pending captures, not an interoperability claim.

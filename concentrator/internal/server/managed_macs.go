@@ -25,10 +25,20 @@ func (a *App) adminManagedCPPage(w http.ResponseWriter, r *http.Request, u store
 }
 func (a *App) managedCPCreate(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	owner := u.ID
+	netid := u.NetID
 	if u.Role == "admin" && r.FormValue("owner_id") != "" {
 		owner = r.FormValue("owner_id")
+		target, err := a.DB.UserByID(r.Context(), owner)
+		if err != nil {
+			dbError(w, err)
+			return
+		}
+		netid = target.NetID
 	}
-	netid := strings.ToUpper(strings.TrimSpace(r.FormValue("netid")))
+	if !store.ValidNetID(netid) {
+		http.Error(w, "set a valid NETID in the owner profile first", http.StatusConflict)
+		return
+	}
 	name := strings.ToUpper(strings.TrimSpace(r.FormValue("cp_name")))
 	_, err := a.DB.AllocateManagedCP(r.Context(), owner, netid, name)
 	if err != nil {

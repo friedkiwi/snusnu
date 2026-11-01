@@ -12,6 +12,7 @@ message RouterWelcome {
   uint32 max_message_bytes = 3;
   uint32 max_circuits = 4;
   string display_name = 5; // Server-owned user-facing name, 1-80 characters.
+  string allowed_netid = 6; // NETID owned by the authenticated router's user.
 }
 
 // Sent by a Rust router to the concentrator after authentication and whenever
@@ -58,6 +59,16 @@ message SnaName {
 message LuReachability {
   SnaName lu = 1;
   SnaName hosting_cp = 2; // Optional when the owning CP is known.
+  repeated LuType supported_types = 3; // Declared capability; empty means unknown.
+}
+
+enum LuType {
+  LU_TYPE_UNSPECIFIED = 0;
+  LU_TYPE_0 = 1;
+  LU_TYPE_1 = 2;
+  LU_TYPE_2 = 3;
+  LU_TYPE_3 = 4;
+  LU_TYPE_6_2 = 5;
 }
 
 // Included in a circuit OPEN, which also carries its own circuit ID. The

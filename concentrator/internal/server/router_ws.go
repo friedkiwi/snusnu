@@ -26,18 +26,18 @@ type outboundMessage struct {
 	cost    int
 }
 type routerSession struct {
-	router           store.Router
-	token, epoch, ip string
-	conn             *websocket.Conn
-	out              chan outboundMessage
-	snapshot         *wire.RouteSnapshot
-	sent             map[string]routeVersion
-	binding          *wire.ManagedCpBindingSnapshot
-	bindingRevision  uint64
-	queued           map[string]int
-	history          map[uint64]routeSignature
-	rateWindow       time.Time
-	rateCount        int
+	router                         store.Router
+	token, epoch, ip, allowedNetID string
+	conn                           *websocket.Conn
+	out                            chan outboundMessage
+	snapshot                       *wire.RouteSnapshot
+	sent                           map[string]routeVersion
+	binding                        *wire.ManagedCpBindingSnapshot
+	bindingRevision                uint64
+	queued                         map[string]int
+	history                        map[uint64]routeSignature
+	rateWindow                     time.Time
+	rateCount                      int
 }
 type routeSignature struct {
 	generation uint64
@@ -88,6 +88,11 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid router credential", http.StatusUnauthorized)
 		return
 	}
+	owner, err := a.DB.UserByID(r.Context(), router.OwnerID)
+	if err != nil || !store.ValidNetID(owner.NetID) {
+		http.Error(w, "router owner has no valid NETID", http.StatusForbidden)
+		return
+	}
 	origin := r.Header.Get("Origin")
 	if origin != "" && origin != a.Config.Origin {
 		http.Error(w, "invalid origin", http.StatusForbidden)
@@ -108,14 +113,14 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}}
+	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}}
 	h := a.hub
 	h.mu.Lock()
 	if previous := h.clients[router.ID]; previous != nil {
 		h.removeLocked(previous)
 	}
 	h.clients[router.ID] = c
-	h.sendLocked(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName}}}, "", 0)
+	h.sendLocked(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}}}, "", 0)
 	h.refreshLocked()
 	if !h.running {
 		h.running = true
@@ -252,6 +257,10 @@ func (h *routerHub) currentLocked(c *routerSession) bool {
 		return false
 	}
 	if c.router.LLCFacing && !r.LLCFacing {
+		return false
+	}
+	owner, err := h.a.DB.UserByID(context.Background(), r.OwnerID)
+	if err != nil || owner.NetID != c.allowedNetID {
 		return false
 	}
 	var epoch string
@@ -409,6 +418,9 @@ func (h *routerHub) publishLocked(c *routerSession, snapshot *wire.RouteSnapshot
 			x.Kind = "CP"
 			x.NetID = v.ControlPoint.Netid
 			x.Name = v.ControlPoint.Name
+			if x.NetID != c.allowedNetID {
+				return errors.New("route NETID is not owned by router user")
+			}
 		case *wire.RouteExport_LogicalUnit:
 			if v.LogicalUnit == nil || v.LogicalUnit.Lu == nil {
 				return errors.New("empty LU")
@@ -416,9 +428,38 @@ func (h *routerHub) publishLocked(c *routerSession, snapshot *wire.RouteSnapshot
 			x.Kind = "LU"
 			x.NetID = v.LogicalUnit.Lu.Netid
 			x.Name = v.LogicalUnit.Lu.Name
+			if x.NetID != c.allowedNetID {
+				return errors.New("route NETID is not owned by router user")
+			}
+			seenTypes := map[wire.LuType]bool{}
+			for _, luType := range v.LogicalUnit.SupportedTypes {
+				label := ""
+				switch luType {
+				case wire.LuType_LU_TYPE_0:
+					label = "LU 0"
+				case wire.LuType_LU_TYPE_1:
+					label = "LU 1"
+				case wire.LuType_LU_TYPE_2:
+					label = "LU 2"
+				case wire.LuType_LU_TYPE_3:
+					label = "LU 3"
+				case wire.LuType_LU_TYPE_6_2:
+					label = "LU 6.2"
+				default:
+					return errors.New("unsupported LU type")
+				}
+				if seenTypes[luType] {
+					return errors.New("duplicate LU type")
+				}
+				seenTypes[luType] = true
+				x.LUTypes = append(x.LUTypes, label)
+			}
 			if v.LogicalUnit.HostingCp != nil {
 				x.HostingCPNetID = v.LogicalUnit.HostingCp.Netid
 				x.HostingCPName = v.LogicalUnit.HostingCp.Name
+				if x.HostingCPNetID != c.allowedNetID {
+					return errors.New("hosting CP NETID is not owned by router user")
+				}
 			}
 		default:
 			return errors.New("route resource absent")

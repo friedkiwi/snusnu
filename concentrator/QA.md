@@ -13,18 +13,18 @@ Every launch creates a new private directory under the OS temporary directory an
 
 ## Accounts
 
-| Role | Email | Password | Username |
-| --- | --- | --- | --- |
-| Admin | `admin@qa.snusnu.test` | `qa-admin-password-123` | `qa_admin` |
-| User | `alice@qa.snusnu.test` | `qa-alice-password-123` | `qa_alice` |
-| User | `bob@qa.snusnu.test` | `qa-bob-password-123` | `qa_bob` |
+| Role | Email | Password | Username | NETID |
+| --- | --- | --- | --- | --- |
+| Admin | `admin@qa.snusnu.test` | `qa-admin-password-123` | `qa_admin` | `QAADMIN` |
+| User | `alice@qa.snusnu.test` | `qa-alice-password-123` | `qa_alice` | `QAALICE` |
+| User | `bob@qa.snusnu.test` | `qa-bob-password-123` | `qa_bob` | `QABOB` |
 
 ## Preloaded clients
 
 | Owner | Display name | Bearer token | Intended CP |
 | --- | --- | --- | --- |
-| Alice | `Alice V4R4` | `qa-alice-router-token-1234567890` | `SOLNET.SNAA` |
-| Bob | `Bob V4R4` | `qa-bob-router-token-1234567890` | `SOLNET.SNAB` |
+| Alice | `Alice V4R4` | `qa-alice-router-token-1234567890` | `QAALICE.SNAA` |
+| Bob | `Bob V4R4` | `qa-bob-router-token-1234567890` | `QABOB.SNAB` |
 
 Both router clients are marked LLC-facing. Their CPs have managed virtual MAC address-book entries, but they have no live advertisements until they connect and publish a route snapshot. Each router uses `ws://localhost:8081/router/v1/ws` with its token in the `Authorization: Bearer` header and subprotocol `snusnu.v1`. The managed MACs can be viewed in the UI; Rust's first V4R4 lab may continue using its configured MACs.
 

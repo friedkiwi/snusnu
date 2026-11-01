@@ -1,6 +1,6 @@
 # SNA over IP: Enterprise Extender and AnyNet
 
-This note separates two IBM protocols that both carry SNA-related traffic over IP but meet the current Rust LLC2 router at different boundaries. The direct Solstice V4R4 result in [llc-lab.md](llc-lab.md) is native 802.3/LLC2 APPC, not either IP protocol.
+This note separates two IBM protocols that both carry SNA-related traffic over IP but meet the current Rust LLC2 router at different boundaries. The direct V4R4 lab result in [llc-lab.md](llc-lab.md) is native 802.3/LLC2 APPC, not either IP protocol.
 
 ## Wire formats
 

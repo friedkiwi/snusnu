@@ -1,10 +1,10 @@
-# Enterprise Extender Solstice lab
+# Enterprise Extender V5R4 lab
 
-On 2026-11-01, two V5R4 OS/400 guests on Solstice completed `STRPASTHR`, remote sign-on, and `ENDPASTHR` through the Rust router's configured EE↔EE UDP relay. The relay carried XID3 activation on UDP 12000 and HPR UI traffic on UDP 12000, 12001, and 12003. This tests EE media forwarding between two HPRIP links. It does not test conversion to native LLC2 APPN.
+On 2026-11-01, two emulated V5R4 OS/400 guests completed `STRPASTHR`, remote sign-on, and `ENDPASTHR` through the Rust router's configured EE↔EE UDP relay. The relay carried XID3 activation on UDP 12000 and HPR UI traffic on UDP 12000, 12001, and 12003. This tests EE media forwarding between two HPRIP links. It does not test conversion to native LLC2 APPN.
 
 ## Guests and links
 
-Use writable clones of `solstice/machine-v5r4-net` with the custom Solstice build at commit `8f89217`; do not modify the template disk. The lab used two isolated TAPs, with no bridge between them:
+Use writable clones of the private V5R4 network template; do not modify the template disk. The lab used two isolated TAPs, with no bridge between them:
 
 | Guest | TAP | Local IP | Local CP | HPRIP remote IP |
 | --- | --- | --- | --- | --- |
