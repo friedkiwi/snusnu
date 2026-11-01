@@ -347,3 +347,15 @@ until UDP X'83' and later APPC handlers exist. A successful harness exit
 means one Attach crossed the LLC-to-TCP62 boundary and its local pacing
 response was acknowledged; it does not mean the application conversation
 completed.
+
+The first live V4R4 A run of this harness on isolated `sol5` reached user
++RSP(BIND), management +RSP(UNBIND), and the 242-byte FMH-5 Attach. Rust
+queued the Attach toward its loopback TCP62 mock and sent a nine-byte user
+IPR; A acknowledged it with LLC RR `N(R)=8`. The mock TCP connection then
+closed, so Rust sent DISC before any application reply. A returned to Main
+Menu with APPC failure `E022000BA2100000`. This run does not establish that
+the Attach reached a usable TCP62 peer or that a conversation completed.
+The private unfiltered capture
+`/tmp/snusnu-v4r4-regression/native-converter-mock-sol5.pcap` contains 53
+frames with no capture drops. The mock lifecycle needs repair before this
+acceptance check is repeated.
