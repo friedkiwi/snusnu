@@ -71,6 +71,15 @@ pub(crate) struct RouteConfig {
     pub(crate) to: String,
     #[serde(default = "default_bidirectional")]
     pub(crate) bidirectional: bool,
+    pub(crate) converter: Option<RouteConverter>,
+}
+
+/// A route names a converter explicitly before two different session
+/// profiles can be joined. No converter is currently enabled at runtime.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RouteConverter {
+    MptnLu62,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +290,22 @@ impl RouterConfig {
             }
             let source_kind = kinds[route.from.as_str()];
             let target_kind = kinds[route.to.as_str()];
+            if let Some(converter) = route.converter {
+                if matches!(
+                    (source_kind, target_kind),
+                    ("llc", "anynet") | ("anynet", "llc")
+                ) && matches!(converter, RouteConverter::MptnLu62)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "LLC to AnyNet LU6.2 conversion requires an operational MPTN session gateway",
+                    ));
+                }
+                return Err(invalid(format!(
+                    "converter {converter:?} is incompatible with route {} -> {}",
+                    route.from, route.to
+                )));
+            }
             if !matches!(
                 (source_kind, target_kind),
                 ("llc", "llc")
@@ -700,5 +725,38 @@ to = "ip"
         assert!(parse(&mixed.replace("[[ee]]", "[[anynet]]"))
             .validate()
             .is_err());
+    }
+
+    #[test]
+    fn llc_anynet_converter_intent_is_explicit_and_disabled() {
+        let gateway = r#"
+[[llc]]
+id = "lan"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+proxy_mac = "02:53:4e:00:00:02"
+[[anynet]]
+id = "mptn"
+local_ip = "127.0.0.2"
+peer_ip = "127.0.0.3"
+local_lu = "SOLNET.SNAB"
+remote_lu = "SOLNET.SNAA"
+[[route]]
+from = "lan"
+to = "mptn"
+converter = "mptn_lu62"
+"#;
+        let error = parse(gateway).validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("MPTN session gateway"));
+        assert!(parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported route"));
+        assert!(toml::from_str::<RouterConfig>(
+            &gateway.replace("converter = \"mptn_lu62\"", "converter = \"unknown\"")
+        )
+        .is_err());
     }
 }

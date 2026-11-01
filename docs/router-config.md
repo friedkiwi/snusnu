@@ -123,3 +123,16 @@ to = "mptn_b"
 Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 397 requires root or `CAP_NET_BIND_SERVICE`. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate AnyNet listener IPs and routes between AnyNet and LLC, EE or WebSocket profiles until a session converter is implemented. IBM's AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
 
 The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the configured TCP relay.
+
+## LLC to AnyNet gateway route intent
+
+The route syntax reserves an explicit converter for a future native LU6.2 to MPTN gateway:
+
+```toml
+[[route]]
+from = "native_lu62"
+to = "mptn_lu62"
+converter = "mptn_lu62"
+```
+
+This route currently fails configuration loading with an `Unsupported` error. Native LLC2 information fields and TCP62 records require session-state translation, including BIND negotiation and the requested MPTN compensations. The router will enable this converter only when both protocol handlers are complete and tested against peers. A cross-profile route without a converter is rejected as an unsupported route.
