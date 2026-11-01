@@ -103,6 +103,15 @@ bidirectional XID/TEST, link-ready events, SNA information, and credit. The
 first attempt after reboot sent no Ethernet frames until both OS/400 APPC
 controllers were varied on again. A complete session then succeeded.
 
+After the WebSocket adapter was changed to share one authenticated socket
+between multiple logical circuits, the same legacy `--remote-link` scenario
+was rerun through the loopback broker on 2026-11-01. A reached B's remote
+Sign On at 17:04:55 local time, signed in to B's Main Menu at 17:05:18,
+and returned to A's Main Menu with `ENDPASTHR` at 17:05:21. The broker
+observed the accepted circuit, bidirectional XID/TEST, link-ready events,
+and SNA information. The broker and router processes were stopped after
+the test; the two V4R4 guests remained running.
+
 ## Go QA concentrator interoperability
 
 On 2026-11-01, two separate `--remote-link` Rust routers attached to the
