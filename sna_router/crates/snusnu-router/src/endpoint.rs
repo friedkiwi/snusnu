@@ -360,11 +360,13 @@ impl Endpoint {
         let now = Instant::now();
         if self.connect_after.is_some_and(|deadline| now >= deadline) {
             self.connect_after = None;
-            if self.llc.state() == State::Disconnected {
+            if may_begin_connect(self.connect_allowed, self.llc.state()) {
                 tracing::info!(interface = %self.interface, "LLC active connect starting");
                 let pdu = self.llc.begin_connect().map_err(llc_error)?;
                 self.send_llc(&pdu)?;
                 self.sync_deadline();
+            } else if !self.connect_allowed {
+                tracing::debug!(interface = %self.interface, "LLC active connect blocked until APPN XID3 activation");
             }
         }
         if !self.deadline.is_some_and(|deadline| now >= deadline) {
@@ -461,6 +463,10 @@ fn blocked_sabme_response(frame: &LlcFrame<'_>, connect_allowed: bool) -> Option
     Some([frame.ssap, frame.dsap | 1, 0x0f | (byte & 0x10)])
 }
 
+fn may_begin_connect(connect_allowed: bool, state: State) -> bool {
+    connect_allowed && state == State::Disconnected
+}
+
 fn llc_error(error: LlcError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("LLC2: {error:?}"))
 }
@@ -487,6 +493,9 @@ mod tests {
             ..command
         };
         assert_eq!(blocked_sabme_response(&response, false), None);
+        assert!(!may_begin_connect(false, State::Disconnected));
+        assert!(may_begin_connect(true, State::Disconnected));
+        assert!(!may_begin_connect(true, State::Connected));
     }
 
     #[test]
