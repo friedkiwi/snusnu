@@ -1,0 +1,171 @@
+//! One-shot, isolated XID3/LLC2 probe against one configured SNA guest.
+//! It stops after receiving SNASVCMG BIND and never enables a routed circuit.
+
+use crate::{
+    config::parse_mac, native_peer_port::NativePeerPort, routing::RoutePort, runtime::LlcPeer, STOP,
+};
+use router_core::{xid3::Role, xid3_local::LocalLlcProfile};
+use serde::Deserialize;
+use std::{
+    fs, io,
+    path::Path,
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeConfig {
+    interface: String,
+    guest_mac: String,
+    proxy_mac: String,
+    local_cp: String,
+    local_station: String,
+    local_node_id: String,
+    tg_number: u8,
+    role: ProbeRole,
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeRole {
+    Primary,
+    Secondary,
+}
+
+impl From<ProbeRole> for Role {
+    fn from(value: ProbeRole) -> Self {
+        match value {
+            ProbeRole::Primary => Role::Primary,
+            ProbeRole::Secondary => Role::Secondary,
+        }
+    }
+}
+
+fn default_timeout() -> u64 {
+    180
+}
+
+fn invalid(reason: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, reason.into())
+}
+
+fn parse_node_id(value: &str) -> io::Result<[u8; 4]> {
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("local_node_id must be eight hexadecimal digits"));
+    }
+    Ok(u32::from_str_radix(value, 16)
+        .map_err(|_| invalid("invalid local_node_id"))?
+        .to_be_bytes())
+}
+
+impl ProbeConfig {
+    fn load(path: &Path) -> io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&content)
+            .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+        if config.interface.is_empty() || !(1..=600).contains(&config.timeout_seconds) {
+            return Err(invalid(
+                "native probe needs an interface and timeout_seconds 1..600",
+            ));
+        }
+        Ok(config)
+    }
+
+    fn profile(&self) -> io::Result<LocalLlcProfile> {
+        Ok(LocalLlcProfile {
+            cp_name: self.local_cp.clone(),
+            station_name: self.local_station.clone(),
+            node_id: parse_node_id(&self.local_node_id)?,
+            tg_number: self.tg_number,
+            // Endpoint accepts up to one 1496-byte information field in the
+            // 802.3 MTU and acknowledges each I-frame. Advertise that actual
+            // capacity, not a user-selected larger window.
+            max_receive_btu: 1496,
+            max_iframes_before_ack: 1,
+            role: self.role.into(),
+        })
+    }
+}
+
+pub(crate) fn run(path: &Path) -> io::Result<()> {
+    let config = ProbeConfig::load(path)?;
+    let profile = config.profile()?;
+    let xid = profile
+        .build()
+        .map_err(|error| invalid(format!("invalid local XID3 profile: {error}")))?;
+    let guest_mac = parse_mac(&config.guest_mac)?;
+    let proxy_mac = parse_mac(&config.proxy_mac)?;
+    tracing::info!(
+        interface = %config.interface,
+        guest_mac = %config.guest_mac,
+        proxy_mac = %config.proxy_mac,
+        local_cp = %profile.cp_name,
+        local_station = %profile.station_name,
+        local_node_id = %config.local_node_id,
+        tg_number = profile.tg_number,
+        role = ?profile.role,
+        timeout_seconds = config.timeout_seconds,
+        "native APPN one-shot probe starting"
+    );
+    let mut port = NativePeerPort::open(
+        LlcPeer {
+            interface: &config.interface,
+            guest_mac,
+            proxy_mac,
+        },
+        xid,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
+    while !STOP.load(Ordering::Relaxed) {
+        let had_frame = port.poll(true)?.is_some();
+        if port.reached_management_bind() {
+            tracing::info!("native probe reached SNASVCMG BIND after LLC2 contact; stopped before unsupported response");
+            return Ok(());
+        }
+        port.tick()?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "native probe timed out before SNASVCMG BIND",
+            ));
+        }
+        if !had_frame {
+            thread::sleep(Duration::from_micros(200));
+        }
+    }
+    tracing::info!("native probe interrupted");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_local_profile_with_actual_llc_receive_window() {
+        let config: ProbeConfig = toml::from_str(
+            r#"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+proxy_mac = "02:00:35:27:23:02"
+local_cp = "SOLNET.SNAB"
+local_station = "SNAB"
+local_node_id = "fff12345"
+tg_number = 1
+role = "primary"
+"#,
+        )
+        .unwrap();
+        let profile = config.profile().unwrap();
+        assert_eq!(profile.max_iframes_before_ack, 1);
+        assert_eq!(profile.max_receive_btu, 1496);
+        assert_eq!(profile.role, Role::Primary);
+        assert_eq!(profile.build().unwrap().node_id(), [0xff, 0xf1, 0x23, 0x45]);
+        assert!(parse_node_id("05633950").is_ok());
+        assert!(parse_node_id("0563395").is_err());
+    }
+}

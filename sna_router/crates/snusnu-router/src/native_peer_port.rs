@@ -13,6 +13,7 @@ use crate::{
     runtime::LlcPeer,
 };
 use router_core::{
+    fid2_bind::{classify_bind, BindClass},
     llc2::State,
     xid3::{Role, Xid3},
     xid3_activation::Phase,
@@ -24,7 +25,7 @@ pub(crate) struct NativePeerPort {
     type1: NativeType1,
     local_xid: Xid3,
     activation_announced: bool,
-    reached_information: bool,
+    reached_management_bind: bool,
 }
 
 impl NativePeerPort {
@@ -42,12 +43,12 @@ impl NativePeerPort {
             type1,
             local_xid,
             activation_announced: false,
-            reached_information: false,
+            reached_management_bind: false,
         })
     }
 
-    pub(crate) fn reached_information(&self) -> bool {
-        self.reached_information
+    pub(crate) fn reached_management_bind(&self) -> bool {
+        self.reached_management_bind
     }
 
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
@@ -81,9 +82,33 @@ impl NativePeerPort {
                     tracing::info!(peer_cp = ?self.type1.peer_name(), "native APPN LLC2 contact established; awaiting management BIND");
                 }
                 Event::Information(piu) => {
-                    self.reached_information = true;
-                    let ru = piu.get(9).copied();
-                    tracing::warn!(bytes = piu.len(), ru_code = ?ru, "native APPN PIU reached XID-only port; management BIND responder unavailable, disconnecting");
+                    let bind = match classify_bind(&piu) {
+                        Ok(bind) => bind,
+                        Err(error) => {
+                            self.endpoint.disconnect()?;
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unsupported native BIND: {error}"),
+                            ));
+                        }
+                    };
+                    let Some(bind) = bind else {
+                        self.endpoint.disconnect()?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "first native PIU is not a BIND",
+                        ));
+                    };
+                    if !matches!(&bind.class, BindClass::Management { mode } if mode == "SNASVCMG")
+                    {
+                        self.endpoint.disconnect()?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "first native BIND is not SNASVCMG",
+                        ));
+                    }
+                    self.reached_management_bind = true;
+                    tracing::warn!(plu = %bind.plu, slu = %bind.slu, daf = bind.daf, oaf = bind.oaf, bytes = piu.len(), "native APPN SNASVCMG BIND reached XID-only port; responder unavailable, disconnecting");
                     self.endpoint.disconnect()?;
                 }
                 Event::Disconnected | Event::TimedOut => {
@@ -122,7 +147,7 @@ impl RoutePort for NativePeerPort {
     }
 
     fn has_capacity(&self) -> bool {
-        !self.reached_information
+        !self.reached_management_bind
     }
 
     fn set_ingress_busy(&mut self, busy: bool) -> io::Result<()> {
