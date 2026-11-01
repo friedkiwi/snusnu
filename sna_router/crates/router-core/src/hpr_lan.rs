@@ -113,13 +113,15 @@ pub fn advertised_hpr_sap(xid: &[u8], medium: HprMedium) -> Result<u8, Negotiati
     }
     let data = capabilities.ok_or(NegotiationError::MissingHprCapabilities)?;
     // The original IBM HPR architecture has a two-byte CV61 fixed prefix.
-    // The observed V5R4 EE XID3 has a five-byte prefix ending in 02 80 02.
+    // Observed V5R4 EE and LAN XID3s have a five-byte prefix beginning
+    // with 02 80 at offset two. Its final byte differs by medium (EE 02,
+    // LAN 04), so it must not be treated as part of the SAP subfield.
     // Select only that explicit observed extension; guessing a subfield
     // boundary could accept a false SAP from arbitrary capability bytes.
     if data.len() < 2 {
         return Err(NegotiationError::InvalidCapabilities);
     }
-    let prefix = if data.len() >= 5 && data[2..5] == [0x02, 0x80, 0x02] {
+    let prefix = if data.len() >= 5 && data[2..4] == [0x02, 0x80] {
         5
     } else {
         2
@@ -482,6 +484,17 @@ mod tests {
         state.observe_received(&remote, HprMedium::Lan).unwrap();
         assert_eq!(state.saps().unwrap().local_hpr, 4);
         assert_eq!(state.saps().unwrap().remote_hpr, 0xca);
+    }
+
+    #[test]
+    fn v5r4_lan_cv61_advertises_c8_sap() {
+        // Direct V5R4 HPR LAN XID3 capability vector, excluding all PIUs.
+        let captured = xid3_with_capabilities(&[
+            0xb8, 0x00, 0x02, 0x80, 0x04, 0x03, 0x80, 0xc8, 0x17, 0x81, 0x00, 0x00, 0x00, 0x00,
+            0xea, 0x60, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x02, 0xa4, 0x00,
+            0x02, 0xa4, 0x00,
+        ]);
+        assert_eq!(advertised_hpr_sap(&captured, HprMedium::Lan), Ok(0xc8));
     }
 
     #[test]
