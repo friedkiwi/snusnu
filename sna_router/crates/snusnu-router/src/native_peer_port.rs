@@ -181,6 +181,17 @@ impl NativePeerPort {
         self.converter_events.pop_front()
     }
 
+    /// Begin a fixed-primary link toward a passive OS/400 LAN controller.
+    /// The caller must enable this explicitly for an inbound routed session;
+    /// a responder-only port continues waiting for the guest's first XID.
+    pub(crate) fn begin_active_xid(&mut self) -> io::Result<()> {
+        let null = self.type1.prepare_active_null_xid()?;
+        self.endpoint.send_type1(&null.pdu)?;
+        self.type1.confirm_sent(&null)?;
+        tracing::info!(peer_cp = ?self.converter_expected_cp, "native active null XID sent to passive peer");
+        Ok(())
+    }
+
     pub(crate) fn enqueue_converter_piu(&mut self, piu: &[u8]) -> io::Result<bool> {
         if self.converter_policy.is_none() {
             return Err(io::Error::new(

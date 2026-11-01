@@ -19,16 +19,40 @@ const POLL_FINAL: u8 = 0x10;
 pub(crate) struct OutboundType1 {
     pub(crate) pdu: Vec<u8>,
     xid: Option<Xid3>,
+    active_null: bool,
 }
 
 pub(crate) struct NativeType1 {
     activation: FixedRoleActivation,
+    active_started: bool,
+    awaiting_null_response: bool,
 }
 
 impl NativeType1 {
     pub(crate) fn new(local_xid: Xid3) -> io::Result<Self> {
         Ok(Self {
             activation: FixedRoleActivation::new(local_xid).map_err(protocol_error)?,
+            active_started: false,
+            awaiting_null_response: false,
+        })
+    }
+
+    /// Start a single fixed-primary XID exchange with a passive APPN peer.
+    /// The null poll is committed only after Endpoint accepts it for send.
+    pub(crate) fn prepare_active_null_xid(&self) -> io::Result<OutboundType1> {
+        if self.activation.local_role() != Role::Primary
+            || self.active_started
+            || self.phase() != Phase::Exchanging
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "active native XID requires an unstarted fixed-primary link",
+            ));
+        }
+        Ok(OutboundType1 {
+            pdu: vec![SNA_SAP, SNA_SAP, XID | POLL_FINAL],
+            xid: None,
+            active_null: true,
         })
     }
 
@@ -58,8 +82,22 @@ impl NativeType1 {
             TEST if !is_response => Ok(Some(OutboundType1 {
                 pdu: [vec![SNA_SAP, SNA_SAP | 1, pdu[2]], info.to_vec()].concat(),
                 xid: None,
+                active_null: false,
             })),
             TEST => Ok(None),
+            XID if is_response && info.is_empty() && self.awaiting_null_response => {
+                let xid = self.activation.on_null_xid().map_err(protocol_error)?;
+                let mut outgoing = vec![SNA_SAP, SNA_SAP, XID | POLL_FINAL];
+                outgoing.extend_from_slice(
+                    &xid.encode()
+                        .map_err(|error| protocol_error(ActivationError::InvalidPeer(error)))?,
+                );
+                Ok(Some(OutboundType1 {
+                    pdu: outgoing,
+                    xid: Some(xid),
+                    active_null: false,
+                }))
+            }
             XID if is_response && info.is_empty() => Ok(None),
             // The V4R4 lab guest answers the initial null poll with a null
             // response, then sends its own prenegotiation XID3 command.
@@ -67,6 +105,7 @@ impl NativeType1 {
             XID if info.is_empty() => Ok(Some(OutboundType1 {
                 pdu: vec![SNA_SAP, SNA_SAP | 1, XID | (pdu[2] & POLL_FINAL)],
                 xid: None,
+                active_null: false,
             })),
             XID => {
                 let xid = self.activation.on_peer_xid(info).map_err(protocol_error)?;
@@ -83,6 +122,7 @@ impl NativeType1 {
                 Ok(Some(OutboundType1 {
                     pdu: outgoing,
                     xid: Some(xid),
+                    active_null: false,
                 }))
             }
             _ => Err(io::Error::new(
@@ -95,11 +135,23 @@ impl NativeType1 {
     /// Call only after `Endpoint::send_type1` accepted this PDU. Send failure
     /// leaves XID activation incomplete and prevents an early SABME.
     pub(crate) fn confirm_sent(&mut self, outbound: &OutboundType1) -> io::Result<Phase> {
-        if let Some(xid) = &outbound.xid {
-            self.activation.confirm_sent(xid).map_err(protocol_error)
-        } else {
-            Ok(self.phase())
+        if outbound.active_null {
+            if self.active_started || outbound.pdu != [SNA_SAP, SNA_SAP, XID | POLL_FINAL] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active native XID poll was already committed",
+                ));
+            }
+            self.active_started = true;
+            self.awaiting_null_response = true;
+            return Ok(self.phase());
         }
+        if let Some(xid) = &outbound.xid {
+            let phase = self.activation.confirm_sent(xid).map_err(protocol_error)?;
+            self.awaiting_null_response = false;
+            return Ok(phase);
+        }
+        Ok(self.phase())
     }
 }
 
@@ -185,5 +237,66 @@ mod tests {
         assert_eq!(response.pdu, [4, 5, 0xf3, 0xaa, 0xbb]);
         assert_eq!(handler.confirm_sent(&response).unwrap(), Phase::Exchanging);
         assert!(handler.on_pdu(&[4, 5, 0xf3]).unwrap().is_none());
+    }
+
+    #[test]
+    fn fixed_primary_starts_passive_peer_with_null_then_owned_xid3() {
+        let local = xid(
+            "SOLNET.ROUTER",
+            Role::Primary,
+            ExchangeState::Prenegotiation,
+        );
+        let mut handler = NativeType1::new(local).unwrap();
+        assert!(handler.on_pdu(&[4, 5, 0xbf]).unwrap().is_none());
+        let null = handler.prepare_active_null_xid().unwrap();
+        assert_eq!(null.pdu, [4, 4, 0xbf]);
+        // A failed socket send has not committed the poll.
+        assert_eq!(handler.prepare_active_null_xid().unwrap().pdu, null.pdu);
+        assert_eq!(handler.confirm_sent(&null).unwrap(), Phase::Exchanging);
+        assert!(handler.prepare_active_null_xid().is_err());
+
+        // A passive V4R4 station returns the null response; the local XID3
+        // command still carries only this router's configured CP identity.
+        let first = handler.on_pdu(&[4, 5, 0xbf]).unwrap().unwrap();
+        assert_eq!(&first.pdu[..3], &[4, 4, 0xbf]);
+        let sent = Xid3::decode(&first.pdu[3..]).unwrap();
+        assert_eq!(sent.cp_name().unwrap(), "SOLNET.ROUTER");
+        assert_eq!(sent.role(), Ok(Role::Primary));
+        assert_eq!(sent.exchange_state(), ExchangeState::Prenegotiation);
+        assert_eq!(handler.confirm_sent(&first).unwrap(), Phase::Exchanging);
+        assert!(handler.on_pdu(&[4, 5, 0xbf]).unwrap().is_none());
+
+        let mut peer = xid(
+            "SOLNET.SNAB",
+            Role::Negotiable,
+            ExchangeState::Prenegotiation,
+        );
+        let mut response = vec![4, 5, 0xbf];
+        response.extend(peer.encode().unwrap());
+        let proceeding = handler.on_pdu(&response).unwrap().unwrap();
+        assert_eq!(&proceeding.pdu[..3], &[4, 4, 0xbf]);
+        assert_eq!(
+            handler.confirm_sent(&proceeding).unwrap(),
+            Phase::Exchanging
+        );
+        peer.set_role(Role::Secondary);
+        peer.set_exchange_state(ExchangeState::NegotiationProceeding);
+        response.truncate(3);
+        response.extend(peer.encode().unwrap());
+        let last = handler.on_pdu(&response).unwrap().unwrap();
+        assert_eq!(handler.confirm_sent(&last).unwrap(), Phase::ReadyForSabme);
+    }
+
+    #[test]
+    fn fixed_secondary_cannot_start_active_null_xid() {
+        let local = xid(
+            "SOLNET.ROUTER",
+            Role::Secondary,
+            ExchangeState::Prenegotiation,
+        );
+        assert!(NativeType1::new(local)
+            .unwrap()
+            .prepare_active_null_xid()
+            .is_err());
     }
 }
