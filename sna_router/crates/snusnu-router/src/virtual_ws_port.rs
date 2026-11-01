@@ -15,9 +15,17 @@ use router_core::{
 };
 use std::io;
 use transport_ip_sna::{
+    anynet::{TcpKind, TcpRecord},
     mptn_ingress::IngressOffer,
     mptn_reverse_user_bind::{NativeAddress, Phase as UserBindPhase, ReverseUserBind},
+    mptn_reverse_user_flow::{NativeInput, ReverseUserFlow},
 };
+
+#[derive(Clone, Copy)]
+enum NativeUserOutputKind {
+    Normal,
+    Grant,
+}
 
 pub(crate) struct VirtualWsPort<P: RoutePort> {
     inner: P,
@@ -33,6 +41,15 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     user_bind_native_completed: bool,
     early_user_response: Option<Vec<u8>>,
     tcp_bind_response: Option<Vec<u8>>,
+    user_address: Option<NativeAddress>,
+    user_flow: Option<ReverseUserFlow>,
+    tcp_user_input: Option<TcpRecord>,
+    deferred_user_normal: bool,
+    native_user_output: Option<Vec<u8>>,
+    native_user_output_kind: Option<NativeUserOutputKind>,
+    native_user_output_queued: bool,
+    native_user_input: Option<Vec<u8>>,
+    tcp_user_output: Option<TcpRecord>,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -57,6 +74,15 @@ impl<P: RoutePort> VirtualWsPort<P> {
             user_bind_native_completed: false,
             early_user_response: None,
             tcp_bind_response: None,
+            user_address: None,
+            user_flow: None,
+            tcp_user_input: None,
+            deferred_user_normal: false,
+            native_user_output: None,
+            native_user_output_kind: None,
+            native_user_output_queued: false,
+            native_user_input: None,
+            tcp_user_output: None,
         })
     }
 
@@ -97,6 +123,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             return Err(protocol("virtual user BIND needs an idle managed link"));
         }
         self.user_bind = Some(ReverseUserBind::after_management(offer, address)?);
+        self.user_address = Some(address);
         Ok(())
     }
 
@@ -118,7 +145,53 @@ impl<P: RoutePort> VirtualWsPort<P> {
             .as_mut()
             .ok_or_else(|| protocol("virtual user BIND is absent"))?
             .mark_tcp_response_enqueued(bytes)?;
+        let (send_window, receive_window) = self
+            .user_bind
+            .as_ref()
+            .unwrap()
+            .native_flow_windows()
+            .ok_or_else(|| protocol("native BIND did not negotiate pacing windows"))?;
+        self.user_flow = Some(ReverseUserFlow::new(
+            self.user_address.unwrap(),
+            send_window,
+            receive_window,
+        )?);
         self.tcp_bind_response = None;
+        Ok(())
+    }
+
+    /// Retain one TCP62 record before releasing the gateway's ingress slot.
+    /// The native PIU is prepared and sent by subsequent poll/tick calls.
+    pub(crate) fn submit_tcp_user_record(&mut self, record: &TcpRecord) -> io::Result<bool> {
+        if self.user_flow.is_none()
+            || self.tcp_user_input.is_some()
+            || self.native_user_output.is_some()
+            || self.deferred_user_normal
+        {
+            return Ok(false);
+        }
+        if !matches!(record.kind, TcpKind::Normal | TcpKind::Segmented) {
+            return Err(protocol(
+                "virtual user flow does not accept this TCP62 record kind",
+            ));
+        }
+        self.tcp_user_input = Some(record.clone());
+        Ok(true)
+    }
+
+    pub(crate) fn tcp_user_record(&self) -> Option<&TcpRecord> {
+        self.tcp_user_output.as_ref()
+    }
+
+    pub(crate) fn mark_tcp_user_record_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.tcp_user_output.as_ref() != Some(record) {
+            return Err(protocol("TCP62 user output differs from prepared record"));
+        }
+        self.user_flow
+            .as_mut()
+            .ok_or_else(|| protocol("virtual user flow absent"))?
+            .mark_tcp_enqueued(record)?;
+        self.tcp_user_output = None;
         Ok(())
     }
 
@@ -133,6 +206,18 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.user_bind_native_completed = false;
         self.early_user_response = None;
         self.tcp_bind_response = None;
+        self.user_address = None;
+        if let Some(flow) = self.user_flow.as_mut() {
+            flow.close();
+        }
+        self.user_flow = None;
+        self.tcp_user_input = None;
+        self.deferred_user_normal = false;
+        self.native_user_output = None;
+        self.native_user_output_kind = None;
+        self.native_user_output_queued = false;
+        self.native_user_input = None;
+        self.tcp_user_output = None;
         if self.management.take().is_some() {
             // FQPCID and BIND token must be freshly minted on the next
             // circuit. A caller must construct a new virtual session.
@@ -200,6 +285,24 @@ impl<P: RoutePort> VirtualWsPort<P> {
             if let Some(piu) = self.early_user_response.take() {
                 self.accept_user_response(&piu)?;
             }
+        } else if completed == 1 && self.native_user_output_queued {
+            let piu = self
+                .native_user_output
+                .take()
+                .ok_or_else(|| protocol("native user output missing"))?;
+            let kind = self
+                .native_user_output_kind
+                .take()
+                .ok_or_else(|| protocol("native user output kind missing"))?;
+            let flow = self
+                .user_flow
+                .as_mut()
+                .ok_or_else(|| protocol("virtual user flow absent"))?;
+            match kind {
+                NativeUserOutputKind::Normal => flow.mark_native_enqueued(&piu)?,
+                NativeUserOutputKind::Grant => flow.mark_native_grant_enqueued(&piu)?,
+            }
+            self.native_user_output_queued = false;
         } else {
             return Err(protocol(
                 "virtual information completion has no outstanding PIU",
@@ -246,6 +349,67 @@ impl<P: RoutePort> VirtualWsPort<P> {
         Ok(())
     }
 
+    fn drive_user_flow(&mut self) -> io::Result<()> {
+        let Some(flow) = self.user_flow.as_mut() else {
+            return Ok(());
+        };
+        if self.tcp_user_output.is_none() && self.native_user_output.is_none() {
+            if let Some(piu) = self.native_user_input.take() {
+                match flow.prepare_native_input(&piu)? {
+                    NativeInput::PacingGrant => {}
+                    NativeInput::TcpRecord(record) => self.tcp_user_output = Some(record.clone()),
+                }
+            }
+        }
+        if self.native_user_output.is_none() {
+            if self.deferred_user_normal {
+                match flow.retry_deferred_normal() {
+                    Ok(Some(piu)) => {
+                        self.native_user_output = Some(piu.to_vec());
+                        self.native_user_output_kind = Some(NativeUserOutputKind::Normal);
+                        self.deferred_user_normal = false;
+                    }
+                    Ok(None) => self.deferred_user_normal = false,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(record) = self.tcp_user_input.take() {
+                match flow.prepare_tcp_normal(&record) {
+                    Ok(Some(piu)) => {
+                        self.native_user_output = Some(piu.to_vec());
+                        self.native_user_output_kind = Some(NativeUserOutputKind::Normal);
+                    }
+                    Ok(None) => {} // One segmented fragment was retained.
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        // The final segment is retained by ReverseUserFlow
+                        // when the native send window is exhausted.
+                        self.deferred_user_normal = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if self.tcp_user_output.is_none() {
+                match flow.prepare_native_grant(1) {
+                    Ok(Some(piu)) => {
+                        self.native_user_output = Some(piu.to_vec());
+                        self.native_user_output_kind = Some(NativeUserOutputKind::Grant);
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if let Some(piu) = self.native_user_output.as_ref() {
+            if !self.native_user_output_queued
+                && self.inner.has_capacity()
+                && self.inner.send(RoutedUnit::SnaInformation(piu.clone()))?
+            {
+                self.native_user_output_queued = true;
+            }
+        }
+        Ok(())
+    }
+
     fn handle(&mut self, events: Vec<RouterEvent>) -> io::Result<Vec<RouterEvent>> {
         let mut output = Vec::with_capacity(events.len());
         for event in events {
@@ -267,7 +431,11 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     let management = self.management.as_mut().ok_or_else(|| {
                         protocol("virtual native session handler is not installed")
                     })?;
-                    if management.phase() == ManagementPhase::Complete {
+                    if self.user_flow.is_some() {
+                        if self.native_user_input.replace(piu).is_some() {
+                            return Err(protocol("virtual native user ingress queue full"));
+                        }
+                    } else if management.phase() == ManagementPhase::Complete {
                         if self
                             .user_bind
                             .as_ref()
@@ -309,12 +477,15 @@ impl<P: RoutePort> VirtualWsPort<P> {
 impl<P: RoutePort> RoutePort for VirtualWsPort<P> {
     fn poll(&mut self, _can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
         self.start_if_needed()?;
-        // Pull pending information so an unsupported PIU causes an immediate
-        // reset instead of being left indefinitely in the WebSocket queue.
-        let events = self.inner.poll(true)?;
+        // Keep the next native user PIU at the circuit boundary while the
+        // prior one still awaits TCP queue acceptance.
+        let can_receive = self.user_flow.is_none()
+            || (self.native_user_input.is_none() && self.tcp_user_output.is_none());
+        let events = self.inner.poll(can_receive)?;
         self.complete_management_egress()?;
         let output = events.map(|events| self.handle(events)).transpose()?;
         self.drive_management()?;
+        self.drive_user_flow()?;
         Ok(output)
     }
 
@@ -324,6 +495,7 @@ impl<P: RoutePort> RoutePort for VirtualWsPort<P> {
         self.complete_management_egress()?;
         let output = self.handle(events)?;
         self.drive_management()?;
+        self.drive_user_flow()?;
         Ok(output)
     }
 
@@ -679,6 +851,40 @@ mod tests {
         let response = port.tcp_bind_response().unwrap().to_vec();
         port.mark_tcp_bind_response_enqueued(&response).unwrap();
         assert!(!port.user_bind_response_ready());
+
+        let attach = TcpRecord::decode(hex("0000000b000001030000aa")).unwrap();
+        assert!(port.submit_tcp_user_record(&attach).unwrap());
+        port.poll(false).unwrap();
+        assert_eq!(&port.inner.information[7], &hex("2c0002010001030100aa"));
+        assert!(!port.submit_tcp_user_record(&attach).unwrap());
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        port.inner
+            .incoming
+            .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(
+                "2c000102800083a000",
+            ))));
+        port.poll(false).unwrap();
+        let native_reply = port.tcp_user_record().unwrap().clone();
+        assert_eq!(native_reply.bytes, hex("0000000a00800083a000"));
+        port.mark_tcp_user_record_enqueued(&native_reply).unwrap();
+        assert!(port.tcp_user_record().is_none());
+        port.inner
+            .incoming
+            .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(
+                "2c0001020001030100bb",
+            ))));
+        port.poll(false).unwrap();
+        let native_request = port.tcp_user_record().unwrap().clone();
+        assert_eq!(native_request.bytes, hex("0000000b000001030000bb"));
+        port.mark_tcp_user_record_enqueued(&native_request).unwrap();
+        port.poll(false).unwrap();
+        assert_eq!(
+            port.inner.information.last().unwrap(),
+            &hex("2d0002010000830100")
+        );
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
     }
 
     #[test]
