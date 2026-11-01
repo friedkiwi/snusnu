@@ -167,6 +167,12 @@ impl Router {
 
     pub(crate) fn add_route(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
         self.check_route_ports(source, target)?;
+        if self.address_routes.keys().any(|(port, _)| port == source) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already uses addressed routes", source.0),
+            ));
+        }
         Self::insert_route(&mut self.routes, source.clone(), target.clone())?;
         tracing::info!(source_port = %source.0, target_port = %target.0, "route installed");
         Ok(())
@@ -182,6 +188,12 @@ impl Router {
         target: &PortId,
     ) -> io::Result<()> {
         self.check_route_ports(source, target)?;
+        if self.routes.contains_key(source) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already uses a default route", source.0),
+            ));
+        }
         Self::insert_route(
             &mut self.address_routes,
             (source.clone(), address.clone()),
@@ -774,14 +786,21 @@ mod tests {
     }
 
     #[test]
-    fn exact_address_route_cannot_be_reassigned_or_fall_back() {
+    fn addressed_source_cannot_fall_back_to_a_default_route() {
         let mut router = Router::new();
         let a = fake_port(&mut router, "llc-a");
         let b = fake_port(&mut router, "llc-b");
         let c = fake_port(&mut router, "llc-c");
         let mac = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
-        router.add_route(&a, &b).unwrap();
         router.add_address_route(&a, mac.clone(), &b).unwrap();
+        assert_eq!(
+            router.add_route(&a, &c).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            router.target(&a).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         assert_eq!(
             router
                 .add_address_route(&a, mac.clone(), &c)
@@ -798,6 +817,21 @@ mod tests {
         );
         router.bind_destination(&a, mac).unwrap();
         assert_eq!(router.target(&a).unwrap(), &b);
+
+        let default_source = fake_port(&mut router, "default-source");
+        router.add_route(&default_source, &c).unwrap();
+        assert_eq!(
+            router
+                .add_address_route(
+                    &default_source,
+                    RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 2]),
+                    &b,
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(router.target(&default_source).unwrap(), &c);
     }
 
     #[test]
