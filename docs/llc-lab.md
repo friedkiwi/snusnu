@@ -232,12 +232,20 @@ application-data fixture.
 `--native-user-bind-probe` uses the same isolated configuration and follows
 the validated management BIND, CNOS, and BIS exchanges. It accepts only the
 captured blank/default-mode user BIND for the configured CP pair, then sends
-one fixed-window candidate +RSP(BIND). It waits for the LLC acknowledgement
-and sends DISC on the next user PIU, logging its TH/RH and packet dump at
+one fixed-window candidate +RSP(BIND). It waits for the LLC acknowledgement,
+then validates and answers the correlated management UNBIND if it arrives.
+It sends DISC on the next user PIU, logging its TH/RH and packet dump at
 debug level. This experiment cannot carry an application conversation or
 advertise a route. It exits with status 1 on the deliberate unsupported
 follow-up or a timeout; inspect the capture to judge whether OS/400 accepted
 the response. Run it only on an isolated TAP with an expendable guest.
+
+In the first live user-response probe, OS/400 acknowledged the 89-byte user
++RSP(BIND), then sent a management UNBIND whose FQPCID matched the earlier
+SNASVCMG BIND. The same order occurs in the two-OS/400 baseline. The probe
+closed before responding to UNBIND, and OS/400 reported an APPC failure. The
+LLC ACK and UNBIND order do not establish user-session acceptance; the next
+probe must answer the management teardown and observe the following user PIU.
 
 In the isolated V4R4 A run on 2026-11-01, the probe sent its 89-byte candidate
 user +RSP(BIND), and A acknowledged the LLC I-frame with RR `N(R)=6`. About

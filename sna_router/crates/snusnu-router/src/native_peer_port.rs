@@ -218,10 +218,10 @@ impl NativePeerPort {
 
     fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
         let management = self.management.as_mut().expect("management mode");
-        if matches!(
-            self.user_probe,
-            UserProbeState::AwaitResponseAck | UserProbeState::AwaitFollowup
-        ) {
+        let management_unbind = piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32;
+        if self.user_probe == UserProbeState::AwaitResponseAck
+            || (self.user_probe == UserProbeState::AwaitFollowup && !management_unbind)
+        {
             tracing::warn!(bytes = piu.len(), th = ?piu.get(..6), rh = ?piu.get(6..9), "native user BIND probe reached peer follow-up; closing before unsupported user traffic");
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
