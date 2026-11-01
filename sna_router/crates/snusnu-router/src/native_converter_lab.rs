@@ -358,6 +358,65 @@ fn observe_udp(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
+/// Inspect one reverse TCP/397 connection from the configured V5 peer. A
+/// TCP62 connection begins with MPTN_Connect (IBM TCP62 draft §5.3.1). This
+/// diagnostic deliberately provides no response or management session.
+struct ReverseConnectProbe {
+    listener: Option<TcpListener>,
+    peer: Option<TcpSession>,
+    expected_ip: Ipv4Addr,
+}
+
+impl ReverseConnectProbe {
+    fn bind(local: SocketAddr, expected_ip: Ipv4Addr) -> io::Result<Self> {
+        let listener = TcpListener::bind(local)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener: Some(listener),
+            peer: None,
+            expected_ip,
+        })
+    }
+
+    fn poll(&mut self) -> io::Result<Option<Connect>> {
+        if self.peer.is_none() {
+            let Some(listener) = self.listener.as_ref() else {
+                return Ok(None);
+            };
+            match listener.accept() {
+                Ok((stream, source)) => {
+                    if source.ip() != self.expected_ip {
+                        return Err(invalid("reverse TCP62 connection from unexpected IP"));
+                    }
+                    tracing::warn!(source = %source, "isolated V5 reverse TCP/397 connection accepted for first-record diagnosis");
+                    self.listener = None; // at most one reverse connection
+                    self.peer = Some(TcpSession::new(stream)?);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(records) = self.peer.as_mut().unwrap().receive_once()? else {
+            return Ok(None);
+        };
+        if records.is_empty() {
+            return Ok(None);
+        }
+        if records.len() != 1 || records[0].kind != TcpKind::Connect {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "reverse TCP62 peer sent an unsupported first record sequence",
+            ));
+        }
+        let connect = Connect::decode(&records[0].bytes)?;
+        if connect.direction != Direction::Request {
+            return Err(invalid("reverse TCP62 first Connect is not a request"));
+        }
+        self.peer = None; // never leave an unhandled session open
+        Ok(Some(connect))
+    }
+}
+
 /// Explicit one-shot diagnostic against an isolated real V5R4 TCP62 peer.
 /// The X'19' claim is restricted to this command and is never installed in
 /// the production route loader. Any UDP packet ends the diagnostic before an
@@ -375,6 +434,7 @@ pub(crate) fn run_v5(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) -> io
             "isolated V5 lab needs two distinct unicast IPv4 addresses",
         ));
     }
+    let mut reverse = ReverseConnectProbe::bind(SocketAddr::new(local_ip.into(), 397), remote_ip)?;
     let udp = UdpSocket::bind(SocketAddr::new(local_ip.into(), 397))?;
     udp.set_nonblocking(true)?;
     let (config, native, user_plu, user_slu, tp, deadline) = open_native(path)?;
@@ -392,6 +452,9 @@ pub(crate) fn run_v5(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) -> io
     );
     tracing::warn!(interface = %config.interface, local_ip = %local_ip, remote_ip = %remote_ip, "experimental V5 TCP62 diagnostic opened; X83 unavailable; no production route advertised");
     while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+        if let Some(connect) = reverse.poll()? {
+            tracing::warn!(source_lu = ?connect.source.node, destination_lu = ?connect.destination.node, options = ?connect.options.iter().map(|field| field.kind).collect::<Vec<_>>(), bind_data_bytes = connect.connection_data().len(), "isolated V5 reverse MPTN Connect observed; management responder unavailable");
+        }
         observe_udp(&udp)?;
         edge.poll_native_once()?;
         edge.flush_tcp()?;
@@ -479,6 +542,42 @@ mod tests {
         assert_eq!(
             observe_udp(&receiver).unwrap_err().kind(),
             io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn reverse_v5_probe_decodes_one_connect_from_configured_peer() {
+        let mut probe =
+            ReverseConnectProbe::bind("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST).unwrap();
+        let address = probe.listener.as_ref().unwrap().local_addr().unwrap();
+        assert!(probe.poll().unwrap().is_none());
+        let mut peer = TcpStream::connect(address).unwrap();
+        let request = v5_template("SOLNET.SNAA", "SOLNET.SNAB").unwrap();
+        peer.write_all(&request.encode().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed = loop {
+            if let Some(connect) = probe.poll().unwrap() {
+                break connect;
+            }
+            assert!(Instant::now() < deadline, "reverse Connect was not decoded");
+            thread::yield_now();
+        };
+        assert_eq!(observed, request);
+        assert!(probe.listener.is_none());
+        assert!(probe.peer.is_none());
+        assert!(probe.poll().unwrap().is_none());
+    }
+
+    #[test]
+    fn reverse_v5_probe_rejects_first_record_from_wrong_source() {
+        let mut probe =
+            ReverseConnectProbe::bind("127.0.0.1:0".parse().unwrap(), Ipv4Addr::new(127, 0, 0, 2))
+                .unwrap();
+        let _peer =
+            TcpStream::connect(probe.listener.as_ref().unwrap().local_addr().unwrap()).unwrap();
+        assert_eq!(
+            probe.poll().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
         );
     }
 
