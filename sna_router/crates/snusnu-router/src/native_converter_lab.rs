@@ -28,6 +28,7 @@ use transport_ip_sna::{
     mptn_compensations::{CompensationSet, TCP62_REQUIRED},
     mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
     mptn_gateway_edge::GatewayEdge,
+    mptn_management_initiator::ManagementInitiator,
     mptn_native_bridge::Bridge,
     mptn_session::BindPolicy,
 };
@@ -125,6 +126,71 @@ fn read_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     bytes[..4].copy_from_slice(&prefix);
     stream.read_exact(&mut bytes[4..])?;
     Ok(bytes)
+}
+
+fn establish_v5_management(
+    local_ip: Ipv4Addr,
+    remote_ip: Ipv4Addr,
+    local_lu: &str,
+    remote_lu: &str,
+    udp: &UdpSocket,
+) -> io::Result<()> {
+    // This is a single-use isolated V5R4 diagnostic. Each transport and
+    // session identifier is fresh, and the captured management profile is
+    // never installed in the production route loader.
+    let mut entropy = [0u8; 20];
+    File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+    let local_name = ebcdic_lu(local_lu)?.node;
+    if local_name.len() != 11 {
+        return Err(invalid("V5 management lab requires an 11-byte local LU"));
+    }
+    let mut fqpcid = [0u8; 22];
+    fqpcid[..2].copy_from_slice(&[0x60, 0x14]);
+    fqpcid[2..10].copy_from_slice(&entropy[..8]);
+    fqpcid[10] = 11;
+    fqpcid[11..].copy_from_slice(&local_name);
+    let correlator: [u8; 8] = entropy[8..16].try_into().unwrap();
+    let mut bind_token = [0x23, 0, 0, 0, 0, 0x80, 0];
+    bind_token[1..5].copy_from_slice(&entropy[16..20]);
+    let mut management =
+        ManagementInitiator::new(local_lu, remote_lu, fqpcid, correlator, bind_token, "", 8)?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind(&SocketAddr::new(local_ip.into(), 0).into())?;
+    socket.connect_timeout(
+        &SocketAddr::new(remote_ip.into(), 397).into(),
+        Duration::from_secs(5),
+    )?;
+    let mut stream: TcpStream = socket.into();
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    tracing::warn!(local_lu, remote_lu, local_ip = %local_ip, remote_ip = %remote_ip, "experimental V5 outbound SNASVCMG/CNOS started");
+    stream.write_all(management.connect_request())?;
+    observe_udp(udp)?;
+    let cnos = management.accept_connect_response(&read_record(&mut stream)?)?;
+    stream.write_all(&cnos)?;
+    observe_udp(udp)?;
+    let bis = management.accept_cnos_reply(&read_record(&mut stream)?)?;
+    stream.write_all(&bis)?;
+    observe_udp(udp)?;
+    let unbind = management.accept_bis(&read_record(&mut stream)?)?;
+    stream.write_all(&unbind)?;
+    management.mark_unbind_sent(&unbind)?;
+    observe_udp(udp)?;
+    let mut tail = [0u8; 1];
+    if stream.read(&mut tail)? != 0 {
+        return Err(invalid("V5 management peer sent data after UNBIND"));
+    }
+    management.observe_peer_close()?;
+    observe_udp(udp)?;
+    if !management.ready() {
+        return Err(invalid("V5 management did not complete"));
+    }
+    tracing::info!(
+        local_lu,
+        remote_lu,
+        "experimental V5 SNASVCMG/CNOS completed before user Connect"
+    );
+    Ok(())
 }
 
 fn mock_peer(
@@ -437,6 +503,16 @@ pub(crate) fn run_v5(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) -> io
     let mut reverse = ReverseConnectProbe::bind(SocketAddr::new(local_ip.into(), 397), remote_ip)?;
     let udp = UdpSocket::bind(SocketAddr::new(local_ip.into(), 397))?;
     udp.set_nonblocking(true)?;
+    let probe = ProbeConfig::load(path)?;
+    let local_lu = probe
+        .user_plu
+        .as_deref()
+        .ok_or_else(|| invalid("user_plu required for V5 management"))?;
+    let remote_lu = probe
+        .user_slu
+        .as_deref()
+        .ok_or_else(|| invalid("user_slu required for V5 management"))?;
+    establish_v5_management(local_ip, remote_ip, local_lu, remote_lu, &udp)?;
     let (config, native, user_plu, user_slu, tp, deadline) = open_native(path)?;
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.bind(&SocketAddr::new(local_ip.into(), 0).into())?;
