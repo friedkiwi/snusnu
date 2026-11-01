@@ -2,6 +2,7 @@
 
 use crate::{
     endpoint::{Endpoint, Event},
+    remote::{Config as RemoteConfig, WsRoutePort},
     routing::{PortId, RoutePort, RoutedUnit, Router, RouterEvent},
 };
 use router_core::llc2::State;
@@ -68,6 +69,10 @@ impl RoutePort for LlcPort {
         self.endpoint.available_receive_slots()
     }
 
+    fn take_completed_information_count(&mut self) -> usize {
+        self.endpoint.take_completed_information_count()
+    }
+
     fn set_ingress_busy(&mut self, busy: bool) -> io::Result<()> {
         self.endpoint.set_local_busy(busy)
     }
@@ -100,5 +105,16 @@ pub(crate) fn run(a: LlcPeer<'_>, b: LlcPeer<'_>) -> io::Result<()> {
     router.register_port(b_id.clone(), Box::new(LlcPort::open(b)?))?;
     router.add_route(&a_id, &b_id)?;
     router.add_route(&b_id, &a_id)?;
+    router.run()
+}
+
+pub(crate) fn run_remote(local: LlcPeer<'_>, config: RemoteConfig) -> io::Result<()> {
+    let mut router = Router::new();
+    let local_id = PortId::new("local-llc");
+    let remote_id = PortId::new("concentrator");
+    router.register_port(local_id.clone(), Box::new(LlcPort::open(local)?))?;
+    router.register_port(remote_id.clone(), Box::new(WsRoutePort::connect(config)?))?;
+    router.add_route(&local_id, &remote_id)?;
+    router.add_route(&remote_id, &local_id)?;
     router.run()
 }

@@ -45,6 +45,14 @@ pub(crate) trait RoutePort {
     fn on_downstream_capacity(&mut self, _available_slots: usize) -> io::Result<()> {
         Ok(())
     }
+    /// Number of previously accepted information units fully delivered by
+    /// this port since the last call. LLC ports count peer acknowledgements.
+    fn take_completed_information_count(&mut self) -> usize {
+        0
+    }
+    fn on_downstream_completed(&mut self, _count: usize) -> io::Result<()> {
+        Ok(())
+    }
     fn set_ingress_busy(&mut self, busy: bool) -> io::Result<()>;
     fn on_peer_ready(&mut self) -> io::Result<()>;
     fn disconnect(&mut self) -> io::Result<()>;
@@ -95,6 +103,7 @@ impl Router {
             let mut received = false;
             for source in self.order.clone() {
                 let target = self.target(&source)?.clone();
+                self.release_completed(&source, &target)?;
                 loop {
                     let capacity = self.port(&target)?.has_capacity();
                     let slots = self.port(&target)?.available_receive_slots();
@@ -126,6 +135,14 @@ impl Router {
                 format!("no route for {}", source.0),
             )
         })
+    }
+
+    fn release_completed(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
+        let completed = self.port_mut(target)?.take_completed_information_count();
+        if completed != 0 {
+            self.port_mut(source)?.on_downstream_completed(completed)?;
+        }
+        Ok(())
     }
 
     fn port(&self, id: &PortId) -> io::Result<&dyn RoutePort> {
@@ -170,5 +187,85 @@ impl Router {
         self.port_mut(source)?.flush()?;
         self.port_mut(&target)?.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Default)]
+    struct State {
+        completions: usize,
+        credited: usize,
+        free_slots: usize,
+    }
+
+    struct FakePort(Rc<RefCell<State>>);
+
+    impl RoutePort for FakePort {
+        fn poll(&mut self, _: bool) -> io::Result<Option<Vec<RouterEvent>>> {
+            Ok(None)
+        }
+        fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
+            Ok(Vec::new())
+        }
+        fn send(&mut self, _: RoutedUnit) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn has_capacity(&self) -> bool {
+            self.0.borrow().free_slots > 0
+        }
+        fn available_receive_slots(&self) -> usize {
+            self.0.borrow().free_slots
+        }
+        fn take_completed_information_count(&mut self) -> usize {
+            std::mem::take(&mut self.0.borrow_mut().completions)
+        }
+        fn on_downstream_completed(&mut self, count: usize) -> io::Result<()> {
+            self.0.borrow_mut().credited += count;
+            Ok(())
+        }
+        fn set_ingress_busy(&mut self, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn on_peer_ready(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completion_releases_credit_even_when_queue_occupancy_is_unchanged() {
+        let ingress_state = Rc::new(RefCell::new(State::default()));
+        // An ACK freed one sent frame while a queued frame immediately took
+        // the same slot. The number of free slots did not change.
+        let egress_state = Rc::new(RefCell::new(State {
+            completions: 1,
+            free_slots: 0,
+            ..State::default()
+        }));
+        let ingress = PortId::new("ingress");
+        let egress = PortId::new("egress");
+        let mut router = Router::new();
+        router
+            .register_port(ingress.clone(), Box::new(FakePort(ingress_state.clone())))
+            .unwrap();
+        router
+            .register_port(egress.clone(), Box::new(FakePort(egress_state.clone())))
+            .unwrap();
+        router.add_route(&ingress, &egress).unwrap();
+
+        router.release_completed(&ingress, &egress).unwrap();
+        assert_eq!(ingress_state.borrow().credited, 1);
+        assert_eq!(egress_state.borrow().free_slots, 0);
+        router.release_completed(&ingress, &egress).unwrap();
+        assert_eq!(ingress_state.borrow().credited, 1);
     }
 }

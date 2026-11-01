@@ -10,6 +10,8 @@ mod endpoint;
 #[cfg(target_os = "linux")]
 mod lab;
 #[cfg(target_os = "linux")]
+mod remote;
+#[cfg(target_os = "linux")]
 mod routing;
 #[cfg(target_os = "linux")]
 mod runtime;
@@ -71,11 +73,43 @@ fn run() -> io::Result<()> {
             },
         );
     }
+    #[cfg(target_os = "linux")]
+    if first.as_deref() == Some("--remote-link") {
+        let interface = args.next().ok_or_else(usage_error)?;
+        let guest_mac = parse_mac(&args.next().ok_or_else(usage_error)?)?;
+        let proxy_mac = parse_mac(&args.next().ok_or_else(usage_error)?)?;
+        let local_cp = parse_cp_name(&args.next().ok_or_else(usage_error)?)?;
+        let target_cp = parse_cp_name(&args.next().ok_or_else(usage_error)?)?;
+        let url = args.next().ok_or_else(usage_error)?;
+        if args.next().is_some() || guest_mac == proxy_mac {
+            return Err(usage_error());
+        }
+        let bearer = env::var("SNUSNU_ROUTER_TOKEN").map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SNUSNU_ROUTER_TOKEN is required",
+            )
+        })?;
+        install_signals();
+        return runtime::run_remote(
+            runtime::LlcPeer {
+                interface: &interface,
+                guest_mac,
+                proxy_mac,
+            },
+            remote::Config {
+                url,
+                bearer,
+                local_cp,
+                target_cp,
+            },
+        );
+    }
     let site = match first.as_deref() {
         None => "local-dev".to_owned(),
         Some("--help") if args.next().is_none() => {
             println!(
-                "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B"
+                "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
             );
             return Ok(());
         }
@@ -105,7 +139,7 @@ fn run() -> io::Result<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B",
+        "usage: snusnu-router [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
     )
 }
 
@@ -124,6 +158,18 @@ fn parse_mac(input: &str) -> io::Result<[u8; 6]> {
         return Err(usage_error());
     }
     Ok(mac)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cp_name(input: &str) -> io::Result<transport_ws::wire::SnaName> {
+    let (netid, name) = input.split_once('.').ok_or_else(usage_error)?;
+    if name.contains('.') {
+        return Err(usage_error());
+    }
+    Ok(transport_ws::wire::SnaName {
+        netid: netid.to_owned(),
+        name: name.to_owned(),
+    })
 }
 
 fn install_signals() {

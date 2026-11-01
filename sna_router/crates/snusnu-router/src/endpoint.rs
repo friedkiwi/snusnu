@@ -34,6 +34,7 @@ pub(crate) struct Endpoint {
     queued: VecDeque<Vec<u8>>,
     deadline: Option<Instant>,
     connect_after: Option<Instant>,
+    completed_information: usize,
 }
 
 impl Endpoint {
@@ -50,6 +51,7 @@ impl Endpoint {
             queued: VecDeque::new(),
             deadline: None,
             connect_after: None,
+            completed_information: 0,
         })
     }
 
@@ -73,10 +75,8 @@ impl Endpoint {
         self.queued.len() + usize::from(self.llc.has_pending_information())
     }
 
-    /// Count queued bytes and the I-frame retained until the guest acknowledges
-    /// it. A transport must not release credit merely when this endpoint sends.
-    pub(crate) fn buffered_information_bytes(&self) -> usize {
-        self.queued.iter().map(Vec::len).sum::<usize>() + self.llc.pending_information_len()
+    pub(crate) fn take_completed_information_count(&mut self) -> usize {
+        std::mem::take(&mut self.completed_information)
     }
 
     /// Poll one frame. `can_accept_information` is the capacity of the next
@@ -111,10 +111,17 @@ impl Endpoint {
                 bytes[14..17 + frame.information.len()].to_vec(),
             )]);
         }
+        let pending_before = self.llc.has_pending_information();
         let effects = self
             .llc
             .receive_with_capacity(&frame, can_accept_information)
             .map_err(llc_error)?;
+        if pending_before
+            && !self.llc.has_pending_information()
+            && self.llc.state() == State::Connected
+        {
+            self.completed_information += 1;
+        }
         let events = self.apply(effects)?;
         self.flush()?;
         self.sync_deadline();
