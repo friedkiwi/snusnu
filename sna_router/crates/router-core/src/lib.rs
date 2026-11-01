@@ -1,8 +1,10 @@
 //! Platform-independent circuit domain foundation.
 
 pub mod appn_control;
+pub mod bis_control;
 pub mod cnos;
 pub mod fid2_bind;
+pub mod fid2_session_control;
 pub mod hpr_lan;
 pub mod hpr_setmode;
 pub mod llc;
