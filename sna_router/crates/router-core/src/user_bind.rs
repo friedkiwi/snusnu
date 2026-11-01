@@ -17,6 +17,7 @@ pub enum UserBindError {
     WrongMode,
     WrongLuPair,
     WrongSession,
+    UnsupportedProfile,
 }
 
 impl fmt::Display for UserBindError {
@@ -36,6 +37,24 @@ pub struct UserBindOffer {
     pub mode: String,
     pub fqpcid: [u8; 22],
     request: Vec<u8>,
+}
+
+const V4R4_USER_REQUEST_FIXED: [u8; 27] = [
+    0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x03, 0x83, 0xc7, 0xc7, 0x83, 0x03, 0x06, 0x02,
+    0, 0, 0, 0, 0, 0, 0, 0x94, 0x43, 0x40, 0,
+];
+
+fn ebcdic_lu(name: &str) -> Result<Vec<u8>, UserBindError> {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'I' => Ok(0xc1 + (b - b'A')),
+            b'J'..=b'R' => Ok(0xd1 + (b - b'J')),
+            b'S'..=b'Z' => Ok(0xe2 + (b - b'S')),
+            b'0'..=b'9' => Ok(0xf0 + (b - b'0')),
+            b'.' => Ok(0x4b),
+            _ => Err(UserBindError::WrongLuPair),
+        })
+        .collect()
 }
 
 impl UserBindOffer {
@@ -85,6 +104,53 @@ impl UserBindOffer {
 
     pub fn request(&self) -> &[u8] {
         &self.request
+    }
+
+    /// Candidate fixed one-stage response for the exact captured V4R4
+    /// default-mode user BIND profile. It is not authorization to transmit:
+    /// the caller must first provide session pacing, APPC, and all AnyNet
+    /// compensations. The local receive window is bounded by that runtime.
+    pub fn build_fixed_response(&self, local_receive_window: u8) -> Result<Vec<u8>, UserBindError> {
+        if !(1..=3).contains(&local_receive_window) {
+            return Err(UserBindError::UnsupportedProfile);
+        }
+        let ru = &self.request[9..];
+        if ru.len() != 132
+            || ru[..27] != V4R4_USER_REQUEST_FIXED
+            || ru[27] != 11
+            || ru[39] != 45
+            || ru[85] != 0
+            || ru[86] != 11
+            || ru[98..120] != self.fqpcid
+            || ru[120..122] != [0x2c, 0x0a]
+        {
+            return Err(UserBindError::UnsupportedProfile);
+        }
+        let slu = ebcdic_lu(&self.slu)?;
+        let mut user = vec![0, 9, 2];
+        user.extend_from_slice(&[0x40; 8]); // SNA default/blank mode.
+        user.extend_from_slice(&[2, 3, 2]); // FQPCID session instance.
+        user.push((1 + slu.len()) as u8);
+        user.push(5);
+        user.extend_from_slice(&slu);
+        let mut response = vec![self.request[0], 0, self.oaf, self.daf, 0, 0, 0xeb, 0x80, 0];
+        let mut fixed = V4R4_USER_REQUEST_FIXED;
+        // IBM SC31-6808 §4-25: secondary send/primary receive stay at the
+        // offered three; secondary receive/primary send use the local limit.
+        // Clear adaptive pacing, security and SYNCPT claims: this candidate
+        // supports only fixed pacing and CONFIRM-level APPC.
+        fixed[8] = 3;
+        fixed[9] = local_receive_window;
+        fixed[12] = 0x80 | local_receive_window;
+        fixed[13] = 3;
+        fixed[23] = 0;
+        fixed[24] = 0x23;
+        response.extend_from_slice(&fixed);
+        response.extend_from_slice(&[0, user.len() as u8]);
+        response.extend_from_slice(&user);
+        response.extend_from_slice(&[0, 0]);
+        response.extend_from_slice(&self.fqpcid);
+        Ok(response)
     }
 }
 
@@ -137,6 +203,13 @@ mod tests {
         assert_eq!(offer.mode, "");
         assert_eq!(offer.request(), piu);
         assert_ne!(&offer.fqpcid, mgmt.fqpcid());
+        let candidate = offer.build_fixed_response(1).unwrap();
+        assert_eq!(candidate.len(), 89);
+        assert_eq!(&candidate[..9], &[0x2d, 0, 2, 2, 0, 0, 0xeb, 0x80, 0]);
+        assert_eq!(&candidate[17..23], &[3, 1, 0xc7, 0xc7, 0x81, 3]);
+        assert_eq!(&candidate[candidate.len() - 22..], &offer.fqpcid);
+        assert_eq!(candidate[9 + 23], 0); // no security/password substitution
+        assert_eq!(candidate[9 + 24], 0x23); // CONFIRM; no SYNCPT claim
     }
 
     #[test]
@@ -162,6 +235,13 @@ mod tests {
         assert_eq!(
             UserBindOffer::from_request(&same_instance, &mgmt, ""),
             Err(UserBindError::WrongSession)
+        );
+        let mut unsupported = user();
+        unsupported[9 + 10] ^= 1; // unvalidated request fixed profile
+        let offer = UserBindOffer::from_request(&unsupported, &mgmt, "").unwrap();
+        assert_eq!(
+            offer.build_fixed_response(1),
+            Err(UserBindError::UnsupportedProfile)
         );
     }
 }
