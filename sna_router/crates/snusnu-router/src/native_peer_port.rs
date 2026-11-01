@@ -16,6 +16,7 @@ use router_core::{
     fid2_bind::{classify_bind, BindClass},
     llc2::State,
     native_management::{ManagementSession, Phase as ManagementPhase},
+    user_bind::UserBindOffer,
     xid3::{Role, Xid3},
     xid3_activation::Phase,
 };
@@ -290,6 +291,15 @@ impl NativePeerPort {
             }
             ManagementPhase::BisComplete => {
                 if matches!(classify_bind(&piu), Ok(Some(_))) {
+                    let offer = UserBindOffer::from_request(
+                        &piu,
+                        management.bind().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
+                        })?,
+                        "",
+                    )
+                    .map_err(management_error)?;
+                    tracing::warn!(plu = %offer.plu, slu = %offer.slu, daf = offer.daf, oaf = offer.oaf, mode = %offer.mode, bytes = offer.request().len(), "native user BIND offer validated; gateway unavailable, disconnecting");
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "native user BIND gateway is not implemented",
