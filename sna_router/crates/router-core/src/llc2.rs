@@ -91,6 +91,13 @@ impl Llc2 {
         self.pending.is_some()
     }
 
+    /// Information retained for retransmission until its N(R) is acknowledged.
+    pub fn pending_information_len(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |pending| pending.information.len())
+    }
+
     /// Advertise whether the caller can accept another information field.
     /// A transition sends RNR or RR so a peer can stop or resume without
     /// waiting for its next frame. The caller sends the returned LLC PDU.
@@ -409,16 +416,20 @@ mod tests {
     fn one_outstanding_frame_and_acknowledgement() {
         let mut link = Llc2::new(4, 4);
         receive(&mut link, &[4, 4, 0x7f]);
+        assert_eq!(link.pending_information_len(), 0);
         assert_eq!(
             link.send_information(&[0x11, 0x22]).unwrap(),
             vec![4, 4, 0, 0, 0x11, 0x22]
         );
+        assert_eq!(link.pending_information_len(), 2);
         assert_eq!(link.send_information(&[0x33]), Err(Error::WindowFull));
         assert_eq!(receive(&mut link, &[4, 5, 1, 2]), Vec::new());
+        assert_eq!(link.pending_information_len(), 0);
         assert_eq!(
             link.send_information(&[0x33]).unwrap(),
             vec![4, 4, 2, 0, 0x33]
         );
+        assert_eq!(link.pending_information_len(), 1);
     }
 
     #[test]
