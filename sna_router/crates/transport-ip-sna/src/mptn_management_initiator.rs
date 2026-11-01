@@ -44,7 +44,7 @@ pub enum Phase {
 pub struct ManagementInitiator {
     request: Connect,
     connect_bytes: Vec<u8>,
-    fqpcid: [u8; 22],
+    fqpcid: Vec<u8>,
     cnos: CnosGds,
     phase: Phase,
     pending_unbind: Option<Vec<u8>>,
@@ -66,8 +66,8 @@ fn name(name: &str) -> io::Result<Vec<u8>> {
     let (Some(netid), Some(cp), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(invalid("management LU must be network-qualified"));
     };
-    if netid.is_empty() || netid.len() > 8 || cp.is_empty() || cp.len() > 8 || name.len() != 11 {
-        return Err(invalid("unsupported V5R4 management LU length"));
+    if netid.is_empty() || netid.len() > 8 || cp.is_empty() || cp.len() > 8 {
+        return Err(invalid("invalid V5R4 management LU length"));
     }
     name.bytes()
         .map(|byte| {
@@ -100,7 +100,7 @@ impl ManagementInitiator {
     pub fn new(
         local_lu: &str,
         remote_lu: &str,
-        fqpcid: [u8; 22],
+        fqpcid: impl Into<Vec<u8>>,
         correlator: [u8; 8],
         bind_token: [u8; 7],
         mode: &str,
@@ -108,9 +108,11 @@ impl ManagementInitiator {
     ) -> io::Result<Self> {
         let local = name(local_lu)?;
         let remote = name(remote_lu)?;
+        let fqpcid = fqpcid.into();
         if local == remote
-            || fqpcid[..2] != [0x60, 0x14]
-            || fqpcid[10] != 11
+            || fqpcid.len() != 11 + local.len()
+            || fqpcid[..2] != [0x60, (9 + local.len()) as u8]
+            || fqpcid[10] as usize != local.len()
             || fqpcid[11..] != local
             || fqpcid[2..10].iter().all(|&byte| byte == 0)
             || correlator.iter().all(|&byte| byte == 0)
@@ -140,7 +142,7 @@ impl ManagementInitiator {
         user.extend_from_slice(&MODE);
         user.extend_from_slice(&[9, 3, 1]);
         user.extend_from_slice(&bind_token);
-        user.extend_from_slice(&[12, 4]);
+        user.extend_from_slice(&[(local.len() + 1) as u8, 4]);
         user.extend_from_slice(&local);
         user.extend_from_slice(&[10, 0x13, 0, 0xb0]);
         user.extend_from_slice(&bind_token);
@@ -155,8 +157,8 @@ impl ManagementInitiator {
         data.extend_from_slice(&remote);
         data.extend_from_slice(&fqpcid);
         data.extend_from_slice(&TAIL);
-        if data.len() != 137 {
-            return Err(invalid("V5R4 management BIND is not the captured profile"));
+        if data.len() != 93 + 3 * local.len() + remote.len() {
+            return Err(invalid("V5R4 management BIND length mismatch"));
         }
         let request = Connect {
             direction: Direction::Request,
@@ -199,10 +201,10 @@ impl ManagementInitiator {
             ],
         };
         let connect_bytes = request.encode()?;
-        if connect_bytes.len() != 230 {
-            return Err(invalid(
-                "V5R4 management Connect is not the captured profile",
-            ));
+        if connect_bytes.len()
+            != 164 + 4 * request.source.node.len() + 2 * request.destination.node.len()
+        {
+            return Err(invalid("V5R4 management Connect length mismatch"));
         }
         Ok(Self {
             request,
@@ -245,15 +247,15 @@ impl ManagementInitiator {
             || response.options[2].value != [1]
             || response.options[3].value != REQUIRED
             || response.options[4].value != [0x84]
-            || response.connection_data().len() != 96
+            || response.connection_data().len() != 63 + self.request.destination.node.len() + self.fqpcid.len()
             || response.connection_data()[5..32] != RESPONSE_FIXED
-            || response.connection_data()[61..65] != [10, 0x13, 0, 0xb0]
-            || response.connection_data()[65] != 0x23
+            || response.connection_data()[50 + self.request.destination.node.len()..54 + self.request.destination.node.len()] != [10, 0x13, 0, 0xb0]
+            || response.connection_data()[54 + self.request.destination.node.len()] != 0x23
             // Both the direct V5R4 response and B's reply to our minted
             // instance end X'13' in zero; its preceding dynamic flag was
             // X'80' in the former and X'00' in the latter.
-            || !matches!(response.connection_data()[70], 0 | 0x80)
-            || response.connection_data()[71] != 0
+            || !matches!(response.connection_data()[59 + self.request.destination.node.len()], 0 | 0x80)
+            || response.connection_data()[60 + self.request.destination.node.len()] != 0
             || required_from_connect(&response).is_err()
             || validate_positive_response(
                 self.request.connection_data(),
@@ -373,19 +375,54 @@ mod tests {
         response.processing = 0x8a;
         let mut user = vec![0, 9, 2];
         user.extend_from_slice(&MODE);
-        user.extend_from_slice(&[2, 3, 2, 12, 5]);
+        user.extend_from_slice(&[2, 3, 2, (request.destination.node.len() + 1) as u8, 5]);
         user.extend_from_slice(&request.destination.node);
         user.extend_from_slice(&[10, 0x13, 0, 0xb0, 0x23, 0x33, 0x33, 0x33, 0x33, 0x80, 0]);
-        assert_eq!(user.len(), 38);
+        assert_eq!(user.len(), 27 + request.destination.node.len());
         let mut data = vec![0, 0, 0xeb, 0x80, 0];
         data.extend_from_slice(&RESPONSE_FIXED);
         data.extend_from_slice(&[0, user.len() as u8]);
         data.extend_from_slice(&user);
         data.extend_from_slice(&[0, 0]);
-        data.extend_from_slice(&ids().0);
-        assert_eq!(data.len(), 96);
+        let request_data = request.connection_data();
+        let fqpcid_len = 11 + request.source.node.len();
+        data.extend_from_slice(
+            &request_data[request_data.len() - 12 - fqpcid_len..request_data.len() - 12],
+        );
+        assert_eq!(data.len(), 63 + request.destination.node.len() + fqpcid_len);
         response.options[1].value = data;
         response.encode().unwrap()
+    }
+
+    #[test]
+    fn qa_cross_netid_management_exchange_preserves_variable_fqpcid() {
+        let local = name("QAALICE.SNAA").unwrap();
+        let mut fqpcid = vec![0x60, (9 + local.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(local.len() as u8);
+        fqpcid.extend_from_slice(&local);
+        let mut peer = ManagementInitiator::new(
+            "QAALICE.SNAA",
+            "QABOB.SNAB",
+            fqpcid.clone(),
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let request = Connect::decode(peer.connect_request()).unwrap();
+        assert_eq!(request.source.node.len(), 12);
+        assert_eq!(request.destination.node.len(), 10);
+        assert_eq!(request.connection_data().len(), 139);
+        assert_eq!(peer.connect_request().len(), 232);
+        let positive = positive(&request);
+        assert_eq!(
+            Connect::decode(&positive).unwrap().connection_data().len(),
+            96
+        );
+        assert_eq!(peer.accept_connect_response(&positive).unwrap().len(), 47);
+        assert_eq!(peer.phase(), Phase::AwaitCnosReply);
     }
 
     fn reply() -> Vec<u8> {

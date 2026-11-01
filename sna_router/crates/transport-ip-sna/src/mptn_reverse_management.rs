@@ -8,10 +8,10 @@
 
 use std::io;
 
-use router_core::fid2_session_control::ManagementBind;
+use router_core::fid2_bind::{classify_bind, BindClass};
 
 use crate::{
-    mptn_bind_negotiation::validate_positive_response,
+    mptn_bind_negotiation::{fqpcid_at, validate_positive_response},
     mptn_compensations::{required_from_connect, CompensationSet},
     mptn_connect::{Connect, Direction},
 };
@@ -20,14 +20,13 @@ const V5_MANAGEMENT_FIXED: [u8; 27] = [
     0x31, 0x00, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33, 0x07, 0x87, 0x86, 0x86, 0x87, 0x07, 0x06, 0x02,
     0, 0, 0, 0, 0, 0, 0, 0x94, 0x43, 0, 0,
 ];
-const REDUCED_BIND_BYTES: usize = 137;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReverseManagementConnect {
     /// The complete, validated request is retained for response correlation.
     /// Owning it does not authorize a positive response.
     request: Connect,
-    fqpcid: [u8; 22],
+    fqpcid: Vec<u8>,
 }
 
 impl ReverseManagementConnect {
@@ -35,7 +34,7 @@ impl ReverseManagementConnect {
         &self.request
     }
 
-    pub fn fqpcid(&self) -> &[u8; 22] {
+    pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
     }
 }
@@ -45,7 +44,10 @@ fn invalid(reason: &'static str) -> io::Error {
 }
 
 fn ebcdic_lu(name: &str) -> io::Result<Vec<u8>> {
-    if name.len() < 3 || name.len() > 17 || name.matches('.').count() != 1 {
+    let Some((netid, cp)) = name.split_once('.') else {
+        return Err(invalid("invalid network-qualified LU policy"));
+    };
+    if netid.is_empty() || netid.len() > 8 || cp.is_empty() || cp.len() > 8 || cp.contains('.') {
         return Err(invalid("invalid network-qualified LU policy"));
     }
     name.bytes()
@@ -69,7 +71,7 @@ pub fn classify_reverse_management_connect(
     request: Connect,
     expected_peer_lu: &str,
     expected_local_lu: &str,
-    forbidden_fqpcid: Option<&[u8; 22]>,
+    forbidden_fqpcid: Option<&[u8]>,
 ) -> io::Result<ReverseManagementConnect> {
     request.encode()?; // also validates public fields on constructed values
     if request.direction != Direction::Request
@@ -89,9 +91,7 @@ pub fn classify_reverse_management_connect(
         ));
     }
     let data = request.connection_data();
-    if data.len() != REDUCED_BIND_BYTES
-        || data[..5] != [0, 0, 0x6b, 0x80, 0]
-        || data[5..32] != V5_MANAGEMENT_FIXED
+    if data.len() < 100 || data[..5] != [0, 0, 0x6b, 0x80, 0] || data[5..32] != V5_MANAGEMENT_FIXED
     {
         return Err(invalid(
             "reverse management BIND fixed profile is unsupported",
@@ -100,15 +100,70 @@ pub fn classify_reverse_management_connect(
     let mut synthetic_piu = Vec::with_capacity(data.len() + 4);
     synthetic_piu.extend_from_slice(&[0x2d, 0, 1, 2]);
     synthetic_piu.extend_from_slice(data);
-    let bind = ManagementBind::from_request(&synthetic_piu, expected_peer_lu, expected_local_lu)
-        .map_err(|_| invalid("reverse management BIND mode, LU pair, or FQPCID invalid"))?;
-    if forbidden_fqpcid.is_some_and(|known| bind.fqpcid() == known) {
+    let bind = classify_bind(&synthetic_piu)
+        .map_err(|_| invalid("reverse management BIND structure invalid"))?
+        .ok_or_else(|| invalid("reverse management Connect lacks BIND"))?;
+    if bind.class
+        != (BindClass::Management {
+            mode: "SNASVCMG".into(),
+        })
+        || bind.plu != expected_peer_lu
+        || bind.slu != expected_local_lu
+    {
+        return Err(invalid("reverse management BIND mode or LU pair invalid"));
+    }
+    let source = &request.source.node;
+    let destination = &request.destination.node;
+    let mut cursor = 32;
+    if data[cursor] as usize != source.len()
+        || data[cursor + 1..cursor + 1 + source.len()] != *source
+    {
+        return Err(invalid("reverse management PLU mismatch"));
+    }
+    cursor += 1 + source.len();
+    let user_len = 34 + source.len();
+    if data[cursor] as usize != user_len {
+        return Err(invalid("reverse management user length unsupported"));
+    }
+    cursor += 1;
+    let user = &data[cursor..cursor + user_len];
+    if user[..11] != [0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]
+        || user[11..14] != [9, 3, 1]
+        || user[14] != 0x23
+        || user[19..21] != [0x80, 0]
+        || user[21] as usize != source.len() + 1
+        || user[22] != 4
+        || user[23..23 + source.len()] != *source
+        || user[23 + source.len()..27 + source.len()] != [10, 0x13, 0, 0xb0]
+        || user[27 + source.len()..34 + source.len()] != user[14..21]
+    {
+        return Err(invalid("reverse management user subfields unsupported"));
+    }
+    cursor += user_len;
+    if data[cursor] != 0
+        || data[cursor + 1] as usize != destination.len()
+        || data[cursor + 2..cursor + 2 + destination.len()] != *destination
+    {
+        return Err(invalid("reverse management SLU mismatch"));
+    }
+    cursor += 2 + destination.len();
+    let fqpcid =
+        fqpcid_at(data, cursor).map_err(|_| invalid("reverse management FQPCID invalid"))?;
+    if fqpcid[11..] != *source
+        || data.get(cursor + fqpcid.len()..)
+            != Some(
+                &[
+                    0x2c, 0x0a, 4, 8, 0x7b, 0xc3, 0xd6, 0xd5, 0xd5, 0xc5, 0xc3, 0xe3,
+                ][..],
+            )
+    {
+        return Err(invalid("reverse management FQPCID or trailer invalid"));
+    }
+    if forbidden_fqpcid.is_some_and(|known| fqpcid == known) {
         return Err(invalid("reverse management FQPCID reuses native session"));
     }
-    Ok(ReverseManagementConnect {
-        request,
-        fqpcid: *bind.fqpcid(),
-    })
+    let fqpcid = fqpcid.to_vec();
+    Ok(ReverseManagementConnect { request, fqpcid })
 }
 
 /// Build a structural positive-response *candidate* for the admitted V5R4
@@ -189,6 +244,7 @@ pub fn candidate_positive_management_response(
 mod tests {
     use super::*;
     use crate::mptn_connect::{Address, OptionalField, TransportRequirements};
+    use crate::mptn_management_initiator::ManagementInitiator;
 
     fn hex(value: &str) -> Vec<u8> {
         value
@@ -196,6 +252,37 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn classifies_qa_cross_netid_management_bind() {
+        let source = ebcdic_lu("QAALICE.SNAA").unwrap();
+        let mut fqpcid = vec![0x60, (9 + source.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(source.len() as u8);
+        fqpcid.extend_from_slice(&source);
+        let initiated = ManagementInitiator::new(
+            "QAALICE.SNAA",
+            "QABOB.SNAB",
+            fqpcid.clone(),
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let request = Connect::decode(initiated.connect_request()).unwrap();
+        let admitted =
+            classify_reverse_management_connect(request, "QAALICE.SNAA", "QABOB.SNAB", None)
+                .unwrap();
+        assert_eq!(admitted.fqpcid(), fqpcid);
+        let response = candidate_positive_management_response(
+            &admitted,
+            CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83]).unwrap(),
+        )
+        .unwrap();
+        assert!(admitted.request().matches_response(&response));
+        assert_eq!(response.connection_data().len(), 85);
     }
 
     fn captured_shape() -> Connect {
@@ -210,7 +297,7 @@ mod tests {
             "601422222222222222220be2d6d3d5c5e34be2d5c1c2",
             "2c0a04087bc3d6d5d5c5c3e3"
         ));
-        assert_eq!(reduced_bind.len(), REDUCED_BIND_BYTES);
+        assert_eq!(reduced_bind.len(), 137);
         let request = Connect {
             direction: Direction::Request,
             processing: 0x0a,

@@ -42,6 +42,20 @@ fn take_len<'a>(ru: &'a [u8], offset: &mut usize) -> Result<&'a [u8], BindNegoti
     Ok(field)
 }
 
+/// X'60' FQPCID has an eight-byte PCID followed by a variable length
+/// network-qualified CP name (IBM SNA Formats GA27-3136, chapter 8).
+pub(crate) fn fqpcid_at(data: &[u8], offset: usize) -> Result<&[u8], BindNegotiationError> {
+    let header = data
+        .get(offset..offset + 11)
+        .ok_or(BindNegotiationError::Truncated)?;
+    let cp_len = header[10] as usize;
+    if header[0] != 0x60 || !(3..=17).contains(&cp_len) || header[1] as usize != 9 + cp_len {
+        return Err(BindNegotiationError::Unsupported);
+    }
+    data.get(offset..offset + 11 + cp_len)
+        .ok_or(BindNegotiationError::Truncated)
+}
+
 fn user_identity(user: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), BindNegotiationError> {
     if user.first() != Some(&0) {
         return Err(BindNegotiationError::Unsupported);
@@ -97,12 +111,7 @@ fn fields(data: &[u8], response: bool) -> Result<BindFields<'_>, BindNegotiation
     if (response && (!plu.is_empty() || !slu.is_empty())) || !urc.is_empty() {
         return Err(BindNegotiationError::Unsupported);
     }
-    let fqpcid = ru
-        .get(cursor..cursor + 22)
-        .ok_or(BindNegotiationError::Truncated)?;
-    if fqpcid[..2] != [0x60, 0x14] {
-        return Err(BindNegotiationError::Unsupported);
-    }
+    let fqpcid = fqpcid_at(ru, cursor)?;
     let (mode, user_slu) = user_identity(user)?;
     Ok(BindFields {
         fixed: &ru[..27],

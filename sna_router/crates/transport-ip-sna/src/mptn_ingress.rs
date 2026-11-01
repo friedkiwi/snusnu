@@ -10,6 +10,7 @@ use router_core::fid2_bind::{classify_bind, BindClass};
 
 use crate::{
     anynet::{TcpKind, TcpRecord},
+    mptn_bind_negotiation::fqpcid_at,
     mptn_compensations::{required_from_connect, CompensationSet},
     mptn_connect::{Connect, Direction},
     mptn_reverse_management::classify_reverse_management_connect,
@@ -31,7 +32,7 @@ pub enum IngressKind {
 pub struct IngressOffer {
     connect: Connect,
     kind: IngressKind,
-    fqpcid: [u8; 22],
+    fqpcid: Vec<u8>,
 }
 
 impl IngressOffer {
@@ -41,7 +42,7 @@ impl IngressOffer {
     pub fn kind(&self) -> &IngressKind {
         &self.kind
     }
-    pub fn fqpcid(&self) -> &[u8; 22] {
+    pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
     }
 }
@@ -64,7 +65,7 @@ pub struct IngressPolicy {
     /// Actual handlers, never merely the peer's advertised code list.
     pub available_compensations: CompensationSet,
     /// A management FQPCID already active on another leg must not be reused.
-    pub forbidden_fqpcid: Option<[u8; 22]>,
+    pub forbidden_fqpcid: Option<Vec<u8>>,
 }
 
 pub struct IngressSession {
@@ -101,41 +102,62 @@ fn name(value: &str) -> io::Result<Vec<u8>> {
         .collect()
 }
 
-fn user_fqpcid(data: &[u8], source: &[u8], destination: &[u8]) -> io::Result<[u8; 22]> {
-    // The direct V5R4 user BIND has 11-byte PLU/SLU, a fixed 45-byte user
-    // field, a 22-byte FQPCID, and X'2C' '#CONNECT' trailer. Other shapes
-    // need their own verified profile before an ingress session can open.
-    if source.len() != 11
-        || destination.len() != 11
-        || data.len() != 137
+fn user_fqpcid(data: &[u8], source: &[u8], destination: &[u8]) -> io::Result<Vec<u8>> {
+    // The fixed V5R4 profile is preserved while PLU, SLU, user subfield and
+    // X'60' CV lengths follow their explicitly encoded network-qualified names.
+    if data.len() != 93 + 3 * source.len() + destination.len()
         || data[..5] != [0, 0, 0x6b, 0x80, 0]
         || data[5..32] != USER_FIXED
-        || data[32] != 11
-        || data[33..44] != *source
-        || data[44..48] != [45, 0, 9, 2]
-        || data[56..59] != [9, 3, 1]
-        || data[59] != 0x23
-        || data[64..66] != [0, 0]
-        || data[66..68] != [12, 4]
-        || data[68..79] != *source
-        || data[79..83] != [10, 0x13, 0, 0xb0]
-        || data[83..90] != data[59..66]
-        || data[90..92] != [0, 11]
-        || data[92..103] != *destination
-        || data[125..129] != [0x2c, 10, 1, 8]
-        || data[129..137] != CONNECT_TAIL
     {
         return Err(invalid("unsupported V5R4 user BIND profile"));
     }
-    let fqpcid: [u8; 22] = data[103..125].try_into().unwrap();
-    if fqpcid[..2] != [0x60, 0x14]
-        || fqpcid[2..10].iter().all(|byte| *byte == 0)
-        || fqpcid[10] != 11
-        || fqpcid[11..] != *source
+    let mut cursor = 32;
+    if data[cursor] as usize != source.len()
+        || data[cursor + 1..cursor + 1 + source.len()] != *source
     {
-        return Err(invalid("user BIND FQPCID does not name its source LU"));
+        return Err(invalid("user BIND PLU mismatch"));
     }
-    Ok(fqpcid)
+    cursor += 1 + source.len();
+    let user_len = 34 + source.len();
+    if data[cursor] as usize != user_len {
+        return Err(invalid("unsupported V5R4 user field length"));
+    }
+    cursor += 1;
+    let user = &data[cursor..cursor + user_len];
+    if user[..3] != [0, 9, 2]
+        || user[3..11] != [0x40; 8]
+        || user[11..14] != [9, 3, 1]
+        || user[14] != 0x23
+        || user[19..21] != [0, 0]
+        || user[21] as usize != source.len() + 1
+        || user[22] != 4
+        || user[23..23 + source.len()] != *source
+        || user[23 + source.len()..27 + source.len()] != [10, 0x13, 0, 0xb0]
+        || user[27 + source.len()..34 + source.len()] != user[14..21]
+    {
+        return Err(invalid("unsupported V5R4 user BIND subfields"));
+    }
+    cursor += user_len;
+    if data[cursor] != 0
+        || data[cursor + 1] as usize != destination.len()
+        || data[cursor + 2..cursor + 2 + destination.len()] != *destination
+    {
+        return Err(invalid("user BIND SLU mismatch"));
+    }
+    cursor += 2 + destination.len();
+    let fqpcid = fqpcid_at(data, cursor).map_err(|_| invalid("malformed user BIND FQPCID"))?;
+    let trailer = data
+        .get(cursor + fqpcid.len()..)
+        .ok_or_else(|| invalid("user BIND trailer is truncated"))?;
+    if fqpcid[2..10].iter().all(|byte| *byte == 0)
+        || fqpcid[11..] != *source
+        || trailer.len() != 12
+        || trailer[..4] != [0x2c, 10, 1, 8]
+        || trailer[4..] != CONNECT_TAIL
+    {
+        return Err(invalid("user BIND FQPCID or trailer mismatch"));
+    }
+    Ok(fqpcid.to_vec())
 }
 
 impl IngressSession {
@@ -229,9 +251,9 @@ impl IngressSession {
                     connect.clone(),
                     &self.policy.source_lu,
                     &self.policy.destination_lu,
-                    self.policy.forbidden_fqpcid.as_ref(),
+                    self.policy.forbidden_fqpcid.as_deref(),
                 )?;
-                (IngressKind::Management, *admitted.fqpcid())
+                (IngressKind::Management, admitted.fqpcid().to_vec())
             }
             BindClass::Management { .. } => return Err(invalid("unsupported management mode")),
             BindClass::NamedLu62 { mode }
@@ -255,7 +277,7 @@ impl IngressSession {
                 ))
             }
         };
-        if self.policy.forbidden_fqpcid.as_ref() == Some(&fqpcid) {
+        if self.policy.forbidden_fqpcid.as_deref() == Some(fqpcid.as_slice()) {
             return Err(invalid("inbound BIND reuses active FQPCID"));
         }
         Ok(IngressOffer {
@@ -297,6 +319,34 @@ mod tests {
         ));
         assert_eq!(data.len(), 137);
         data[92..103].copy_from_slice(&name("OTHNET.SNAB").unwrap());
+        data
+    }
+
+    fn variable_data(source: &str, destination: &str) -> Vec<u8> {
+        let source = name(source).unwrap();
+        let destination = name(destination).unwrap();
+        let token = [0x23, 0x11, 0x11, 0x11, 0x11, 0, 0];
+        let mut data = vec![0, 0, 0x6b, 0x80, 0];
+        data.extend_from_slice(&USER_FIXED);
+        data.push(source.len() as u8);
+        data.extend_from_slice(&source);
+        data.push((34 + source.len()) as u8);
+        data.extend_from_slice(&[0, 9, 2]);
+        data.extend_from_slice(&[0x40; 8]);
+        data.extend_from_slice(&[9, 3, 1]);
+        data.extend_from_slice(&token);
+        data.extend_from_slice(&[(source.len() + 1) as u8, 4]);
+        data.extend_from_slice(&source);
+        data.extend_from_slice(&[10, 0x13, 0, 0xb0]);
+        data.extend_from_slice(&token);
+        data.extend_from_slice(&[0, destination.len() as u8]);
+        data.extend_from_slice(&destination);
+        data.extend_from_slice(&[0x60, (9 + source.len()) as u8]);
+        data.extend_from_slice(&[0x22; 8]);
+        data.push(source.len() as u8);
+        data.extend_from_slice(&source);
+        data.extend_from_slice(&[0x2c, 10, 1, 8]);
+        data.extend_from_slice(&CONNECT_TAIL);
         data
     }
 
@@ -387,6 +437,30 @@ mod tests {
     }
 
     #[test]
+    fn admits_qa_netids_with_independent_name_and_fqpcid_lengths() {
+        assert_eq!(variable_data("SOLNET.SNAA", "OTHNET.SNAB"), request_data());
+        let mut qa = policy();
+        qa.source_lu = "QAALICE.SNAA".into();
+        qa.destination_lu = "QABOB.SNAB".into();
+        let mut request = connect(variable_data(&qa.source_lu, &qa.destination_lu));
+        request.source.node = name(&qa.source_lu).unwrap();
+        request.destination.node = name(&qa.destination_lu).unwrap();
+        let mut ingress = IngressSession::new(qa).unwrap();
+        let offer = ingress.receive(&request.encode().unwrap()).unwrap();
+        assert_eq!(
+            offer.kind(),
+            &IngressKind::User {
+                mode: String::new()
+            }
+        );
+        assert_eq!(offer.fqpcid().len(), 23);
+        assert_eq!(offer.fqpcid()[1], 21);
+        assert_eq!(&offer.fqpcid()[11..], name("QAALICE.SNAA").unwrap());
+        assert_eq!(offer.connect().source.node.len(), 12);
+        assert_eq!(offer.connect().destination.node.len(), 10);
+    }
+
+    #[test]
     fn rejects_wrong_lu_fqpcid_mode_and_missing_handler() {
         let request = connect(request_data());
         let mut wrong_name = request.clone();
@@ -445,7 +519,7 @@ mod tests {
         let offer = ingress.receive(&request.encode().unwrap()).unwrap();
         assert_eq!(offer.kind(), &IngressKind::Management);
         let mut duplicate = policy();
-        duplicate.forbidden_fqpcid = Some(*offer.fqpcid());
+        duplicate.forbidden_fqpcid = Some(offer.fqpcid().to_vec());
         assert!(IngressSession::new(duplicate)
             .unwrap()
             .receive(&request.encode().unwrap())
