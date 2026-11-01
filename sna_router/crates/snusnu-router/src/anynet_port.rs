@@ -25,6 +25,7 @@ struct SessionIdentity {
     source: Vec<u8>,
     destination: Vec<u8>,
     correlator: Vec<u8>,
+    request_from_peer: bool,
     accepted: bool,
 }
 
@@ -324,6 +325,7 @@ impl AnyNetPort {
                     source: connect.source.node,
                     destination: connect.destination.node,
                     correlator: connect.correlator,
+                    request_from_peer: from_peer,
                     accepted: false,
                 });
                 Ok(())
@@ -338,6 +340,7 @@ impl AnyNetPort {
                 if identity.source != connect.source.node
                     || identity.destination != connect.destination.node
                     || identity.correlator != connect.correlator
+                    || identity.request_from_peer == from_peer
                     || identity.accepted
                 {
                     return Err(io::Error::new(
@@ -751,5 +754,22 @@ mod tests {
                 .is_some_and(|events| matches!(events.as_slice(), [RouterEvent::Closed]));
             closed
         });
+    }
+
+    #[test]
+    fn connect_response_must_arrive_from_opposite_leg() {
+        let mut port = AnyNetPort::open_at(
+            IpAddr::V4(Ipv4Addr::new(127, 85, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 85, 0, 2)),
+            18_399,
+        )
+        .unwrap();
+        let request = TcpRecord::decode(CONNECT.to_vec()).unwrap();
+        port.validate_record(&request, true).unwrap();
+        let mut bytes = CONNECT.to_vec();
+        bytes[5] = 0x8a;
+        let response = TcpRecord::decode(bytes).unwrap();
+        assert!(port.validate_record(&response, true).is_err());
+        port.validate_record(&response, false).unwrap();
     }
 }
