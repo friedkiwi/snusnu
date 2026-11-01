@@ -57,15 +57,11 @@ An EE link can also be attached without any LLC peers. Each `[[ee]]` entry binds
 id = "ee_a"
 local_ip = "192.0.2.1"
 peer_ip = "192.0.2.11"
-local_lu = "SOLNET.SNAA"
-remote_lu = "SOLNET.SNAB"
 
 [[ee]]
 id = "ee_b"
 local_ip = "192.0.2.2"
 peer_ip = "192.0.2.12"
-local_lu = "SOLNET.SNAB"
-remote_lu = "SOLNET.SNAA"
 
 [[route]]
 from = "ee_a"
@@ -73,6 +69,8 @@ to = "ee_b"
 ```
 
 EE↔EE relays EE datagrams. The loader rejects LLC↔EE routes and does not translate LLC2 PIUs into AnyNet MPTN or HPR records. Those profiles require explicit protocol converters.
+
+The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this EE configuration on two isolated TAPs.
 
 ## Constrained AnyNet relay
 
@@ -83,17 +81,21 @@ Two `[[anynet]]` ports can form a standalone AnyNet↔AnyNet route. Each port bi
 id = "mptn_a"
 local_ip = "192.0.2.1"
 peer_ip = "192.0.2.11"
+local_lu = "SOLNET.SNAA"
+remote_lu = "SOLNET.SNAB"
 
 [[anynet]]
 id = "mptn_b"
 local_ip = "192.0.2.2"
 peer_ip = "192.0.2.12"
+local_lu = "SOLNET.SNAB"
+remote_lu = "SOLNET.SNAA"
 
 [[route]]
 from = "mptn_a"
 to = "mptn_b"
 ```
 
-Each `local_ip` must already be assigned on the host. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate AnyNet listener IPs and routes between AnyNet and LLC, EE or WebSocket profiles until a session converter is implemented. IBM's AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
+Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 397 requires root or `CAP_NET_BIND_SERVICE`. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate AnyNet listener IPs and routes between AnyNet and LLC, EE or WebSocket profiles until a session converter is implemented. IBM's AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
 
-The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this configuration on two isolated TAPs.
+The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the configured TCP relay.
