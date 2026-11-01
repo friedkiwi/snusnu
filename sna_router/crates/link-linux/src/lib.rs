@@ -1,6 +1,9 @@
-//! Boundary for future Linux packet I/O. No live adapter exists yet.
+//! Linux packet I/O boundary.
 
 use router_core::CircuitId;
+
+#[cfg(target_os = "linux")]
+pub mod packet;
 
 pub trait LinkPort {
     type Error;

@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 router-core = { path = "../router-core" }
+libc = "0.2"
