@@ -56,3 +56,59 @@ The native APPN answer side, bidirectional session conversion, and remote
 circuit mapping must be ready before running the final test. Do not change
 the `SOLNET` regression guests or start the QA concentrator as part of guest
 preparation.
+
+## Prepared clone state
+
+Both cold copies booted and reached Main Menu on 2026-11-02. Their original
+`SOLNET` guests were powered off during the copies to keep the DASD images
+consistent. On the V4 copy, the following changes succeeded with its APPC
+controllers varied off:
+
+```text
+VRYCFG CFGOBJ(SNAB) CFGTYPE(*CTL) STATUS(*OFF)
+VRYCFG CFGOBJ(QILANM3601) CFGTYPE(*CTL) STATUS(*OFF)
+CHGNETA LCLNETID(QAALICE)
+CHGCTLAPPC CTLD(SNAB) RMTNETID(QABOB) RMTCPNAME(SNAB) ADPTADR(02534E000002) INLCNN(*ANS)
+```
+
+`DSPNETA` confirmed `QAALICE.SNAA`, and `DSPCTLD SNAB` confirmed remote
+`QABOB.SNAB`, answer mode, and the expected Bob managed MAC. The managed MAC
+must still be compared with the actual fresh QA address-book assignment.
+An opt-in active-XID probe on isolated `sol8` then reached LLC2 contact:
+Alice answered the null XID, negotiated XID3, and sent SABME to Rust; the
+probe answered UA. The probe stopped before any application session. Alice's
+`SNAB` controller and device were varied off afterward.
+
+On the V5 copy, `ANYTOA` and the automatically created virtual APPN
+controller `QAPEND0001` had to be varied off before `CHGNETA` would accept
+the NETID change. The following changes then succeeded:
+
+```text
+CHGNETA LCLNETID(QABOB)
+CHGCTLAPPC CTLD(ANYTOA) RMTNETID(QAALICE) RMTCPNAME(SNAA)
+RMVTCPHTE INTNETADR('10.99.4.10')
+ADDTCPHTE INTNETADR('10.99.4.11') HOSTNAME(SNAA.QAALICE.SNA.IBM.COM)
+```
+
+`CHGCFGL TYPE(*APPNRMT)` provided the V5R4 entry screen; the existing
+`SNAA` row was edited to remote NETID `QAALICE`, local location `SNAB`,
+remote CP `SNAA`, and CP NETID `QAALICE`. `DSPNETA`, `DSPCTLD ANYTOA`,
+the configuration-list screen, and `CFGTCP` option 10 confirmed the new
+values. The system hostname entry was preserved. `QAPEND0001` and
+`ANYTOA` were then varied on. The IBM [AnyNet setup guide](https://www.ibm.com/support/pages/setting-ibm-anynet-os400-system)
+describes the `location.NETID.SNA.IBM.COM` host alias and `QAPPNRMT`
+relationship.
+
+The source `SOLNET` V5 guest also uses IP `10.99.4.3` on a different TAP.
+The host therefore uses a source policy route for Bob's copied guest rather
+than replacing the source guest's main-table route:
+
+```sh
+sudo ip addr add 10.99.4.11/32 dev sol9
+sudo ip route add 10.99.4.3/32 dev sol9 src 10.99.4.11 table 109
+sudo ip rule add pref 1009 from 10.99.4.11/32 lookup 109
+```
+
+`ip route get 10.99.4.3 from 10.99.4.11` selected `sol9`, while the
+unchanged `.10` source selected `sol7`; two source-pinned pings to Bob's
+guest succeeded. The TAPs remain outside any bridge.
