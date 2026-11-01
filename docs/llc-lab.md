@@ -172,6 +172,12 @@ Run `snusnu-router --native-probe probe.toml` with `CAP_NET_RAW` and optionally
 first management BIND arrived. Protocol errors and the configured timeout
 exit with status 1. An operator interrupt exits without a success claim.
 
+For an OS/400 controller configured with `INLCNN(*ANS)`, set `active_xid = true`
+in the probe TOML and keep `role = "secondary"`. The probe sends the initial
+null XID, follows with its locally configured XID3, waits for the guest's
+SABME, and exits successfully at LLC2 contact. It stops before sending a
+management BIND. The option is available only with `--native-probe`.
+
 On 2026-11-01, the one-guest probe reached this milestone against the
 isolated V4R4 SNAA guest on `sol5` with the fixed-secondary SNAB profile
 above. The guest sent a null XID, then prenegotiation and negotiation XID3s.

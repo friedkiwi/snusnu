@@ -192,6 +192,10 @@ impl NativePeerPort {
         Ok(())
     }
 
+    pub(crate) fn link_established(&self) -> bool {
+        self.type1.phase() == Phase::ReadyForSabme && self.endpoint.state() == State::Connected
+    }
+
     pub(crate) fn enqueue_converter_piu(&mut self, piu: &[u8]) -> io::Result<bool> {
         if self.converter_policy.is_none() {
             return Err(io::Error::new(

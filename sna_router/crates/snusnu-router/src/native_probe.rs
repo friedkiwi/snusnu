@@ -33,6 +33,10 @@ pub(crate) struct ProbeConfig {
     pub(crate) local_node_id: String,
     pub(crate) tg_number: u8,
     pub(crate) role: ProbeRole,
+    /// Opt in to starting XID toward an answering controller. The plain
+    /// probe then stops after LLC2 contact, before management initiation.
+    #[serde(default)]
+    pub(crate) active_xid: bool,
     #[serde(default = "default_timeout")]
     pub(crate) timeout_seconds: u64,
 }
@@ -131,6 +135,11 @@ fn run_with_mode(
     user_pacing: bool,
 ) -> io::Result<()> {
     let config = ProbeConfig::load(path)?;
+    if config.active_xid && management {
+        return Err(invalid(
+            "active_xid is supported only by the link probe until management initiation is wired",
+        ));
+    }
     let profile = config.profile()?;
     let xid = profile
         .build()
@@ -188,9 +197,16 @@ fn run_with_mode(
     } else {
         NativePeerPort::open(peer, xid)?
     };
+    if config.active_xid {
+        port.begin_active_xid()?;
+    }
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
     while !STOP.load(Ordering::Relaxed) {
         let had_frame = port.poll(true)?.is_some();
+        if config.active_xid && port.link_established() {
+            tracing::info!(peer_cp = ?config.remote_cp, "native active XID probe reached LLC2 contact; stopped before management BIND");
+            return Ok(());
+        }
         if management && !user_bind && port.management_complete() {
             tracing::info!("native management probe completed bounded UNBIND exchange; user routing remains disabled");
             return Ok(());
@@ -209,6 +225,8 @@ fn run_with_mode(
                     "native user BIND probe timed out before peer follow-up"
                 } else if management {
                     "native management probe timed out before UNBIND completion"
+                } else if config.active_xid {
+                    "native active XID probe timed out before LLC2 contact"
                 } else {
                     "native probe timed out before SNASVCMG BIND"
                 },
@@ -245,8 +263,30 @@ role = "primary"
         assert_eq!(profile.max_iframes_before_ack, 1);
         assert_eq!(profile.max_receive_btu, 1496);
         assert_eq!(profile.role, Role::Primary);
+        assert!(!config.active_xid);
         assert_eq!(profile.build().unwrap().node_id(), [0xff, 0xf1, 0x23, 0x45]);
         assert!(parse_node_id("05633950").is_ok());
         assert!(parse_node_id("0563395").is_err());
+    }
+
+    #[test]
+    fn answering_guest_link_probe_requires_explicit_active_xid() {
+        let config: ProbeConfig = toml::from_str(
+            r#"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:02"
+proxy_mac = "02:00:35:27:23:01"
+local_cp = "QAALICE.SNAA"
+remote_cp = "QABOB.SNAB"
+local_station = "SNAA"
+local_node_id = "fff12345"
+tg_number = 1
+role = "secondary"
+active_xid = true
+"#,
+        )
+        .unwrap();
+        assert!(config.active_xid);
+        assert_eq!(config.profile().unwrap().role, Role::Secondary);
     }
 }
