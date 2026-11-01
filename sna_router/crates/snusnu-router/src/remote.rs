@@ -1096,12 +1096,22 @@ fn accept_managed_revision(last: &mut u64, next: u64) -> io::Result<()> {
 
 fn validate_managed_bindings(bindings: &[wire::ManagedCpBinding]) -> io::Result<()> {
     let mut addresses = HashSet::new();
+    let mut address_ids = HashSet::new();
+    let mut control_points = HashSet::new();
     for binding in bindings {
+        let cp = binding
+            .control_point
+            .as_ref()
+            .ok_or_else(|| protocol("managed binding missing CP"))?;
+        validate_name(cp)?;
         if binding.virtual_mac.len() != 6
             || binding.virtual_mac[..3] != [0x02, 0x53, 0x4e]
             || !addresses.insert(binding.virtual_mac.as_slice())
+            || binding.address_id.len() != 16
+            || !address_ids.insert(binding.address_id.as_slice())
+            || !control_points.insert((cp.netid.as_str(), cp.name.as_str()))
         {
-            return Err(protocol("invalid or duplicate managed virtual MAC"));
+            return Err(protocol("invalid or duplicate managed CP binding"));
         }
     }
     Ok(())
@@ -1604,14 +1614,111 @@ mod tests {
     fn validates_managed_virtual_mac_namespace_and_uniqueness() {
         let binding = |mac: &[u8]| wire::ManagedCpBinding {
             address_id: vec![1; 16],
-            control_point: None,
+            control_point: Some(name("SOLNET", "PEERA")),
             virtual_mac: mac.to_vec(),
             candidates: vec![],
         };
         let valid = binding(&[0x02, 0x53, 0x4e, 0, 0, 1]);
         assert!(validate_managed_bindings(&[valid.clone()]).is_ok());
-        assert!(validate_managed_bindings(&[valid.clone(), valid]).is_err());
+        assert!(validate_managed_bindings(&[valid.clone(), valid.clone()]).is_err());
         assert!(validate_managed_bindings(&[binding(&[0x02, 0x53, 0x4f, 0, 0, 1])]).is_err());
+        let mut duplicate_cp = binding(&[0x02, 0x53, 0x4e, 0, 0, 2]);
+        duplicate_cp.address_id = vec![2; 16];
+        assert!(validate_managed_bindings(&[valid.clone(), duplicate_cp]).is_err());
+        let mut duplicate_id = binding(&[0x02, 0x53, 0x4e, 0, 0, 2]);
+        duplicate_id.control_point = Some(name("SOLNET", "PEERB"));
+        assert!(validate_managed_bindings(&[valid.clone(), duplicate_id]).is_err());
+        let mut missing_cp = valid.clone();
+        missing_cp.control_point = None;
+        assert!(validate_managed_bindings(&[missing_cp]).is_err());
+        let mut short_id = valid;
+        short_id.address_id.pop();
+        assert!(validate_managed_bindings(&[short_id]).is_err());
+    }
+
+    #[test]
+    fn duplicate_managed_cp_snapshot_is_rejected_before_a_route_can_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |_: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            socket
+                .send(WsMessage::Binary(
+                    envelope(wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                        router_id: vec![7; 16],
+                        connection_epoch: vec![8; 16],
+                        max_message_bytes: 65536,
+                        max_circuits: 1,
+                        display_name: "test router".into(),
+                    }))
+                    .encode_to_vec()
+                    .into(),
+                ))
+                .unwrap();
+            let WsMessage::Binary(_) = socket.read().unwrap() else {
+                panic!("expected published local routes");
+            };
+            let binding = |id, mac| wire::ManagedCpBinding {
+                address_id: vec![id; 16],
+                control_point: Some(name("SOLNET", "PEERA")),
+                virtual_mac: vec![0x02, 0x53, 0x4e, 0, 0, mac],
+                candidates: vec![],
+            };
+            socket
+                .send(WsMessage::Binary(
+                    envelope(wire::ws_envelope::Body::ManagedCpBindings(
+                        wire::ManagedCpBindingSnapshot {
+                            schema_version: 1,
+                            recipient_epoch: vec![8; 16],
+                            revision: 1,
+                            bindings: vec![binding(1, 1), binding(2, 2)],
+                        },
+                    ))
+                    .encode_to_vec()
+                    .into(),
+                ))
+                .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        let mut port = WsRoutePort::connect_many(
+            vec![Config {
+                url,
+                bearer: "test-token".into(),
+                local_cp: name("SOLNET", "SNAA"),
+                target_cp: name("SOLNET", "PEERA"),
+            }],
+            vec![],
+        )
+        .unwrap()
+        .remove(0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = loop {
+            if let Err(error) = port.poll(true) {
+                break error;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "invalid managed snapshot was accepted"
+            );
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(port.managed_mac.is_none());
+        assert!(port.target.is_none());
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
