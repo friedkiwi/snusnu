@@ -387,6 +387,35 @@ mod tests {
     }
 
     #[test]
+    fn decodes_sanitized_v4r4_fixed_fields_at_wire_offsets() {
+        // The fixed area and F4 CP name follow a native V4R4 proceeding
+        // XID3. Node ID and product identity are synthetic. This literal is
+        // independent of the builder under test. The captured primary
+        // proceeded with 0x50 and sent SABME; its secondary answered UA.
+        let primary = [
+            0x32, 0x2f, 0xff, 0xf1, 0x23, 0x45, 0x00, 0x00, 0x00, 0xb4, 0xc0, 0x00, 0x00,
+            0x00, 0x00, 0x80, 0x01, 0x01, 0x0b, 0x50, 0x00, 0x05, 0xd8, 0x00, 0x00, 0x00,
+            0x00, 0x07, 0x00, 0x0e, 0x0c, 0xf4, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3,
+            0x4b, 0xe2, 0xd5, 0xc1, 0xc2, 0x10, 0x02, 0x11, 0x01,
+        ];
+        let xid = Xid3::decode(&primary).unwrap();
+        assert_eq!(xid.role(), Ok(Role::Primary));
+        assert!(xid.abm_capable());
+        assert_eq!(xid.exchange_state(), ExchangeState::NegotiationProceeding);
+        assert_eq!(xid.max_receive_btu(), 1496);
+        assert_eq!(xid.max_iframes_before_ack(), 7);
+        assert_eq!(xid.cp_name().unwrap(), "SOLNET.SNAB");
+        assert_eq!(xid.encode().unwrap(), primary);
+
+        let mut secondary = primary;
+        secondary[19] = 0x40;
+        assert_eq!(Xid3::decode(&secondary).unwrap().role(), Ok(Role::Secondary));
+        let mut negotiable = primary;
+        negotiable[19] = 0x70;
+        assert_eq!(Xid3::decode(&negotiable).unwrap().role(), Ok(Role::Negotiable));
+    }
+
+    #[test]
     fn roundtrip_and_extracts_peer_identity_and_role() {
         let sample = sample();
         let decoded = Xid3::decode(&sample.encode().unwrap()).unwrap();
