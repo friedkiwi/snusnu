@@ -11,10 +11,11 @@ use crate::{
 };
 use router_core::{
     fixed_pacing::is_canonical_ipr,
+    native_management::{ManagementSession, Phase as ResponderPhase},
     native_management_initiator::{NativeManagementInitiator, Phase as ManagementPhase},
     xid3::Xid3,
 };
-use std::io;
+use std::{collections::VecDeque, io};
 use transport_ip_sna::{
     anynet::{TcpKind, TcpRecord},
     mptn_ingress::IngressOffer,
@@ -36,6 +37,15 @@ enum TcpUserOutputKind {
     ExpeditedAck,
 }
 
+#[derive(Clone, Copy)]
+enum ManagementEgress {
+    Initiator,
+    ResponderBind,
+    ResponderAttach,
+    ResponderBis,
+    ResponderUnbind,
+}
+
 pub(crate) struct VirtualWsPort<P: RoutePort> {
     inner: P,
     cp: VirtualNativeCp,
@@ -44,6 +54,8 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     peer_cp: String,
     initial_xid_sent: bool,
     management: Option<NativeManagementInitiator>,
+    reciprocal_management: Option<ManagementSession>,
+    management_egress: VecDeque<ManagementEgress>,
     management_invalidated: bool,
     early_management_information: Option<Vec<u8>>,
     user_bind: Option<ReverseUserBind>,
@@ -79,6 +91,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
             peer_cp: peer_cp.to_owned(),
             initial_xid_sent: false,
             management: None,
+            reciprocal_management: None,
+            management_egress: VecDeque::new(),
             management_invalidated: false,
             early_management_information: None,
             user_bind: None,
@@ -125,6 +139,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.management
             .as_ref()
             .is_some_and(|management| management.phase() == ManagementPhase::Complete)
+            && self
+                .reciprocal_management
+                .as_ref()
+                .is_none_or(|management| management.phase() == ResponderPhase::Closed)
     }
 
     pub(crate) fn begin_user_bind(
@@ -227,6 +245,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.cp = VirtualNativeCp::new(self.local_xid.clone(), &self.local_cp, &self.peer_cp)?;
         self.initial_xid_sent = false;
         self.early_management_information = None;
+        self.reciprocal_management = None;
+        self.management_egress.clear();
         if let Some(user_bind) = self.user_bind.as_mut() {
             user_bind.close();
         }
@@ -289,21 +309,68 @@ impl<P: RoutePort> VirtualWsPort<P> {
         if completed == 0 {
             return Ok(());
         }
-        let management = self
-            .management
-            .as_mut()
-            .ok_or_else(|| protocol("virtual information completion without management"))?;
-        if Self::waiting_management_ack(management.phase()) {
-            management
-                .acknowledge(completed)
-                .map_err(|_| protocol("virtual management LLC acknowledgement mismatch"))?;
-            if let Some(piu) = self.early_management_information.take() {
-                management
-                    .observe(&piu)
-                    .map_err(|_| protocol("early virtual management PIU is invalid"))?;
-                self.inner.on_downstream_completed(1)?;
+        let mut remaining = completed;
+        while let Some(tag) = self.management_egress.pop_front() {
+            if remaining == 0 {
+                self.management_egress.push_front(tag);
+                break;
             }
-        } else if completed == 1
+            remaining -= 1;
+            match tag {
+                ManagementEgress::Initiator => {
+                    let management = self
+                        .management
+                        .as_mut()
+                        .ok_or_else(|| protocol("virtual management absent"))?;
+                    management
+                        .acknowledge(1)
+                        .map_err(|_| protocol("virtual management LLC acknowledgement mismatch"))?;
+                    if let Some(piu) = self.early_management_information.take() {
+                        management
+                            .observe(&piu)
+                            .map_err(|_| protocol("early virtual management PIU is invalid"))?;
+                        self.inner.on_downstream_completed(1)?;
+                    }
+                }
+                ManagementEgress::ResponderBind => {
+                    let responder = self
+                        .reciprocal_management
+                        .as_mut()
+                        .ok_or_else(|| protocol("reciprocal management absent"))?;
+                    responder.acknowledge_bind(1).map_err(|_| {
+                        protocol("reciprocal management BIND acknowledgement mismatch")
+                    })?;
+                    if let Some(piu) = responder.take_early_attach() {
+                        self.receive_reciprocal_management(&piu)?;
+                        self.inner.on_downstream_completed(1)?;
+                    }
+                }
+                ManagementEgress::ResponderAttach => self
+                    .reciprocal_management
+                    .as_mut()
+                    .ok_or_else(|| protocol("reciprocal management absent"))?
+                    .acknowledge_attach_replies(1)
+                    .map_err(|_| protocol("reciprocal management CNOS acknowledgement mismatch"))?,
+                ManagementEgress::ResponderBis => self
+                    .reciprocal_management
+                    .as_mut()
+                    .ok_or_else(|| protocol("reciprocal management absent"))?
+                    .acknowledge_bis(1)
+                    .map_err(|_| protocol("reciprocal management BIS acknowledgement mismatch"))?,
+                ManagementEgress::ResponderUnbind => self
+                    .reciprocal_management
+                    .as_mut()
+                    .ok_or_else(|| protocol("reciprocal management absent"))?
+                    .acknowledge_unbind(1)
+                    .map_err(|_| {
+                        protocol("reciprocal management UNBIND acknowledgement mismatch")
+                    })?,
+            }
+        }
+        if remaining == 0 {
+            return Ok(());
+        }
+        if remaining == 1
             && self
                 .user_bind
                 .as_ref()
@@ -315,7 +382,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 self.accept_user_response(&piu)?;
                 self.inner.on_downstream_completed(1)?;
             }
-        } else if completed == 1 && self.native_user_output_queued {
+        } else if remaining == 1 && self.native_user_output_queued {
             let piu = self
                 .native_user_output
                 .take()
@@ -380,6 +447,103 @@ impl<P: RoutePort> VirtualWsPort<P> {
             management.mark_enqueued(&piu).map_err(|_| {
                 protocol("virtual management egress changed after queue acceptance")
             })?;
+            self.management_egress
+                .push_back(ManagementEgress::Initiator);
+        }
+        Ok(())
+    }
+
+    fn send_reciprocal(&mut self, piu: Vec<u8>, tag: ManagementEgress) -> io::Result<()> {
+        if !self.inner.send(RoutedUnit::SnaInformation(piu))? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "reciprocal management egress has no WebSocket credit",
+            ));
+        }
+        self.management_egress.push_back(tag);
+        Ok(())
+    }
+
+    fn receive_reciprocal_management(&mut self, piu: &[u8]) -> io::Result<()> {
+        if self.reciprocal_management.is_none() {
+            self.reciprocal_management = Some(ManagementSession::new(
+                self.peer_cp.clone(),
+                self.local_cp.clone(),
+            ));
+        }
+        let responder = self.reciprocal_management.as_mut().unwrap();
+        if piu.len() == 9 && piu[6..9] == [0x83, 1, 0] {
+            responder
+                .observe_ipr(piu)
+                .map_err(|_| protocol("reciprocal management IPR invalid"))?;
+            return Ok(());
+        }
+        match responder.phase() {
+            ResponderPhase::AwaitBind => {
+                responder
+                    .observe_bind(piu)
+                    .map_err(|_| protocol("reciprocal management BIND invalid"))?;
+                let response = responder
+                    .prepare_bind_response()
+                    .map_err(|_| protocol("reciprocal management BIND response unavailable"))?
+                    .to_vec();
+                self.send_reciprocal(response.clone(), ManagementEgress::ResponderBind)?;
+                self.reciprocal_management
+                    .as_mut()
+                    .unwrap()
+                    .mark_bind_enqueued(&response)
+                    .map_err(|_| protocol("reciprocal management BIND egress mismatch"))?;
+            }
+            ResponderPhase::AwaitBindAck => responder
+                .buffer_early_attach(piu)
+                .map_err(|_| protocol("reciprocal early CNOS invalid"))?,
+            ResponderPhase::AwaitAttach => {
+                let (ipr, cnos) = responder
+                    .observe_attach(piu)
+                    .map_err(|_| protocol("reciprocal CNOS invalid"))?;
+                let (ipr, cnos) = (ipr.to_vec(), cnos.to_vec());
+                self.send_reciprocal(ipr.clone(), ManagementEgress::ResponderAttach)?;
+                self.send_reciprocal(cnos.clone(), ManagementEgress::ResponderAttach)?;
+                self.reciprocal_management
+                    .as_mut()
+                    .unwrap()
+                    .mark_attach_replies_enqueued(&ipr, &cnos)
+                    .map_err(|_| protocol("reciprocal CNOS egress mismatch"))?;
+            }
+            ResponderPhase::CnosComplete => {
+                let ipr = responder
+                    .observe_remote_bis(piu)
+                    .map_err(|_| protocol("reciprocal BIS invalid"))?
+                    .to_vec();
+                self.send_reciprocal(ipr.clone(), ManagementEgress::ResponderBis)?;
+                let responder = self.reciprocal_management.as_mut().unwrap();
+                responder
+                    .mark_bis_ipr_enqueued(&ipr)
+                    .map_err(|_| protocol("reciprocal BIS IPR egress mismatch"))?;
+                let bis = responder
+                    .prepare_local_bis(true)
+                    .map_err(|_| protocol("reciprocal local BIS unavailable"))?
+                    .to_vec();
+                self.send_reciprocal(bis.clone(), ManagementEgress::ResponderBis)?;
+                self.reciprocal_management
+                    .as_mut()
+                    .unwrap()
+                    .mark_local_bis_enqueued(&bis)
+                    .map_err(|_| protocol("reciprocal BIS egress mismatch"))?;
+            }
+            ResponderPhase::BisComplete => {
+                let response = responder
+                    .prepare_unbind_response(piu)
+                    .map_err(|_| protocol("reciprocal UNBIND invalid"))?
+                    .to_vec();
+                self.send_reciprocal(response.clone(), ManagementEgress::ResponderUnbind)?;
+                self.reciprocal_management
+                    .as_mut()
+                    .unwrap()
+                    .mark_unbind_enqueued(&response)
+                    .map_err(|_| protocol("reciprocal UNBIND egress mismatch"))?;
+            }
+            _ => return Err(protocol("reciprocal management PIU in wrong phase")),
         }
         Ok(())
     }
@@ -488,6 +652,16 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 }
                 RouterEvent::Unit(RoutedUnit::SnaInformation(piu)) => {
                     let mut observed = false;
+                    if self.user_bind.is_none()
+                        && !self.management_complete()
+                        && piu.len() >= 9
+                        && piu[0] & 0x02 == 0
+                        && !(piu.len() == 12 && piu[6..9] == [0x83, 1, 0])
+                    {
+                        self.receive_reciprocal_management(&piu)?;
+                        self.inner.on_downstream_completed(1)?;
+                        continue;
+                    }
                     let management = self.management.as_mut().ok_or_else(|| {
                         protocol("virtual native session handler is not installed")
                     })?;
@@ -758,6 +932,66 @@ mod tests {
         })
         .unwrap();
         ingress.receive(&connect.encode().unwrap()).unwrap().clone()
+    }
+
+    #[test]
+    fn reciprocal_qa_management_bind_keeps_independent_session_and_exact_credit() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::new(
+            inner,
+            xid("QABOB.SNAB", Role::Secondary),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+        )
+        .unwrap();
+        let initiator = NativeManagementInitiator::new(
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            0x2f,
+            1,
+            2,
+            [0xce, 0xc3, 0x74, 0x77, 0xb5, 0xdb, 0xed, 0x8c],
+            [0x23, 0x50, 0x69, 0x47, 0xa1, 0, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        port.attach_management(initiator).unwrap();
+        let reciprocal_bind = hex(concat!(
+            "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
+            "0cd8c1c1d3c9c3c54be2d5c1c12e000902e2d5c1e2e5c3d4c7",
+            "09030123f4fd39d800000d04d8c1c1d3c9c3c54be2d5c1c1",
+            "0a1300b023f4fd39d80000000ad8c1c2d6c24be2d5c1c2",
+            "6015d8e7221f0a531d820cd8c1c1d3c9c3c54be2d5c1c1",
+            "2c0a04087bc3d6d5d5c5c3e3"
+        ));
+        port.handle(vec![RouterEvent::Unit(RoutedUnit::SnaInformation(
+            reciprocal_bind,
+        ))])
+        .unwrap();
+        assert_eq!(port.inner.inbound_completed, 1);
+        assert_eq!(&port.inner.information[0][..9], &hex("2d0002010000eb8000"));
+        assert_eq!(
+            port.reciprocal_management.as_ref().unwrap().phase(),
+            ResponderPhase::AwaitBindAck
+        );
+        assert_eq!(
+            port.management.as_ref().unwrap().phase(),
+            ManagementPhase::BindPrepared
+        );
+        port.inner.completed = 1;
+        port.complete_management_egress().unwrap();
+        assert_eq!(
+            port.reciprocal_management.as_ref().unwrap().phase(),
+            ResponderPhase::AwaitAttach
+        );
     }
 
     #[test]
