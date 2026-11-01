@@ -60,6 +60,9 @@ impl Datagram {
         if port != CONTROL_PORT && kind != LdlcKind::UiNlp {
             return Err(invalid("EE priority port carries non-UI frame"));
         }
+        if kind == LdlcKind::UiNlp && payload[2] != 0x03 {
+            return Err(invalid("EE UI P/F bit must be clear"));
+        }
         if kind == LdlcKind::UiNlp && payload.len() == 3 {
             return Err(invalid("EE UI has no HPR NLP"));
         }
@@ -153,5 +156,6 @@ mod tests {
         assert!(Datagram::decode(HIGH_PORT, vec![4, 4, 0xaf, 0x81]).is_err());
         assert!(Datagram::decode(12005, vec![4, 4, 3, 0x81]).is_err());
         assert!(Datagram::decode(HIGH_PORT, vec![4, 4, 3]).is_err());
+        assert!(Datagram::decode(HIGH_PORT, vec![4, 4, 0x13, 0x81]).is_err());
     }
 }
