@@ -11,9 +11,7 @@ use crate::{
     STOP,
 };
 use router_core::{
-    native_management_initiator::NativeManagementInitiator,
-    xid3::Role,
-    xid3_local::LocalLlcProfile,
+    native_management_initiator::NativeManagementInitiator, xid3::Role, xid3_local::LocalLlcProfile,
 };
 use std::{
     fs::File,
@@ -40,12 +38,21 @@ fn node_id(value: &str) -> io::Result<[u8; 4]> {
         .to_be_bytes())
 }
 
-fn one_gateway(config: &RouterConfig, bearer: &str) -> io::Result<(RemoteConfig, wire::SnaName, LocalLlcProfile, String)> {
-    if config.mptn_gateway.len() != 1 || config.remote.len() != 1 || !config.llc.is_empty()
-        || !config.ee.is_empty() || !config.anynet.is_empty() || !config.hpr_lan.is_empty()
+fn one_gateway(
+    config: &RouterConfig,
+    bearer: &str,
+) -> io::Result<(RemoteConfig, wire::SnaName, LocalLlcProfile, String)> {
+    if config.mptn_gateway.len() != 1
+        || config.remote.len() != 1
+        || !config.llc.is_empty()
+        || !config.ee.is_empty()
+        || !config.anynet.is_empty()
+        || !config.hpr_lan.is_empty()
         || config.route.len() != 1
     {
-        return Err(invalid("virtual management lab needs exactly one gateway, remote and route"));
+        return Err(invalid(
+            "virtual management lab needs exactly one gateway, remote and route",
+        ));
     }
     let gateway = &config.mptn_gateway[0];
     let remote = &config.remote[0];
@@ -54,7 +61,9 @@ fn one_gateway(config: &RouterConfig, bearer: &str) -> io::Result<(RemoteConfig,
         .get(&gateway.source_lu)
         .is_some_and(|types| types.contains(&ConfiguredLuType::Lu6_2))
     {
-        return Err(invalid("virtual management lab requires an exported LU6.2 source"));
+        return Err(invalid(
+            "virtual management lab requires an exported LU6.2 source",
+        ));
     }
     let profile = LocalLlcProfile {
         cp_name: gateway.local_cp.clone(),
@@ -71,10 +80,18 @@ fn one_gateway(config: &RouterConfig, bearer: &str) -> io::Result<(RemoteConfig,
         local_cp: config::parse_cp(&remote.local_cp)?,
         target_cp: config::parse_cp(&remote.target_cp)?,
         target_lu: Some(config::parse_cp(
-            remote.target_lu.as_deref().ok_or_else(|| invalid("missing target LU"))?,
+            remote
+                .target_lu
+                .as_deref()
+                .ok_or_else(|| invalid("missing target LU"))?,
         )?),
     };
-    Ok((route, config::parse_cp(&gateway.source_lu)?, profile, gateway.peer_cp.clone()))
+    Ok((
+        route,
+        config::parse_cp(&gateway.source_lu)?,
+        profile,
+        gateway.peer_cp.clone(),
+    ))
 }
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
@@ -83,7 +100,9 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         .map_err(|_| invalid("SNUSNU_ROUTER_TOKEN is required"))?;
     let (route, source_lu, profile, peer_cp) = one_gateway(&config, &bearer)?;
     let local_cp = profile.cp_name.clone();
-    let local_xid = profile.build().map_err(|error| invalid(format!("local XID3 profile: {error}")))?;
+    let local_xid = profile
+        .build()
+        .map_err(|error| invalid(format!("local XID3 profile: {error}")))?;
     let source = wire::LuReachability {
         lu: Some(source_lu.clone()),
         hosting_cp: Some(route.local_cp.clone()),
@@ -110,18 +129,31 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     )
     .map_err(|error| invalid(format!("native management policy: {error}")))?;
     port.attach_management(management)?;
-    tracing::info!(local_cp, peer_cp, upstream, "experimental virtual WS management lab started");
+    tracing::info!(
+        local_cp,
+        peer_cp,
+        upstream,
+        "experimental virtual WS management lab started"
+    );
     let deadline = Instant::now() + TIMEOUT;
     while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
         if let Some(events) = port.poll(false)? {
             for event in events {
                 match event {
-                    RouterEvent::Ready => tracing::info!(local_cp, peer_cp, "virtual native LLC link ready"),
+                    RouterEvent::Ready => {
+                        tracing::info!(local_cp, peer_cp, "virtual native LLC link ready")
+                    }
                     RouterEvent::Closed | RouterEvent::TimedOut => {
-                        return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "virtual WS management link closed"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "virtual WS management link closed",
+                        ));
                     }
                     RouterEvent::Unit(_) | RouterEvent::ManagedMac(_) => {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected virtual management route event"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected virtual management route event",
+                        ));
                     }
                 }
             }
@@ -129,7 +161,11 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         port.tick()?;
         port.flush()?;
         if port.management_complete() {
-            tracing::info!(local_cp, peer_cp, "virtual WS management exchange completed");
+            tracing::info!(
+                local_cp,
+                peer_cp,
+                "virtual WS management exchange completed"
+            );
             return Ok(());
         }
         thread::sleep(Duration::from_micros(200));
@@ -137,7 +173,10 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     if STOP.load(Ordering::Relaxed) {
         return Ok(());
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, "virtual WS management exchange timed out"))
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "virtual WS management exchange timed out",
+    ))
 }
 
 #[cfg(test)]
