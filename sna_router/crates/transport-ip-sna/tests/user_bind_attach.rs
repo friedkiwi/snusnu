@@ -698,3 +698,59 @@ fn gateway_rejects_application_data_before_connect_response() {
     assert!(edge.is_closed());
     assert!(edge.native_mut().closed);
 }
+
+#[test]
+fn tcp62_abort_closes_native_association_without_delivering_termination_data() {
+    use transport_ip_sna::mptn_gateway::native_normal_to_mptn;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let mut native = MockNative {
+        accepts: true,
+        ..Default::default()
+    };
+    native.events.push_back(NativeEvent::UserBind(user_bind()));
+    let mut edge = GatewayEdge::new(native, TcpSession::new(sender).unwrap(), bridge, template());
+    edge.poll_native_once().unwrap();
+    edge.flush_tcp().unwrap();
+    let connect = Connect::decode(&read_record(&mut peer)).unwrap();
+    edge.native_mut().accepts = false;
+    peer.write_all(&positive_response(&connect).bytes).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.phase() == BridgePhase::AwaitConnect && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(edge.phase(), BridgePhase::NativeBindPrepared);
+    peer.write_all(
+        &native_normal_to_mptn(&first_application_reply())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    edge.poll_tcp_once().unwrap(); // normal data held behind native BIND egress
+    assert!(edge.native_mut().sent.is_empty());
+    // A later Abort preempts the held record while native egress is blocked.
+    peer.write_all(&[0, 0, 0, 10, 0x10, 0, 1, 2, 3, 4]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let error = loop {
+        match edge.poll_tcp_once() {
+            Err(error) => break error,
+            Ok(()) => assert!(Instant::now() < deadline, "Abort was not consumed"),
+        }
+    };
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    assert!(edge.is_closed());
+    assert!(edge.native_mut().closed);
+    assert!(edge.native_mut().sent.is_empty());
+}

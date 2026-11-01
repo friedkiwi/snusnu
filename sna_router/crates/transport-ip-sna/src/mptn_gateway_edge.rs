@@ -194,9 +194,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
             return Err(invalid("gateway edge is closed"));
         }
         self.drive_incoming()?;
-        if !self.incoming.is_empty() {
-            return Ok(());
-        }
+        // Keep reading one bounded chunk per poll even when native egress is
+        // blocked: a later TCP62 Abort must be able to preempt queued normal
+        // records rather than waiting for their LLC completion forever.
         for record in self
             .tcp
             .as_mut()
@@ -218,6 +218,23 @@ impl<L: NativeLeg> GatewayEdge<L> {
     }
 
     fn drive_incoming(&mut self) -> io::Result<()> {
+        if let Some(abort) = self
+            .incoming
+            .iter()
+            .find(|record| record.kind == TcpKind::Abort)
+        {
+            if abort.bytes.len() != 5 && abort.bytes.len() < 10 {
+                return Err(invalid("TCP62 Abort termination header is truncated"));
+            }
+            // TCP62 Abort discards pending normal and expedited data. The
+            // native LLC association is closed because the UDP UNBIND
+            // compensation is unavailable to this gateway.
+            self.close()?;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "TCP62 peer aborted user session",
+            ));
+        }
         while let Some(record) = self.incoming.front() {
             match record.kind {
                 TcpKind::Connect => {
