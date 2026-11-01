@@ -9,6 +9,7 @@ pub mod mptn_connect;
 pub mod mptn_expedited;
 pub mod mptn_gateway;
 pub mod mptn_gateway_edge;
+pub mod mptn_ingress;
 pub mod mptn_keepalive;
 pub mod mptn_management_initiator;
 pub mod mptn_native_bridge;
