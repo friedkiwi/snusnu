@@ -14,6 +14,7 @@ use crate::{
     mptn_bind_negotiation::validate_positive_response,
     mptn_compensations::{required_from_connect, CompensationSet},
     mptn_connect::{Address, Connect, Direction},
+    mptn_expedited::{Flow as ExpeditedFlow, Inbound as ExpeditedInbound},
     mptn_gateway::{mptn_normal_to_native, native_normal_to_mptn, NativeSessionAddress},
 };
 
@@ -58,6 +59,7 @@ pub struct GatewaySession {
     state: State,
     pending_tcp: usize,
     pending_native: usize,
+    expedited: ExpeditedFlow,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -135,6 +137,7 @@ impl GatewaySession {
             return Err(state_error("invalid gateway pending-byte limit"));
         }
         Ok(Self {
+            expedited: ExpeditedFlow::new(policy.max_pending_bytes)?,
             policy,
             available_compensations,
             state: State::Idle,
@@ -154,6 +157,13 @@ impl GatewaySession {
 
     pub fn pending_bytes(&self) -> (usize, usize) {
         (self.pending_tcp, self.pending_native)
+    }
+
+    pub fn pending_expedited_bytes(&self) -> (usize, usize) {
+        (
+            self.expedited.pending_tcp(),
+            self.expedited.pending_native(),
+        )
     }
 
     /// Map one complete native user BIND to a TCP62 Connect request. `template`
@@ -288,6 +298,9 @@ impl GatewaySession {
         let State::Established { native } = self.state else {
             return Err(state_error("gateway session not established"));
         };
+        if !self.expedited.outbound_normal_may_pass() {
+            return Err(state_error("TCP62 expedited flow is closed"));
+        }
         if piu.get(2..4) != Some(&[native.daf, native.oaf][..])
             || piu
                 .first()
@@ -314,6 +327,12 @@ impl GatewaySession {
         let State::Established { native } = self.state else {
             return Err(state_error("gateway session not established"));
         };
+        if !self.expedited.inbound_normal_may_pass() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "earlier TCP62 expedited data awaits native delivery",
+            ));
+        }
         let reversed = NativeSessionAddress {
             daf: native.oaf,
             oaf: native.daf,
@@ -327,6 +346,80 @@ impl GatewaySession {
             piu.len(),
         )?;
         Ok(piu)
+    }
+
+    /// Carry a native expedited PIU over TCP62. The caller must enqueue this
+    /// record on the same TCP stream as later normal records, in that order.
+    pub fn native_expedited(&mut self, piu: &[u8]) -> io::Result<TcpRecord> {
+        let State::Established { native } = self.state else {
+            return Err(state_error("gateway session not established"));
+        };
+        if piu.get(2..4) != Some(&[native.daf, native.oaf][..])
+            || piu
+                .first()
+                .is_none_or(|first| first & 0x02 != u8::from(native.odai) << 1)
+        {
+            return Err(invalid("native expedited PIU session address mismatch"));
+        }
+        let translated = native_normal_to_mptn(piu)?;
+        if translated.native_pacing_requested {
+            return Err(invalid("native pacing response handler is not installed"));
+        }
+        self.expedited.send_expedited(&translated.bytes[5..])
+    }
+
+    /// Rebuild the native FID2 header for one TCP62 expedited record. Return
+    /// its immediate TCP acknowledgement; normal ingress stays held until
+    /// `complete_native_expedited_delivery` confirms native egress.
+    pub fn mptn_expedited(&mut self, record: &TcpRecord) -> io::Result<(Vec<u8>, TcpRecord)> {
+        let State::Established { native } = self.state else {
+            return Err(state_error("gateway session not established"));
+        };
+        if record.kind != TcpKind::Expedited {
+            return Err(invalid("expected TCP62 expedited data"));
+        }
+        let reversed = NativeSessionAddress {
+            daf: native.oaf,
+            oaf: native.daf,
+            odai: native.odai,
+        };
+        // The reduced SNA header is identical for normal and expedited TCP62
+        // records. Reuse the normal decoder's category and pacing checks.
+        let mut normal = record.clone();
+        normal.kind = TcpKind::Normal;
+        normal.bytes[4] = 0;
+        let piu = mptn_normal_to_native(&normal, reversed)?;
+        let ExpeditedInbound::Expedited { ack } = self.expedited.receive(record)? else {
+            return Err(invalid("unexpected TCP62 expedited state"));
+        };
+        Ok((piu, ack))
+    }
+
+    /// Process an expedited ACK or abort after the TCP62 session is open.
+    pub fn receive_expedited_control(
+        &mut self,
+        record: &TcpRecord,
+    ) -> io::Result<ExpeditedInbound> {
+        if !matches!(self.state, State::Established { .. }) {
+            return Err(state_error("gateway session not established"));
+        }
+        if !matches!(record.kind, TcpKind::ExpeditedAck | TcpKind::Abort) {
+            return Err(invalid("expected TCP62 expedited ACK or abort"));
+        }
+        let inbound = self.expedited.receive(record)?;
+        if matches!(inbound, ExpeditedInbound::Aborted { .. }) {
+            self.close();
+        }
+        Ok(inbound)
+    }
+
+    /// `piu_bytes` is the full native PIU length returned by
+    /// `mptn_expedited`, including four restored FID2 address bytes.
+    pub fn complete_native_expedited_delivery(&mut self, piu_bytes: usize) -> io::Result<()> {
+        let reduced = piu_bytes
+            .checked_sub(4)
+            .ok_or_else(|| state_error("native expedited PIU length is invalid"))?;
+        self.expedited.complete_native_delivery(reduced)
     }
 
     pub fn complete_tcp_delivery(&mut self, bytes: usize) -> io::Result<()> {
@@ -514,6 +607,46 @@ mod tests {
             .begin_native_bind(&captured_user_bind(), template)
             .is_err());
         assert_eq!(session.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn expedited_ack_and_native_delivery_gate_later_normal_data() {
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let request = session
+            .begin_native_bind(&captured_user_bind(), request_template())
+            .unwrap();
+        let decoded = Connect::decode(&request.bytes).unwrap();
+        session
+            .receive_connect_response(&response_for(&decoded))
+            .unwrap();
+
+        let outbound = [0x2c, 0, 1, 2, 0, 2, 0x4b, 0x80, 0, 0xc9];
+        let record = session.native_expedited(&outbound).unwrap();
+        assert_eq!(record.kind, TcpKind::Expedited);
+        assert_eq!(session.pending_expedited_bytes(), (11, 0));
+        let ack = TcpRecord::decode(vec![0, 0, 0, 5, 0x03]).unwrap();
+        assert_eq!(
+            session.receive_expedited_control(&ack).unwrap(),
+            ExpeditedInbound::Acked
+        );
+
+        let incoming =
+            TcpRecord::decode(vec![0, 0, 0, 11, 0x01, 0, 3, 0x4b, 0x80, 0, 0xc9]).unwrap();
+        let (native, ack) = session.mptn_expedited(&incoming).unwrap();
+        assert_eq!(native, [0x2c, 0, 2, 1, 0, 3, 0x4b, 0x80, 0, 0xc9]);
+        assert_eq!(ack.bytes, [0, 0, 0, 5, 0x03]);
+        let later = TcpRecord::decode(vec![0, 0, 0, 10, 0, 0, 4, 3, 0, 0]).unwrap();
+        assert_eq!(
+            session.mptn_normal(&later).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        session
+            .complete_native_expedited_delivery(native.len())
+            .unwrap();
+        assert_eq!(
+            session.mptn_normal(&later).unwrap()[..6],
+            [0x2c, 0, 2, 1, 0, 4]
+        );
     }
 
     #[test]
