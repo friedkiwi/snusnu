@@ -232,3 +232,14 @@ V4 displayed APPC failure `E022000BA2100000`. Private captures are
 `/tmp/snusnu-v4r4-regression/native-sustained-sol5.pcap` and
 `/tmp/snusnu-v5r4-ip-lab/native-sustained-sol7.pcap`; both guest devices
 were varied off after the run.
+
+The next run after a pacing-state adjustment made the response sequence
+clearer. The user BIND used DAF/OAF `02/02`. After Rust forwarded B's
+82-byte first user response, A sent a nine-byte IPR
+`2c0002020000830100`, followed about 5 ms later by a distinct nine-byte
+PIU `2c000202800083a000` with its TH response bit set. The latter coincided
+with the Rust `native user IPR violates session pacing` error. The exact
+meaning of that second PIU and B's first response still need protocol-level
+validation before accepting it as ordinary pacing. The private captures are
+`native-sustained2-sol5.pcap` and `native-sustained2-sol7.pcap` in the same
+lab directories; both devices were varied off afterward.
