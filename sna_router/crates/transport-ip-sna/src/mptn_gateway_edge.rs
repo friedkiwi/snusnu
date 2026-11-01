@@ -38,6 +38,12 @@ enum NativeReply {
     UserNormal,
 }
 
+#[derive(Clone, Copy)]
+enum NativeNormalKind {
+    Request,
+    PositiveResponse,
+}
+
 const MAX_INCOMING_BYTES: usize = MAX_RECORD * 2;
 
 pub struct GatewayEdge<L: NativeLeg> {
@@ -48,7 +54,7 @@ pub struct GatewayEdge<L: NativeLeg> {
     native_reply: Option<(NativeReply, Vec<u8>)>,
     connect: Option<TcpRecord>,
     attach: Option<(TcpRecord, bool)>,
-    normal: Option<(TcpRecord, bool)>,
+    normal: Option<(TcpRecord, bool, NativeNormalKind)>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
     /// TCP queue order and whether GatewaySession charged this record.
@@ -162,11 +168,14 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     if !can_accept_information || !self.first_attach_delivery_complete() {
                         return Err(invalid("native user data before gateway credit"));
                     }
-                    if piu.len() == 9 && piu[6] == 0x83 {
+                    if piu.len() == 9 && piu[6..9] == [0x83, 0x01, 0] {
                         self.bridge.observe_native_ipr(&piu)?;
+                    } else if piu.len() == 9 && piu[6..9] == [0x83, 0xa0, 0] {
+                        let record = self.bridge.next_native_positive_response(&piu)?;
+                        self.normal = Some((record, false, NativeNormalKind::PositiveResponse));
                     } else {
                         let (record, _) = self.bridge.next_native_normal(&piu)?;
-                        self.normal = Some((record, false));
+                        self.normal = Some((record, false, NativeNormalKind::Request));
                     }
                 }
                 NativeEvent::EgressAck(n) => {
@@ -376,25 +385,31 @@ impl<L: NativeLeg> GatewayEdge<L> {
             // pending and no pacing credit is granted.
             self.drive_queues()?;
         }
-        if let Some((record, queued)) = self.normal.take() {
+        if let Some((record, queued, kind)) = self.normal.take() {
             if !queued {
                 match self.tcp.as_mut().unwrap().queue(record.clone()) {
                     Ok(()) => self.writes.push_back((record.bytes.len(), true)),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        self.normal = Some((record, false));
+                        self.normal = Some((record, false, kind));
                         return Ok(());
                     }
                     Err(error) => return Err(error),
                 }
             }
-            match self
-                .bridge
-                .mark_normal_enqueued(&record, self.native.available_slots())
-            {
+            let accepted = match kind {
+                NativeNormalKind::Request => self
+                    .bridge
+                    .mark_normal_enqueued(&record, self.native.available_slots()),
+                NativeNormalKind::PositiveResponse => self
+                    .bridge
+                    .mark_native_positive_response_enqueued(&record)
+                    .map(|()| None),
+            };
+            match accepted {
                 Ok(Some(ipr)) => self.native_reply = Some((NativeReply::Ipr, ipr)),
                 Ok(None) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.normal = Some((record, true));
+                    self.normal = Some((record, true, kind));
                     return Ok(());
                 }
                 Err(error) => return Err(error),

@@ -644,6 +644,12 @@ fn unregistered_edge_uses_typed_native_events_and_socket_completions() {
         .events
         .push_back(NativeEvent::EgressAck(1));
     edge.poll_native_once().unwrap();
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::UserInformation(hex("2c000102800083a000")));
+    edge.poll_native_once().unwrap();
+    edge.flush_tcp().unwrap();
+    assert_eq!(read_record(&mut peer), hex("0000000a00800083a000"));
     let deadline = Instant::now() + Duration::from_secs(2);
     while edge.native_mut().sent.len() < 4 && Instant::now() < deadline {
         edge.poll_tcp_once().unwrap();
