@@ -18,7 +18,7 @@ For a native LLC2 circuit, useful events are `Type1(XID|TEST, bytes)`, `Connecte
 
 | Ingress ↔ egress | Required route behavior | Initial status |
 | --- | --- | --- |
-| Native LLC2 ↔ native LLC2 | Relay Type 1 and PIU events while terminating LLC2 independently | Configured multi-peer runtime; V4R4 regression pending for the new config path |
+| Native LLC2 ↔ native LLC2 | Relay Type 1 and PIU events while terminating LLC2 independently | Configured multi-peer runtime; V4R4 pass-through completed through `--config` |
 | Native LLC2 ↔ AnyNet | MPTN gateway for a configured LU6.2 session; native APPN CP/TG and IP-side MPTN behavior both matter | Research and captures needed |
 | AnyNet ↔ AnyNet | Session-level forwarding with full MPTN state, or ordinary IP routing when no conversion is wanted | Bounded TCP62 codecs and sockets; no configured route yet |
 | EE ↔ EE | Preserve LDLC/HPR UDP payloads and priority ports between configured peers | Configured UDP relay and synthetic loopback test; real EE peer test pending |
@@ -32,7 +32,7 @@ The current configuration accepts LLC2↔LLC2, EE↔EE, and LLC2↔WebSocket rou
 
 ## Implementation status and next protocol work
 
-1. **Local runtime and flow control:** `--config` registers separate LLC2 associations, validates MAC selectors, and installs bidirectional routes. LLC2 uses local busy RNR/RR and bounded queues. The fixed `--lab-link` and `--local-link` modes remain available. The new config path is being regression-tested with V4R4 guests.
+1. **Local runtime and flow control:** `--config` registers separate LLC2 associations, validates MAC selectors, and installs bidirectional routes. LLC2 uses local busy RNR/RR and bounded queues. The fixed `--lab-link` and `--local-link` modes remain available. The configured path completed V4R4 remote sign-on and pass-through teardown.
 2. **Remote hop:** `transport-ws` and the Go concentrator carried a complete V4R4 pass-through. The Rust hub now exports multiple CP/LU routes and demultiplexes multiple circuits on one authenticated connection. The native DLC/PIU profile is the only supported WebSocket data profile.
 3. **AnyNet evidence and gateway:** bounded TCP/UDP 397 codecs and a pure converter for complete, post-BIND normal FID2 PIUs are implemented. Capture direct V5R4 AnyNet APPC traffic and correlate MPTN Connect/BIND, data, pacing, expedited, UNBIND, and keepalive with native PIUs. Then implement session state, APPN control suppression, pacing, segmentation, and UDP handling. The [IBM-authored TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00) describes access nodes but leaves full MPTN gateway behavior beyond its scope.
 4. **EE evidence and media conversion:** a configured EE↔EE UDP relay and LDLC/UI codec exist. Capture EE between capable peers and paired native HPR LAN traffic before implementing XID/TG/link activation conversion. General legacy LLC2 APPC to EE requires APPN/HPR network-node behavior, beyond UDP framing.

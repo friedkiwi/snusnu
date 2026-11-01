@@ -62,6 +62,15 @@ sudo target/debug/snusnu-router --local-link \
 exchange XID/TEST and SNA information through the router's `RoutePort`
 interface. It operates without a concentrator.
 
+The same guests also completed the session through the declarative
+[`--config` router](router-config.md) on 2026-11-01. A's `STRPASTHR
+RMTLOCNAME(SNAB)` reached B's remote Sign On at 17:02:56 local time;
+QSECOFR sign-on reached B's Main Menu at 17:03:05, and `ENDPASTHR`
+returned A to its Main Menu at 17:03:12. The router logged both LLC2
+associations connected and bidirectional MAC routes. This regression used
+the existing two isolated TAPs; same-interface multi-peer filtering has
+a separate synthetic AF_PACKET test.
+
 For one LLC endpoint routed through a concentrator, use a router credential
 in the environment rather than on the command line:
 
