@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
 use transport_ws::{wire, WsClient};
@@ -17,6 +17,8 @@ const INITIAL_ALLOWANCE: u64 = 1500;
 const MAX_PENDING_EVENTS: usize = INITIAL_ALLOWANCE as usize;
 const MAX_PENDING_TYPE1: usize = 16;
 const MAX_CLOSED_IDS: usize = 64;
+const FIRST_OPEN_RETRY: Duration = Duration::from_millis(500);
+const MAX_OPEN_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct Config {
@@ -206,6 +208,8 @@ pub(crate) struct WsRoutePort {
     opening: bool,
     local_ready: bool,
     request_id: u64,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
     pending_type1: VecDeque<Vec<u8>>,
     pending_information: VecDeque<Vec<u8>>,
     // Each unit forwarded into the LLC endpoint remains retained here until
@@ -467,6 +471,8 @@ impl WsRoutePort {
                 opening: false,
                 local_ready: false,
                 request_id: 0,
+                retry_at: None,
+                retry_delay: FIRST_OPEN_RETRY,
                 pending_type1: VecDeque::new(),
                 pending_information: VecDeque::new(),
                 downstream_sizes: VecDeque::new(),
@@ -492,6 +498,7 @@ impl WsRoutePort {
         if self.circuit.is_some()
             || self.opening
             || self.pending_type1.is_empty()
+            || self.retry_at.is_some_and(|at| Instant::now() < at)
             || (self.require_managed_binding && self.managed_mac.is_none())
         {
             return Ok(());
@@ -823,6 +830,19 @@ impl WsRoutePort {
             && (!self.require_managed_binding || self.managed_mac.is_some());
         let reason = if accept {
             wire::OpenFailure::Unspecified
+        } else if v2
+            && self.target_lu.is_some()
+            && self.target.is_none()
+            && incoming.source_route.as_ref().is_some_and(|r| {
+                r.router_id == incoming.source_router_id
+                    && r.epoch.len() == 16
+                    && r.route_id != 0
+                    && r.route_generation != 0
+            })
+        {
+            // The Go hub has validated this source LU, but this router may
+            // receive IncomingOpen before its reciprocal OriginRoutes.
+            wire::OpenFailure::RouteGone
         } else if !source_ok {
             wire::OpenFailure::Forbidden
         } else if target_ok {
@@ -886,9 +906,26 @@ impl WsRoutePort {
                 target_cp = %format_cp(&self.target_cp),
                 "circuit open rejected"
             );
-            self.pending_type1.clear();
+            if self.shared.borrow().client.subprotocol() == transport_ws::SUBPROTOCOL_V2
+                && retryable_open_failure(result.reason)
+            {
+                let delay = self.retry_delay;
+                self.retry_at = Some(Instant::now() + delay);
+                self.retry_delay = delay.saturating_mul(2).min(MAX_OPEN_RETRY);
+                info!(
+                    request_id = result.request_id,
+                    retry_ms = delay.as_millis(),
+                    "retrying transient v2 circuit open"
+                );
+            } else {
+                self.pending_type1.clear();
+                self.retry_at = None;
+                self.retry_delay = FIRST_OPEN_RETRY;
+            }
             return Ok(());
         }
+        self.retry_at = None;
+        self.retry_delay = FIRST_OPEN_RETRY;
         if result.circuit_id.len() != 16 {
             return Err(protocol("invalid circuit ID"));
         }
@@ -1163,6 +1200,10 @@ impl RoutePort for WsRoutePort {
 
 fn envelope(body: wire::ws_envelope::Body) -> wire::WsEnvelope {
     wire::WsEnvelope { body: Some(body) }
+}
+
+fn retryable_open_failure(reason: i32) -> bool {
+    reason == wire::OpenFailure::RouteGone as i32 || reason == wire::OpenFailure::Busy as i32
 }
 
 fn validate_name(name: &wire::SnaName) -> io::Result<()> {
@@ -1908,6 +1949,25 @@ mod tests {
             assert_eq!(source.router_id, vec![7; 16]);
             assert_eq!(source.epoch, vec![8; 16]);
             assert_eq!(source.route_id, source_id);
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OpenResult(wire::OpenResult {
+                    request_id: open.request_id,
+                    circuit_id: vec![],
+                    accepted: false,
+                    peer_receive_allowance_bytes: 0,
+                    reason: wire::OpenFailure::RouteGone as i32,
+                }),
+            );
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("expected retried open")
+            };
+            let retried = wire::WsEnvelope::decode(payload).unwrap();
+            let Some(wire::ws_envelope::Body::OpenRequest(retried)) = retried.body else {
+                panic!("expected retried open request")
+            };
+            assert!(retried.request_id > open.request_id);
+            assert_eq!(retried.source_route, Some(source));
         });
         let source_lu = name("QABOB", "LUB");
         let mut port = WsRoutePort::connect_gateway_v2(
@@ -1932,6 +1992,14 @@ mod tests {
             port.poll(true).unwrap();
         }
         assert!(port.opening);
+        let first_request_id = port.request_id;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while port.request_id == first_request_id && Instant::now() < deadline {
+            port.poll(true).unwrap();
+            port.tick().unwrap();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(port.request_id > first_request_id);
         server.join().unwrap();
     }
 
@@ -1999,6 +2067,20 @@ mod tests {
             assert!(snapshot.routes[1].id > 0);
             assert!(snapshot.routes[1].id <= i64::MAX as u64);
             assert_ne!(snapshot.routes[1].id, snapshot.routes[0].id);
+        }
+    }
+
+    #[test]
+    fn only_transient_v2_open_rejections_retry() {
+        assert!(retryable_open_failure(wire::OpenFailure::RouteGone as i32));
+        assert!(retryable_open_failure(wire::OpenFailure::Busy as i32));
+        for permanent in [
+            wire::OpenFailure::Forbidden,
+            wire::OpenFailure::Unsupported,
+            wire::OpenFailure::Protocol,
+            wire::OpenFailure::Unspecified,
+        ] {
+            assert!(!retryable_open_failure(permanent as i32));
         }
     }
 
