@@ -190,3 +190,32 @@ After `ENDPASTHR` returned normally, A was stopped and the bridge removed.
 B's host table was restored to `.2` containing only its system hostname and
 `.10` containing only `SNAA.SOLNET.SNA.IBM.COM`; B's `SNAA00` device was
 varied off. The original host `.10/32` route to B `.3` again passed two pings.
+
+## Outbound management and first real mixed Attach
+
+The first opt-in Rust outbound management attempt on the isolated `.10` to
+B `.3:397` path received a 189-byte *positive* SNASVCMG Connect response,
+but its strict response validator rejected B's newly allocated BIND token.
+The direct baseline token ended `80 00`; this positive response ended
+`00 00`. The LU pair, correlator, 22-byte FQPCID, BIND structure, and
+option set matched. The validator was corrected to admit both observed token
+forms. This diagnostic did not open the native LLC endpoint or touch V4.
+
+In the next opt-in run, Rust sent a 230-byte SNASVCMG Connect request and
+received B's 189-byte positive response. The subsequent normal records were
+CNOS Attach (47 bytes), CNOS reply (35), and two 11-byte BIS records,
+followed by a 38-byte management Abort. Rust then opened the native LLC
+endpoint. V4R4 A's `STRPASTHR RMTLOCNAME(SNAB)` reached the user BIND; Rust
+sent a 225-byte user Connect request to B, received a 184-byte positive
+response, and delivered A's first FMH-5 Attach in a 243-byte TCP62 normal
+record to the real V5R4 peer. The opt-in diagnostic deliberately stopped
+there. V4 returned to Main Menu with APPC failure `E022000BA2100000`, so
+this is evidence of BIND admission and one application record crossing the
+LLC/AnyNet boundary, not a completed remote sign-on.
+
+The private captures are
+`/tmp/snusnu-v5r4-ip-lab/native-management-outbound-retry-sol7.pcap` and
+`/tmp/snusnu-v4r4-regression/native-management-outbound-retry-sol5.pcap`.
+After the run, B's `SNAA00` device and V4's `SNAB` controller/device were
+varied off. B's `.10` alias, host route, and isolated sol7 topology remain
+ready for a sustained-flow test.
