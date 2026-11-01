@@ -22,7 +22,17 @@ use router_core::{
     xid3::{Role, Xid3},
     xid3_activation::Phase,
 };
-use std::{io, time::Duration};
+use std::{collections::VecDeque, io, time::Duration};
+
+#[derive(Debug)]
+pub(crate) enum NativeLlcEvent {
+    UserBind(Vec<u8>),
+    FirstAttach(Vec<u8>),
+    UserInformation(Vec<u8>),
+    BindResponseAck,
+    EgressAck(usize),
+    Closed,
+}
 
 pub(crate) struct NativePeerPort {
     endpoint: Endpoint,
@@ -36,6 +46,13 @@ pub(crate) struct NativePeerPort {
     user_pacing: Option<UserPacingSession>,
     pacing_probe: Option<PacingProbePolicy>,
     first_user_attach: Option<Vec<u8>>,
+    converter_policy: Option<(String, String)>,
+    converter_expected_cp: Option<String>,
+    converter_events: VecDeque<NativeLlcEvent>,
+    converter_offer: Option<UserBindOffer>,
+    converter_bind_response_pending: bool,
+    converter_bind_response_acked: bool,
+    converter_first_attach_seen: bool,
 }
 
 struct PacingProbePolicy {
@@ -76,6 +93,13 @@ impl NativePeerPort {
             user_pacing: None,
             pacing_probe: None,
             first_user_attach: None,
+            converter_policy: None,
+            converter_expected_cp: None,
+            converter_events: VecDeque::new(),
+            converter_offer: None,
+            converter_bind_response_pending: false,
+            converter_bind_response_acked: false,
+            converter_first_attach_seen: false,
         })
     }
 
@@ -126,6 +150,67 @@ impl NativePeerPort {
         Ok(port)
     }
 
+    pub(crate) fn open_converter(
+        peer: LlcPeer<'_>,
+        local_xid: Xid3,
+        remote_cp: String,
+        local_cp: String,
+        user_plu: String,
+        user_slu: String,
+    ) -> io::Result<Self> {
+        let mut port = Self::open_management(peer, local_xid, remote_cp.clone(), local_cp)?;
+        port.converter_policy = Some((user_plu, user_slu));
+        port.converter_expected_cp = Some(remote_cp);
+        Ok(port)
+    }
+
+    pub(crate) fn take_converter_event(&mut self) -> Option<NativeLlcEvent> {
+        self.converter_events.pop_front()
+    }
+
+    pub(crate) fn enqueue_converter_piu(&mut self, piu: &[u8]) -> io::Result<bool> {
+        if self.converter_policy.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native converter mode disabled",
+            ));
+        }
+        if self.converter_offer.is_some()
+            && !self.converter_bind_response_acked
+            && !self.converter_bind_response_pending
+        {
+            let offer = self.converter_offer.as_ref().unwrap();
+            if piu != offer.build_fixed_response(1).map_err(management_error)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native user BIND response differs from validated fixed profile",
+                ));
+            }
+            if self.endpoint.queue_information(piu.to_vec())? {
+                self.converter_bind_response_pending = true;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if !self.converter_bind_response_acked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native user BIND not acknowledged",
+            ));
+        }
+        if self.management.as_ref().map(ManagementSession::phase) != Some(ManagementPhase::Closed) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "user PIU before management teardown",
+            ));
+        }
+        self.endpoint.queue_information(piu.to_vec())
+    }
+
+    pub(crate) fn converter_available_slots(&self) -> usize {
+        self.endpoint.available_receive_slots()
+    }
+
     pub(crate) fn reached_management_bind(&self) -> bool {
         self.reached_management_bind
     }
@@ -133,7 +218,18 @@ impl NativePeerPort {
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
         if let Some(management) = self.management.as_mut() {
             let completed = self.endpoint.take_completed_information_count();
-            if self.user_probe == UserProbeState::AwaitResponseAck && completed == 1 {
+            if self.converter_bind_response_pending && completed == 1 {
+                self.converter_bind_response_pending = false;
+                self.converter_bind_response_acked = true;
+                self.converter_events
+                    .push_back(NativeLlcEvent::BindResponseAck);
+            } else if self.converter_policy.is_some()
+                && management.phase() == ManagementPhase::Closed
+                && completed != 0
+            {
+                self.converter_events
+                    .push_back(NativeLlcEvent::EgressAck(completed));
+            } else if self.user_probe == UserProbeState::AwaitResponseAck && completed == 1 {
                 if let Some(pacing) = self.user_pacing.as_mut() {
                     pacing
                         .acknowledge_bind(completed)
@@ -184,6 +280,14 @@ impl NativePeerPort {
                         if self.type1.confirm_sent(&outbound)? == Phase::ReadyForSabme
                             && !self.activation_announced
                         {
+                            if let Some(expected) = &self.converter_expected_cp {
+                                if self.type1.peer_name() != Some(expected.as_str()) {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "native XID3 CP differs from converter peer policy",
+                                    ));
+                                }
+                            }
                             self.endpoint.set_connect_allowed(true)?;
                             if self.type1.local_role() == Role::Primary {
                                 // Let any crossed final XID command/response
@@ -243,6 +347,10 @@ impl NativePeerPort {
                     self.endpoint.disconnect()?;
                 }
                 Event::Disconnected | Event::TimedOut => {
+                    if self.converter_policy.is_some() {
+                        self.converter_events.push_back(NativeLlcEvent::Closed);
+                        return Ok(Vec::new());
+                    }
                     if self.management.is_some() {
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionAborted,
@@ -265,6 +373,27 @@ impl NativePeerPort {
     fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
         let management = self.management.as_mut().expect("management mode");
         let management_unbind = piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32;
+        if self.converter_policy.is_some() && management.phase() == ManagementPhase::Closed {
+            if !self.converter_bind_response_acked {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "user BIND response not acknowledged",
+                ));
+            }
+            if !self.converter_first_attach_seen {
+                let offer = self.converter_offer.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "converter user BIND missing")
+                })?;
+                parse_first_user_attach(&piu, offer).map_err(management_error)?;
+                self.converter_first_attach_seen = true;
+                self.converter_events
+                    .push_back(NativeLlcEvent::FirstAttach(piu));
+            } else {
+                self.converter_events
+                    .push_back(NativeLlcEvent::UserInformation(piu));
+            }
+            return Ok(());
+        }
         if self.user_probe == UserProbeState::AwaitFollowup
             && !management_unbind
             && self.pacing_probe.is_some()
@@ -432,7 +561,13 @@ impl NativePeerPort {
                     let bind = management.bind().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
                     })?;
-                    let offer = if let Some(policy) = &self.pacing_probe {
+                    let offer = if let Some((plu, slu)) = &self.converter_policy {
+                        UserBindOffer::from_request_with_policy(
+                            &piu,
+                            bind,
+                            UserBindPolicy { plu, slu, mode: "" },
+                        )
+                    } else if let Some(policy) = &self.pacing_probe {
                         UserBindOffer::from_request_with_policy(
                             &piu,
                             bind,
@@ -446,6 +581,18 @@ impl NativePeerPort {
                         UserBindOffer::from_request(&piu, bind, "")
                     }
                     .map_err(management_error)?;
+                    if self.converter_policy.is_some() {
+                        if self.converter_offer.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate converter user BIND",
+                            ));
+                        }
+                        self.converter_offer = Some(offer);
+                        self.converter_events
+                            .push_back(NativeLlcEvent::UserBind(piu));
+                        return Ok(());
+                    }
                     tracing::warn!(plu = %offer.plu, slu = %offer.slu, daf = offer.daf, oaf = offer.oaf, mode = %offer.mode, bytes = offer.request().len(), experimental_response = self.user_probe == UserProbeState::AwaitBind, "native user BIND offer validated; user gateway unavailable");
                     if self.user_probe == UserProbeState::AwaitBind {
                         let mut pacing = if self.pacing_probe.is_some() {
