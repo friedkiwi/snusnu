@@ -415,6 +415,15 @@ impl Router {
         peer: &PortId,
         mac: [u8; 6],
     ) -> io::Result<Option<(RouteAddress, PortId)>> {
+        // Keep the namespace check at the routing boundary as well as in the
+        // WebSocket decoder and LLC endpoint. Other RoutePort adapters can
+        // accept managed-MAC events without passing through either check.
+        if mac[..3] != [0x02, 0x53, 0x4e] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed MAC is outside the SNUSNU namespace",
+            ));
+        }
         let Some(old @ RouteAddress::Mac(_)) = self.destinations.get(peer) else {
             return Ok(None);
         };
@@ -883,6 +892,32 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert!(target_state.borrow().managed_macs.is_empty());
         assert_eq!(router.destinations.get(&target), Some(&initial));
+    }
+
+    #[test]
+    fn managed_mac_namespace_is_checked_before_port_or_route_changes() {
+        let mut router = Router::new();
+        let remote = fake_port(&mut router, "remote");
+        let target_state = Rc::new(RefCell::new(State::default()));
+        let target = PortId::new("target");
+        router
+            .register_port(target.clone(), Box::new(FakePort(target_state.clone())))
+            .unwrap();
+        router.add_route(&remote, &target).unwrap();
+        let initial = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        router
+            .add_address_route(&target, initial.clone(), &remote)
+            .unwrap();
+        router.bind_destination(&target, initial.clone()).unwrap();
+
+        let invalid = [0x02, 0x53, 0x4f, 0, 0, 7];
+        let error = router
+            .dispatch(&remote, vec![RouterEvent::ManagedMac(invalid)])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(target_state.borrow().managed_macs.is_empty());
+        assert_eq!(router.destinations.get(&target), Some(&initial));
+        assert_eq!(router.target(&target).unwrap(), &remote);
     }
 
     #[test]
