@@ -173,7 +173,6 @@ impl Endpoint {
         if self.llc.state() != State::Disconnected
             || !self.queued.is_empty()
             || self.llc.has_pending_information()
-            || self.connect_after.is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
