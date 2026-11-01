@@ -10,5 +10,6 @@ pub mod mptn_expedited;
 pub mod mptn_gateway;
 pub mod mptn_keepalive;
 pub mod mptn_oob;
+pub mod mptn_oob_sequence;
 pub mod mptn_segments;
 pub mod mptn_session;
