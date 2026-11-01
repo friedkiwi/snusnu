@@ -370,13 +370,21 @@ impl Bridge {
             self.gateway.complete_native_delivery(piu.len())?;
             return Err(invalid("TCP62 normal data is not an FM request"));
         }
-        // The first observed V4R4 reply asks for both DR1 and DR2. Admit
-        // only one outstanding response in the implied first bracket, so a
-        // later 0x8000 response has an unambiguous local correspondent.
-        if piu[7] & 0xa0 != 0 && (piu[7] & 0xa0 != 0xa0 || self.outstanding_implied_bracket_dr) {
+        // DR1+DR2 without ERI needs one correlated positive response. The
+        // observed next V5R4 FMD request is RQE1 with Change Direction
+        // (RH 03 90 20): it requests a negative response only on exception,
+        // so it must not consume the outstanding positive-response slot.
+        let response_form = piu[7] & 0xb0;
+        let supported_response_form = match response_form {
+            0 => true,
+            0xa0 => !self.outstanding_implied_bracket_dr,
+            0x90 => piu[6..9] == [0x03, 0x90, 0x20],
+            _ => false,
+        };
+        if !supported_response_form {
             self.gateway.complete_native_delivery(piu.len())?;
             return Err(invalid(
-                "TCP62 definite response request is unsupported or outstanding",
+                "TCP62 FM response request is unsupported or outstanding",
             ));
         }
         let prepared = match self.pacing.as_mut().unwrap().prepare_normal_send(&piu) {
@@ -408,7 +416,7 @@ impl Bridge {
             .unwrap()
             .mark_egress_enqueued(piu)
             .map_err(|_| invalid("native normal egress differs from prepared PIU"))?;
-        if piu[7] & 0xa0 == 0xa0 {
+        if piu[7] & 0xb0 == 0xa0 {
             self.outstanding_implied_bracket_dr = true;
         }
         self.phase = Phase::AwaitNativeNormalAck;

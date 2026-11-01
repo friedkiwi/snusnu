@@ -468,6 +468,69 @@ fn v4r4_implied_bracket_positive_response_crosses_tcp62_without_pacing_credit() 
 }
 
 #[test]
+fn v5r4_rqe1_change_direction_follows_positive_response_without_new_dr() {
+    use transport_ip_sna::mptn_gateway::native_normal_to_mptn;
+
+    let mut bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let connect_record = bridge.begin_native_bind(&user_bind(), template()).unwrap();
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    let bind_response = bridge
+        .accept_connect_response(&positive_response(&connect))
+        .unwrap();
+    bridge.mark_native_bind_enqueued(&bind_response).unwrap();
+    bridge.acknowledge_native_bind(1).unwrap();
+    let (attach, _) = bridge.first_attach(&first_user_attach()).unwrap();
+    let ipr = bridge.mark_attach_enqueued(&attach, 1).unwrap();
+    bridge.mark_ipr_enqueued(&ipr).unwrap();
+    bridge.complete_tcp_delivery(attach.bytes.len()).unwrap();
+
+    let tcp = TcpRecord::decode(
+        native_normal_to_mptn(&first_application_reply())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let native_reply = bridge.next_mptn_normal(&tcp).unwrap().unwrap();
+    bridge.mark_native_normal_enqueued(&native_reply).unwrap();
+    bridge.acknowledge_native_normal(1).unwrap();
+    let positive = bridge
+        .next_native_positive_response(&hex("2c000102800083a000"))
+        .unwrap();
+    bridge
+        .mark_native_positive_response_enqueued(&positive)
+        .unwrap();
+    bridge.complete_tcp_delivery(positive.bytes.len()).unwrap();
+    bridge
+        .observe_native_ipr(&hex("2c0001020000830100"))
+        .unwrap();
+
+    // V5R4 capture after the 10-byte positive response: 525-byte TCP62
+    // normal record, SNF 0002, RH 03 90 20 = FM RQE1 + Change Direction.
+    let mut bytes = hex("0000020d000002039020020312a0000004108003");
+    bytes.resize(525, 0);
+    let rqe1 = TcpRecord::decode(bytes).unwrap();
+    let mut unsupported = rqe1.clone();
+    unsupported.bytes[8] = 0x80; // DR1 without ERI needs a separate handler.
+    assert!(bridge.next_mptn_normal(&unsupported).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+
+    let prepared = bridge.next_mptn_normal(&rqe1).unwrap().unwrap();
+    assert_eq!(&prepared[..9], &hex("2c0002010002039020"));
+    assert_eq!(prepared.len(), 524);
+    bridge.mark_native_normal_enqueued(&prepared).unwrap();
+    bridge.acknowledge_native_normal(1).unwrap();
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+    assert_eq!(bridge.phase(), BridgePhase::Active);
+}
+
+#[test]
 fn gateway_tcp_credit_releases_after_complete_socket_write() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
