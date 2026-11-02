@@ -885,6 +885,9 @@ to = "upstream"
         );
         assert_eq!(parsed.remote[0].bearer_token().unwrap(), "test-token");
         assert!(!format!("{:?}", parsed).contains("test-token"));
+        let without_token = parse(&config.replace("token = \"test-token\"\n", ""));
+        without_token.validate().unwrap();
+        assert_eq!(without_token.remote[0].bearer_token().unwrap(), "");
         parse(&config.replace("[[concentrator]]", "[[remote]]"))
             .validate()
             .unwrap();

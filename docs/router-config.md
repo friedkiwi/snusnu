@@ -48,7 +48,7 @@ from = "snaa"
 to = "upstream"
 ```
 
-`token` is the concentrator's bearer credential for this router. Use `token = ""` when the endpoint does not require bearer authentication. Keep a file containing a real token readable only by the router operator; the token is never printed in logs. The older `--remote-link` command still reads `SNUSNU_ROUTER_TOKEN` from the environment.
+`token` is optional. Omit it or set `token = ""` to send no Authorization header. Keep a file containing a real token readable only by the router operator; the token is never printed in logs. The older `--remote-link` command still reads `SNUSNU_ROUTER_TOKEN` from the environment.
 
 Configured `[[concentrator]]` entries share one authenticated connection and publish one snapshot of CPs and LUs derived from their attached local peers. An LLC association declares its CP and LUs once on `[[llc]]`; the router uses those declarations for publication and verifies the CP against the guest's XID3 before LLC2 contact. The `target_cp` (and optional `target_lu`) on an LLC concentrator route currently selects one destination from the concentrator's advertised directory. These target fields are temporary per-circuit selection until the router can select a destination from each incoming session. Standalone LLC routes can omit identity declarations. The configured proxy MAC must be in the `02:53:4e` managed namespace and is updated to the server-assigned virtual MAC while its LLC association is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
 

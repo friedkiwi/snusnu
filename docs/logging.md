@@ -45,7 +45,7 @@ sudo --preserve-env=RUST_LOG,SNUSNU_LOG_FORMAT \
 ```
 
 For configured `[[concentrator]]` routes, the bearer credential is the
-`token` value in the TOML file; an empty value means no bearer credential.
+`token` value in the TOML file; omitting it or setting it empty means no bearer credential.
 Keep a config containing a real token readable only by the router operator.
 The older `--remote-link` command uses `SNUSNU_ROUTER_TOKEN` from the
 environment; include it in `sudo --preserve-env` when needed. The router
