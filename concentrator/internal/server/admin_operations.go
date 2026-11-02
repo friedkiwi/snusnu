@@ -1,0 +1,277 @@
+package server
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/friedkiwi/snusnu/concentrator/internal/store"
+)
+
+type maintenanceDefinition struct {
+	Name, Title, Description, Schedule string
+	Run                                func(context.Context) (string, error)
+}
+
+type maintenanceRun struct {
+	Name, Title, Description, Schedule   string
+	StartedAt, FinishedAt                int64
+	Status, Trigger, TriggeredBy, Result string
+}
+
+type maintenanceManager struct {
+	a       *App
+	mu      sync.Mutex
+	running map[string]bool
+	tasks   map[string]maintenanceDefinition
+}
+
+func newMaintenanceManager(a *App) *maintenanceManager {
+	m := &maintenanceManager{a: a, running: make(map[string]bool), tasks: make(map[string]maintenanceDefinition)}
+	m.tasks["expired-records"] = maintenanceDefinition{
+		Name: "expired-records", Title: "Expired authentication records", Schedule: "Hourly",
+		Description: "Remove expired sessions, verification and password-reset tokens, WebAuthn ceremonies, and rate-limit records.",
+		Run: func(ctx context.Context) (string, error) {
+			n, err := a.DB.CleanupExpired(ctx)
+			return fmt.Sprintf("Deleted %d expired records.", n), err
+		},
+	}
+	m.tasks["router-log-retention"] = maintenanceDefinition{
+		Name: "router-log-retention", Title: "Router log retention", Schedule: "Hourly",
+		Description: "Delete router flow and operational log records older than 30 days.",
+		Run: func(ctx context.Context) (string, error) {
+			n, err := a.DB.CleanupRouterLogs(ctx)
+			return fmt.Sprintf("Deleted %d expired router log records.", n), err
+		},
+	}
+	m.tasks["sna-circuit-history"] = maintenanceDefinition{
+		Name: "sna-circuit-history", Title: "SNA circuit history retention", Schedule: "Hourly",
+		Description: "Delete completed SNA circuit summaries older than 90 days.",
+		Run: func(ctx context.Context) (string, error) {
+			n, err := a.DB.CleanupCircuitHistory(ctx)
+			return fmt.Sprintf("Deleted %d expired SNA circuit summaries.", n), err
+		},
+	}
+	return m
+}
+
+// StartMaintenance runs the same registered tasks exposed in the admin panel.
+// Calling it more than once is harmless only when the caller owns one App.
+func (a *App) StartMaintenance(ctx context.Context) {
+	a.workersOnce.Do(func() {
+		a.queueMu.Lock()
+		a.queuesOpen = true
+		a.queueMu.Unlock()
+		a.workersRunning.Store(true)
+		workerCtx, cancel := context.WithCancel(context.Background())
+		a.workerCancel = cancel
+		a.startCircuitHistoryWriter(workerCtx)
+		a.startRouterLogWriter(workerCtx)
+		a.workersWG.Add(1)
+		go func() {
+			defer a.workersWG.Done()
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					for name := range a.maintenance.tasks {
+						runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+						_, _ = a.maintenance.run(runCtx, name, "scheduled", "")
+						cancel()
+					}
+				}
+			}
+		}()
+	})
+}
+
+// ShutdownBackground fences producers before waiting for both persistence
+// queues and the maintenance scheduler to stop.
+func (a *App) ShutdownBackground(ctx context.Context) error {
+	a.queueMu.Lock()
+	a.queuesOpen = false
+	a.queueMu.Unlock()
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
+	done := make(chan struct{})
+	go func() { a.workersWG.Wait(); close(done) }()
+	select {
+	case <-done:
+		a.workersRunning.Store(false)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+var errMaintenanceRunning = errors.New("maintenance task is already running")
+
+func (m *maintenanceManager) run(ctx context.Context, name, trigger, actor string) (string, error) {
+	def, ok := m.tasks[name]
+	if !ok {
+		return "", store.ErrNotFound
+	}
+	m.mu.Lock()
+	if m.running[name] {
+		m.mu.Unlock()
+		return "", errMaintenanceRunning
+	}
+	m.running[name] = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.running, name)
+		m.mu.Unlock()
+	}()
+
+	started := store.Now()
+	claim, err := m.a.DB.Exec(ctx, `INSERT INTO maintenance_runs(task_name,started_at,finished_at,status,trigger_kind,triggered_by,result)
+		VALUES(?,?,0,'running',?,?,'')
+		ON CONFLICT(task_name) DO UPDATE SET started_at=excluded.started_at,finished_at=0,status='running',trigger_kind=excluded.trigger_kind,triggered_by=excluded.triggered_by,result=''
+		WHERE maintenance_runs.status<>'running' OR maintenance_runs.started_at<?`, name, started, trigger, actor, started-3600)
+	if err != nil {
+		return "", err
+	}
+	claimed, err := claim.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if claimed == 0 {
+		return "", errMaintenanceRunning
+	}
+	result, runErr := def.Run(ctx)
+	status := "success"
+	if runErr != nil {
+		status = "failed"
+		if result != "" {
+			result += " "
+		}
+		result += runErr.Error()
+	}
+	// Use a fresh bounded context so cancellation of the task does not leave a
+	// permanently displayed running state.
+	finishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, finishErr := m.a.DB.Exec(finishCtx, "UPDATE maintenance_runs SET finished_at=?,status=?,result=? WHERE task_name=?", store.Now(), status, result, name)
+	if runErr != nil {
+		return result, runErr
+	}
+	return result, finishErr
+}
+
+func (m *maintenanceManager) list(ctx context.Context) ([]maintenanceRun, error) {
+	rows, err := m.a.DB.Query(ctx, "SELECT task_name,started_at,finished_at,status,trigger_kind,triggered_by,result FROM maintenance_runs")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byName := make(map[string]maintenanceRun)
+	for rows.Next() {
+		var run maintenanceRun
+		if err = rows.Scan(&run.Name, &run.StartedAt, &run.FinishedAt, &run.Status, &run.Trigger, &run.TriggeredBy, &run.Result); err != nil {
+			return nil, err
+		}
+		if run.Status == "running" && run.StartedAt < store.Now()-3600 {
+			run.Status = "failed"
+			run.FinishedAt = store.Now()
+			run.Result = "The previous run did not complete; its worker may have stopped."
+		}
+		byName[run.Name] = run
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]maintenanceRun, 0, len(m.tasks))
+	for name, def := range m.tasks {
+		run := byName[name]
+		run.Name, run.Title, run.Description, run.Schedule = name, def.Title, def.Description, def.Schedule
+		result = append(result, run)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Title < result[j].Title })
+	return result, nil
+}
+
+type adminRouterSession struct {
+	ID, Name, IP, Protocol, Epoch                string
+	ConnectedAt                                  int64
+	RouteCount                                   int
+	RouteRevision                                uint64
+	OutboundQueued, OutboundCapacity, DataQueued int
+}
+
+type adminCircuit struct {
+	ID, SourceID, SourceName, TargetID, TargetName, State    string
+	SourceSent, SourceAllowance, TargetSent, TargetAllowance uint64
+}
+
+func (h *routerHub) adminSnapshot() ([]adminRouterSession, []adminCircuit) {
+	routers := make([]adminRouterSession, 0, h.sessionCount())
+	for _, c := range h.sessions() {
+		c.mu.Lock()
+		item := adminRouterSession{ID: c.router.ID, Name: c.router.DisplayName, IP: c.ip, Protocol: c.subprotocol, Epoch: c.epoch, ConnectedAt: c.connectedAt.Unix(), OutboundQueued: len(c.out), OutboundCapacity: cap(c.out)}
+		if c.snapshot != nil {
+			item.RouteCount = len(c.snapshot.Routes)
+			item.RouteRevision = c.snapshot.Revision
+		}
+		for _, bytes := range c.queued {
+			item.DataQueued += bytes
+		}
+		c.mu.Unlock()
+		routers = append(routers, item)
+	}
+	sort.Slice(routers, func(i, j int) bool { return routers[i].Name < routers[j].Name })
+	var circuits []adminCircuit
+	h.circuits.Range(func(key, value any) bool {
+		id, c := key.(string), value.(*wsCircuit)
+		c.mu.Lock()
+		sourceRouter, targetRouter := c.source.routerSnapshot(), c.target.routerSnapshot()
+		item := adminCircuit{ID: id, SourceID: sourceRouter.ID, SourceName: sourceRouter.DisplayName, TargetID: targetRouter.ID, TargetName: targetRouter.DisplayName, State: "Active", SourceAllowance: c.allowance[0], TargetAllowance: c.allowance[1], SourceSent: c.sent[0], TargetSent: c.sent[1]}
+		if c.pending {
+			item.State = "Pending"
+		}
+		c.mu.Unlock()
+		circuits = append(circuits, item)
+		return true
+	})
+	sort.Slice(circuits, func(i, j int) bool { return circuits[i].ID < circuits[j].ID })
+	return routers, circuits
+}
+
+func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	tasks, err := a.maintenance.list(r.Context())
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		dbError(w, err)
+		return
+	}
+	routers, circuits := a.hub.adminSnapshot()
+	policyVersion, policyRouters, policyBlocks := uint64(0), 0, 0
+	if policy := a.hub.policy.Load(); policy != nil {
+		policyVersion, policyRouters, policyBlocks = policy.version, len(policy.routers), len(policy.blocks)
+	}
+	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": len(a.routerLogs), "RouterLogCapacity": cap(a.routerLogs)})
+}
+
+func (a *App) runMaintenanceTask(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	_, err := a.maintenance.run(ctx, r.PathValue("task"), "manual", u.Email)
+	if errors.Is(err, store.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if errors.Is(err, errMaintenanceRunning) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	// Failures are persisted and displayed on the destination page.
+	http.Redirect(w, r, "/admin/operations", http.StatusSeeOther)
+}

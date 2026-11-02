@@ -30,20 +30,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.DB.Close()
-	go func() {
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := db.Prune(ctx); err != nil {
-					log.Printf("database cleanup: %v", err)
-				}
-			}
-		}
-	}()
 	if *promote != "" {
 		res, err := db.Exec(ctx, "UPDATE users SET role='admin' WHERE email=? AND verified_at>0", *promote)
 		if err != nil {
@@ -63,6 +49,17 @@ func main() {
 		log.Printf("reset MFA and sessions for %s", *resetMFA)
 		return
 	}
+	instanceID := store.RandomUUID()
+	if err := db.AcquireInstance(ctx, instanceID); err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := db.ReleaseInstance(releaseCtx, instanceID); err != nil {
+			log.Printf("release instance lease: %v", err)
+		}
+	}()
 	if err := db.ResetLiveState(ctx); err != nil {
 		log.Fatal(err)
 	}
@@ -74,6 +71,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := app.InitializeRouterPolicy(ctx); err != nil {
+		log.Fatal(err)
+	}
+	app.StartMaintenance(ctx)
+	app.StartInstanceHeartbeat(ctx, instanceID)
 	srv := server.New(*addr)
 	srv.Handler = app.Handler()
 	done := make(chan error, 1)
@@ -84,11 +86,19 @@ func main() {
 			log.Fatal(err)
 		}
 	case <-ctx.Done():
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		app.BeginDrain(drainCtx)
+		drainCancel()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Fatal(err)
+			log.Printf("HTTP shutdown: %v", err)
 		}
+		cancel()
+		backgroundCtx, backgroundCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := app.ShutdownBackground(backgroundCtx); err != nil {
+			log.Printf("background shutdown: %v", err)
+		}
+		backgroundCancel()
 		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}

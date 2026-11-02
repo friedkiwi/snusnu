@@ -6,8 +6,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -19,6 +21,9 @@ import (
 
 const maxWSMessage = 64 * 1024
 const maxWSCircuits = 64
+const wsPingInterval = 5 * time.Second
+const wsReadTimeout = 15 * time.Second
+const wsWriteTimeout = 10 * time.Second
 
 type outboundMessage struct {
 	data    []byte
@@ -26,6 +31,7 @@ type outboundMessage struct {
 	cost    int
 }
 type routerSession struct {
+	mu                             sync.Mutex
 	router                         store.Router
 	token, epoch, ip, allowedNetID string
 	subprotocol                    string
@@ -39,7 +45,18 @@ type routerSession struct {
 	history                        map[uint64]routeSignature
 	rateWindow                     time.Time
 	rateCount                      int
+	connectedAt                    time.Time
+	closed                         atomic.Bool
+	circuitCount                   atomic.Int32
+	done                           chan struct{}
 }
+
+func (c *routerSession) routerSnapshot() store.Router {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.router
+}
+
 type routeSignature struct {
 	generation uint64
 	identity   string
@@ -49,15 +66,20 @@ type routeVersion struct {
 	revision uint64
 }
 type routerHub struct {
-	a        *App
-	mu       sync.Mutex
-	clients  map[string]*routerSession
-	circuits map[string]*wsCircuit
-	running  bool
+	a               *App
+	policyMu        sync.Mutex
+	reconcileMu     sync.Mutex
+	clients         sync.Map // router ID -> *routerSession
+	circuits        sync.Map // circuit UUID -> *wsCircuit
+	tombstones      sync.Map // circuit UUID -> expiry time.Time
+	running         atomic.Bool
+	policy          atomic.Pointer[routerPolicySnapshot]
+	reconciliations atomic.Uint64
+	draining        atomic.Bool
 }
 
 func newRouterHub(a *App) *routerHub {
-	return &routerHub{a: a, clients: map[string]*routerSession{}, circuits: map[string]*wsCircuit{}}
+	return &routerHub{a: a}
 }
 func uuidBytes(value string) []byte {
 	id, err := uuid.Parse(value)
@@ -74,6 +96,10 @@ func uuidString(value []byte) (string, bool) {
 	return id.String(), err == nil
 }
 func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
+	if a.hub.draining.Load() {
+		http.Error(w, "service is draining", http.StatusServiceUnavailable)
+		return
+	}
 	requested := websocket.Subprotocols(r)
 	subprotocol := ""
 	for _, offered := range requested {
@@ -122,20 +148,20 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}}
+	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}, connectedAt: time.Now(), done: make(chan struct{})}
 	h := a.hub
-	h.mu.Lock()
-	if previous := h.clients[router.ID]; previous != nil {
-		h.removeLocked(previous)
+	if _, err := h.loadPolicy(r.Context()); err != nil {
+		conn.Close()
+		return
 	}
-	h.clients[router.ID] = c
-	h.sendLocked(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}}}, "", 0)
-	h.refreshLocked()
-	if !h.running {
-		h.running = true
+	if previous, loaded := h.clients.Swap(router.ID, c); loaded {
+		h.remove(previous.(*routerSession))
+	}
+	h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}}}, "", 0)
+	h.refresh()
+	if h.running.CompareAndSwap(false, true) {
 		go h.tick()
 	}
-	h.mu.Unlock()
 	go h.write(c)
 	h.read(c)
 }
@@ -143,37 +169,42 @@ func (h *routerHub) tick() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		h.mu.Lock()
-		if len(h.clients) == 0 {
-			h.running = false
-			h.mu.Unlock()
+		h.expireCircuits(time.Now())
+		if h.sessionCount() == 0 {
+			h.running.Store(false)
+			if h.sessionCount() != 0 && h.running.CompareAndSwap(false, true) {
+				continue
+			}
 			return
 		}
-		h.refreshLocked()
-		h.mu.Unlock()
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := h.refreshPolicyAndRoutes(refreshCtx)
+		cancel()
+		if err != nil {
+			log.Printf("router policy refresh: %v", err)
+		}
 	}
 }
 func (h *routerHub) write(c *routerSession) {
-	ticker := time.NewTicker(20 * time.Second)
+	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case msg, ok := <-c.out:
-			if !ok {
-				return
-			}
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		case <-c.done:
+			return
+		case msg := <-c.out:
+			c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := c.conn.WriteMessage(websocket.BinaryMessage, msg.data); err != nil {
 				h.detach(c)
 				return
 			}
 			if msg.cost > 0 {
-				h.mu.Lock()
+				c.mu.Lock()
 				c.queued[msg.circuit] -= msg.cost
-				h.mu.Unlock()
+				c.mu.Unlock()
 			}
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				h.detach(c)
 				return
@@ -184,8 +215,8 @@ func (h *routerHub) write(c *routerSession) {
 func (h *routerHub) read(c *routerSession) {
 	defer h.detach(c)
 	c.conn.SetReadLimit(maxWSMessage)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.conn.SetPongHandler(func(string) error { return c.conn.SetReadDeadline(time.Now().Add(60 * time.Second)) })
+	c.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	c.conn.SetPongHandler(func(string) error { return c.conn.SetReadDeadline(time.Now().Add(wsReadTimeout)) })
 	for {
 		kind, payload, err := c.conn.ReadMessage()
 		if err != nil {
@@ -198,56 +229,61 @@ func (h *routerHub) read(c *routerSession) {
 		if err := proto.Unmarshal(payload, &envelope); err != nil {
 			return
 		}
-		h.mu.Lock()
-		if h.clients[c.router.ID] != c {
-			h.mu.Unlock()
+		if !h.isCurrent(c) {
 			return
 		}
-		err = h.handleLocked(c, &envelope)
-		h.mu.Unlock()
+		err = h.handle(c, &envelope)
 		if err != nil {
 			log.Printf("router %s protocol: %v", c.router.ID, err)
-			_ = h.a.DB.AppendRouterLog(context.Background(), store.LogEntry{RouterID: c.router.ID, Direction: "system", Level: "error", EventType: "protocol", SourceIP: c.ip, Summary: err.Error()})
+			h.a.enqueueRouterLog(store.LogEntry{RouterID: c.router.ID, Direction: "system", Level: "error", EventType: "protocol", SourceIP: c.ip, Summary: err.Error()})
 			return
 		}
 	}
 }
 func (h *routerHub) detach(c *routerSession) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.clients[c.router.ID] == c {
-		h.removeLocked(c)
-		h.refreshLocked()
+	if h.clients.CompareAndDelete(c.router.ID, c) {
+		h.remove(c)
+		h.refresh()
 	}
 }
-func (h *routerHub) removeLocked(c *routerSession) {
-	if h.clients[c.router.ID] != c {
+func (h *routerHub) remove(c *routerSession) {
+	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
-	delete(h.clients, c.router.ID)
-	for id, circuit := range h.circuits {
-		if circuit.source == c || circuit.target == c {
+	close(c.done)
+	h.circuits.Range(func(key, value any) bool {
+		id, circuit := key.(string), value.(*wsCircuit)
+		circuit.mu.Lock()
+		if !circuit.closed && (circuit.source == c || circuit.target == c) {
+			circuit.closed = true
+			releaseCircuitValue(circuit)
 			peer := circuit.source
 			if peer == c {
 				peer = circuit.target
 			}
-			h.sendLocked(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: wire.ResetReason_RESET_REASON_REMOTE_LINK}}}, "", 0)
-			delete(h.circuits, id)
+			h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: wire.ResetReason_RESET_REASON_REMOTE_LINK}}}, "", 0)
+			h.archiveCircuitLocked(id, circuit, wire.ResetReason_RESET_REASON_REMOTE_LINK.String(), "system", "")
+			h.retireCircuit(id, circuit)
 		}
-	}
-	_ = h.a.DB.EndRouterEpoch(context.Background(), c.router.ID, c.epoch)
-	close(c.out)
+		circuit.mu.Unlock()
+		return true
+	})
 	_ = c.conn.Close()
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = h.a.DB.EndRouterEpoch(cleanupCtx, c.router.ID, c.epoch)
+	cancel()
 }
-func (h *routerHub) sendLocked(c *routerSession, e *wire.WsEnvelope, circuit string, cost int) bool {
-	if c == nil || h.clients[c.router.ID] != c {
+func (h *routerHub) send(c *routerSession, e *wire.WsEnvelope, circuit string, cost int) bool {
+	if c == nil || !h.isCurrent(c) || c.closed.Load() {
 		return false
 	}
 	data, err := proto.Marshal(e)
 	if err != nil || len(data) > maxWSMessage {
 		return false
 	}
-	if cost > 0 && c.queued[circuit]+cost > 64*1024 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed.Load() || cost > 0 && c.queued[circuit]+cost > 64*1024 {
 		return false
 	}
 	select {
@@ -260,154 +296,217 @@ func (h *routerHub) sendLocked(c *routerSession, e *wire.WsEnvelope, circuit str
 		return false
 	}
 }
-func (h *routerHub) currentLocked(c *routerSession) bool {
-	r, err := h.a.DB.RouterByToken(context.Background(), c.token)
-	if err != nil || r.ID != c.router.ID {
-		return false
+func (h *routerHub) session(id string) *routerSession {
+	value, ok := h.clients.Load(id)
+	if !ok {
+		return nil
 	}
-	if c.router.LLCFacing && !r.LLCFacing {
-		return false
-	}
-	owner, err := h.a.DB.UserByID(context.Background(), r.OwnerID)
-	if err != nil || owner.NetID != c.allowedNetID {
-		return false
-	}
-	var epoch string
-	if err := h.a.DB.Row(context.Background(), "SELECT epoch FROM router_epochs WHERE router_id=?", c.router.ID).Scan(&epoch); err != nil || epoch != c.epoch {
-		return false
-	}
-	if r.DisplayName != c.router.DisplayName {
-		c.router.DisplayName = r.DisplayName
-		h.sendLocked(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_IdentityUpdate{IdentityUpdate: &wire.RouterIdentityUpdate{DisplayName: r.DisplayName}}}, "", 0)
-	}
-	c.router.LLCFacing = r.LLCFacing
-	return true
+	return value.(*routerSession)
 }
-func (h *routerHub) refreshLocked() {
-	for _, c := range h.clients {
-		if !h.currentLocked(c) {
-			h.removeLocked(c)
+
+func (h *routerHub) isCurrent(c *routerSession) bool {
+	return c != nil && !c.closed.Load() && h.session(c.router.ID) == c
+}
+
+func (h *routerHub) sessions() []*routerSession {
+	var result []*routerSession
+	h.clients.Range(func(_, value any) bool {
+		result = append(result, value.(*routerSession))
+		return true
+	})
+	return result
+}
+
+func (h *routerHub) sessionCount() int {
+	n := 0
+	h.clients.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+type publishedRoutes struct {
+	session  *routerSession
+	epoch    string
+	snapshot *wire.RouteSnapshot
+}
+
+func (h *routerHub) refresh() {
+	h.reconcileMu.Lock()
+	defer h.reconcileMu.Unlock()
+	h.reconciliations.Add(1)
+	sessions := h.sessions()
+	for _, c := range sessions {
+		if !h.current(c) && h.clients.CompareAndDelete(c.router.ID, c) {
+			h.remove(c)
 		}
 	}
-	for _, recipient := range h.clients {
-		for id, origin := range h.clients {
-			if origin == recipient || origin.snapshot == nil {
-				continue
-			}
-			allowed, err := h.a.DB.CanForward(context.Background(), recipient.router.ID, origin.router.ID)
-			if err != nil || !allowed {
+	sessions = h.sessions()
+	origins := make(map[string]publishedRoutes, len(sessions))
+	for _, origin := range sessions {
+		origin.mu.Lock()
+		if origin.snapshot != nil {
+			origins[origin.router.ID] = publishedRoutes{session: origin, epoch: origin.epoch, snapshot: proto.Clone(origin.snapshot).(*wire.RouteSnapshot)}
+		}
+		origin.mu.Unlock()
+	}
+	for _, recipient := range sessions {
+		for id, origin := range origins {
+			if origin.session == recipient || !h.allowed(recipient, origin.session) {
 				continue
 			}
 			version := routeVersion{origin.epoch, origin.snapshot.Revision}
-			if recipient.sent[id] != version {
-				if h.sendLocked(recipient, &wire.WsEnvelope{Body: &wire.WsEnvelope_OriginRoutes{OriginRoutes: &wire.OriginRouteSnapshot{RouterId: uuidBytes(id), Snapshot: origin.snapshot}}}, "", 0) {
-					recipient.sent[id] = version
+			recipient.mu.Lock()
+			prior := recipient.sent[id]
+			recipient.mu.Unlock()
+			if prior != version && h.send(recipient, &wire.WsEnvelope{Body: &wire.WsEnvelope_OriginRoutes{OriginRoutes: &wire.OriginRouteSnapshot{RouterId: uuidBytes(id), Snapshot: origin.snapshot}}}, "", 0) {
+				recipient.mu.Lock()
+				recipient.sent[id] = version
+				recipient.mu.Unlock()
+			}
+		}
+		recipient.mu.Lock()
+		sent := make(map[string]routeVersion, len(recipient.sent))
+		for id, version := range recipient.sent {
+			sent[id] = version
+		}
+		llcFacing := recipient.router.LLCFacing
+		recipient.mu.Unlock()
+		for id, version := range sent {
+			origin, exists := origins[id]
+			if !exists || !h.allowed(recipient, origin.session) || origin.epoch != version.epoch {
+				h.send(recipient, &wire.WsEnvelope{Body: &wire.WsEnvelope_OriginWithdraw{OriginWithdraw: &wire.OriginWithdraw{RouterId: uuidBytes(id), Epoch: uuidBytes(version.epoch)}}}, "", 0)
+				recipient.mu.Lock()
+				if recipient.sent[id] == version {
+					delete(recipient.sent, id)
+				}
+				recipient.mu.Unlock()
+			}
+		}
+		if llcFacing {
+			h.refreshBindings(recipient, origins, h.policy.Load())
+		}
+	}
+	h.circuits.Range(func(key, value any) bool {
+		id, circuit := key.(string), value.(*wsCircuit)
+		circuit.mu.Lock()
+		if !h.routeValid(circuit) || !h.allowed(circuit.source, circuit.target) {
+			h.resetCircuitValue(id, circuit, wire.ResetReason_RESET_REASON_ROUTE_GONE, "system", "")
+		}
+		circuit.mu.Unlock()
+		return true
+	})
+}
+
+func (h *routerHub) refreshBindings(c *routerSession, origins map[string]publishedRoutes, policy *routerPolicySnapshot) {
+	c.mu.Lock()
+	revision := c.bindingRevision + 1
+	c.mu.Unlock()
+	if policy == nil {
+		return
+	}
+	bindings := make([]*wire.ManagedCpBinding, 0, len(policy.managed))
+	for _, address := range policy.managed {
+		var refs []*wire.RouteReference
+		for originID, origin := range origins {
+			originPolicy, ok := policy.routers[originID]
+			if !ok || originPolicy.ownerID != address.ownerID || !policy.allows(c.router.ID, originID) {
+				continue
+			}
+			for _, route := range origin.snapshot.Routes {
+				cp := route.GetControlPoint()
+				if cp != nil && cp.Netid == address.netID && cp.Name == address.cpName {
+					refs = append(refs, &wire.RouteReference{RouterId: uuidBytes(originID), Epoch: uuidBytes(origin.epoch), RouteId: route.Id, RouteGeneration: route.Generation})
 				}
 			}
 		}
-		for id, version := range recipient.sent {
-			origin := h.clients[id]
-			allowed := false
-			if origin != nil && origin.snapshot != nil {
-				allowed, _ = h.a.DB.CanForward(context.Background(), recipient.router.ID, id)
-			}
-			if origin == nil || origin.snapshot == nil || !allowed || origin.epoch != version.epoch {
-				h.sendLocked(recipient, &wire.WsEnvelope{Body: &wire.WsEnvelope_OriginWithdraw{OriginWithdraw: &wire.OriginWithdraw{RouterId: uuidBytes(id), Epoch: uuidBytes(version.epoch)}}}, "", 0)
-				delete(recipient.sent, id)
-			}
+		if len(refs) == 0 {
+			continue
 		}
-		if recipient.router.LLCFacing {
-			h.refreshBindingsLocked(recipient)
-		}
+		sort.Slice(refs, func(i, j int) bool {
+			return string(refs[i].RouterId) < string(refs[j].RouterId) || string(refs[i].RouterId) == string(refs[j].RouterId) && refs[i].RouteId < refs[j].RouteId
+		})
+		mac := store.ManagedCP{Suffix: address.suffix}.MACBytes()
+		bindings = append(bindings, &wire.ManagedCpBinding{AddressId: uuidBytes(address.id), ControlPoint: &wire.SnaName{Netid: address.netID, Name: address.cpName}, VirtualMac: mac[:], Candidates: refs})
 	}
-	for id, circuit := range h.circuits {
-		if !h.routeValidLocked(circuit) || !h.allowedLocked(circuit.source, circuit.target) {
-			h.resetCircuitLocked(id, wire.ResetReason_RESET_REASON_ROUTE_GONE)
-		}
-	}
-}
-func (h *routerHub) refreshBindingsLocked(c *routerSession) {
-	projection, err := h.a.DB.BuildManagedBindingSnapshot(context.Background(), c.router.ID, c.epoch, c.bindingRevision+1)
-	if err != nil {
-		return
-	}
-	bindings := make([]*wire.ManagedCpBinding, 0, len(projection.Bindings))
-	for _, b := range projection.Bindings {
-		refs := make([]*wire.RouteReference, 0, len(b.Candidates))
-		for _, ref := range b.Candidates {
-			refs = append(refs, &wire.RouteReference{RouterId: uuidBytes(ref.RouterID), Epoch: uuidBytes(ref.Epoch), RouteId: uint64(ref.RouteID), RouteGeneration: uint64(ref.Generation)})
-		}
-		bindings = append(bindings, &wire.ManagedCpBinding{AddressId: uuidBytes(b.AddressID), ControlPoint: &wire.SnaName{Netid: b.NetID, Name: b.CPName}, VirtualMac: b.MAC[:], Candidates: refs})
-	}
-	next := &wire.ManagedCpBindingSnapshot{SchemaVersion: 1, RecipientEpoch: uuidBytes(c.epoch), Revision: c.bindingRevision + 1, Bindings: bindings}
+	next := &wire.ManagedCpBindingSnapshot{SchemaVersion: 1, RecipientEpoch: uuidBytes(c.epoch), Revision: revision, Bindings: bindings}
+	c.mu.Lock()
 	if c.binding != nil {
 		prior := proto.Clone(c.binding).(*wire.ManagedCpBindingSnapshot)
 		prior.Revision = next.Revision
 		if proto.Equal(prior, next) {
+			c.mu.Unlock()
 			return
 		}
 	}
-	if h.sendLocked(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_ManagedCpBindings{ManagedCpBindings: next}}, "", 0) {
+	c.mu.Unlock()
+	if h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_ManagedCpBindings{ManagedCpBindings: next}}, "", 0) {
+		c.mu.Lock()
 		c.binding = next
-		c.bindingRevision++
+		c.bindingRevision = revision
+		c.mu.Unlock()
 	}
 }
-func (h *routerHub) allowedLocked(source, target *routerSession) bool {
-	if source == nil || target == nil || h.clients[source.router.ID] != source || h.clients[target.router.ID] != target {
-		return false
-	}
-	allowed, err := h.a.DB.CanForward(context.Background(), source.router.ID, target.router.ID)
-	return err == nil && allowed
-}
-func (h *routerHub) handleLocked(c *routerSession, e *wire.WsEnvelope) error {
-	if !h.currentLocked(c) {
+func (h *routerHub) handle(c *routerSession, e *wire.WsEnvelope) error {
+	if !h.current(c) {
 		return errors.New("credential revoked or epoch replaced")
 	}
 	now := time.Now()
+	c.mu.Lock()
 	if now.Sub(c.rateWindow) >= time.Second {
 		c.rateWindow = now
 		c.rateCount = 0
 	}
 	c.rateCount++
 	if c.rateCount > 256 {
+		c.mu.Unlock()
 		return errors.New("router message rate exceeded")
 	}
+	c.mu.Unlock()
 	switch body := e.Body.(type) {
 	case *wire.WsEnvelope_PublishRoutes:
 		if body.PublishRoutes == nil {
 			return errors.New("empty route snapshot")
 		}
-		if err := h.publishLocked(c, body.PublishRoutes); err != nil {
+		if err := h.publish(c, body.PublishRoutes); err != nil {
 			return err
 		}
-		h.refreshLocked()
+		h.refresh()
 	case *wire.WsEnvelope_OpenRequest:
-		return h.openLocked(c, body.OpenRequest)
+		if h.draining.Load() {
+			return errors.New("service is draining")
+		}
+		return h.open(c, body.OpenRequest)
 	case *wire.WsEnvelope_OpenDecision:
-		return h.decisionLocked(c, body.OpenDecision)
+		return h.decision(c, body.OpenDecision)
 	case *wire.WsEnvelope_CircuitEvent:
-		return h.eventLocked(c, body.CircuitEvent)
+		return h.event(c, body.CircuitEvent)
 	case *wire.WsEnvelope_CircuitCredit:
-		return h.creditLocked(c, body.CircuitCredit)
+		return h.credit(c, body.CircuitCredit)
 	case *wire.WsEnvelope_CircuitClose:
 		if body.CircuitClose == nil {
 			return errors.New("empty circuit close")
 		}
-		return h.endCircuitLocked(c, body.CircuitClose.CircuitId, false, 0)
+		return h.endCircuit(c, body.CircuitClose.CircuitId, false, 0)
 	case *wire.WsEnvelope_CircuitReset:
 		if body.CircuitReset == nil {
 			return errors.New("empty circuit reset")
 		}
-		return h.endCircuitLocked(c, body.CircuitReset.CircuitId, true, body.CircuitReset.Reason)
+		return h.endCircuit(c, body.CircuitReset.CircuitId, true, body.CircuitReset.Reason)
 	default:
 		return errors.New("message direction or type invalid")
 	}
 	return nil
 }
-func (h *routerHub) publishLocked(c *routerSession, snapshot *wire.RouteSnapshot) error {
+func (h *routerHub) publish(c *routerSession, snapshot *wire.RouteSnapshot) error {
+	c.mu.Lock()
 	if len(c.history) > 4096 {
+		c.mu.Unlock()
 		return errors.New("route ID history limit exceeded")
 	}
+	history := make(map[uint64]routeSignature, len(c.history))
+	for id, signature := range c.history {
+		history[id] = signature
+	}
+	c.mu.Unlock()
 	epoch, ok := uuidString(snapshot.Epoch)
 	if !ok || epoch != c.epoch {
 		return store.ErrStaleEpoch
@@ -475,14 +574,22 @@ func (h *routerHub) publishLocked(c *routerSession, snapshot *wire.RouteSnapshot
 		}
 		exports = append(exports, x)
 		identity := x.Kind + ":" + x.NetID + ":" + x.Name + ":" + x.HostingCPNetID + ":" + x.HostingCPName
-		if previous, seen := c.history[x.ID]; seen && (x.Generation < previous.generation || (x.Generation == previous.generation && identity != previous.identity)) {
+		if previous, seen := history[x.ID]; seen && (x.Generation < previous.generation || (x.Generation == previous.generation && identity != previous.identity)) {
 			return errors.New("route ID retargeted without new generation")
 		}
 		updates[x.ID] = routeSignature{generation: x.Generation, identity: identity}
 	}
-	if err := h.a.DB.ReplaceRouterSnapshot(context.Background(), c.router.ID, c.epoch, snapshot.Revision, exports); err != nil {
+	persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := h.a.DB.ReplaceRouterSnapshot(persistCtx, c.router.ID, c.epoch, snapshot.Revision, exports)
+	cancel()
+	if err != nil {
 		return err
 	}
+	if !h.isCurrent(c) {
+		return store.ErrStaleEpoch
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.snapshot = proto.Clone(snapshot).(*wire.RouteSnapshot)
 	for id, sig := range updates {
 		c.history[id] = sig

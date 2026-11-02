@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -54,9 +56,9 @@ func (a *App) adminDeleteUser(w http.ResponseWriter, r *http.Request, u store.Us
 	http.Redirect(w, r, "/admin/users", 303)
 }
 func (a *App) closeDeletedUserRouters() {
-	a.hub.mu.Lock()
-	a.hub.refreshLocked()
-	a.hub.mu.Unlock()
+	if err := a.hub.refreshPolicyAndRoutes(context.Background()); err != nil {
+		log.Printf("refresh router policy after account deletion: %v", err)
+	}
 }
 func accountDeleteError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrLastAdmin) {

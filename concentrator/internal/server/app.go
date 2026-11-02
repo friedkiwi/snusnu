@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
@@ -18,6 +19,8 @@ import (
 	"net/smtp"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -32,11 +35,24 @@ type Config struct {
 	Development                                        bool
 }
 type App struct {
-	DB       *store.Store
-	Config   Config
-	webauthn *webauthn.WebAuthn
-	client   *http.Client
-	hub      *routerHub
+	DB             *store.Store
+	Config         Config
+	webauthn       *webauthn.WebAuthn
+	client         *http.Client
+	hub            *routerHub
+	maintenance    *maintenanceManager
+	circuitHistory chan circuitHistoryRecord
+	routerLogs     chan store.LogEntry
+	workersOnce    sync.Once
+	workersWG      sync.WaitGroup
+	workerCancel   context.CancelFunc
+	queueMu        sync.RWMutex
+	queuesOpen     bool
+	workersRunning atomic.Bool
+	routerLogDrops atomic.Uint64
+	historyDrops   atomic.Uint64
+	writeFailures  atomic.Uint64
+	leaseHealthy   atomic.Bool
 }
 
 func NewApp(db *store.Store, cfg Config) (*App, error) {
@@ -57,18 +73,19 @@ func NewApp(db *store.Store, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}}
+	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: make(chan circuitHistoryRecord, 256), routerLogs: make(chan store.LogEntry, 4096)}
 	a.hub = newRouterHub(a)
+	a.maintenance = newMaintenanceManager(a)
 	return a, nil
 }
 
 func (a *App) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.Handle("GET /assets/", http.StripPrefix("/", assetHandler()))
-	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprint(w, "ok\n")
-	})
+	m.HandleFunc("GET /livez", a.liveness)
+	m.HandleFunc("GET /readyz", a.readiness)
+	m.HandleFunc("GET /healthz", a.readiness)
+	m.HandleFunc("GET /metrics", a.metrics)
 	m.HandleFunc("GET /openapi.json", a.openAPISpec)
 	m.HandleFunc("GET /router/v1/ws", a.routerWebSocket)
 	m.HandleFunc("GET /", a.home)
@@ -103,6 +120,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /llc-macs/{id}/retire", http.NotFound)
 	m.HandleFunc("GET /admin/llc-macs", a.admin(a.adminManagedCPPage))
 	m.HandleFunc("GET /flows", a.full(a.flows))
+	m.HandleFunc("GET /circuits", a.full(a.snaCircuits))
+	m.HandleFunc("POST /circuits/{id}/reset", a.full(a.resetSNACircuit))
 	m.HandleFunc("GET /blocks", a.full(a.blocks))
 	m.HandleFunc("POST /blocks/{id}/remove", a.full(a.removeBlock))
 	m.HandleFunc("GET /admin/blocks", a.admin(a.adminBlocks))
@@ -133,6 +152,10 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /admin/users/{id}/delete", a.admin(a.adminDeleteUserPage))
 	m.HandleFunc("POST /admin/users/{id}/delete", a.admin(a.adminDeleteUser))
 	m.HandleFunc("GET /admin/routers", a.admin(a.adminRouters))
+	m.HandleFunc("GET /admin/operations", a.admin(a.adminOperations))
+	m.HandleFunc("GET /admin/circuits", a.admin(a.adminSNACircuits))
+	m.HandleFunc("POST /admin/circuits/{id}/reset", a.admin(a.adminResetSNACircuit))
+	m.HandleFunc("POST /admin/operations/{task}/run", a.admin(a.runMaintenanceTask))
 	m.HandleFunc("POST /admin/users/role", a.admin(a.setRole))
 	m.HandleFunc("POST /admin/users/reset-password", a.admin(a.adminResetPassword))
 	m.HandleFunc("POST /admin/directory", a.admin(a.createDirectory))
@@ -621,7 +644,9 @@ func dbError(w http.ResponseWriter, err error) {
 func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 	pageLayout := strings.Replace(layout, `<a class="nav-link" href="/llc-macs">LLC MACs</a>`, "", 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/clients">API clients</a>`, "", 1)
+	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/flows">Flows</a>`, `<a class="nav-link" href="/flows">Flows</a><a class="nav-link" href="/circuits">SNA circuits</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `>All MACs</a>`, `>LLC allocations</a>`, 1)
+	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/admin/routers">All routers</a>`, `<a class="dropdown-item" href="/admin/routers">All routers</a><a class="dropdown-item" href="/admin/circuits">All SNA circuits</a><a class="dropdown-item" href="/admin/operations">Operations</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/settings">Settings</a>`, `<a class="dropdown-item" href="/settings">Settings</a><a class="dropdown-item" href="/clients">API keys</a>`, 1)
 	t, err := template.New("page").Funcs(template.FuncMap{"date": func(unix int64) string {
 		if unix == 0 {

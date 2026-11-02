@@ -34,11 +34,17 @@ func TestUpgradeFromVersionOne(t *testing.T) {
 	}
 	defer s.DB.Close()
 	var version int
-	if err = s.Row(ctx, "SELECT version FROM schema_migrations WHERE version=5").Scan(&version); err != nil || version != 5 {
+	if err = s.Row(ctx, "SELECT version FROM schema_migrations WHERE version=10").Scan(&version); err != nil || version != 10 {
 		t.Fatalf("migration version: %d %v", version, err)
 	}
 	var count int
 	if err = s.Row(ctx, "SELECT COUNT(*) FROM routers").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Row(ctx, "SELECT COUNT(*) FROM maintenance_runs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Row(ctx, "SELECT COUNT(*) FROM sna_circuit_history").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 }

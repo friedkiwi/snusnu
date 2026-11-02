@@ -124,6 +124,113 @@ func TestPagesRender(t *testing.T) {
 	}
 }
 
+func TestAdminOperationsRunsAndReportsMaintenance(t *testing.T) {
+	a := testApp(t)
+	ctx := context.Background()
+	adminID := store.RandomUUID()
+	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'admin',?)", adminID, "ops@example.com", "unused", store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	token, session, err := a.DB.NewSession(ctx, adminID, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: "snusnu_session", Value: token}
+
+	page := uiGet(t, a, "/admin/operations", cookie)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Maintenance tasks") || !strings.Contains(page.Body.String(), "Router sessions") || !strings.Contains(page.Body.String(), "Never run") {
+		t.Fatalf("operations page: %d %s", page.Code, page.Body.String())
+	}
+	w := postForm(a, "/admin/operations/expired-records/run", url.Values{"csrf": {session.CSRF}}, cookie)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/admin/operations" {
+		t.Fatalf("manual maintenance: %d %s", w.Code, w.Body.String())
+	}
+	page = uiGet(t, a, "/admin/operations", cookie)
+	for _, want := range []string{"Success", "manual by ops@example.com", "Deleted 0 expired records."} {
+		if !strings.Contains(page.Body.String(), want) {
+			t.Fatalf("operations result missing %q: %s", want, page.Body.String())
+		}
+	}
+
+	userID := store.RandomUUID()
+	if _, err = a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", userID, "not-ops@example.com", "unused", store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	userToken, userSession, err := a.DB.NewSession(ctx, userID, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userCookie := &http.Cookie{Name: "snusnu_session", Value: userToken}
+	if got := uiGet(t, a, "/admin/operations", userCookie).Code; got != http.StatusForbidden {
+		t.Fatalf("non-admin operations read: %d", got)
+	}
+	if got := postForm(a, "/admin/operations/router-log-retention/run", url.Values{"csrf": {userSession.CSRF}}, userCookie).Code; got != http.StatusForbidden {
+		t.Fatalf("non-admin maintenance run: %d", got)
+	}
+}
+
+func TestSNACircuitVisibilityResetAndHistory(t *testing.T) {
+	a := testApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.startCircuitHistoryWriter(ctx)
+
+	ownerID, peerID, outsiderID := store.RandomUUID(), store.RandomUUID(), store.RandomUUID()
+	for _, x := range []struct{ id, email string }{{ownerID, "circuit-owner@example.com"}, {peerID, "circuit-peer@example.com"}, {outsiderID, "circuit-outsider@example.com"}} {
+		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at) VALUES(?,?,?,'user',?)", x.id, x.email, "unused", store.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token, session, err := a.DB.NewSession(ctx, ownerID, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: "snusnu_session", Value: token}
+	makeRouterSession := func(id, owner, name string) *routerSession {
+		return &routerSession{router: store.Router{ID: id, OwnerID: owner, DisplayName: name}, out: make(chan outboundMessage, 16), queued: map[string]int{}}
+	}
+	ownedSource := makeRouterSession(store.RandomUUID(), ownerID, "Owned router")
+	ownedTarget := makeRouterSession(store.RandomUUID(), peerID, "Peer router")
+	otherSource := makeRouterSession(store.RandomUUID(), peerID, "Other source")
+	otherTarget := makeRouterSession(store.RandomUUID(), outsiderID, "Other target")
+	ownedID, otherID := store.RandomUUID(), store.RandomUUID()
+	now := time.Now()
+	for _, router := range []*routerSession{ownedSource, ownedTarget, otherSource, otherTarget} {
+		a.hub.clients.Store(router.router.ID, router)
+	}
+	a.hub.circuits.Store(ownedID, &wsCircuit{source: ownedSource, target: ownedTarget, allowance: [2]uint64{4096, 8192}, sent: [2]uint64{100, 200}, events: [2]uint64{2, 3}, openedAt: now, activatedAt: now, lastActivityAt: now})
+	a.hub.circuits.Store(otherID, &wsCircuit{source: otherSource, target: otherTarget, openedAt: now, activatedAt: now, lastActivityAt: now})
+
+	page := uiGet(t, a, "/circuits", cookie)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), ownedID) || strings.Contains(page.Body.String(), otherID) || !strings.Contains(page.Body.String(), "Transport credit") {
+		t.Fatalf("user SNA circuits page: %d %s", page.Code, page.Body.String())
+	}
+	w := postForm(a, "/circuits/"+otherID+"/reset", url.Values{"csrf": {session.CSRF}}, cookie)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("reset unrelated circuit: %d", w.Code)
+	}
+	w = postForm(a, "/circuits/"+ownedID+"/reset", url.Values{"csrf": {session.CSRF}}, cookie)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("reset owned circuit: %d %s", w.Code, w.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var count int
+		err = a.DB.Row(ctx, "SELECT COUNT(*) FROM sna_circuit_history WHERE id=? AND actor_id=?", ownedID, "circuit-owner@example.com").Scan(&count)
+		if err == nil && count == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("circuit history not persisted: count=%d err=%v", count, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	page = uiGet(t, a, "/circuits", cookie)
+	if !strings.Contains(page.Body.String(), ownedID) || !strings.Contains(page.Body.String(), "circuit-owner@example.com") {
+		t.Fatalf("circuit history page: %s", page.Body.String())
+	}
+}
+
 func TestRoleAndClientVisibility(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()

@@ -1,10 +1,11 @@
 package server
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sync"
+	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
@@ -13,6 +14,7 @@ import (
 )
 
 type wsCircuit struct {
+	mu             sync.Mutex
 	source, target *routerSession
 	requestID      uint64
 	targetRef      *wire.RouteReference
@@ -20,29 +22,93 @@ type wsCircuit struct {
 	pending        bool
 	allowance      [2]uint64 // data bytes each side may send
 	sent           [2]uint64
+	openedAt       time.Time
+	activatedAt    time.Time
+	lastActivityAt time.Time
+	events         [2]uint64
+	peakQueued     uint64
+	closed         bool
+	counted        bool
 }
 
-func (h *routerHub) circuitCountLocked(c *routerSession) int {
-	n := 0
-	for _, v := range h.circuits {
-		if v.source == c || v.target == c {
-			n++
-		}
-	}
-	return n
+var errCircuitClosed = errors.New("circuit is already closed")
+
+func (h *routerHub) retireCircuit(id string, c *wsCircuit) {
+	h.circuits.CompareAndDelete(id, c)
+	h.tombstones.Store(id, time.Now().Add(time.Minute))
 }
-func (h *routerHub) routeValidLocked(c *wsCircuit) bool {
-	if h.routeForRefLocked(c.target, c.targetRef) == nil {
+
+func (h *routerHub) isTombstoned(id string) bool {
+	value, ok := h.tombstones.Load(id)
+	return ok && time.Now().Before(value.(time.Time))
+}
+
+func (h *routerHub) expireCircuits(now time.Time) {
+	h.tombstones.Range(func(key, value any) bool {
+		if !now.Before(value.(time.Time)) {
+			h.tombstones.Delete(key)
+		}
+		return true
+	})
+	h.circuits.Range(func(key, value any) bool {
+		id, c := key.(string), value.(*wsCircuit)
+		c.mu.Lock()
+		if !c.closed && c.pending && now.Sub(c.openedAt) >= 10*time.Second {
+			h.send(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_BUSY}}}, "", 0)
+			h.send(c.target, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: wire.ResetReason_RESET_REASON_REMOTE_LINK}}}, "", 0)
+			c.closed = true
+			releaseCircuitValue(c)
+			h.archiveCircuitLocked(id, c, "open timeout", "system", "")
+			h.retireCircuit(id, c)
+		}
+		c.mu.Unlock()
+		return true
+	})
+}
+
+func (h *routerHub) circuitCount(c *routerSession) int {
+	return int(c.circuitCount.Load())
+}
+
+func reserveCircuit(source, target *routerSession) bool {
+	if source.circuitCount.Add(1) > maxWSCircuits {
+		source.circuitCount.Add(-1)
 		return false
 	}
-	return c.sourceRef == nil || h.routeForRefLocked(c.source, c.sourceRef) != nil
+	if target.circuitCount.Add(1) > maxWSCircuits {
+		target.circuitCount.Add(-1)
+		source.circuitCount.Add(-1)
+		return false
+	}
+	return true
 }
 
-func (h *routerHub) routeForRefLocked(owner *routerSession, ref *wire.RouteReference) *wire.RouteExport {
-	if owner == nil || owner.snapshot == nil || ref == nil ||
+// releaseCircuitValue requires c.mu and releases each reservation once.
+func releaseCircuitValue(c *wsCircuit) {
+	if !c.counted {
+		return
+	}
+	c.counted = false
+	c.source.circuitCount.Add(-1)
+	c.target.circuitCount.Add(-1)
+}
+func (h *routerHub) routeValid(c *wsCircuit) bool {
+	if h.routeForRef(c.target, c.targetRef) == nil {
+		return false
+	}
+	return c.sourceRef == nil || h.routeForRef(c.source, c.sourceRef) != nil
+}
+
+func (h *routerHub) routeForRef(owner *routerSession, ref *wire.RouteReference) *wire.RouteExport {
+	if owner == nil || ref == nil ||
 		string(ref.RouterId) != string(uuidBytes(owner.router.ID)) ||
 		string(ref.Epoch) != string(uuidBytes(owner.epoch)) ||
 		ref.RouteId == 0 || ref.RouteGeneration == 0 {
+		return nil
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.snapshot == nil {
 		return nil
 	}
 	for _, route := range owner.snapshot.Routes {
@@ -59,14 +125,22 @@ func sourceLUValid(owner *routerSession, route *wire.RouteExport) bool {
 	}
 	return route.GetLogicalUnit().Lu.Netid == owner.allowedNetID
 }
-func (h *routerHub) openLocked(source *routerSession, req *wire.OpenRequest) error {
+func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
 		return errors.New("invalid open request")
 	}
-	for _, v := range h.circuits {
+	duplicate := false
+	h.circuits.Range(func(_, value any) bool {
+		v := value.(*wsCircuit)
+		v.mu.Lock()
 		if v.source == source && v.pending && v.requestID == req.RequestId {
-			return errors.New("duplicate outstanding request ID")
+			duplicate = true
 		}
+		v.mu.Unlock()
+		return !duplicate
+	})
+	if duplicate {
+		return errors.New("duplicate outstanding request ID")
 	}
 	ref := req.Target
 	if source.subprotocol == "snusnu.v1" && req.SourceRoute != nil {
@@ -75,46 +149,54 @@ func (h *routerHub) openLocked(source *routerSession, req *wire.OpenRequest) err
 	if source.subprotocol == "snusnu.v2" && req.SourceRoute == nil {
 		return errors.New("snusnu.v2 open requires source LU route")
 	}
-	if req.SourceRoute != nil && !sourceLUValid(source, h.routeForRefLocked(source, req.SourceRoute)) {
-		h.sendLocked(source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: req.RequestId, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN}}}, "", 0)
+	if req.SourceRoute != nil && !sourceLUValid(source, h.routeForRef(source, req.SourceRoute)) {
+		h.send(source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: req.RequestId, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN}}}, "", 0)
 		return nil
 	}
 	targetID, ok := uuidString(ref.RouterId)
 	if !ok || len(ref.Epoch) != 16 || ref.RouteId == 0 || ref.RouteGeneration == 0 {
 		return errors.New("invalid route reference")
 	}
-	target := h.clients[targetID]
+	target := h.session(targetID)
 	reason := wire.OpenFailure_OPEN_FAILURE_ROUTE_GONE
 	if target != nil && target != source {
-		if !h.allowedLocked(source, target) {
+		if !h.allowed(source, target) {
 			reason = wire.OpenFailure_OPEN_FAILURE_FORBIDDEN
-		} else if req.SourceRoute != nil && (target.subprotocol != "snusnu.v2" || !sourceLUValid(target, h.routeForRefLocked(target, ref))) {
+		} else if req.SourceRoute != nil && (target.subprotocol != "snusnu.v2" || !sourceLUValid(target, h.routeForRef(target, ref))) {
 			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
-		} else if h.circuitCountLocked(source) >= maxWSCircuits || h.circuitCountLocked(target) >= maxWSCircuits {
+		} else if h.circuitCount(source) >= maxWSCircuits || h.circuitCount(target) >= maxWSCircuits {
 			reason = wire.OpenFailure_OPEN_FAILURE_BUSY
 		} else {
-			candidate := &wsCircuit{source: source, target: target, targetRef: proto.Clone(ref).(*wire.RouteReference)}
+			candidate := &wsCircuit{source: source, target: target, targetRef: proto.Clone(ref).(*wire.RouteReference), openedAt: time.Now(), lastActivityAt: time.Now()}
 			if req.SourceRoute != nil {
 				candidate.sourceRef = proto.Clone(req.SourceRoute).(*wire.RouteReference)
 			}
-			if h.routeValidLocked(candidate) {
-				id := uuid.NewString()
-				candidate.requestID = req.RequestId
-				candidate.pending = true
-				candidate.allowance[1] = req.ReceiveAllowanceBytes
-				h.circuits[id] = candidate
-				if h.sendLocked(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef}}}, "", 0) {
-					return nil
+			if h.routeValid(candidate) {
+				if !reserveCircuit(source, target) {
+					reason = wire.OpenFailure_OPEN_FAILURE_BUSY
+				} else {
+					candidate.counted = true
+					id := uuid.NewString()
+					candidate.requestID = req.RequestId
+					candidate.pending = true
+					candidate.allowance[1] = req.ReceiveAllowanceBytes
+					h.circuits.Store(id, candidate)
+					if h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef}}}, "", 0) {
+						return nil
+					}
+					h.circuits.CompareAndDelete(id, candidate)
+					candidate.mu.Lock()
+					releaseCircuitValue(candidate)
+					candidate.mu.Unlock()
+					reason = wire.OpenFailure_OPEN_FAILURE_BUSY
 				}
-				delete(h.circuits, id)
-				reason = wire.OpenFailure_OPEN_FAILURE_BUSY
 			}
 		}
 	}
-	h.sendLocked(source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: req.RequestId, Accepted: false, Reason: reason}}}, "", 0)
+	h.send(source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: req.RequestId, Accepted: false, Reason: reason}}}, "", 0)
 	return nil
 }
-func (h *routerHub) decisionLocked(target *routerSession, decision *wire.OpenDecision) error {
+func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision) error {
 	if decision == nil {
 		return errors.New("empty open decision")
 	}
@@ -122,27 +204,49 @@ func (h *routerHub) decisionLocked(target *routerSession, decision *wire.OpenDec
 	if !ok {
 		return errors.New("invalid circuit ID")
 	}
-	c := h.circuits[id]
-	if c == nil || c.target != target || !c.pending {
+	value, found := h.circuits.Load(id)
+	if !found {
+		if h.isTombstoned(id) {
+			return nil
+		}
 		return errors.New("unexpected open decision")
 	}
-	delete(h.circuits, id)
-	accepted := decision.Accept && decision.ReceiveAllowanceBytes > 0 && decision.ReceiveAllowanceBytes <= 1<<20 && h.routeValidLocked(c) && h.allowedLocked(c.source, target)
+	c := value.(*wsCircuit)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.target != target || !c.pending {
+		return errors.New("unexpected open decision")
+	}
+	h.circuits.CompareAndDelete(id, c)
+	accepted := decision.Accept && decision.ReceiveAllowanceBytes > 0 && decision.ReceiveAllowanceBytes <= 1<<20 && h.routeValid(c) && h.allowed(c.source, target)
 	if decision.Accept && !accepted {
+		h.send(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_PROTOCOL}}}, "", 0)
+		c.closed = true
+		releaseCircuitValue(c)
+		h.archiveCircuitLocked(id, c, "invalid open acceptance", "router", target.router.ID)
+		h.retireCircuit(id, c)
 		return errors.New("invalid accepted open")
 	}
 	if accepted {
 		c.pending = false
+		c.activatedAt = time.Now()
+		c.lastActivityAt = c.activatedAt
 		c.allowance[0] = decision.ReceiveAllowanceBytes
-		h.circuits[id] = c
+		h.circuits.Store(id, c)
 		// The target must receive OpenReady before the source can send data.
-		h.sendLocked(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenReady{OpenReady: &wire.OpenReady{CircuitId: decision.CircuitId}}}, "", 0)
+		h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenReady{OpenReady: &wire.OpenReady{CircuitId: decision.CircuitId}}}, "", 0)
 	}
 	reason := decision.Reason
 	if !accepted && reason == wire.OpenFailure_OPEN_FAILURE_UNSPECIFIED {
 		reason = wire.OpenFailure_OPEN_FAILURE_PROTOCOL
 	}
-	h.sendLocked(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, CircuitId: func() []byte {
+	if !accepted {
+		c.closed = true
+		releaseCircuitValue(c)
+		h.archiveCircuitLocked(id, c, reason.String(), "router", target.router.ID)
+		h.retireCircuit(id, c)
+	}
+	h.send(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, CircuitId: func() []byte {
 		if accepted {
 			return decision.CircuitId
 		}
@@ -155,13 +259,24 @@ func (h *routerHub) decisionLocked(target *routerSession, decision *wire.OpenDec
 	}(), Reason: reason}}}, "", 0)
 	return nil
 }
-func (h *routerHub) findCircuitLocked(sender *routerSession, idBytes []byte) (string, *wsCircuit, int, error) {
+
+// findCircuit returns a circuit with its mutex held. The caller must unlock it.
+func (h *routerHub) findCircuit(sender *routerSession, idBytes []byte) (string, *wsCircuit, int, error) {
 	id, ok := uuidString(idBytes)
 	if !ok {
 		return "", nil, 0, errors.New("invalid circuit ID")
 	}
-	c := h.circuits[id]
-	if c == nil || c.pending {
+	value, found := h.circuits.Load(id)
+	if !found {
+		if h.isTombstoned(id) {
+			return "", nil, 0, errCircuitClosed
+		}
+		return "", nil, 0, errors.New("unknown or pending circuit")
+	}
+	c := value.(*wsCircuit)
+	c.mu.Lock()
+	if c.closed || c.pending {
+		c.mu.Unlock()
 		return "", nil, 0, errors.New("unknown or pending circuit")
 	}
 	if c.source == sender {
@@ -170,18 +285,23 @@ func (h *routerHub) findCircuitLocked(sender *routerSession, idBytes []byte) (st
 	if c.target == sender {
 		return id, c, 1, nil
 	}
+	c.mu.Unlock()
 	return "", nil, 0, errors.New("circuit sender mismatch")
 }
-func (h *routerHub) eventLocked(sender *routerSession, event *wire.CircuitEvent) error {
+func (h *routerHub) event(sender *routerSession, event *wire.CircuitEvent) error {
 	if event == nil {
 		return errors.New("empty circuit event")
 	}
-	id, c, side, err := h.findCircuitLocked(sender, event.CircuitId)
+	id, c, side, err := h.findCircuit(sender, event.CircuitId)
 	if err != nil {
+		if errors.Is(err, errCircuitClosed) {
+			return nil
+		}
 		return err
 	}
-	if !h.routeValidLocked(c) || !h.allowedLocked(c.source, c.target) {
-		h.resetCircuitLocked(id, wire.ResetReason_RESET_REASON_ROUTE_GONE)
+	if !h.routeValid(c) || !h.allowed(c.source, c.target) {
+		h.resetCircuitValue(id, c, wire.ResetReason_RESET_REASON_ROUTE_GONE, "system", "")
+		c.mu.Unlock()
 		return nil
 	}
 	peer := c.target
@@ -193,55 +313,79 @@ func (h *routerHub) eventLocked(sender *routerSession, event *wire.CircuitEvent)
 	case *wire.CircuitEvent_SnaInformation:
 		cost = len(value.SnaInformation)
 		if cost == 0 || cost > 16*1024 {
+			c.mu.Unlock()
 			return errors.New("invalid SNA information size")
 		}
 		if c.sent[side] > c.allowance[side] || uint64(cost) > c.allowance[side]-c.sent[side] {
-			h.resetCircuitLocked(id, wire.ResetReason_RESET_REASON_CREDIT)
+			h.resetCircuitValue(id, c, wire.ResetReason_RESET_REASON_CREDIT, "system", "")
+			c.mu.Unlock()
 			return nil
 		}
 	case *wire.CircuitEvent_Type1:
 		if value.Type1 == nil || len(value.Type1.Information) > 16*1024 || (value.Type1.Kind != wire.Type1Kind_TYPE1_KIND_XID && value.Type1.Kind != wire.Type1Kind_TYPE1_KIND_TEST) || value.Type1.Dsap < 2 || value.Type1.Dsap > 254 || value.Type1.Dsap%2 != 0 || value.Type1.Ssap < 2 || value.Type1.Ssap > 254 || value.Type1.Ssap%2 != 0 {
+			c.mu.Unlock()
 			return errors.New("invalid DLC type 1 event")
 		}
 	case *wire.CircuitEvent_LinkReady:
 	default:
+		c.mu.Unlock()
 		return errors.New("invalid circuit event")
 	}
-	if !h.sendLocked(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitEvent{CircuitEvent: event}}, id, cost) {
-		h.resetCircuitLocked(id, wire.ResetReason_RESET_REASON_PROTOCOL)
+	if !h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitEvent{CircuitEvent: event}}, id, cost) {
+		h.resetCircuitValue(id, c, wire.ResetReason_RESET_REASON_PROTOCOL, "system", "")
+		c.mu.Unlock()
 		return nil
 	}
 	c.sent[side] += uint64(cost)
-	h.logEventLocked(sender, peer, event)
+	c.events[side]++
+	c.lastActivityAt = time.Now()
+	peer.mu.Lock()
+	queued := uint64(peer.queued[id])
+	peer.mu.Unlock()
+	if queued > c.peakQueued {
+		c.peakQueued = queued
+	}
+	c.mu.Unlock()
+	h.logEvent(sender, peer, event)
 	return nil
 }
-func (h *routerHub) creditLocked(sender *routerSession, credit *wire.CircuitCredit) error {
+func (h *routerHub) credit(sender *routerSession, credit *wire.CircuitCredit) error {
 	if credit == nil {
 		return errors.New("empty credit")
 	}
-	id, c, side, err := h.findCircuitLocked(sender, credit.CircuitId)
+	id, c, side, err := h.findCircuit(sender, credit.CircuitId)
 	if err != nil {
+		if errors.Is(err, errCircuitClosed) {
+			return nil
+		}
 		return err
 	}
-	if !h.routeValidLocked(c) || !h.allowedLocked(c.source, c.target) {
-		h.resetCircuitLocked(id, wire.ResetReason_RESET_REASON_ROUTE_GONE)
+	if !h.routeValid(c) || !h.allowed(c.source, c.target) {
+		h.resetCircuitValue(id, c, wire.ResetReason_RESET_REASON_ROUTE_GONE, "system", "")
+		c.mu.Unlock()
 		return nil
 	}
 	other := 1 - side
 	if credit.AllowanceBytes <= c.allowance[other] || credit.AllowanceBytes > 1<<32 {
+		c.mu.Unlock()
 		return errors.New("invalid or nonincreasing credit")
 	}
 	c.allowance[other] = credit.AllowanceBytes
+	c.lastActivityAt = time.Now()
 	peer := c.target
 	if side == 1 {
 		peer = c.source
 	}
-	h.sendLocked(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitCredit{CircuitCredit: credit}}, "", 0)
+	c.mu.Unlock()
+	h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitCredit{CircuitCredit: credit}}, "", 0)
 	return nil
 }
-func (h *routerHub) endCircuitLocked(sender *routerSession, idBytes []byte, reset bool, reason wire.ResetReason) error {
-	id, c, side, err := h.findCircuitLocked(sender, idBytes)
+func (h *routerHub) endCircuit(sender *routerSession, idBytes []byte, reset bool, reason wire.ResetReason) error {
+	id, c, side, err := h.findCircuit(sender, idBytes)
 	if err != nil {
+		if errors.Is(err, errCircuitClosed) {
+			return nil
+		}
 		return err
 	}
 	peer := c.target
@@ -249,24 +393,55 @@ func (h *routerHub) endCircuitLocked(sender *routerSession, idBytes []byte, rese
 		peer = c.source
 	}
 	if reset {
-		h.sendLocked(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: idBytes, Reason: reason}}}, "", 0)
+		h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: idBytes, Reason: reason}}}, "", 0)
 	} else {
-		h.sendLocked(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitClose{CircuitClose: &wire.CircuitClose{CircuitId: idBytes}}}, "", 0)
+		h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitClose{CircuitClose: &wire.CircuitClose{CircuitId: idBytes}}}, "", 0)
 	}
-	delete(h.circuits, id)
+	h.archiveCircuitLocked(id, c, func() string {
+		if reset {
+			return reason.String()
+		}
+		return "normal close"
+	}(), "router", sender.router.ID)
+	c.closed = true
+	releaseCircuitValue(c)
+	h.retireCircuit(id, c)
+	c.mu.Unlock()
 	return nil
 }
-func (h *routerHub) resetCircuitLocked(id string, reason wire.ResetReason) {
-	c := h.circuits[id]
-	if c == nil {
+func (h *routerHub) resetCircuit(id string, reason wire.ResetReason) {
+	h.resetCircuitBy(id, reason, "system", "")
+}
+
+func (h *routerHub) resetCircuitBy(id string, reason wire.ResetReason, actorType, actorID string, historyReason ...string) {
+	value, found := h.circuits.Load(id)
+	if !found {
 		return
 	}
-	for _, peer := range []*routerSession{c.source, c.target} {
-		h.sendLocked(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: reason}}}, "", 0)
-	}
-	delete(h.circuits, id)
+	c := value.(*wsCircuit)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h.resetCircuitValue(id, c, reason, actorType, actorID, historyReason...)
 }
-func (h *routerHub) logEventLocked(sender, peer *routerSession, event *wire.CircuitEvent) {
+
+// resetCircuitValue requires c.mu to be held.
+func (h *routerHub) resetCircuitValue(id string, c *wsCircuit, reason wire.ResetReason, actorType, actorID string, historyReason ...string) {
+	if c.closed {
+		return
+	}
+	c.closed = true
+	releaseCircuitValue(c)
+	for _, peer := range []*routerSession{c.source, c.target} {
+		h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: reason}}}, "", 0)
+	}
+	archivedReason := reason.String()
+	if len(historyReason) != 0 && historyReason[0] != "" {
+		archivedReason = historyReason[0]
+	}
+	h.archiveCircuitLocked(id, c, archivedReason, actorType, actorID)
+	h.retireCircuit(id, c)
+}
+func (h *routerHub) logEvent(sender, peer *routerSession, event *wire.CircuitEvent) {
 	// Keep previews bounded. The LLC endpoints own full SNA packet decoding.
 	kind := "SNA information"
 	size := 0
@@ -295,7 +470,7 @@ func (h *routerHub) logEventLocked(sender, peer *routerSession, event *wire.Circ
 	}{{sender, peer, "outbound"}, {peer, sender, "inbound"}} {
 		entry := storeLog(x.router, x.peer, x.direction, kind, string(encoded))
 		entry.SourceIP = sender.ip
-		_ = h.a.DB.AppendRouterLog(context.Background(), entry)
+		h.a.enqueueRouterLog(entry)
 	}
 }
 

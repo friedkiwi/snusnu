@@ -106,6 +106,7 @@ func (a *App) routerRename(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/routers/"+item.ID, 303)
 }
 func (a *App) routerPause(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -118,6 +119,7 @@ func (a *App) routerPause(w http.ResponseWriter, r *http.Request, u store.User, 
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/routers/"+item.ID, 303)
 }
 func (a *App) routerRotate(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -130,6 +132,7 @@ func (a *App) routerRotate(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL(), "Rotated": true, "NetID": u.NetID})
 }
 func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -141,6 +144,7 @@ func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/dashboard", 303)
 }
 func (a *App) globalDirectory(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -198,6 +202,7 @@ func (a *App) removeBlock(w http.ResponseWriter, r *http.Request, u store.User, 
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/blocks", 303)
 }
 func (a *App) profileEditPage(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -225,6 +230,7 @@ func (a *App) profileEdit(w http.ResponseWriter, r *http.Request, u store.User, 
 		http.Error(w, "username or NETID already taken, or profile is invalid", 409)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/profiles/"+u.ID, 303)
 }
 func (a *App) profilePictureUpload(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -314,5 +320,6 @@ func (a *App) profileBlock(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/profiles/"+id, 303)
 }

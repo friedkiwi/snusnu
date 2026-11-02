@@ -194,9 +194,9 @@ func TestRouterWebSocketTwoPeerCircuit(t *testing.T) {
 	if err := a.DB.SetBlock(ctx, ids[0], ids[1], true); err != nil {
 		t.Fatal(err)
 	}
-	a.hub.mu.Lock()
-	a.hub.refreshLocked()
-	a.hub.mu.Unlock()
+	if err := a.hub.refreshPolicyAndRoutes(ctx); err != nil {
+		t.Fatal(err)
+	}
 	expectTestBody(t, ca, "withdraw")
 	expectTestBody(t, cb, "withdraw")
 }
@@ -248,9 +248,9 @@ func TestRouterWebSocketManagedBindingsAndRevocation(t *testing.T) {
 	if err := a.DB.SetBlock(ctx, recipientOwner, owner, true); err != nil {
 		t.Fatal(err)
 	}
-	a.hub.mu.Lock()
-	a.hub.refreshLocked()
-	a.hub.mu.Unlock()
+	if err := a.hub.refreshPolicyAndRoutes(ctx); err != nil {
+		t.Fatal(err)
+	}
 	expectTestBody(t, llc, "withdraw")
 	empty := readTestEnvelope(t, llc).GetManagedCpBindings()
 	if empty == nil || len(empty.Bindings) != 0 || empty.Revision <= binding.Revision {
@@ -259,9 +259,9 @@ func TestRouterWebSocketManagedBindingsAndRevocation(t *testing.T) {
 	if _, err := a.DB.RotateRouterToken(ctx, recipient.ID); err != nil {
 		t.Fatal(err)
 	}
-	a.hub.mu.Lock()
-	a.hub.refreshLocked()
-	a.hub.mu.Unlock()
+	if err := a.hub.refreshPolicyAndRoutes(ctx); err != nil {
+		t.Fatal(err)
+	}
 	llc.SetReadDeadline(time.Now().Add(time.Second))
 	if _, _, err := llc.ReadMessage(); err == nil {
 		t.Fatal("revoked router socket remained open")

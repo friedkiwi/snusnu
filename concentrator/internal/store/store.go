@@ -105,16 +105,49 @@ func Hash(token string) string { h := sha256.Sum256([]byte(token)); return hex.E
 func Now() int64               { return time.Now().UTC().Unix() }
 
 func (s *Store) Prune(ctx context.Context) error {
-	for _, q := range []string{"DELETE FROM sessions WHERE expires_at<?", "DELETE FROM email_tokens WHERE expires_at<?", "DELETE FROM password_reset_tokens WHERE expires_at<?", "DELETE FROM ceremonies WHERE expires_at<?", "DELETE FROM auth_attempts WHERE reset_at<?", "DELETE FROM router_logs WHERE occurred_at<?"} {
-		cutoff := Now()
-		if strings.Contains(q, "router_logs") {
-			cutoff -= 30 * 24 * 3600
-		}
-		if _, err := s.Exec(ctx, q, cutoff); err != nil {
-			return err
-		}
+	_, err := s.CleanupExpired(ctx)
+	if err != nil {
+		return err
 	}
-	return nil
+	_, err = s.CleanupRouterLogs(ctx)
+	return err
+}
+
+// CleanupExpired removes short-lived authentication and ceremony records.
+// It returns the number of deleted rows so scheduled and manual runs can be
+// inspected through the operations UI.
+func (s *Store) CleanupExpired(ctx context.Context) (int64, error) {
+	var deleted int64
+	for _, q := range []string{"DELETE FROM sessions WHERE expires_at<?", "DELETE FROM email_tokens WHERE expires_at<?", "DELETE FROM password_reset_tokens WHERE expires_at<?", "DELETE FROM ceremonies WHERE expires_at<?", "DELETE FROM auth_attempts WHERE reset_at<?"} {
+		result, err := s.Exec(ctx, q, Now())
+		if err != nil {
+			return deleted, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return deleted, err
+		}
+		deleted += n
+	}
+	return deleted, nil
+}
+
+// CleanupRouterLogs applies the thirty-day operational log retention policy.
+func (s *Store) CleanupRouterLogs(ctx context.Context) (int64, error) {
+	result, err := s.Exec(ctx, "DELETE FROM router_logs WHERE occurred_at<?", Now()-30*24*3600)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// CleanupCircuitHistory applies the ninety-day SNA circuit summary retention policy.
+func (s *Store) CleanupCircuitHistory(ctx context.Context) (int64, error) {
+	result, err := s.Exec(ctx, "DELETE FROM sna_circuit_history WHERE closed_at<?", Now()-90*24*3600)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (s *Store) ResetMFA(ctx context.Context, email string) error {
@@ -246,7 +279,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8, schemaV9, schemaV10} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -336,6 +369,21 @@ var schemaV6 = []string{
 var schemaV7 = []string{
 	`ALTER TABLE users ADD COLUMN netid TEXT NOT NULL DEFAULT ''`,
 	`CREATE UNIQUE INDEX idx_users_netid ON users(netid) WHERE netid<>''`,
+}
+
+var schemaV8 = []string{
+	`CREATE TABLE maintenance_runs (task_name TEXT PRIMARY KEY, started_at BIGINT NOT NULL, finished_at BIGINT NOT NULL DEFAULT 0, status TEXT NOT NULL CHECK(status IN ('running','success','failed')), trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('scheduled','manual')), triggered_by TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')`,
+}
+
+var schemaV9 = []string{
+	`CREATE TABLE sna_circuit_history (id TEXT PRIMARY KEY,source_router_id TEXT NOT NULL,source_router_name TEXT NOT NULL,source_owner_id TEXT NOT NULL,target_router_id TEXT NOT NULL,target_router_name TEXT NOT NULL,target_owner_id TEXT NOT NULL,profile TEXT NOT NULL,opened_at BIGINT NOT NULL,activated_at BIGINT NOT NULL DEFAULT 0,closed_at BIGINT NOT NULL,state TEXT NOT NULL,close_reason TEXT NOT NULL DEFAULT '',source_bytes BIGINT NOT NULL DEFAULT 0,target_bytes BIGINT NOT NULL DEFAULT 0,source_events BIGINT NOT NULL DEFAULT 0,target_events BIGINT NOT NULL DEFAULT 0,peak_queued_bytes BIGINT NOT NULL DEFAULT 0,actor_type TEXT NOT NULL DEFAULT 'system',actor_id TEXT NOT NULL DEFAULT '')`,
+	`CREATE INDEX idx_sna_circuit_history_source_time ON sna_circuit_history(source_owner_id,closed_at)`,
+	`CREATE INDEX idx_sna_circuit_history_target_time ON sna_circuit_history(target_owner_id,closed_at)`,
+	`CREATE INDEX idx_sna_circuit_history_closed ON sna_circuit_history(closed_at)`,
+}
+
+var schemaV10 = []string{
+	`CREATE TABLE concentrator_instance (id INTEGER PRIMARY KEY CHECK(id=1),instance_id TEXT NOT NULL,heartbeat_at BIGINT NOT NULL)`,
 }
 
 var ErrNotFound = errors.New("not found")
