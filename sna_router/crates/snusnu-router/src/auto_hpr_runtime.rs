@@ -591,10 +591,21 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
         }
         if let Some(datagram) = link.poll(now)? {
             if let Some(runtime) = active.as_mut() {
-                let messages =
-                    runtime
-                        .rtp
-                        .on_ee_ui(&link, &datagram, clock.elapsed().as_micros() as u64)?;
+                let messages = match runtime.rtp.on_ee_ui(
+                    &link,
+                    &datagram,
+                    clock.elapsed().as_micros() as u64,
+                ) {
+                    Ok(messages) => messages,
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        tracing::warn!(attachment = %attachment.id, peer_ip = %attachment.peer_ip,
+                            udp_port = datagram.port, dsap = datagram.dsap,
+                            ssap = datagram.ssap, generation = link.generation().get(),
+                            error = %error, "discarded invalid HPR datagram");
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
+                };
                 runtime.queue_rtp(messages)?;
             }
         }
