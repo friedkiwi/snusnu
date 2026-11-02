@@ -2363,6 +2363,78 @@ mod tests {
     }
 
     #[test]
+    fn automatic_hub_publishes_only_owned_names_and_resolves_dynamic_lu() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |_: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL_V2),
+                    );
+                    Ok(response)
+                },
+            ).unwrap();
+            socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::Welcome(
+                wire::RouterWelcome {
+                    router_id: vec![7; 16], connection_epoch: vec![8; 16],
+                    max_message_bytes: 65536, max_circuits: 4,
+                    display_name: "auto router".into(), allowed_netid: "OWNED".into(),
+                })).encode_to_vec().into())).unwrap();
+            for expected_revision in 1..=2 {
+                let WsMessage::Binary(payload) = socket.read().unwrap() else { panic!("snapshot expected") };
+                let envelope = wire::WsEnvelope::decode(payload).unwrap();
+                let Some(wire::ws_envelope::Body::PublishRoutes(snapshot)) = envelope.body else {
+                    panic!("publish expected")
+                };
+                assert_eq!(snapshot.revision, expected_revision);
+                assert!(snapshot.routes.iter().all(|route| match route.resource.as_ref().unwrap() {
+                    wire::route_export::Resource::ControlPoint(cp) => cp.netid == "OWNED",
+                    wire::route_export::Resource::LogicalUnit(lu) => lu.lu.as_ref().unwrap().netid == "OWNED",
+                }));
+                assert_eq!(snapshot.routes.len(), if expected_revision == 1 { 0 } else { 2 });
+            }
+            socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::OriginRoutes(
+                wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16], revision: 1,
+                        routes: vec![wire::RouteExport {
+                            id: 31, generation: 1,
+                            resource: Some(wire::route_export::Resource::LogicalUnit(
+                                wire::LuReachability {
+                                    lu: Some(name("TARGET", "LUB")),
+                                    hosting_cp: Some(name("TARGET", "CPB")),
+                                    supported_types: Vec::new(),
+                                })),
+                        }],
+                    }),
+                })).encode_to_vec().into())).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+        let mut hub = AutoWsHub::connect(&url, "", &[], &[]).unwrap();
+        let source = name("OWNED", "LUA");
+        let host = name("OWNED", "CPA");
+        hub.publish_local(&[host.clone(), name("FOREIGN", "CPX")],
+            &[wire::LuReachability { lu: Some(source.clone()),
+                hosting_cp: Some(host), supported_types: Vec::new() }]).unwrap();
+        let target = name("TARGET", "LUB");
+        for _ in 0..1000 {
+            hub.poll_incoming().unwrap();
+            if hub.resolve_lu(&target).unwrap().is_some() { break; }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(hub.resolve_lu(&target).unwrap().unwrap().1,
+            Some(name("TARGET", "CPB")));
+        assert!(hub.open_lu(&target, &source).unwrap().is_some());
+        server.join().unwrap();
+    }
+
+    #[test]
     fn shared_socket_demultiplexes_two_incoming_circuits() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
