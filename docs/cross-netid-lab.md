@@ -148,3 +148,31 @@ deliberately rejected that user session, and Bob reported APPC failure
 datagrams. This proves the copied V5 guest can initiate cross-NETID AnyNet
 management and reach user Connect; it does not establish the WebSocket or
 LLC2 route.
+
+## First combined WebSocket gateway runs
+
+The QA concentrator authenticated Bob and Alice as separate router owners.
+Its managed binding for `QABOB.SNAB` was delivered to Alice as
+`02:53:4e:00:00:02`. A virtual native management probe through the
+WebSocket concentrator reached the passive V4 Alice guest and completed
+SNASVCMG BIND, CNOS/IPR/BIS, and correlated management UNBIND response.
+
+The first combined AnyNet/WebSocket/LLC run exposed an autonomous Bob user
+Connect retry before the manual pass-through trigger; the router rejected
+that unexpected order. The next run reached Alice's positive user BIND
+response with TH/RH `2f0002020000 eb8500`, an observed V4R4 response
+variant. A corrected run then missed a short idle LLC window by about one
+second: Alice disconnected before Bob's first TCP SYN. Prefilling the
+NETID-qualified `STRPASTHR` and pressing Enter immediately after the TCP
+listener became ready removed that timing gap.
+
+In the fourth combined run, Bob's user Connect reached V4 Alice; Alice
+returned a positive user BIND response, and the router queued the positive
+TCP62 Connect response. The router forwarded Bob's first FMH-5 Attach to
+Alice, then stopped on Alice's first 12-byte native pacing PIU
+(`2f0002020000 830100 000003`) with the diagnostic
+`native pacing response must be handled locally`. Bob reported APPC failure
+`E01A8002000032FE`; remote Sign On was not reached. Private captures are
+`/tmp/snusnu-cross-netid/combined4-sol9.pcap` and `combined4-sol8.pcap`
+(13 and 70 packets, zero capture drops). The next gateway step is to
+consume that native pacing response locally and continue the user session.
