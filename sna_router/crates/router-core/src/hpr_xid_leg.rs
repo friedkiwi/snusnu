@@ -108,7 +108,10 @@ impl HprXidLeg {
         {
             return Err(LegError::MissingTgIdentifier);
         }
-        if identifier.is_some_and(|number| number != tg_number) {
+        // OS/400 sends zero in the prenegotiation CV46 while its fixed TG
+        // field already contains the proposed number. The CV46 number is
+        // assigned during negotiation and must then agree with that field.
+        if identifier.is_some_and(|number| number != 0 && number != tg_number) {
             return Err(LegError::TgMismatch);
         }
         let pre = Prenegotiation {
@@ -151,6 +154,9 @@ impl HprXidLeg {
             return Err(LegError::IdentityChanged);
         }
         if evidence.tg_number != pre.tg_number {
+            return Err(LegError::TgMismatch);
+        }
+        if tg_identifier(bytes)?.is_some_and(|number| number != evidence.tg_number) {
             return Err(LegError::TgMismatch);
         }
         *slot = Some(evidence);
@@ -359,7 +365,14 @@ mod tests {
         leg.observe_prenegotiation(Side::Local, &fixture(medium, Side::Local, false, false))
             .unwrap();
         let mut remote_pre = fixture(medium, Side::Remote, false, false);
-        remote_pre[2..6].fill(0); // Preserved V5R4 EE prenegotiation shape.
+        remote_pre[2..6].fill(0);
+        // Preserved V5R4 EE trace: CV46 proposes TG zero here, then sends
+        // the assigned TG one in the negotiation-proceeding XID.
+        let descriptor = remote_pre
+            .windows(7)
+            .position(|bytes| bytes == [0x46, 5, 5, 0x80, 1, 0, 0])
+            .unwrap();
+        remote_pre[descriptor + 4] = 0;
         leg.observe_prenegotiation(Side::Remote, &remote_pre)
             .unwrap();
         leg.observe_negotiation(Side::Local, &fixture(medium, Side::Local, true, false))
@@ -371,6 +384,17 @@ mod tests {
             leg.xid_agreement().unwrap().remote.node_id,
             [0xff, 0xf6, 1, 0]
         );
+
+        let descriptor = remote_np
+            .windows(7)
+            .position(|bytes| bytes == [0x46, 5, 5, 0x80, 1, 0, 0])
+            .unwrap();
+        remote_np[descriptor + 4] = 0;
+        assert_eq!(
+            leg.observe_negotiation(Side::Remote, &remote_np),
+            Err(LegError::TgMismatch)
+        );
+        remote_np[descriptor + 4] = 1;
 
         remote_np[2..6].copy_from_slice(&[0xff, 0xf6, 0x01, 0x01]);
         assert_eq!(

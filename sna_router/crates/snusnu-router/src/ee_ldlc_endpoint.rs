@@ -428,7 +428,14 @@ impl EeLdlcEndpoint {
         let remote_observation = self
             .activation
             .observe_xid(Side::Remote, information)
-            .map_err(|_| invalid("remote EE XID rejected"))?;
+            .map_err(|error| {
+                tracing::warn!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                    cp=?Xid3::decode(information).ok().and_then(|xid| xid.cp_name().ok()),
+                    tg=information.get(16).copied(),
+                    node_id=?information.get(2..6), ?error,
+                    "remote EE XID rejected");
+                invalid("remote EE XID rejected")
+            })?;
         if let Err(error) = self.send_control(
             DEFAULT_BASE_SAP,
             DEFAULT_BASE_SAP | 1,
