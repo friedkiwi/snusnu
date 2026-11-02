@@ -68,6 +68,18 @@ impl LlcAutoListener {
         self.active_proxy_macs.remove(&mac);
     }
 
+    /// Reserve a destination before an upstream-initiated circuit opens its
+    /// LLC endpoint. This prevents the listener from offering the same link.
+    pub(crate) fn reserve(&mut self, mac: [u8; 6]) -> io::Result<bool> {
+        if !self.allowed_proxy_macs.contains(&mac) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LLC proxy MAC is not registered for this attachment",
+            ));
+        }
+        Ok(self.active_proxy_macs.insert(mac))
+    }
+
     /// Poll one frame and offer its destination at most once while its
     /// association is active. A private endpoint receives subsequent frames.
     pub(crate) fn poll_offer(&mut self) -> io::Result<Option<LlcIngressOffer>> {
@@ -134,10 +146,27 @@ fn classify_offer(
 }
 
 impl LlcIngressOffer {
+    /// Pass an owned endpoint and its first events to the native APPN
+    /// converter. The opening frame cannot be lost between sockets.
+    pub(crate) fn into_endpoint(self) -> io::Result<(Endpoint, Vec<Event>, Option<String>)> {
+        self.into_endpoint_with_gate(false)
+    }
+
+    fn into_endpoint_with_gate(
+        self,
+        connect_allowed: bool,
+    ) -> io::Result<(Endpoint, Vec<Event>, Option<String>)> {
+        let mut endpoint = Endpoint::open(&self.interface, self.guest_mac, self.proxy_mac)?;
+        if !connect_allowed {
+            endpoint.set_connect_allowed(false)?;
+        }
+        let first_events = endpoint.inject_frame(&self.first_frame, true)?;
+        Ok((endpoint, first_events, self.peer_cp))
+    }
+
     /// Open a private LLC2 association and replay the offered first frame.
     pub(crate) fn open_port(self) -> io::Result<AutoLlcPort> {
-        let mut endpoint = Endpoint::open(&self.interface, self.guest_mac, self.proxy_mac)?;
-        let first_events = endpoint.inject_frame(&self.first_frame, true)?;
+        let (endpoint, first_events, _) = self.into_endpoint_with_gate(true)?;
         Ok(AutoLlcPort {
             endpoint,
             first_events: first_events.into(),
@@ -148,6 +177,22 @@ impl LlcIngressOffer {
 pub(crate) struct AutoLlcPort {
     endpoint: Endpoint,
     first_events: VecDeque<Event>,
+}
+
+impl AutoLlcPort {
+    /// A remote circuit can select a known local LLC attachment before that
+    /// attachment sends its first frame. The caller reserves the MAC in the
+    /// listener first and releases it when the circuit closes.
+    pub(crate) fn open_outbound(
+        interface: &str,
+        guest_mac: [u8; 6],
+        proxy_mac: [u8; 6],
+    ) -> io::Result<Self> {
+        Ok(Self {
+            endpoint: Endpoint::open(interface, guest_mac, proxy_mac)?,
+            first_events: VecDeque::new(),
+        })
+    }
 }
 
 impl RoutePort for AutoLlcPort {
