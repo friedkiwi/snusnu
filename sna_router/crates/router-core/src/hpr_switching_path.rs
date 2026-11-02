@@ -102,7 +102,7 @@ pub fn validate_inbound_switching_path(
             if authorized.generation != bootstrap.generation
                 || authorized.target_lu.netid != bootstrap.local.cp.netid
                 || authorized.tg_number != tg_number
-                || authorized.return_link_label != bootstrap.peer.link_label
+                || authorized.return_link_label != bootstrap.local.link_label
                 || authorized.maximum_packet_size != bootstrap.max_packet_size
             {
                 return Err(PathError::InvalidUserAuthorization);
@@ -215,7 +215,9 @@ fn validate_cv83(cv: &[u8], bootstrap: &HprControlBootstrap) -> Result<(u32, u32
         return Err(PathError::InvalidReturnPath);
     }
     let path = &cv[16..];
-    let label = &bootstrap.peer.link_label;
+    // The return ANR path points *toward us*, so its link label is the one
+    // advertised in our CV61, not the peer's label for the forward direction.
+    let label = &bootstrap.local.link_label;
     if path.len() != 4 + label.len()
         || path[0] as usize != path.len()
         || path[1] != 0x67
@@ -308,7 +310,11 @@ mod tests {
             cp: cp.parse::<QualifiedName>().unwrap(),
             node_id: [0, 0, 0, node],
             hpr_sap: 4,
-            link_label: vec![0x80, 2],
+            link_label: if node == 2 {
+                vec![0x80, 0x80]
+            } else {
+                vec![0x80, 2]
+            },
             tower: ControlFlowsTower {
                 max_send_packet_size: 1461,
                 path_switch_time_ms: 60_000,
@@ -342,8 +348,43 @@ mod tests {
     // Preserved V5R4 direct EE setup headers (packets 14/18). User payloads
     // are removed and THDR data lengths set to zero; only XID-derived
     // identifiers, CS X0D, SI X14 and ARB X22 remain.
-    const CONTROL: &str = "c608a400ff008015f7e9930000407c0c002b00000000000000001e0580000803e2d6d3d5c5e30600e2d5c1c100000426a40006390000000400000b0d010198000000092800d9e2c5e3e4d70000000803e2d6d3d5c5e30600e2d5c1c2000006390000000400000e1400001683a800000005b50000ea60000000b406670400800200001a85000116461480010be2d6d3d5c5e34be2d5c1c1210000000000000522000000000fa000009c40000010cc00000114";
-    const USER: &str = "c208a400ff008015f7e9940000487c0c002b00000000000000001e0580000803e2d6d3d5c5e30600e2d5c1c100000426a40006390000000400000c0d0101980000000f28800c2c01087bc3d6d5d5c5c3e3000803e2d6d3d5c5e30600e2d5c1c2000006390000000400000d14000016832800000005b50003a980000000b406670400800200001685000112461080010be2d6d3d5c5e34be2d5c1c12100000522000000000fa000009c40000010cc00000114";
+    const CONTROL: &str = "c608a400ff008015f7e9930000407c0c002b00000000000000001e0580000803e2d6d3d5c5e30600e2d5c1c100000426a40006390000000400000b0d010198000000092800d9e2c5e3e4d70000000803e2d6d3d5c5e30600e2d5c1c2000006390000000400000e1400001683a800000005b50000ea60000000b406670400808000001a85000116461480010be2d6d3d5c5e34be2d5c1c1210000000000000522000000000fa000009c40000010cc00000114";
+    const USER: &str = "c208a400ff008015f7e9940000487c0c002b00000000000000001e0580000803e2d6d3d5c5e30600e2d5c1c100000426a40006390000000400000c0d0101980000000f28800c2c01087bc3d6d5d5c5c3e3000803e2d6d3d5c5e30600e2d5c1c2000006390000000400000d14000016832800000005b50003a980000000b406670400808000001685000112461080010be2d6d3d5c5e34be2d5c1c12100000522000000000fa000009c40000010cc00000114";
+    // Live V5R4 EN -> SNUSNU.SVC CPSVCMG setup, retransmission with no data.
+    // Captured 2026-11-02 16:40:08 UTC; only the three-byte EE UI header is
+    // removed. Its reverse X'67' label 80 80 is our advertised link label,
+    // while the guest advertised 80 02 for traffic in the other direction.
+    const LIVE_CPSVCMG: &str = "c608a480ff0080e8992c8f0000204c0c002b00000000000000911e0580000803e2d6d3d5c5e30600e2d5c1c200000426a40006390000000700000b0d0101980000000a2800c3d7e2e5c3d4c700000803e2d5e4e2d5e40500e2e5c30000000639fff2c48000000e1400001683a800000005b50000ea60000000b406670400808000001a85000116461480010be2d6d3d5c5e34be2d5c1c2210000000000000522000000000fa000009c40000010cc00000114";
+
+    #[test]
+    fn live_cross_netid_cp_management_uses_local_reverse_link_label() {
+        let mut local = advertisement("SNUSNU.SVC", 2);
+        local.tower.cp_nce_label = vec![0xa4, 0x80];
+        local.tower.cp_nce_instance = [0xff, 0xf2, 0xc4, 0x80];
+        let mut peer = advertisement("SOLNET.SNAB", 1);
+        peer.tower.cp_nce_label = vec![0xa4, 0];
+        let bootstrap =
+            HprControlBootstrap::new(ConnectionGeneration::new(1).unwrap(), local, peer).unwrap();
+        let bytes = nlp(LIVE_CPSVCMG);
+        let packet = RtpPacket::parse(&bytes).unwrap();
+        let path =
+            validate_inbound_switching_path(packet, &bootstrap, 1, &RtpSetupTopic::CpSvcMg, None)
+                .unwrap();
+        assert_eq!(path.peer_nce_label, [0xa4, 0]);
+        assert_eq!(path.priority, 3);
+        let mut wrong_direction = bootstrap.clone();
+        wrong_direction.local.link_label = vec![0x80, 2];
+        assert_eq!(
+            validate_inbound_switching_path(
+                packet,
+                &wrong_direction,
+                1,
+                &RtpSetupTopic::CpSvcMg,
+                None
+            ),
+            Err(PathError::InvalidReturnPath)
+        );
+    }
 
     #[test]
     fn direct_v5r4_control_and_user_switching_paths_are_distinct_topics() {
@@ -366,7 +407,7 @@ mod tests {
                         12, 0x2c, 1, 8, 0x7b, 0xc3, 0xd6, 0xd5, 0xd5, 0xc5, 0xc3, 0xe3,
                     ],
                     tg_number: 1,
-                    return_link_label: vec![0x80, 2],
+                    return_link_label: vec![0x80, 0x80],
                     maximum_packet_size: 1461,
                 }),
             ),

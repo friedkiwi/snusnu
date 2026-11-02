@@ -224,7 +224,7 @@ impl DirectRouteSetupService {
             local_nce_instance: self.lu_nce_instance,
             cos_tpf: cached.cos_tpf.clone(),
             tg_number: self.tg_number,
-            return_link_label: self.bootstrap.peer.link_label.clone(),
+            return_link_label: self.bootstrap.local.link_label.clone(),
             maximum_packet_size: self.bootstrap.max_packet_size,
         })
     }
