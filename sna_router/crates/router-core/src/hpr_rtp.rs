@@ -20,6 +20,7 @@ pub enum RtpError {
     InvalidDataOffset,
     DataLengthMismatch,
     UnsupportedConnectionQualifier,
+    InvalidConnectionQualifier,
     InvalidOptionalSegments,
 }
 
@@ -29,6 +30,16 @@ pub enum RtpError {
 pub struct RtpOptionalSegment<'a> {
     pub key: u8,
     pub data: &'a [u8],
+}
+
+/// The receive-side Network Address (X'05') CV carried by an originator's
+/// qualified TCID. Identifiers remain in their on-wire encoding; this is not
+/// an RTP connection key or an accepted connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtpConnectionQualifier<'a> {
+    pub network_id: &'a [u8],
+    pub node_id: &'a [u8],
+    pub nce_id: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,18 +112,92 @@ impl<'a> RtpPacket<'a> {
             .wrapping_add(self.end_of_message as u32)
     }
 
-    /// Frame the THDR optional segments. IBM SNA Formats GA27-3136-20,
-    /// pp. 2-11–2-13, gives a one-byte length in four-byte words and a
-    /// one-byte key for each segment. The connection qualifier precedes the
-    /// segments and requires its own CV parser, so this method rejects it.
-    /// No segment body, including ARB (X'22'), is interpreted here.
-    pub fn optional_segments(self) -> Result<Vec<RtpOptionalSegment<'a>>, RtpError> {
-        // Byte 9 bits 3–4 indicate a connection qualifier. Its X'05' CV
-        // cannot safely be mistaken for a segment's length/key pair.
-        if self.thdr[9] & 0x18 != 0 {
+    /// Parse the qualified TCID's Network Address (X'05') CV. IBM SNA
+    /// Formats GA27-3136-20, pp. 2-11–2-13, places this CV ahead of the
+    /// optional segments. This only checks framing and required identifiers;
+    /// it does not establish, acknowledge, or identify an RTP connection.
+    pub fn connection_qualifier(self) -> Result<Option<RtpConnectionQualifier<'a>>, RtpError> {
+        self.qualifier_and_segments()
+            .map(|(qualifier, _)| qualifier)
+    }
+
+    fn qualifier_and_segments(
+        self,
+    ) -> Result<(Option<RtpConnectionQualifier<'a>>, &'a [u8]), RtpError> {
+        let indicator = self.thdr[9] & 0x18;
+        if indicator == 0 {
+            return Ok((None, &self.thdr[MIN_THDR..]));
+        }
+        // CQFI=01 means ORIGIN. Other nonzero values are reserved.
+        if indicator != 0x08 {
             return Err(RtpError::UnsupportedConnectionQualifier);
         }
-        let mut remaining = &self.thdr[MIN_THDR..];
+        let field = &self.thdr[MIN_THDR..];
+        if field.len() < 4 || field[1] != 0x05 {
+            return Err(RtpError::InvalidConnectionQualifier);
+        }
+        let length = usize::from(field[0]);
+        let aligned_length = length.div_ceil(4) * 4;
+        if length < 4 || aligned_length > field.len() {
+            return Err(RtpError::InvalidConnectionQualifier);
+        }
+        let (cv, rest) = field.split_at(aligned_length);
+        if cv[length..].iter().any(|byte| *byte != 0) {
+            return Err(RtpError::InvalidConnectionQualifier);
+        }
+        // The Network Address CV has two fixed bytes before nested CVs.
+        let mut nested = &cv[4..length];
+        let mut network_id = None;
+        let mut node_id = None;
+        let mut nce_id = None;
+        while !nested.is_empty() {
+            if nested.len() < 2 {
+                return Err(RtpError::InvalidConnectionQualifier);
+            }
+            let nested_length = usize::from(nested[0]);
+            let aligned = nested_length.div_ceil(4) * 4;
+            if nested_length < 2 || nested_length > nested.len() {
+                return Err(RtpError::InvalidConnectionQualifier);
+            }
+            // The final nested CV may end at the parent CV's exact byte
+            // boundary; its word padding then belongs to the parent.
+            let consumed = aligned.min(nested.len());
+            if consumed != aligned && nested_length != nested.len() {
+                return Err(RtpError::InvalidConnectionQualifier);
+            }
+            if nested[nested_length..consumed]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(RtpError::InvalidConnectionQualifier);
+            }
+            let value = &nested[2..nested_length];
+            let destination = match nested[1] {
+                0x03 => Some(&mut network_id),
+                0x00 => Some(&mut node_id),
+                0x26 => Some(&mut nce_id),
+                _ => None,
+            };
+            if let Some(destination) = destination {
+                if destination.replace(value).is_some() || value.is_empty() {
+                    return Err(RtpError::InvalidConnectionQualifier);
+                }
+            }
+            nested = &nested[consumed..];
+        }
+        let qualifier = RtpConnectionQualifier {
+            network_id: network_id.ok_or(RtpError::InvalidConnectionQualifier)?,
+            node_id: node_id.ok_or(RtpError::InvalidConnectionQualifier)?,
+            nce_id: nce_id.ok_or(RtpError::InvalidConnectionQualifier)?,
+        };
+        Ok((Some(qualifier), rest))
+    }
+
+    /// Frame the THDR optional segments. Each segment has a one-byte length
+    /// in four-byte words and a one-byte key. No segment body, including ARB
+    /// (X'22'), is interpreted here.
+    pub fn optional_segments(self) -> Result<Vec<RtpOptionalSegment<'a>>, RtpError> {
+        let (_, mut remaining) = self.qualifier_and_segments()?;
         if self.thdr[9] & 0x04 == 0 {
             return if remaining.is_empty() {
                 Ok(Vec::new())
@@ -219,6 +304,28 @@ mod tests {
         nlp
     }
 
+    fn sanitized_qualified_setup_header() -> Vec<u8> {
+        // Same structural lengths and keys as the V5R4 setup header. The
+        // network, node, NCE, other control fields, and data are synthetic.
+        let mut nlp = vec![0xc2, 0x08, 0xa4, 0, 0xff, 0];
+        let mut thdr = vec![0; 20];
+        thdr[..4].copy_from_slice(&0x8015_f7e9u32.to_be_bytes());
+        thdr[8] = 0x40;
+        thdr[9] = 0x0c;
+        thdr[10..12].copy_from_slice(&43u16.to_be_bytes());
+        nlp.extend_from_slice(&thdr);
+        nlp.extend_from_slice(&[
+            30, 0x05, 0x80, 0, 8, 0x03, b'N', b'E', b'T', b'0', b'0', b'1', 6, 0x00, b'N', b'O',
+            b'D', b'E', 0, 0, 4, 0x26, 0x12, 0x34, 6, 0x39, 0, 0, 0, 4, 0, 0,
+        ]);
+        for (words, key) in [(11, 0x0d), (14, 0x14), (5, 0x22)] {
+            nlp.extend_from_slice(&[words, key]);
+            nlp.resize(nlp.len() + usize::from(words) * 4 - 2, 0);
+        }
+        assert_eq!(nlp.len(), 6 + 172);
+        nlp
+    }
+
     #[test]
     fn parses_real_header_boundaries_and_eom_sequence_consumption() {
         let nlp = captured_header_with_synthetic_data();
@@ -304,6 +411,70 @@ mod tests {
     }
 
     #[test]
+    fn frames_sanitized_qualified_setup_without_accepting_connection() {
+        let nlp = sanitized_qualified_setup_header();
+        let packet = RtpPacket::parse(&nlp).unwrap();
+        let qualifier = packet.connection_qualifier().unwrap().unwrap();
+        assert_eq!(qualifier.network_id, b"NET001");
+        assert_eq!(qualifier.node_id, b"NODE");
+        assert_eq!(qualifier.nce_id, &[0x12, 0x34]);
+        assert_eq!(
+            packet
+                .optional_segments()
+                .unwrap()
+                .iter()
+                .map(|s| s.key)
+                .collect::<Vec<_>>(),
+            [0x0d, 0x14, 0x22]
+        );
+        assert_eq!(
+            RtpPosition::default().observe(packet),
+            SequenceObservation::QualifiedConnectionUnsupported
+        );
+    }
+
+    #[test]
+    fn rejects_bad_qualifier_framing_and_reserved_indicator() {
+        let original = sanitized_qualified_setup_header();
+        let mut nlp = original.clone();
+        nlp[27] = 0x06; // expected Network Address CV X'05'
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().connection_qualifier(),
+            Err(RtpError::InvalidConnectionQualifier)
+        );
+        nlp = original.clone();
+        nlp[26] = 33; // CV exceeds its word-aligned area before segments
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().connection_qualifier(),
+            Err(RtpError::InvalidConnectionQualifier)
+        );
+        nlp = original.clone();
+        nlp[31] = 0; // missing Network ID CV X'03'
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().connection_qualifier(),
+            Err(RtpError::InvalidConnectionQualifier)
+        );
+        nlp = original.clone();
+        nlp[45] = 0xff; // nonzero nested CV word pad
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().connection_qualifier(),
+            Err(RtpError::InvalidConnectionQualifier)
+        );
+        nlp = original.clone();
+        nlp[56] = 0xff; // nonzero parent CV word pad
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().connection_qualifier(),
+            Err(RtpError::InvalidConnectionQualifier)
+        );
+        nlp = original;
+        nlp[15] = 0x14; // reserved CQFI=10
+        assert_eq!(
+            RtpPacket::parse(&nlp).unwrap().connection_qualifier(),
+            Err(RtpError::UnsupportedConnectionQualifier)
+        );
+    }
+
+    #[test]
     fn optional_segment_framing_rejects_invalid_flags_and_lengths() {
         let mut nlp = captured_header_with_synthetic_data();
         nlp[15] = 0; // THDR byte 9: OSI off while 12 segment bytes remain.
@@ -323,7 +494,7 @@ mod tests {
             Err(RtpError::InvalidOptionalSegments)
         );
         nlp[26] = 3;
-        nlp[15] = 0x0c; // connection qualifier indicator
+        nlp[15] = 0x1c; // reserved connection qualifier indicator
         assert_eq!(
             RtpPacket::parse(&nlp).unwrap().optional_segments(),
             Err(RtpError::UnsupportedConnectionQualifier)
