@@ -137,7 +137,7 @@ impl ReverseUserBind {
             || piu[0] != self.native_request[0]
             || piu[1] != 0
             || piu[2..4] != [self.native_address.oaf, self.native_address.daf]
-            || piu[4..9] != [0, 0, 0xeb, 0x80, 0]
+            || !matches!(&piu[4..9], [0, 0, 0xeb, 0x80, 0] | [0, 0, 0xeb, 0x85, 0])
         {
             return Err(invalid(
                 "native user BIND did not return positive response for this session",
@@ -147,10 +147,15 @@ impl ReverseUserBind {
         // The shared validator accepts the canonical native RH 0x84. Live
         // V4R4 uses 0x85; normalize only this copy for correlation.
         native_request[3] &= !1;
-        validate_positive_response(&native_request, &piu[4..]).map_err(|_| {
+        let mut native_response = piu[4..].to_vec();
+        // QAALICE V4R4 returned RH eb 85 00 on the live user BIND. Keep
+        // that PIU intact on the native link; the shared BIND validator and
+        // TCP62 Connect use the canonical eb 80 00 reduced response.
+        native_response[3] = 0x80;
+        validate_positive_response(&native_request, &native_response).map_err(|_| {
             invalid("native user BIND response failed LU, mode or FQPCID correlation")
         })?;
-        let mut tcp_bind_response = piu[4..].to_vec();
+        let mut tcp_bind_response = native_response;
         let fixed = &mut tcp_bind_response[5..32];
         if fixed[8..14] != [0, 0x80, 0xc7, 0xc7, 0x80, 0] || fixed[25] != 0x40 {
             return Err(invalid(
@@ -222,6 +227,9 @@ mod tests {
     const REQUEST: &str = "00006b800031001307b0b0513303838c8c8303060200000000000000944300000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301238ff2ee2700000c04e2d6d3d5c5e34be2d5c1c10a1300b0238ff2ee270000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e3";
     const RESPONSE: &str = "0000eb800031001307b0b0513303038c8c830306020000000000000094430000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b0238ff4f5c3000000006014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1";
     const V4_RESPONSE: &str = "0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1";
+    const LIVE_QA_CONNECT: &str = "000000e4800a00e02a0b010dd8c1c1d3c9c3c54be2d5c1c1010b010bd8c1c2d6c24be2d5c1c20109b023f700831e80000f00008005000000760000007620000508000601010a02008b00006b800031001307b0b0513303838c8c8303060200000000000000944300000ad8c1c2d6c24be2d5c1c22c000902404040404040404009030123f700801d00000b04d8c1c2d6c24be2d5c1c20a1300b023f700801d0000000cd8c1c1d3c9c3c54be2d5c1c16013e8e772dd2407024a0ad8c1c2d6c24be2d5c1c22c0a01087bc3d6d5d5c5c3e31800000501190a000a0020010310831a00000584";
+    const LIVE_QA_NATIVE_BIND: &str = "2f00020200006b850031001307b0b051330383c7c78303060200000000000000944340000ad8c1c2d6c24be2d5c1c22c000902404040404040404009030123f700801d00000b04d8c1c2d6c24be2d5c1c20a1300b023f700801d0000000cd8c1c1d3c9c3c54be2d5c1c16013e8e772dd2407024a0ad8c1c2d6c24be2d5c1c22c0a01087bc3d6d5d5c5c3e3";
+    const LIVE_QA_V4_RESPONSE: &str = "2f0002020000eb850031001307b0b051330080c7c7800006020000000000000094434000002700090240404040404040400203020d05d8c1c1d3c9c3c54be2d5c1c10a1300b023f70000a9000000006013e8e772dd2407024a0ad8c1c2d6c24be2d5c1c2";
 
     fn connect() -> Connect {
         let source = hex("e2d6d3d5c5e34be2d5c1c1");
@@ -375,5 +383,39 @@ mod tests {
             tcp.connection_data()[5 + 8..5 + 14],
             [3, 3, 0x8c, 0x8c, 0x83, 3]
         );
+    }
+
+    #[test]
+    fn live_qa_v4_positive_bind_with_eb85_becomes_tcp62_positive() {
+        let mut ingress = IngressSession::new(IngressPolicy {
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            user_mode: None,
+            allow_blank_user_mode: true,
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            forbidden_fqpcid: None,
+        })
+        .unwrap();
+        let offer = ingress.receive(&hex(LIVE_QA_CONNECT)).unwrap();
+        let mut bridge = ReverseUserBind::after_management(
+            offer,
+            NativeAddress {
+                daf: 2,
+                oaf: 2,
+                odai: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(bridge.native_bind(), hex(LIVE_QA_NATIVE_BIND));
+        bridge
+            .mark_native_bind_enqueued(&hex(LIVE_QA_NATIVE_BIND))
+            .unwrap();
+        let piu = hex(LIVE_QA_V4_RESPONSE);
+        assert_eq!(piu.len(), 100); // 118-byte Ethernet frame minus 18-byte LLC envelope
+        let tcp = bridge.accept_native_response(&piu).unwrap();
+        assert_eq!(tcp.direction, Direction::PositiveResponse);
+        assert_eq!(&tcp.connection_data()[..5], &[0, 0, 0xeb, 0x80, 0]);
+        assert_eq!(bridge.native_flow_windows(), Some((3, 1)));
     }
 }
