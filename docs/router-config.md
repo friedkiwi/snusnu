@@ -1,6 +1,6 @@
 # Rust router configuration
 
-`snusnu-router --config FILE` starts multiple independent LLC2 associations and explicit routes. Each `[[llc]]` entry names the guest MAC on one Linux Ethernet interface. `guest_mac` is always required. Standalone LLC links also need an explicit `proxy_mac`, the local address the guest contacts. On an LLC link routed to `[[concentrator]]`, omit `proxy_mac` to use the concentrator's managed CP binding. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
+`snusnu-router --config FILE` starts multiple independent LLC2 associations and explicit routes. Each `[[llc]]` entry names the guest MAC on one Linux Ethernet interface; `guest_mac` is always required. For an LLC-to-LLC route, each endpoint uses the opposite peer's `guest_mac` as its local proxy address by default. For an LLC route to a non-LLC target, `[[route]] proxy_mac` can specify the local address the guest contacts; a concentrator route normally obtains it from the server's managed CP binding instead. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
 
 For the two V4R4 guests used in [the LLC lab](llc-lab.md), save this as `router.toml`:
 
@@ -9,13 +9,11 @@ For the two V4R4 guests used in [the LLC lab](llc-lab.md), save this as `router.
 id = "snaa"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:00:35:27:23:02"
 
 [[llc]]
 id = "snab"
 interface = "sol4"
 guest_mac = "02:00:35:27:23:02"
-proxy_mac = "02:00:35:27:23:01"
 
 [[route]]
 from = "snaa"
@@ -24,6 +22,8 @@ bidirectional = true
 ```
 
 Run `sudo sna_router/target/debug/snusnu-router --config router.toml` from the repository root. Each route selects a target association by its stable local ID. A source must have exactly one target while the current flow-control contract is per association. The loader rejects unknown IDs, ambiguous routes, duplicate associations, invalid MACs and ports without a route before opening any socket. `bidirectional` defaults to `true`.
+
+`proxy_mac` on `[[route]]` overrides an inferred target address for one LLC-facing direction. A bidirectional LLC-to-LLC route has two different local addresses, so it cannot use one route-level override; use the opposite guests' MACs as shown above. The old `[[llc]] proxy_mac` field remains a deprecated migration fallback. Do not set it together with `[[route]] proxy_mac`.
 
 An optional `[[concentrator]]` entry makes a WebSocket hop another named port. For example, use this as a separate configuration to route one LLC association to `upstream`:
 
@@ -49,7 +49,7 @@ to = "upstream"
 
 `token` is optional. Omit it or set `token = ""` to send no Authorization header. Keep a file containing a real token readable only by the router operator; the token is never printed in logs. The older `--remote-link` command still reads `SNUSNU_ROUTER_TOKEN` from the environment.
 
-Configured `[[concentrator]]` entries share one WebSocket connection and publish one snapshot of CPs and LUs derived from their attached local peers. An LLC association declares its CP and LUs once on `[[llc]]`; the router uses those declarations for publication and verifies the CP against the guest's XID3 before LLC2 contact. The `target_cp` (and optional `target_lu`) on an LLC concentrator route currently selects one destination from the concentrator's advertised directory. These target fields are temporary per-circuit selection until the router can select a destination from each incoming session. Standalone LLC routes can omit identity declarations. With `proxy_mac` omitted, the LLC port opens its AF_PACKET socket without a bound proxy MAC and waits for the server-assigned virtual MAC of the target CP before accepting or transmitting LLC frames. An explicit managed-prefix `proxy_mac` remains a provisional legacy value and can be replaced by that binding while LLC is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
+Configured `[[concentrator]]` entries share one WebSocket connection and publish one snapshot of CPs and LUs derived from their attached local peers. An LLC association declares its CP and LUs once on `[[llc]]`; the router uses those declarations for publication and verifies the CP against the guest's XID3 before LLC2 contact. The `target_cp` (and optional `target_lu`) on an LLC concentrator route currently selects one destination from the concentrator's advertised directory. These target fields are temporary per-circuit selection until the router can select a destination from each incoming session. Standalone LLC routes can omit identity declarations. With route `proxy_mac` omitted, the LLC port waits for the server-assigned virtual MAC of the target CP before accepting or transmitting LLC frames. An explicit managed-prefix route `proxy_mac` remains a provisional value and can be replaced by that binding while LLC is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
 
 An exported LU can optionally declare its supported type on its local peer for the global directory and remote route metadata. Omitted declarations remain `Unknown`; they are not inferred from the LU name. Keys must also appear in the same peer's `lus`, and duplicate or empty type lists are rejected:
 

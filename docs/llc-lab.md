@@ -71,6 +71,31 @@ associations connected and bidirectional MAC routes. This regression used
 the existing two isolated TAPs; same-interface multi-peer filtering has
 a separate synthetic AF_PACKET test.
 
+The declarative version needs only each guest's own MAC. For this
+bidirectional LLC-to-LLC route, each port uses the other guest's MAC as its
+proxy address:
+
+```toml
+[[llc]]
+id = "a"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+
+[[llc]]
+id = "b"
+interface = "sol4"
+guest_mac = "02:00:35:27:23:02"
+
+[[route]]
+from = "a"
+to = "b"
+```
+
+An LLC route to a non-LLC destination can set `proxy_mac` on `[[route]]`.
+For an LLC route to the concentrator, the usual choice is to omit it and use
+the server-assigned CP virtual MAC. The native probe's separate `proxy_mac`
+setting below is not part of the declarative router schema.
+
 For one LLC endpoint routed through a concentrator, use a router credential
 in the environment rather than on the command line:
 
