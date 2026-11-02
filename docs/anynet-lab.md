@@ -296,3 +296,21 @@ and its `SNAB` controller and B's `SNAA00` device were varied off. This live
 run verifies the opt-in LLC2→TCP62 direction through Sign On. It did not
 exercise ordinary `--config`, normal `ENDPASTHR` teardown, UDP X'83', or the
 WebSocket concentrator.
+
+The same `sol5`/`sol7` pair then reached the V5R4 remote Sign On through the
+extracted reverse runner, which uses the reusable outbound TCP62 connector,
+V5R4 management/CNOS initiator, `GatewayEdge`, and a route Connect template.
+The command was:
+
+```sh
+sudo sna_router/target/debug/snusnu-router \
+  --mptn-llc-reverse-lab /tmp/snusnu-native-v4a-user-pacing.toml \
+  10.99.4.10 10.99.4.3 --acknowledge-experimental-x83
+```
+
+After A's `SNAB` controller was varied on, `STRPASTHR RMTLOCNAME(SNAB)`
+displayed B's `S1054504` Sign On (`QBASE`, `QPADEV0001`). The private log
+`/tmp/snusnu-reverse-extracted-20261102.log` records management readiness,
+XID3/LLC2 contact, native BIND validation, and the separate user TCP/397
+connection. This verifies the extracted opt-in runner; ordinary `--config`
+and normal session teardown remain separate acceptance checks.
