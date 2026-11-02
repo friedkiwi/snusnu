@@ -19,6 +19,8 @@ mod auto_llc_ws;
 #[cfg(target_os = "linux")]
 mod auto_local_converter;
 #[cfg(target_os = "linux")]
+mod auto_local_dispatch;
+#[cfg(target_os = "linux")]
 mod auto_runtime;
 #[cfg(target_os = "linux")]
 mod config;
