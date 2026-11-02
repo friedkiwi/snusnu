@@ -2,10 +2,11 @@
 
 use crate::{
     anynet_port::AnyNetPort,
-    config::{self, RouterConfig},
+    config::{self, BidirectionalGatewayConfig, RouterConfig},
     endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
     hpr_lan_port::HprLanPort,
     ip_ports::EePort,
+    mptn_bidirectional_gateway,
     mptn_llc_reverse::{self, ReverseLlcConfig},
     mptn_ws_reverse::{self, ReverseWsConfig},
     remote::{Config as RemoteConfig, WsRoutePort},
@@ -278,6 +279,9 @@ fn configured_proxy_mac(config: &RouterConfig, peer: &config::LlcConfig) -> io::
 /// The route table is checked before any raw socket is opened.
 pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     config.validate()?;
+    if let Some(duplex) = config.bidirectional_gateway_config()? {
+        return run_bidirectional_gateway(duplex);
+    }
     if let Some(reverse) = config.reverse_llc_config()? {
         return run_reverse_llc(reverse);
     }
@@ -450,6 +454,34 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                 tracing::warn!(upstream = upstream_authority(url), error = %error, retry_ms = delay.as_millis(), "concentrator link lost");
                 wait_or_stop(delay);
                 delay = delay.saturating_mul(2).min(MAX_RETRY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn run_bidirectional_gateway(config: BidirectionalGatewayConfig<'_>) -> io::Result<()> {
+    let mut delay = Duration::from_millis(500);
+    tracing::info!(
+        local_ip=%config.gateway.local_ip,
+        peer_ip=%config.gateway.peer_ip,
+        hosted_lu=%config.gateway.source_lu,
+        remote_lu=%config.gateway.destination_lu,
+        upstream=%upstream_authority(&config.concentrator.url),
+        "duplex MPTN gateway starting"
+    );
+    while !crate::STOP.load(Ordering::Relaxed) {
+        match mptn_bidirectional_gateway::run_once(&config) {
+            Ok(()) => {
+                delay = Duration::from_millis(500);
+                tracing::info!(hosted_lu=%config.gateway.source_lu, "duplex gateway circuit closed");
+                wait_or_stop(Duration::from_millis(200));
+            }
+            Err(error) if retryable_reverse_error(&error) || retryable_remote_error(&error) => {
+                tracing::warn!(peer_ip=%config.gateway.peer_ip, upstream=%upstream_authority(&config.concentrator.url), error=%error, retry_ms=delay.as_millis(), "duplex gateway circuit failed");
+                wait_or_stop(delay);
+                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
             }
             Err(error) => return Err(error),
         }
