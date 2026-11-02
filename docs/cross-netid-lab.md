@@ -191,3 +191,15 @@ record; the positive response matched. The missing three-byte pacing grant
 is the next live gateway question. Private captures are
 `combined6-sol9.pcap` and `combined6-sol8.pcap` in the lab directory (18
 and 109 packets, zero capture drops).
+
+The seventh combined run used the adaptive 12-byte native IPR grant. Bob's
+NETID-qualified `STRPASTHR` traversed its AnyNet TCP/397 connection, Rust
+router A, the QA concentrator WebSocket, Rust router B, and Alice's LLC2
+link. Bob displayed Alice's remote `Sign On` screen (`System S1012345`,
+virtual display `QPADEV0001`). No credentials were entered. The private
+captures `combined7-sol9.pcap` and `combined7-sol8.pcap` contain 13 and
+97 packets respectively, with zero capture drops. This verifies the
+cross-NETID route through the first remote display; authenticated sign-on
+and normal session teardown remain to be checked. The seventh router used
+a bounded 180-second lab timeout, so a follow-up with an established
+session held open is planned.
