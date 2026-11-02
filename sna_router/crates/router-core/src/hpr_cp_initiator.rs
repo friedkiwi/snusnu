@@ -64,6 +64,7 @@ pub struct ReciprocalCpSession {
     fqpcid: Vec<u8>,
     association: Option<Fid5AddressAssociation>,
     capabilities: Option<Vec<u8>>,
+    pacing_grant: Option<Vec<u8>>,
 }
 
 impl ReciprocalCpSession {
@@ -143,6 +144,7 @@ impl ReciprocalCpSession {
             fqpcid,
             association: None,
             capabilities: None,
+            pacing_grant: None,
         })
     }
 
@@ -233,9 +235,31 @@ impl ReciprocalCpSession {
                     .ok_or(CpInitiatorError::WrongPhase)?
                     .observe_data(Direction::SluToPlu, observation, fid5)
                     .map_err(|_| CpInitiatorError::WrongScope)?;
+                // The SLU grants the adaptive pacing window with a solicited
+                // expedited IPM after our CP Capabilities Attach. It is not
+                // the X'12C1' capabilities reply and need not advance the
+                // CP transaction. The V5R4 trace sends this before its GDS.
+                if fid5.expedited && fid5.rh == [0x83, 0x01, 0] {
+                    let window = if fid5.ru.len() == 3 && fid5.ru[0] == 0 {
+                        u16::from_be_bytes([fid5.ru[1], fid5.ru[2]])
+                    } else {
+                        return Err(CpInitiatorError::InvalidCapabilities);
+                    };
+                    if !(1..=32767).contains(&window)
+                        || self
+                            .pacing_grant
+                            .as_ref()
+                            .is_some_and(|grant| grant != bytes)
+                    {
+                        return Err(CpInitiatorError::InvalidCapabilities);
+                    }
+                    self.pacing_grant = Some(bytes.to_vec());
+                    return Ok(Vec::new());
+                }
                 if fid5.expedited
                     || fid5.rh != [0x03, 0x91, 1]
                     || fid5.ru.len() < 12
+                    || fid5.ru.len() > 128
                     || fid5.ru[0..4] != [0, fid5.ru.len() as u8, 0x12, 0xc1]
                     || fid5.ru[8] & 0xe0 != 0x80
                 {
@@ -312,7 +336,9 @@ mod tests {
     #[test]
     fn reciprocal_cp_bind_and_capabilities_use_distinct_directional_addresses() {
         let generation = ConnectionGeneration::new(3).unwrap();
-        let nonce = 0x0102_0304_0506_0708;
+        // Outbound CP nonce observed in the successful V5R4 BIND exchange
+        // at 2026-11-02 17:21:20 UTC.
+        let nonce = 0x18ca_5a3a_bb99_b979;
         let mut session = ReciprocalCpSession::for_peers(
             "SNUSNU.SVC".parse().unwrap(),
             "SOLNET.SNAB".parse().unwrap(),
@@ -323,7 +349,7 @@ mod tests {
         let bind = session.prepare_bind().unwrap().to_vec();
         let parsed = Fid5WholeBiu::parse_complete(&bind).unwrap();
         assert_eq!(parsed.session_address, (ASSIGNOR | nonce).to_be_bytes());
-        assert_eq!(parsed.ru[24], 0x23); // Confirm only; parallel sessions and CNOS.
+        assert_eq!(parsed.ru[24], 0x23); // Confirm, parallel sessions, CNOS.
         assert_eq!(parsed.classify_bind().unwrap().unwrap().plu, "SNUSNU.SVC");
         assert_eq!(parsed.classify_bind().unwrap().unwrap().slu, "SOLNET.SNAB");
         assert!(parsed
@@ -372,6 +398,30 @@ mod tests {
         assert_eq!(&caps.ru[..CAP_ATTACH.len()], &CAP_ATTACH);
         assert_eq!(&caps.ru[CAP_ATTACH.len()..], &LOCAL_CAPABILITIES);
         session.mark_capabilities_sent().unwrap();
+        let mut ipm = vec![0x5d, 0, 0, 0];
+        ipm.extend_from_slice(&nonce.to_be_bytes());
+        ipm.extend_from_slice(&[0x83, 0x01, 0, 0, 0, 1]);
+        assert_eq!(
+            ipm,
+            [
+                0x5d, 0, 0, 0, 0x18, 0xca, 0x5a, 0x3a, 0xbb, 0x99, 0xb9, 0x79, 0x83, 0x01, 0, 0, 0,
+                1
+            ]
+        );
+        for _ in 0..2 {
+            assert!(session
+                .ingest(
+                    scope,
+                    RtpObservation {
+                        generation,
+                        tcid: scope.slu_tcid,
+                    },
+                    &ipm,
+                )
+                .unwrap()
+                .is_empty());
+            assert_eq!(session.phase(), CpInitiatorPhase::AwaitCapabilitiesReply);
+        }
         let mut peer_caps = vec![0x5c, 0, 0, 1];
         peer_caps.extend_from_slice(&nonce.to_be_bytes());
         peer_caps.extend_from_slice(&[3, 0x91, 1]);
