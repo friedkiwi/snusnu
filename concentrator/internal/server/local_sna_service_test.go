@@ -210,6 +210,10 @@ func TestLocalSNAAdapterActivatesStampedPeer(t *testing.T) {
 	expectTestBody(t, conn, "credit")
 	outbound += len(versionGrant) + len(versionReply)
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
+	// V4R4 may include the three-byte pacing parameter after the RH.
+	iprWithParameter := []byte{0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0, 0, 0, 6}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SnaInformation{SnaInformation: iprWithParameter}}})
+	expectTestBody(t, conn, "credit")
 	packet, _ := hex.DecodeString("001412ff00000000000000000000000000000000")
 	echoRequest := append([]byte{0x2e, 0, 2, 2, 0, 3, 3, 0x91, 0x20}, packet...)
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SnaInformation{SnaInformation: echoRequest}}})

@@ -169,8 +169,7 @@ func (s *ManagementSession) ReceiveIPR(data []byte) error {
 	if s.phase != ManagementAwaitCNOSAck && s.phase != ManagementCNOSComplete {
 		return ErrManagementState
 	}
-	if len(data) != 9 || data[0] != s.bindRequest[0] || data[1] != 0 || data[2] != s.bindRequest[2] || data[3] != s.bindRequest[3] ||
-		!bytes.Equal(data[6:], []byte{0x83, 1, 0}) {
+	if !IsPacingResponse(data) || data[0] != s.bindRequest[0] || data[1] != 0 || data[2] != s.bindRequest[2] || data[3] != s.bindRequest[3] || data[4] != 0 || data[5] != 0 {
 		return ErrManagementState
 	}
 	return s.pacing.ReceiveIPR()

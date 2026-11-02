@@ -272,7 +272,7 @@ func (s *localSNAService) drainEarly(c *localSNACircuit) error {
 }
 
 func isLocalIPR(data []byte) bool {
-	return len(data) == 9 && bytes.Equal(data[6:], []byte{0x83, 1, 0})
+	return lu62.IsPacingResponse(data)
 }
 
 func (s *localSNAService) dispatch(c *localSNACircuit, data []byte) error {

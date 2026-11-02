@@ -2,6 +2,25 @@ package lu62
 
 import "testing"
 
+func TestPacingResponseForms(t *testing.T) {
+	for _, data := range [][]byte{
+		{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0},
+		{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0, 0, 0, 6},
+	} {
+		if !IsPacingResponse(data) {
+			t.Fatalf("rejected observed pacing response: %x", data)
+		}
+	}
+	for _, data := range [][]byte{
+		{0x2f, 0, 2, 1, 0, 0, 0x83, 1},
+		{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0, 0, 0, 7},
+	} {
+		if IsPacingResponse(data) {
+			t.Fatalf("accepted malformed pacing response: %x", data)
+		}
+	}
+}
+
 func TestFixedPacingNeedsExplicitWindowGrants(t *testing.T) {
 	p, err := NewFixedPacing(3, 1)
 	if err != nil {
