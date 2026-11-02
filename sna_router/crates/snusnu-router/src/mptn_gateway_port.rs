@@ -171,12 +171,6 @@ impl MptnGatewayPort {
         &mut self,
         can_accept_information: bool,
     ) -> io::Result<Option<GatewayEvent>> {
-        Self::poll_outbound_fallback_at(
-            &mut self.active,
-            self.config.peer_ip,
-            Instant::now(),
-            |bytes, peer| Self::send_oob_response(&self.udp, bytes, peer),
-        )?;
         match self.poll_udp_once() {
             Ok(Some(event)) => return Ok(Some(event)),
             Ok(None) => {}
@@ -185,6 +179,14 @@ impl MptnGatewayPort {
                 return Err(error);
             }
         }
+        // Give an already received UDP acknowledgement precedence over an
+        // expiry observed in this same poll iteration.
+        Self::poll_outbound_fallback_at(
+            &mut self.active,
+            self.config.peer_ip,
+            Instant::now(),
+            |bytes, peer| Self::send_oob_response(&self.udp, bytes, peer),
+        )?;
         if self.active.is_none() {
             match self.listener.accept() {
                 Ok((stream, peer)) if peer.ip() == self.config.peer_ip => {
