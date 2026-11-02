@@ -1914,6 +1914,59 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_user_offer_exposes_exact_destination_before_positive_reply() {
+        let request = hex(concat!(
+            "000000e4800a00e02a0b010dd8c1c1d3c9c3c54be2d5c1c1010b010bd8c1c2d6c24be2d5c1c201",
+            "09b023f6611b4500000f00008005000000760000007620000508000601010a02008b00006b80003100",
+            "1307b0b0513303838c8c8303060200000000000000944300000ad8c1c2d6c24be2d5c1c22c0009",
+            "02404040404040404009030123f661184500000b04d8c1c2d6c24be2d5c1c20a1300b023f66118",
+            "450000000cd8c1c1d3c9c3c54be2d5c1c16013e8e772dd240702490ad8c1c2d6c24be2d5c1c2",
+            "2c0a01087bc3d6d5d5c5c3e31800000501190a000a0020010310831a00000584"
+        ));
+        let mut port = MptnGatewayPort::bind_dynamic(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: String::new(),
+            destination_lu: String::new(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        let mut peer = peer_socket(port.listener.local_addr().unwrap());
+        peer.write_all(&request).unwrap();
+        let (id, offer) = (0..1000)
+            .find_map(|_| {
+                let event = port.poll_association_once(true).unwrap();
+                if event.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                match event {
+                    Some((id, GatewayEvent::UserBind(offer))) => Some((id, offer)),
+                    Some((_, GatewayEvent::Rejected(reason))) => panic!("rejected: {reason}"),
+                    _ => None,
+                }
+            })
+            .expect("dynamic user offer");
+        assert_eq!(id, 0);
+        assert_eq!(
+            MptnGatewayPort::offer_lus(&offer).unwrap(),
+            ("QABOB.SNAB".into(), "QAALICE.SNAA".into())
+        );
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn captured_shape_keepalive_replies_only_to_configured_pair() {
         let mut port = MptnGatewayPort::bind(GatewayConfig {
             local: "127.0.0.1:0".parse().unwrap(),
