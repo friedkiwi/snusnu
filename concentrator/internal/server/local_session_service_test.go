@@ -255,4 +255,49 @@ func TestLocalAPINGSessionAcceptsV5R4EESNASVCMGPingBind(t *testing.T) {
 	if credit := expectTestBody(t, conn, "credit").GetCircuitCredit(); credit.AllowanceBytes != 1500+uint64(len(reduced)) {
 		t.Fatalf("SNASVCMG PING BIND inbound credit: %+v", credit)
 	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(len(response.ReducedUnit))}})
+	// The live V5R4 guest sends this CNOS control-operator Attach after the
+	// SNASVCMG BIND. The neutral wire has already removed the carrier PI bit.
+	cnos, err := hex.DecodeString("00010b90200c0502ff0003d000000206f100191210020000000000080004000400084040404040404040")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SessionEvent{SessionEvent: &wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: cnos}}}}}})
+	grant := expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetPacingCredit()
+	if grant == nil || grant.Normal != 1 || grant.Expedited != 0 {
+		t.Fatalf("CNOS pacing grant: %+v", grant)
+	}
+	cnosReply := expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetInformation()
+	if cnosReply == nil || !bytes.Equal(cnosReply.ReducedUnit[5:10], []byte{0, 0x19, 0x12, 0x10, 0x0a}) {
+		t.Fatalf("CNOS accepted-pending reply: %+v", cnosReply)
+	}
+	if credit := expectTestBody(t, conn, "credit").GetCircuitCredit(); credit.AllowanceBytes != 1500+uint64(len(reduced)+len(cnos)) {
+		t.Fatalf("CNOS inbound credit: %+v", credit)
+	}
+	outbound := uint64(len(response.ReducedUnit) + len(cnosReply.ReducedUnit))
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + outbound}})
+	bis := []byte{0, 2, 0x4b, 0x90, 0, 0x70}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SessionEvent{SessionEvent: &wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: bis}}}}}})
+	grant = expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetPacingCredit()
+	if grant == nil || grant.Normal != 1 {
+		t.Fatalf("BIS pacing grant: %+v", grant)
+	}
+	bisReply := expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetInformation()
+	if bisReply == nil || !bytes.Equal(bisReply.ReducedUnit, []byte{0, 2, 0x4b, 0xb0, 0, 0x70}) {
+		t.Fatalf("BIS reply: %+v", bisReply)
+	}
+	expectTestBody(t, conn, "credit")
+	outbound += uint64(len(bisReply.ReducedUnit))
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + outbound}})
+	fq, err := lu62.RequestFQPCID(append([]byte{0x2f, 0, 1, 2}, reduced...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbind := append([]byte{0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}, fq...)
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SessionEvent{SessionEvent: &wire.SessionEvent{Event: &wire.SessionEvent_Unbind{Unbind: unbind}}}}})
+	unbindReply := expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetUnbind()
+	if !bytes.Equal(unbindReply, []byte{0, 0, 0xeb, 0x80, 0, 0x32}) {
+		t.Fatalf("management UNBIND reply: %x", unbindReply)
+	}
+	expectTestBody(t, conn, "credit")
 }

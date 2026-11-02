@@ -119,12 +119,35 @@ func (s *localSNAService) drainSessionEarly(c *localSNACircuit) error {
 func (s *localSNAService) dispatchSession(c *localSNACircuit, event *wire.SessionEvent) error {
 	switch value := event.Event.(type) {
 	case *wire.SessionEvent_BindRequest:
-		if c.user != nil {
+		if c.user != nil || c.management.Phase() != lu62.ManagementAwaitBind {
 			return errLocalSNA
 		}
 		request, err := virtualFID2(value.BindRequest, true)
 		if err != nil {
 			return err
+		}
+		bind, err := lu62.ParseBind(request)
+		if err != nil || bind == nil {
+			return errLocalSNA
+		}
+		if bind.Mode == "SNASVCMG" {
+			management, err := lu62.NewStandaloneManagementSession(c.peer.NetID+"."+c.peer.CP, "SNUSNU.PING")
+			if err != nil {
+				return err
+			}
+			response, err := management.PrepareBind(request)
+			if err != nil {
+				return err
+			}
+			reduced, err := reducedFromVirtual(response)
+			if err != nil {
+				return err
+			}
+			c.management = management
+			if err := s.sendSession(c, &wire.SessionEvent{Event: &wire.SessionEvent_BindResult{BindResult: &wire.SessionBindResult{Accepted: true, ReducedUnit: reduced}}}, management.AckBind); err != nil {
+				return err
+			}
+			return management.MarkBindSent(response)
 		}
 		user, err := lu62.NewStandaloneUserSession(c.peer.NetID+"."+c.peer.LU, "SNUSNU.PING")
 		if err != nil {
@@ -144,26 +167,52 @@ func (s *localSNAService) dispatchSession(c *localSNACircuit, event *wire.Sessio
 		}
 		return user.MarkBindSent(response)
 	case *wire.SessionEvent_Information:
-		if c.user == nil {
-			return errLocalSNA
-		}
 		request, err := virtualFID2(value.Information.ReducedUnit, value.Information.Expedited)
 		if err != nil {
 			return err
 		}
+		if c.management.Phase() == lu62.ManagementAwaitCNOS {
+			return s.sessionCNOS(c, request)
+		}
+		if c.management.Phase() == lu62.ManagementCNOSComplete {
+			return s.sessionManagementBIS(c, request)
+		}
+		if c.user == nil {
+			return errLocalSNA
+		}
 		return s.sessionInformation(c, request)
 	case *wire.SessionEvent_PacingCredit:
-		if c.user == nil || value.PacingCredit.Normal != 1 || value.PacingCredit.Expedited != 0 {
+		if value.PacingCredit.Normal != 1 || value.PacingCredit.Expedited != 0 {
+			return errLocalSNA
+		}
+		if c.management.Phase() == lu62.ManagementAwaitCNOSAck || c.management.Phase() == lu62.ManagementCNOSComplete {
+			return c.management.ReceiveIPR([]byte{0x2e, 0, virtualFID2DAF, virtualFID2OAF, 0, 0, 0x83, 1, 0})
+		}
+		if c.user == nil {
 			return errLocalSNA
 		}
 		return c.user.ReceiveIPR([]byte{0x2f, 0, virtualFID2DAF, virtualFID2OAF, 0, 0, 0x83, 1, 0})
 	case *wire.SessionEvent_Unbind:
-		if c.user == nil {
-			return errLocalSNA
-		}
 		request, err := virtualFID2(value.Unbind, true)
 		if err != nil {
 			return err
+		}
+		if c.management.Phase() == lu62.ManagementBISComplete {
+			response, err := c.management.PrepareUnbind(request)
+			if err != nil {
+				return err
+			}
+			reduced, err := reducedFromVirtual(response)
+			if err != nil {
+				return err
+			}
+			if err := s.sendSession(c, &wire.SessionEvent{Event: &wire.SessionEvent_Unbind{Unbind: reduced}}, c.management.AckUnbind); err != nil {
+				return err
+			}
+			return c.management.MarkUnbindSent(response)
+		}
+		if c.user == nil {
+			return errLocalSNA
 		}
 		response, err := c.user.PrepareUnbind(request)
 		if err != nil {
@@ -180,6 +229,51 @@ func (s *localSNAService) dispatchSession(c *localSNACircuit, event *wire.Sessio
 	default:
 		return errLocalSNA
 	}
+}
+
+// The neutral session wire omits the carrier's pacing-indicator bit. The
+// management responder uses a virtual FID2 PI to generate its local grant;
+// the router applies the actual carrier pacing on egress.
+func (s *localSNAService) sessionCNOS(c *localSNACircuit, request []byte) error {
+	if len(request) < 9 || request[6] != 0x0b || request[7]&^byte(1) != 0x90 || request[8] != 0x20 {
+		return errLocalSNA
+	}
+	request[7] |= 1
+	grant, response, err := c.management.PrepareCNOS(request)
+	if err != nil {
+		return err
+	}
+	if err := s.sendSessionGrant(c, grant); err != nil {
+		return err
+	}
+	if err := s.sendSessionPIU(c, response, c.management.AckCNOS); err != nil {
+		return err
+	}
+	if err := c.management.MarkCNOSSent(grant, response); err != nil {
+		return err
+	}
+	return c.management.AckCNOS()
+}
+
+func (s *localSNAService) sessionManagementBIS(c *localSNACircuit, request []byte) error {
+	if len(request) != 10 || request[6] != 0x4b || request[7]&^byte(1) != 0x90 || request[8] != 0 || request[9] != 0x70 {
+		return errLocalSNA
+	}
+	request[7] |= 1
+	grant, response, err := c.management.PrepareBIS(request, 2, true)
+	if err != nil {
+		return err
+	}
+	if err := s.sendSessionGrant(c, grant); err != nil {
+		return err
+	}
+	if err := s.sendSessionPIU(c, response, c.management.AckBIS); err != nil {
+		return err
+	}
+	if err := c.management.MarkBISSent(grant, response); err != nil {
+		return err
+	}
+	return c.management.AckBIS()
 }
 
 func (s *localSNAService) sessionInformation(c *localSNACircuit, request []byte) error {

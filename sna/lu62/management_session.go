@@ -30,6 +30,8 @@ const (
 // outbound PIUs have been accepted and then acknowledged by its link.
 type ManagementSession struct {
 	remoteCP, localCP string
+	standalone        bool
+	primaryWindow     byte
 	phase             ManagementPhase
 	bindRequest       []byte
 	bindResponse      []byte
@@ -53,7 +55,23 @@ func NewManagementSession(remoteCP, localCP string) (*ManagementSession, error) 
 	if _, err := encodeLUName(localCP); err != nil || remoteCP == localCP {
 		return nil, ErrManagementState
 	}
-	return &ManagementSession{remoteCP: remoteCP, localCP: localCP}, nil
+	return &ManagementSession{remoteCP: remoteCP, localCP: localCP, primaryWindow: 7}, nil
+}
+
+// NewStandaloneManagementSession serves the server-owned PING LU after the
+// carrier adapter has established CP control flow. Its SNASVCMG session is
+// distinct from the later APING user session and uses a three-frame window.
+func NewStandaloneManagementSession(remoteCP, localLU string) (*ManagementSession, error) {
+	if localLU != "SNUSNU.PING" {
+		return nil, ErrManagementState
+	}
+	s, err := NewManagementSession(remoteCP, localLU)
+	if err != nil {
+		return nil, err
+	}
+	s.standalone = true
+	s.primaryWindow = 3
+	return s, nil
 }
 
 func (s *ManagementSession) Phase() ManagementPhase { return s.phase }
@@ -66,7 +84,17 @@ func (s *ManagementSession) PrepareBind(request []byte) ([]byte, error) {
 	if s.phase != ManagementAwaitBind {
 		return nil, ErrManagementState
 	}
-	response, err := CandidateManagementResponse(request, s.remoteCP, s.localCP, 1)
+	var response []byte
+	var err error
+	if s.standalone {
+		bind, parseErr := ParseBind(request)
+		if parseErr != nil || bind == nil || bind.Mode != "SNASVCMG" {
+			return nil, ErrManagementState
+		}
+		response, err = CandidateStandaloneUserResponse(request, s.remoteCP, s.localCP, 1)
+	} else {
+		response, err = CandidateManagementResponse(request, s.remoteCP, s.localCP, 1)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +121,7 @@ func (s *ManagementSession) AckBind() error {
 	if s.phase != ManagementAwaitBindAck {
 		return ErrManagementState
 	}
-	pacing, err := NewFixedPacing(7, 1)
+	pacing, err := NewFixedPacing(s.primaryWindow, 1)
 	if err != nil {
 		return err
 	}
