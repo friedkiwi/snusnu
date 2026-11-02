@@ -340,18 +340,23 @@ restarting Bob's router**. The latter two sessions and the intervening
 router recovery are recorded in
 `/tmp/snusnu-cross-netid/bob-duplex-reverse.log`.
 
-The reverse session's native teardown still raises `later native PIU is not
-an FM request`; Bob's router logs the session error, recreates its circuit,
-and remains available. Alice's dial controller briefly reopened an idle
-native link before it was varied off. The earlier Bob-initiated session
-also remained attached after the local return-home action; varying Bob's
-`ANYTOA` controller off closed TCP62 and exposed an unsupported TCP62
-UNBIND shape. The router now treats that peer protocol failure as a
-circuit failure and retries, rather than exiting. These are teardown gaps,
-so this run proves sequential initiation in both directions and Sign On,
-not clean protocol shutdown or concurrent opposite-direction sessions.
+The reverse session's native teardown sends a normal-flow DFC BIS request
+(`RH 4b9100`, RU `70`). The converter currently expects an FM request and
+raises `later native PIU is not an FM request`; Bob's router logs the session
+error, recreates its circuit, and remains available. Alice's dial controller
+briefly reopened an idle native link before it was varied off. The earlier
+Bob-initiated session also remained attached after the local return-home
+action; varying Bob's `ANYTOA` controller off closed TCP62 and exposed an
+unsupported TCP62 UNBIND shape. The router now treats that peer protocol
+failure as a circuit failure and retries, rather than exiting. These are
+teardown gaps, so this run proves sequential initiation in both directions
+and Sign On, not clean protocol shutdown or concurrent opposite-direction
+sessions.
 
 Alice's `SNAB` controller was restored to `INLCNN(*ANS)` and its original
 `ADPTADR(02534E000002)`, then varied on. Bob's `ANYTOA` was varied on.
 Both Rust routers and the QA concentrator were stopped; ports 397 and 8081
 had no listeners. No remote sign-on credentials were entered.
+
+The [IBM SNA Formats reference](https://vtda.org/docs/computing/IBM/Other/SNA/GA27-3136-7_SystemsNetworkArchitecture_Mar87.pdf)
+identifies DFC RU `70` as Bracket Initiation Stop (BIS).
