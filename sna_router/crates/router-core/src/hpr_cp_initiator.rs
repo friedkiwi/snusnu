@@ -19,7 +19,7 @@ const RESERVED: u64 = 1 << 62;
 const CPSVCMG: [u8; 7] = [0xc3, 0xd7, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
 const REQUEST_FIXED: [u8; 27] = [
     0x31, 0, 0x13, 7, 0xb0, 0xb0, 0x51, 0x33, 7, 0x87, 0x86, 0x86, 0x87, 7, 6, 2, 0, 0, 0, 0, 0, 0,
-    0, 0x94, 0x43, 0, 0,
+    0, 0x94, 0x23, 0, 0,
 ];
 const LOCAL_CAPABILITIES: [u8; 12] = [0, 12, 0x12, 0xc1, 0, 0, 0, 0, 0xe0, 0x80, 0, 0];
 const CAP_ATTACH: [u8; 17] = [
@@ -32,6 +32,7 @@ pub enum CpInitiatorError {
     InvalidName,
     WrongPhase,
     WrongScope,
+    BindRejected { sense: u32 },
     InvalidResponse,
     InvalidCapabilities,
 }
@@ -181,6 +182,24 @@ impl ReciprocalCpSession {
             Fid5WholeBiu::parse_complete(bytes).map_err(|_| CpInitiatorError::InvalidResponse)?;
         match self.phase {
             CpInitiatorPhase::AwaitBindResponse => {
+                // The peer can terminate a rejected BIND with UNBIND type
+                // X'0F' and a four-byte sense. Report that sense and its
+                // BIND displacement instead of treating it as a malformed
+                // positive response.
+                if observation.tcid == scope.slu_tcid
+                    && fid5.expedited
+                    && fid5.sequence_number == 0
+                    && fid5.session_address
+                        == (u64::from_be_bytes(self.bind[4..12].try_into().unwrap()) & !ASSIGNOR)
+                            .to_be_bytes()
+                    && fid5.rh == [0x6b, 0x80, 0]
+                    && fid5.ru.len() >= 6
+                    && fid5.ru[0..2] == [0x32, 0x0f]
+                {
+                    return Err(CpInitiatorError::BindRejected {
+                        sense: u32::from_be_bytes(fid5.ru[2..6].try_into().unwrap()),
+                    });
+                }
                 let mut association = Fid5AddressAssociation::new(scope);
                 association
                     .observe_bind_request(
@@ -304,6 +323,7 @@ mod tests {
         let bind = session.prepare_bind().unwrap().to_vec();
         let parsed = Fid5WholeBiu::parse_complete(&bind).unwrap();
         assert_eq!(parsed.session_address, (ASSIGNOR | nonce).to_be_bytes());
+        assert_eq!(parsed.ru[24], 0x23); // Confirm only; parallel sessions and CNOS.
         assert_eq!(parsed.classify_bind().unwrap().unwrap().plu, "SNUSNU.SVC");
         assert_eq!(parsed.classify_bind().unwrap().unwrap().slu, "SOLNET.SNAB");
         assert!(parsed
@@ -368,5 +388,47 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(session.phase(), CpInitiatorPhase::Active);
+    }
+
+    #[test]
+    fn reports_live_v5r4_unbind_bind_sense_and_pointer() {
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let nonce = 0x18ca_5a3a_bb99_b978;
+        let mut session = ReciprocalCpSession::for_peers(
+            "SNUSNU.SVC".parse().unwrap(),
+            "SOLNET.SNAB".parse().unwrap(),
+            generation,
+            nonce,
+        )
+        .unwrap();
+        session.mark_bind_sent().unwrap();
+        let scope = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: 0x8000_0001_0000_0001,
+            subsequent_plu_tcid: 0xe899_2ca2_0000_00b8,
+            slu_tcid: 0x0000_0001_0000_0001,
+        };
+        // Complete FID5 BIU from the 2026-11-02 17:20:24 V5R4 trace.
+        let unbind: Vec<u8> = concat!(
+            "5d00000018ca5a3abb99b9786b8000320f08350018",
+            "601318ca5a3abb99b9780ae2d5e4e2d5e44be2e5c3",
+            "351408350018ec01310be2d6d3d5c5e34be2d5c1c200",
+        )
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+        assert_eq!(
+            session.ingest(
+                scope,
+                RtpObservation {
+                    generation,
+                    tcid: scope.slu_tcid,
+                },
+                &unbind,
+            ),
+            Err(CpInitiatorError::BindRejected { sense: 0x0835_0018 })
+        );
+        assert_eq!(session.phase(), CpInitiatorPhase::AwaitBindResponse);
     }
 }
