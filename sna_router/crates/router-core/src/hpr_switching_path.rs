@@ -207,7 +207,9 @@ fn validate_cs_target(
 }
 
 fn validate_cv83(cv: &[u8], bootstrap: &HprControlBootstrap) -> Result<(u32, u32, u32), PathError> {
-    if cv.len() < 21 || cv[3] != 0 || cv[2] & !0xa8 != 0 {
+    // X'10' is the architected limited-resource-link indicator (bit 3).
+    // The V5R4 LU-LU setup sets it while its control connections do not.
+    if cv.len() < 21 || cv[3] != 0 || cv[2] & !0xb8 != 0 {
         return Err(PathError::InvalidReturnPath);
     }
     let max_packet = u32::from_be_bytes(cv[4..8].try_into().unwrap());
@@ -355,6 +357,10 @@ mod tests {
     // removed. Its reverse X'67' label 80 80 is our advertised link label,
     // while the guest advertised 80 02 for traffic in the other direction.
     const LIVE_CPSVCMG: &str = "c608a480ff0080e8992c8f0000204c0c002b00000000000000911e0580000803e2d6d3d5c5e30600e2d5c1c200000426a40006390000000700000b0d0101980000000a2800c3d7e2e5c3d4c700000803e2d5e4e2d5e40500e2e5c30000000639fff2c48000000e1400001683a800000005b50000ea60000000b406670400808000001a85000116461480010be2d6d3d5c5e34be2d5c1c2210000000000000522000000000fa000009c40000010cc00000114";
+    // Live APING LU-LU setup retransmission at 17:51:53 UTC, after the
+    // positive RouteSetup reply. The 3-byte EE header and BIND data are
+    // absent; all CS, SI, ARB and directional labels are preserved.
+    const LIVE_USER: &str = "c208a481ff0080e8992ccc0002084c0c002b00000000000000941e0580000803e2d6d3d5c5e30600e2d5c1c200000426a40006390000000700000c0d0101980000000f28800c2c01087bc3d6d5d5c5c3e3000803e2d5e4e2d5e40500e2e5c30000000639fff2c48000000d1400001683b800000005b50003a9800000000506670400808000001685000112461080010be2d6d3d5c5e34be2d5c1c22100000522000000000fa000009c40000186a0000003e8";
 
     #[test]
     fn live_cross_netid_cp_management_uses_local_reverse_link_label() {
@@ -381,6 +387,50 @@ mod tests {
                 1,
                 &RtpSetupTopic::CpSvcMg,
                 None
+            ),
+            Err(PathError::InvalidReturnPath)
+        );
+    }
+
+    #[test]
+    fn live_user_limited_resource_path_uses_authorized_lu_and_local_label() {
+        let mut local = advertisement("SNUSNU.SVC", 2);
+        local.tower.cp_nce_instance = [0xff, 0xf2, 0xc4, 0x80];
+        let peer = advertisement("SOLNET.SNAB", 1);
+        let bootstrap =
+            HprControlBootstrap::new(ConnectionGeneration::new(1).unwrap(), local, peer).unwrap();
+        let route = AuthorizedUserRoute {
+            generation: bootstrap.generation,
+            target_lu: "SNUSNU.PING".parse().unwrap(),
+            local_nce_label: vec![0xa4, 0x81],
+            local_nce_instance: [0xff, 0xf2, 0xc4, 0x80],
+            cos_tpf: nlp("0c2c01087bc3d6d5d5c5c3e3"),
+            tg_number: 1,
+            return_link_label: bootstrap.local.link_label.clone(),
+            maximum_packet_size: bootstrap.max_packet_size,
+        };
+        let bytes = nlp(LIVE_USER);
+        let packet = RtpPacket::parse(&bytes).unwrap();
+        let topic = classify_setup_topic(packet).unwrap();
+        let path =
+            validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&route)).unwrap();
+        assert_eq!(path.priority, 1);
+        assert_eq!(path.peer_nce_label, [0xa4, 0]);
+        assert_eq!(path.alive_seconds, 5);
+        let mut reserved = bytes.clone();
+        let flags = reserved
+            .windows(3)
+            .position(|cv| cv == [0x16, 0x83, 0xb8])
+            .unwrap()
+            + 2;
+        reserved[flags] |= 0x01;
+        assert_eq!(
+            validate_inbound_switching_path(
+                RtpPacket::parse(&reserved).unwrap(),
+                &bootstrap,
+                1,
+                &topic,
+                Some(&route),
             ),
             Err(PathError::InvalidReturnPath)
         );
