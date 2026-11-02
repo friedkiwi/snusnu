@@ -288,6 +288,10 @@ impl RtpInboundEndpoint {
         self.config.generation
     }
 
+    pub fn priority(&self) -> u8 {
+        self.config.path.priority
+    }
+
     pub fn inbound_tcid(&self) -> Option<u64> {
         (self.phase != EndpointPhase::AwaitSetup).then_some(self.config.assigned_tcid & !ASSIGNOR)
     }

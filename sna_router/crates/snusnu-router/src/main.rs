@@ -41,6 +41,9 @@ mod endpoint;
 #[cfg(target_os = "linux")]
 mod hpr_lan_port;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // The HPR session loop attaches this adapter once wired.
+mod hpr_rtp_port;
+#[cfg(target_os = "linux")]
 mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
