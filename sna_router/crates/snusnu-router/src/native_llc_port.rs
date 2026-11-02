@@ -7,6 +7,7 @@
 //! route ready by itself.
 
 use crate::{
+    auto_llc::LlcIngressOffer,
     native_peer_port::{NativeLlcEvent, NativePeerPort},
     routing::RoutePort,
     runtime::LlcPeer,
@@ -21,6 +22,36 @@ pub(crate) struct NativeLlcPort {
 }
 
 impl NativeLlcPort {
+    pub(crate) fn open_from_offer(
+        offer: LlcIngressOffer,
+        local_xid: Xid3,
+        remote_cp: String,
+        local_cp: String,
+        user_plu: String,
+        user_slu: String,
+    ) -> io::Result<Self> {
+        let interface = offer.interface.clone();
+        let (endpoint, first_events, observed_cp) = offer.into_endpoint()?;
+        if observed_cp.as_ref().is_some_and(|cp| cp != &remote_cp) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LLC first XID3 CP differs from selected peer",
+            ));
+        }
+        Ok(Self {
+            inner: NativePeerPort::open_converter_from_endpoint(
+                endpoint,
+                first_events,
+                &interface,
+                local_xid,
+                remote_cp,
+                local_cp,
+                user_plu,
+                user_slu,
+            )?,
+        })
+    }
+
     pub(crate) fn open(
         peer: LlcPeer<'_>,
         local_xid: Xid3,

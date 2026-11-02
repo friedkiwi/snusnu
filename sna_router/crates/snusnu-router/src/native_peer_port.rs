@@ -85,11 +85,20 @@ fn exclusive_bind_ack(completed: usize) -> io::Result<bool> {
 
 impl NativePeerPort {
     pub(crate) fn open(peer: LlcPeer<'_>, local_xid: Xid3) -> io::Result<Self> {
-        let type1 = NativeType1::new(local_xid.clone())?;
         let mut endpoint = Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?;
         endpoint.set_connect_allowed(false)?;
+        Self::open_with_endpoint(endpoint, peer.interface, local_xid)
+    }
+
+    fn open_with_endpoint(
+        mut endpoint: Endpoint,
+        interface: &str,
+        local_xid: Xid3,
+    ) -> io::Result<Self> {
+        let type1 = NativeType1::new(local_xid.clone())?;
+        endpoint.set_connect_allowed(false)?;
         tracing::info!(
-            interface = peer.interface,
+            interface,
             local_cp = %local_xid.cp_name().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
             "native APPN XID-only port opened"
         );
@@ -174,6 +183,27 @@ impl NativePeerPort {
         let mut port = Self::open_management(peer, local_xid, remote_cp.clone(), local_cp)?;
         port.converter_policy = Some((user_plu, user_slu));
         port.converter_expected_cp = Some(remote_cp);
+        Ok(port)
+    }
+
+    /// Construct the native state machine around an already selected LLC
+    /// association. The listener's first frame is applied exactly once, and
+    /// no second converter endpoint is opened for this circuit.
+    pub(crate) fn open_converter_from_endpoint(
+        endpoint: Endpoint,
+        first_events: Vec<Event>,
+        interface: &str,
+        local_xid: Xid3,
+        remote_cp: String,
+        local_cp: String,
+        user_plu: String,
+        user_slu: String,
+    ) -> io::Result<Self> {
+        let mut port = Self::open_with_endpoint(endpoint, interface, local_xid)?;
+        port.management = Some(ManagementSession::new(remote_cp.clone(), local_cp));
+        port.converter_policy = Some((user_plu, user_slu));
+        port.converter_expected_cp = Some(remote_cp);
+        port.process(first_events)?;
         Ok(port)
     }
 
