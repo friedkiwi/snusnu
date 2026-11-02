@@ -159,6 +159,17 @@ func sourceLUValid(owner *routerSession, route *wire.RouteExport) bool {
 	}
 	return route.GetLogicalUnit().Lu.Netid == owner.allowedNetID && route.GetLogicalUnit().HostingCp.Netid == owner.allowedNetID
 }
+func sourceLUSupports62(route *wire.RouteExport) bool {
+	if route == nil || route.GetLogicalUnit() == nil {
+		return false
+	}
+	for _, kind := range route.GetLogicalUnit().SupportedTypes {
+		if kind == wire.LuType_LU_TYPE_6_2 {
+			return true
+		}
+	}
+	return false
+}
 func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
 		return errors.New("invalid open request")
@@ -191,6 +202,8 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	reason := wire.OpenFailure_OPEN_FAILURE_ROUTE_GONE
 	if target != nil && target != source {
 		if target.local && req.SourceRoute == nil {
+			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
+		} else if target.local && !sourceLUSupports62(h.routeForRef(source, req.SourceRoute)) {
 			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
 		} else if !h.allowed(source, target) {
 			reason = wire.OpenFailure_OPEN_FAILURE_FORBIDDEN

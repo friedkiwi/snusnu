@@ -57,10 +57,18 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	sourceSnapshot := &wire.RouteSnapshot{Epoch: welcome.ConnectionEpoch, Revision: 1, Routes: []*wire.RouteExport{
 		{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: &wire.SnaName{Netid: "PEERNET", Name: "CP"}}},
 		{Id: 2, Generation: 1, Resource: &wire.RouteExport_LogicalUnit{LogicalUnit: &wire.LuReachability{Lu: &wire.SnaName{Netid: "PEERNET", Name: "LU"}, HostingCp: &wire.SnaName{Netid: "PEERNET", Name: "CP"}, SupportedTypes: []wire.LuType{wire.LuType_LU_TYPE_6_2}}}},
+		{Id: 3, Generation: 1, Resource: &wire.RouteExport_LogicalUnit{LogicalUnit: &wire.LuReachability{Lu: &wire.SnaName{Netid: "PEERNET", Name: "LU0"}, HostingCp: &wire.SnaName{Netid: "PEERNET", Name: "CP"}, SupportedTypes: []wire.LuType{wire.LuType_LU_TYPE_0}}}},
 	}}
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_PublishRoutes{PublishRoutes: sourceSnapshot})
 	source := &wire.RouteReference{RouterId: welcome.RouterId, Epoch: welcome.ConnectionEpoch, RouteId: 2, RouteGeneration: 1}
 	target := &wire.RouteReference{RouterId: uuidBytes(serviceRouterID), Epoch: routes.Snapshot.Epoch, RouteId: 2, RouteGeneration: 1}
+	nonAppc := proto.Clone(source).(*wire.RouteReference)
+	nonAppc.RouteId = 3
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenRequest{OpenRequest: &wire.OpenRequest{RequestId: 8, Target: target, SourceRoute: nonAppc, ReceiveAllowanceBytes: 1500}})
+	unsupported := expectTestBody(t, conn, "result").GetOpenResult()
+	if unsupported.Accepted || unsupported.Reason != wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED {
+		t.Fatalf("non-LU 6.2 source accepted: %+v", unsupported)
+	}
 	forged := proto.Clone(source).(*wire.RouteReference)
 	forged.RouteId = 1 // The peer's CP is not a source LU.
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenRequest{OpenRequest: &wire.OpenRequest{RequestId: 9, Target: target, SourceRoute: forged, ReceiveAllowanceBytes: 1500}})
