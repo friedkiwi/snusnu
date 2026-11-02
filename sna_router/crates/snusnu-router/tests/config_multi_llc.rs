@@ -151,12 +151,14 @@ fn one_broken_llc_route_does_not_stop_an_independent_route() {
     }
 
     let config = format!(
-        "[[llc]]\nid='a'\ninterface='{a}'\nguest_mac='{guest_a}'\nproxy_mac='{proxy_a}'\n\
-         [[llc]]\nid='b'\ninterface='{b}'\nguest_mac='{guest_b}'\nproxy_mac='{proxy_b}'\n\
-         [[llc]]\nid='c'\ninterface='{c}'\nguest_mac='{guest_c}'\nproxy_mac='{proxy_c}'\n\
-         [[llc]]\nid='d'\ninterface='{d}'\nguest_mac='{guest_d}'\nproxy_mac='{proxy_d}'\n\
-         [[route]]\nfrom='a'\nto='b'\n\
-         [[route]]\nfrom='c'\nto='d'\n",
+        "[[llc]]\nid='a'\ninterface='{a}'\nguest_mac='{guest_a}'\n\
+         [[llc]]\nid='b'\ninterface='{b}'\nguest_mac='{guest_b}'\n\
+         [[llc]]\nid='c'\ninterface='{c}'\nguest_mac='{guest_c}'\n\
+         [[llc]]\nid='d'\ninterface='{d}'\nguest_mac='{guest_d}'\n\
+         [[route]]\nfrom='a'\nto='b'\nbidirectional=false\nproxy_mac='{proxy_a}'\n\
+         [[route]]\nfrom='b'\nto='a'\nbidirectional=false\nproxy_mac='{proxy_b}'\n\
+         [[route]]\nfrom='c'\nto='d'\nbidirectional=false\nproxy_mac='{proxy_c}'\n\
+         [[route]]\nfrom='d'\nto='c'\nbidirectional=false\nproxy_mac='{proxy_d}'\n",
         a = names[0],
         b = names[2],
         c = names[4],
@@ -309,12 +311,14 @@ fn distinct_proxy_macs_on_one_interface_select_distinct_llc_routes() {
     lab.pair(&names[4], &names[5]);
 
     let config = format!(
-        "[[llc]]\nid='a1'\ninterface='{shared}'\nguest_mac='{guest_a}'\nproxy_mac='{proxy_a1}'\n\
-         [[llc]]\nid='a2'\ninterface='{shared}'\nguest_mac='{guest_a}'\nproxy_mac='{proxy_a2}'\n\
-         [[llc]]\nid='b1'\ninterface='{out1}'\nguest_mac='{guest_b1}'\nproxy_mac='{proxy_b1}'\n\
-         [[llc]]\nid='b2'\ninterface='{out2}'\nguest_mac='{guest_b2}'\nproxy_mac='{proxy_b2}'\n\
-         [[route]]\nfrom='a1'\nto='b1'\n\
-         [[route]]\nfrom='a2'\nto='b2'\n",
+        "[[llc]]\nid='a1'\ninterface='{shared}'\nguest_mac='{guest_a}'\n\
+         [[llc]]\nid='a2'\ninterface='{shared}'\nguest_mac='{guest_a}'\n\
+         [[llc]]\nid='b1'\ninterface='{out1}'\nguest_mac='{guest_b1}'\n\
+         [[llc]]\nid='b2'\ninterface='{out2}'\nguest_mac='{guest_b2}'\n\
+         [[route]]\nfrom='a1'\nto='b1'\nbidirectional=false\nproxy_mac='{proxy_a1}'\n\
+         [[route]]\nfrom='b1'\nto='a1'\nbidirectional=false\nproxy_mac='{proxy_b1}'\n\
+         [[route]]\nfrom='a2'\nto='b2'\nbidirectional=false\nproxy_mac='{proxy_a2}'\n\
+         [[route]]\nfrom='b2'\nto='a2'\nbidirectional=false\nproxy_mac='{proxy_b2}'\n",
         shared = names[0],
         out1 = names[2],
         out2 = names[4],
