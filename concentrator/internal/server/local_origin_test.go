@@ -21,10 +21,10 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	events := make(chan *wire.CircuitEvent, 1)
 	if err := a.hub.registerLocalService(serviceCtx, func(envelope *wire.WsEnvelope, peer LocalPeer) {
 		if open := envelope.GetIncomingOpen(); open != nil {
-			if peer.OwnerID != owner || peer.NetID != "PEERNET" || peer.LU != "LU" {
+			if peer.OwnerID != owner || peer.NetID != "PEERNET" || peer.CP != "CP" || peer.LU != "LU" {
 				t.Errorf("wrong local peer: %+v", peer)
 			}
-			if stamped := peer.SNAPeer(); !stamped.Valid() || stamped.Principal != owner || stamped.NetID != "PEERNET" || stamped.LU != "LU" {
+			if stamped := peer.SNAPeer(); !stamped.Valid() || stamped.Principal != owner || stamped.NetID != "PEERNET" || stamped.CP != "CP" || stamped.LU != "LU" {
 				t.Errorf("wrong SNA peer: %+v", stamped)
 			}
 			incoming <- open

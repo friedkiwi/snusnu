@@ -154,10 +154,10 @@ func (h *routerHub) routeForRef(owner *routerSession, ref *wire.RouteReference) 
 }
 
 func sourceLUValid(owner *routerSession, route *wire.RouteExport) bool {
-	if owner == nil || route == nil || route.GetLogicalUnit() == nil || route.GetLogicalUnit().Lu == nil {
+	if owner == nil || route == nil || route.GetLogicalUnit() == nil || route.GetLogicalUnit().Lu == nil || route.GetLogicalUnit().HostingCp == nil {
 		return false
 	}
-	return route.GetLogicalUnit().Lu.Netid == owner.allowedNetID
+	return route.GetLogicalUnit().Lu.Netid == owner.allowedNetID && route.GetLogicalUnit().HostingCp.Netid == owner.allowedNetID
 }
 func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
@@ -203,7 +203,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 			if req.SourceRoute != nil {
 				candidate.sourceRef = proto.Clone(req.SourceRoute).(*wire.RouteReference)
 				if sourceLU := h.routeForRef(source, req.SourceRoute).GetLogicalUnit(); sourceLU != nil {
-					candidate.sourcePeer = LocalPeer{RouterID: source.router.ID, OwnerID: source.router.OwnerID, NetID: sourceLU.Lu.Netid, LU: sourceLU.Lu.Name}
+					candidate.sourcePeer = LocalPeer{RouterID: source.router.ID, OwnerID: source.router.OwnerID, NetID: sourceLU.Lu.Netid, CP: sourceLU.HostingCp.Name, LU: sourceLU.Lu.Name}
 				}
 			}
 			if h.routeValid(candidate) {

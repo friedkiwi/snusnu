@@ -18,11 +18,11 @@ const serviceMACSuffix = 0xffffff
 // LocalPeer is stamped from the authenticated router session and its live LU
 // advertisement. Services can use OwnerID to keep per-user data isolated.
 type LocalPeer struct {
-	RouterID, OwnerID, NetID, LU string
+	RouterID, OwnerID, NetID, CP, LU string
 }
 
 func (p LocalPeer) SNAPeer() sna.Peer {
-	return sna.Peer{Principal: p.OwnerID, NetID: p.NetID, LU: p.LU}
+	return sna.Peer{Principal: p.OwnerID, NetID: p.NetID, CP: p.CP, LU: p.LU}
 }
 
 type localDelivery struct {

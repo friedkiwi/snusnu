@@ -10,10 +10,10 @@ import (
 )
 
 func TestConversationVersionEchoAndNoEcho(t *testing.T) {
-	if _, err := NewConversation(sna.Peer{Principal: "user-1", NetID: "SOLNET", LU: "SNAA"}, "BAD\x00XX"); !errors.Is(err, ErrConversation) {
+	if _, err := NewConversation(sna.Peer{Principal: "user-1", NetID: "SOLNET", CP: "SNAA", LU: "SNAA"}, "BAD\x00XX"); !errors.Is(err, ErrConversation) {
 		t.Fatalf("invalid system type: %v", err)
 	}
-	peer := sna.Peer{Principal: "user-1", NetID: "SOLNET", LU: "SNAA"}
+	peer := sna.Peer{Principal: "user-1", NetID: "SOLNET", CP: "SNAA", LU: "SNAA"}
 	c, err := NewConversation(peer, "OS/400")
 	if err != nil || c.Peer() != peer {
 		t.Fatalf("peer: %+v %v", c, err)

@@ -6,7 +6,8 @@ package sna
 type Peer struct {
 	Principal string
 	NetID     string
+	CP        string
 	LU        string
 }
 
-func (p Peer) Valid() bool { return p.Principal != "" && p.NetID != "" && p.LU != "" }
+func (p Peer) Valid() bool { return p.Principal != "" && p.NetID != "" && p.CP != "" && p.LU != "" }
