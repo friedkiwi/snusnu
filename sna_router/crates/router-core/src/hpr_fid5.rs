@@ -8,7 +8,7 @@
 //! it can classify a BIND's LU names and mode for route policy.
 
 use crate::fid2_bind::{classify_reduced_bind, BindError, BindIdentity};
-use crate::session::{SessionError, SessionUnit};
+use crate::session::{Flow, SessionError, SessionUnit};
 
 const FID5_TH_LEN: usize = 12;
 const RH_LEN: usize = 3;
@@ -19,6 +19,29 @@ pub enum Fid5Error {
     WrongFormat,
     SegmentedBiu,
     NonzeroReserved,
+    InvalidSessionAddress,
+}
+
+/// Form a whole-BIU FID5 message for a session whose directional address has
+/// already been established by the HPR session adapter. This does not assign
+/// an address or transmit an RTP packet. The first bit of the address is the
+/// assignor indicator; its second bit is reserved (IBM SNA Formats, p. 4-15).
+pub fn encode_whole_biu(
+    session_address: [u8; 8],
+    flow: Flow,
+    unit: &SessionUnit,
+) -> Result<Vec<u8>, Fid5Error> {
+    if session_address[0] & 0x40 != 0 {
+        return Err(Fid5Error::InvalidSessionAddress);
+    }
+    let mut message = Vec::with_capacity(FID5_TH_LEN + RH_LEN + unit.ru().len());
+    message.push(0x5c | u8::from(flow == Flow::Expedited));
+    message.push(0);
+    message.extend_from_slice(unit.snf());
+    message.extend_from_slice(&session_address);
+    message.extend_from_slice(unit.rh());
+    message.extend_from_slice(unit.ru());
+    Ok(message)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +182,28 @@ mod tests {
         assert_eq!(
             Fid5WholeBiu::parse_complete(&message),
             Err(Fid5Error::NonzeroReserved)
+        );
+    }
+
+    #[test]
+    fn whole_biu_roundtrips_normal_and_expedited_units() {
+        let unit = SessionUnit::from_reduced(&[0x80, 0x01, 0x6b, 0x80, 0, 0x31]).unwrap();
+        let address = [0x01, 0, 0, 0, 0, 0, 0, 1];
+        for flow in [Flow::Normal, Flow::Expedited] {
+            let encoded = encode_whole_biu(address, flow, &unit).unwrap();
+            let decoded = Fid5WholeBiu::parse_complete(&encoded).unwrap();
+            assert_eq!(decoded.session_address, address);
+            assert_eq!(decoded.expedited, flow == Flow::Expedited);
+            assert_eq!(decoded.session_unit().unwrap(), unit);
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_session_address_bit() {
+        let unit = SessionUnit::from_reduced(&[0, 1, 0x6b, 0x80, 0]).unwrap();
+        assert_eq!(
+            encode_whole_biu([0x40, 0, 0, 0, 0, 0, 0, 1], Flow::Normal, &unit),
+            Err(Fid5Error::InvalidSessionAddress)
         );
     }
 }
