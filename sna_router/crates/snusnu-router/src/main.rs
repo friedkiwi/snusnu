@@ -46,10 +46,10 @@ mod routing;
 mod runtime;
 mod virtual_native_cp;
 #[cfg(target_os = "linux")]
-mod ws_native_responder;
-#[cfg(target_os = "linux")]
 mod virtual_ws_management_lab;
 mod virtual_ws_port;
+#[cfg(target_os = "linux")]
+mod ws_native_responder;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -198,6 +198,26 @@ fn run() -> io::Result<()> {
         return native_converter_lab::run_v5_flow(std::path::Path::new(&path), local_ip, remote_ip);
     }
     #[cfg(target_os = "linux")]
+    if first.as_deref() == Some("--mptn-llc-reverse-lab") {
+        let path = args.next().ok_or_else(usage_error)?;
+        let local_ip = args
+            .next()
+            .ok_or_else(usage_error)?
+            .parse()
+            .map_err(|_| usage_error())?;
+        let peer_ip = args
+            .next()
+            .ok_or_else(usage_error)?
+            .parse()
+            .map_err(|_| usage_error())?;
+        if args.next().as_deref() != Some("--acknowledge-experimental-x83") || args.next().is_some()
+        {
+            return Err(usage_error());
+        }
+        install_signals();
+        return mptn_llc_reverse::run_probe(std::path::Path::new(&path), local_ip, peer_ip);
+    }
+    #[cfg(target_os = "linux")]
     if first.as_deref() == Some("--mptn-ingress-management-lab") {
         let local_ip = args
             .next()
@@ -315,7 +335,7 @@ fn run() -> io::Result<()> {
         None => "local-dev".to_owned(),
         Some("--help") if args.next().is_none() => {
             println!(
-                "usage: snusnu-router --config FILE | --mptn-ws-gateway-lab FILE --acknowledge-experimental-x83 | --virtual-ws-management-lab FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | --native-user-pacing-probe FILE | --native-converter-mock-lab FILE | --native-converter-v5-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --native-converter-v5-flow-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --mptn-ingress-management-lab LOCAL_IPV4 PEER_IPV4 PEER_NETID.CP LOCAL_NETID.CP --acknowledge-experimental-x83 | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
+                "usage: snusnu-router --config FILE | --mptn-llc-reverse-lab FILE LOCAL_IP PEER_IP --acknowledge-experimental-x83 | --mptn-ws-gateway-lab FILE --acknowledge-experimental-x83 | --virtual-ws-management-lab FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | --native-user-pacing-probe FILE | --native-converter-mock-lab FILE | --native-converter-v5-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --native-converter-v5-flow-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --mptn-ingress-management-lab LOCAL_IPV4 PEER_IPV4 PEER_NETID.CP LOCAL_NETID.CP --acknowledge-experimental-x83 | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)"
             );
             return Ok(());
         }
@@ -345,7 +365,7 @@ fn run() -> io::Result<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: snusnu-router --config FILE | --mptn-ws-gateway-lab FILE --acknowledge-experimental-x83 | --virtual-ws-management-lab FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | --native-user-pacing-probe FILE | --native-converter-mock-lab FILE | --native-converter-v5-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --native-converter-v5-flow-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --mptn-ingress-management-lab LOCAL_IPV4 PEER_IPV4 PEER_NETID.CP LOCAL_NETID.CP --acknowledge-experimental-x83 | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
+        "usage: snusnu-router --config FILE | --mptn-llc-reverse-lab FILE LOCAL_IP PEER_IP --acknowledge-experimental-x83 | --mptn-ws-gateway-lab FILE --acknowledge-experimental-x83 | --virtual-ws-management-lab FILE | --native-probe FILE | --native-management-probe FILE | --native-user-bind-probe FILE | --native-user-pacing-probe FILE | --native-converter-mock-lab FILE | --native-converter-v5-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --native-converter-v5-flow-lab FILE LOCAL_IPV4 REMOTE_IPV4 --acknowledge-experimental-x83 | --mptn-ingress-management-lab LOCAL_IPV4 PEER_IPV4 PEER_NETID.CP LOCAL_NETID.CP --acknowledge-experimental-x83 | [--site-id ID] | --lab-link IFACE_A IFACE_B MAC_A MAC_B | --local-link IFACE_A GUEST_A PROXY_A IFACE_B GUEST_B PROXY_B | --remote-link IFACE GUEST_MAC PROXY_MAC LOCAL_NETID.CP TARGET_NETID.CP WS_URL (token in SNUSNU_ROUTER_TOKEN)",
     )
 }
 
