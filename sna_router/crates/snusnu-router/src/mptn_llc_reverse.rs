@@ -52,6 +52,7 @@ pub(crate) struct ReverseLlcConfig {
     pub(crate) destination_lu: String,
     pub(crate) user_tp: [u8; 4],
     pub(crate) endpoint: OutboundEndpoint,
+    /// Maximum time to establish the native management session.
     pub(crate) timeout: Duration,
 }
 
@@ -195,10 +196,10 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
         destination_lu = %config.destination_lu,
         local_ip = %config.endpoint.local_ip,
         peer_ip = %config.endpoint.peer_ip,
-        timeout_seconds = config.timeout.as_secs(),
+        setup_timeout_seconds = config.timeout.as_secs(),
         "LLC to MPTN reverse session starting"
     );
-    let deadline = Instant::now() + config.timeout;
+    let setup_deadline = Instant::now() + config.timeout;
     let socket = UdpSocket::bind(SocketAddr::new(config.endpoint.local_ip, 397))?;
     socket.set_nonblocking(true)?;
     config.endpoint.establish_v5_management(
@@ -225,7 +226,7 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
     )?;
     while native.management_bind().is_none()
         && !STOP.load(Ordering::Relaxed)
-        && Instant::now() < deadline
+        && Instant::now() < setup_deadline
     {
         match native.receive_once()? {
             None => thread::sleep(IDLE_POLL),
@@ -266,12 +267,6 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
         loop {
             if STOP.load(Ordering::Relaxed) {
                 return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "native to MPTN session timed out",
-                ));
             }
             poll_udp(&socket, &mut oob, &mut edge)?;
             edge.poll_native_once()?;

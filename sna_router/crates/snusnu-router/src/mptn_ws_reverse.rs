@@ -1,7 +1,7 @@
 //! One concentrator-initiated native circuit to a local MPTN peer.
 //!
-//! This bounded runner is intentionally separate from the ordinary route
-//! loader until a real reverse WebSocket/OS400 exchange has been verified.
+//! Setup is bounded; an established user circuit runs until peer close or
+//! router shutdown so an idle sign-on screen can remain connected.
 
 use crate::{
     config::parse_cp,
@@ -45,6 +45,7 @@ pub(crate) struct ReverseWsConfig {
     pub(crate) tg_number: u8,
     pub(crate) user_tp: [u8; 4],
     pub(crate) endpoint: OutboundEndpoint,
+    /// Maximum time to establish the native circuit and management session.
     pub(crate) timeout: Duration,
 }
 
@@ -186,7 +187,7 @@ fn poll_udp<L: NativeLeg>(
 /// The caller owns reconnection and any later circuit on the published LU.
 pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
     config.validate()?;
-    let deadline = Instant::now() + config.timeout;
+    let setup_deadline = Instant::now() + config.timeout;
     let socket = UdpSocket::bind(SocketAddr::new(config.endpoint.local_ip, 397))?;
     socket.set_nonblocking(true)?;
     let hosted = parse_cp(&config.hosted_lu)?;
@@ -211,7 +212,7 @@ pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= setup_deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "inbound WebSocket Open timed out",
@@ -230,7 +231,10 @@ pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
         peer_ip = %config.endpoint.peer_ip,
         "authenticated inbound circuit selected local MPTN peer"
     );
-    while !native.management_ready() && !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+    while !native.management_ready()
+        && !STOP.load(Ordering::Relaxed)
+        && Instant::now() < setup_deadline
+    {
         native.poll_management_once()?;
         thread::sleep(IDLE_POLL);
     }
@@ -277,12 +281,6 @@ pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
         loop {
             if STOP.load(Ordering::Relaxed) {
                 return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "WebSocket to MPTN session timed out",
-                ));
             }
             poll_udp(&socket, &mut oob, &mut edge)?;
             edge.poll_native_once()?;
