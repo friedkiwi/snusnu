@@ -140,6 +140,9 @@ pub(crate) struct RouteConfig {
     /// LLC-facing address of this route's target. Omit for a concentrator
     /// binding or when the target is another configured LLC peer.
     pub(crate) proxy_mac: Option<String>,
+    /// Selects a TCP62 gateway circuit by the network-qualified destination
+    /// LU in an incoming Connect. Omit for a gateway with one destination.
+    pub(crate) destination_lu: Option<String>,
 }
 
 /// A route names a converter explicitly before two different session
@@ -224,6 +227,27 @@ impl RemoteConfig {
 }
 
 impl RouterConfig {
+    /// Routes served by one TCP62 listener. The returned LU is the exact
+    /// destination in an incoming Connect.
+    pub(crate) fn gateway_routes<'a>(&'a self, id: &str) -> Vec<(&'a RouteConfig, &'a str)> {
+        let Some(gateway) = self.mptn_gateway.iter().find(|gateway| gateway.id == id) else {
+            return Vec::new();
+        };
+        self.route
+            .iter()
+            .filter(|route| route.from == id || route.to == id)
+            .map(|route| {
+                (
+                    route,
+                    route
+                        .destination_lu
+                        .as_deref()
+                        .unwrap_or(&gateway.destination_lu),
+                )
+            })
+            .collect()
+    }
+
     /// Address presented to one local LLC peer for its configured route.
     /// `None` means the concentrator must supply the managed target address.
     pub(crate) fn llc_proxy_mac(&self, llc_id: &str) -> io::Result<Option<[u8; 6]>> {
@@ -404,7 +428,10 @@ impl RouterConfig {
                 || peer.local_ip.is_unspecified()
                 || peer.peer_ip.is_unspecified()
             {
-                return Err(invalid(format!("invalid MPTN relay IP pair for {}", peer.id)));
+                return Err(invalid(format!(
+                    "invalid MPTN relay IP pair for {}",
+                    peer.id
+                )));
             }
             if !anynet_listeners.insert(peer.local_ip) {
                 return Err(invalid(format!(
@@ -520,6 +547,7 @@ impl RouterConfig {
             ));
         }
         let mut directed = HashMap::<&str, &str>::new();
+        let mut gateway_destinations = HashMap::<(&str, &str), &str>::new();
         for route in &self.route {
             if !ids.contains(route.from.as_str())
                 || !ids.contains(route.to.as_str())
@@ -532,6 +560,48 @@ impl RouterConfig {
             }
             let source_kind = kinds[route.from.as_str()];
             let target_kind = kinds[route.to.as_str()];
+            let gateway_id = if source_kind == "mptn_gateway" {
+                Some(route.from.as_str())
+            } else if target_kind == "mptn_gateway" {
+                Some(route.to.as_str())
+            } else {
+                None
+            };
+            if let Some(id) = gateway_id {
+                if !route.bidirectional {
+                    return Err(invalid(format!(
+                        "TCP62 gateway route {} -> {} must be bidirectional",
+                        route.from, route.to
+                    )));
+                }
+                let gateway = self
+                    .mptn_gateway
+                    .iter()
+                    .find(|gateway| gateway.id == id)
+                    .expect("gateway kind checked");
+                let destination = route
+                    .destination_lu
+                    .as_deref()
+                    .unwrap_or(&gateway.destination_lu);
+                parse_cp(destination)?;
+                if let Some(old) = gateway_destinations.insert(
+                    (id, destination),
+                    if id == route.from {
+                        &route.to
+                    } else {
+                        &route.from
+                    },
+                ) {
+                    return Err(invalid(format!(
+                        "duplicate TCP62 gateway destination {destination} on {id}: {old}"
+                    )));
+                }
+            } else if route.destination_lu.is_some() {
+                return Err(invalid(format!(
+                    "route {} -> {} destination_lu requires a TCP62 gateway",
+                    route.from, route.to
+                )));
+            }
             if let Some(mac) = &route.proxy_mac {
                 parse_mac(mac)?;
                 if source_kind != "llc" && target_kind != "llc" {
@@ -553,9 +623,13 @@ impl RouterConfig {
                     ("mptn_gateway", "remote") | ("remote", "mptn_gateway")
                 ) && matches!(converter, RouteConverter::MptnLu62)
                 {
-                    add_directed(&mut directed, &route.from, &route.to)?;
+                    if source_kind != "mptn_gateway" {
+                        add_directed(&mut directed, &route.from, &route.to)?;
+                    }
                     if route.bidirectional {
-                        add_directed(&mut directed, &route.to, &route.from)?;
+                        if target_kind != "mptn_gateway" {
+                            add_directed(&mut directed, &route.to, &route.from)?;
+                        }
                     }
                     continue;
                 }
@@ -614,12 +688,17 @@ impl RouterConfig {
         }
         let mut exported_cps = HashSet::new();
         let mut exported_lus = HashSet::new();
+        let mut exported_gateways = HashSet::new();
         for remote in &self.remote {
             // The current WebSocket adapter has one circuit and one credit
             // stream. It cannot safely multiplex several local associations.
-            let attached = directed
+            let attached = self
+                .route
                 .iter()
-                .filter(|(_, target)| **target == remote.id)
+                .filter(|route| {
+                    (route.from == remote.id && route.bidirectional)
+                        || (route.to == remote.id && route.bidirectional)
+                })
                 .count();
             if attached != 1 || !directed.contains_key(remote.id.as_str()) {
                 return Err(invalid(
@@ -628,14 +707,23 @@ impl RouterConfig {
             }
             let local_id = directed[remote.id.as_str()];
             if let Some(gateway) = self.mptn_gateway.iter().find(|peer| peer.id == local_id) {
-                if remote
-                    .target_cp
+                let selected_lu = self
+                    .gateway_routes(&gateway.id)
+                    .into_iter()
+                    .find_map(|(route, lu)| {
+                        if route.from == remote.id || route.to == remote.id {
+                            Some(lu)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("remote has one gateway route");
+                if remote.target_cp.as_deref().is_some_and(|cp| {
+                    cp != gateway.peer_cp && selected_lu == gateway.destination_lu
+                }) || remote
+                    .target_lu
                     .as_deref()
-                    .is_some_and(|cp| cp != gateway.peer_cp)
-                    || remote
-                        .target_lu
-                        .as_deref()
-                        .is_some_and(|lu| lu != gateway.destination_lu)
+                    .is_some_and(|lu| lu != selected_lu)
                 {
                     return Err(invalid(format!(
                         "concentrator {} target does not match TCP62 gateway {} destination",
@@ -644,10 +732,12 @@ impl RouterConfig {
                 }
                 let local_cp = parse_cp(&gateway.local_cp)?;
                 let source_lu = parse_cp(&gateway.source_lu)?;
-                if !exported_cps.insert((local_cp.netid, local_cp.name))
-                    || !exported_lus.insert((source_lu.netid, source_lu.name))
-                {
-                    return Err(invalid("duplicate local CP or LU export"));
+                if exported_gateways.insert(&gateway.id) {
+                    if !exported_cps.insert((local_cp.netid, local_cp.name))
+                        || !exported_lus.insert((source_lu.netid, source_lu.name))
+                    {
+                        return Err(invalid("duplicate local CP or LU export"));
+                    }
                 }
                 continue;
             }
@@ -716,12 +806,20 @@ impl RouterConfig {
             }
         }
         for id in ids {
-            if !directed.contains_key(id) {
+            if !directed.contains_key(id)
+                && !self
+                    .mptn_gateway
+                    .iter()
+                    .any(|gateway| gateway.id == id && !self.gateway_routes(id).is_empty())
+            {
                 return Err(invalid(format!("port {id} has no outgoing route")));
             }
         }
         let mut target_sources = HashMap::<&str, &str>::new();
         for (source, target) in directed {
+            if self.mptn_gateway.iter().any(|gateway| gateway.id == target) {
+                continue;
+            }
             if let Some(old) = target_sources.insert(target, source) {
                 if old != source {
                     return Err(invalid(format!(
@@ -849,7 +947,10 @@ to = "b"
             derived.llc_proxy_mac("b").unwrap(),
             Some(parse_mac("02:00:00:00:00:01").unwrap())
         );
-        let ambiguous = GOOD.replace("to = \"b\"", "to = \"b\"\nproxy_mac = \"02:53:4e:00:00:05\"");
+        let ambiguous = GOOD.replace(
+            "to = \"b\"",
+            "to = \"b\"\nproxy_mac = \"02:53:4e:00:00:05\"",
+        );
         assert!(parse(&ambiguous)
             .validate()
             .unwrap_err()
@@ -893,18 +994,14 @@ proxy_mac = "02:53:4e:00:00:06"
 
     #[test]
     fn rejects_missing_and_ambiguous_routes() {
-        assert!(
-            parse(&GOOD.replace("to = \"b\"", "to = \"missing\""))
-                .validate()
-                .is_err()
-        );
-        assert!(
-            parse(&format!(
-                "{GOOD}\n[[route]]\nfrom = \"a\"\nto = \"b\"\nbidirectional = false\n"
-            ))
+        assert!(parse(&GOOD.replace("to = \"b\"", "to = \"missing\""))
             .validate()
-            .is_ok()
-        );
+            .is_err());
+        assert!(parse(&format!(
+            "{GOOD}\n[[route]]\nfrom = \"a\"\nto = \"b\"\nbidirectional = false\n"
+        ))
+        .validate()
+        .is_ok());
         assert!(parse(&format!("{GOOD}\n[[llc]]\nid=\"c\"\ninterface=\"sol6\"\nguest_mac=\"02:00:00:00:00:05\"\n[[route]]\nfrom=\"a\"\nto=\"c\"\n")).validate().is_err());
     }
 
@@ -912,8 +1009,8 @@ proxy_mac = "02:53:4e:00:00:06"
     fn rejects_duplicate_association_and_malformed_mac() {
         assert!(
             parse(&GOOD.replace("02:00:00:00:00:03", "02:00:00:00:00:01"))
-            .validate()
-            .is_err()
+                .validate()
+                .is_err()
         );
         assert!(
             parse(&GOOD.replace("02:00:00:00:00:03", "03:00:00:00:00:03"))
@@ -996,13 +1093,11 @@ peer_ip = "127.0.0.3"
 from = "a"
 to = "east"
 "#;
-        assert!(
-            parse(mixed)
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported route")
-        );
+        assert!(parse(mixed)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported route"));
     }
 
     #[test]
@@ -1028,8 +1123,10 @@ to = "upstream"
         let parsed = parse(config);
         parsed.validate().unwrap();
         assert_eq!(parsed.llc_proxy_mac("a").unwrap(), None);
-        let route_proxy = config
-            .replace("to = \"upstream\"", "to = \"upstream\"\nproxy_mac = \"02:53:4e:00:00:09\"");
+        let route_proxy = config.replace(
+            "to = \"upstream\"",
+            "to = \"upstream\"\nproxy_mac = \"02:53:4e:00:00:09\"",
+        );
         let route_proxy = parse(&route_proxy);
         route_proxy.validate().unwrap();
         assert_eq!(
@@ -1064,43 +1161,33 @@ to = "upstream"
                 .to_string()
                 .contains("invalid unicast MAC")
         );
-        assert!(
-            parse(&config.replace("target_cp = \"DSTNET.SNAB\"", ""))
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires target_cp")
-        );
-        assert!(
-            parse(&config.replace("DSTNET.PAYROLL", "SOLNET.PAYROLL"))
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("different NETID")
-        );
-        assert!(
-            parse(&config.replace("SOLNET.LUA", "OTHER.LUA"))
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("outside its local NETID")
-        );
-        assert!(
-            parse(&config.replace(
-                "lu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
-                "lu_types = { \"SOLNET.OTHER\" = [\"lu_6_2\"] }"
-            ))
+        assert!(parse(&config.replace("target_cp = \"DSTNET.SNAB\"", ""))
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("unexported LU")
-        );
-        assert!(
-            toml::from_str::<RouterConfig>(
-                &config.replace("token = \"test-token\"", "source_lu = \"SOLNET.LUA\"")
-            )
-            .is_err()
-        );
+            .contains("requires target_cp"));
+        assert!(parse(&config.replace("DSTNET.PAYROLL", "SOLNET.PAYROLL"))
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("different NETID"));
+        assert!(parse(&config.replace("SOLNET.LUA", "OTHER.LUA"))
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("outside its local NETID"));
+        assert!(parse(&config.replace(
+            "lu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
+            "lu_types = { \"SOLNET.OTHER\" = [\"lu_6_2\"] }"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("unexported LU"));
+        assert!(toml::from_str::<RouterConfig>(
+            &config.replace("token = \"test-token\"", "source_lu = \"SOLNET.LUA\"")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1174,11 +1261,9 @@ converter = "mptn_lu62"
             "bob"
         );
         assert_eq!(parsed.remote[0].bearer_token().unwrap(), "");
-        assert!(
-            parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
-                .validate()
-                .is_err()
-        );
+        assert!(parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
+            .validate()
+            .is_err());
         assert!(
             parse(&gateway.replace("token = \"\"", "target_lu = \"QAALICE.OTHER\""))
                 .validate()
@@ -1186,6 +1271,77 @@ converter = "mptn_lu62"
                 .to_string()
                 .contains("does not match")
         );
+    }
+
+    #[test]
+    fn tcp62_gateway_routes_multiple_destination_lus_on_one_listener() {
+        let config = r#"
+[[mptn]]
+profile = "gateway"
+id = "bob"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+destination_lu = "QAALICE.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+[[concentrator]]
+id = "alice"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = ""
+target_cp = "QAALICE.SNAA"
+target_lu = "QAALICE.SNAA"
+[[concentrator]]
+id = "carol"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = ""
+target_cp = "QACAROL.SNAC"
+target_lu = "QACAROL.SNAC"
+[[route]]
+from = "bob"
+to = "alice"
+converter = "mptn_lu62"
+destination_lu = "QAALICE.SNAA"
+[[route]]
+from = "bob"
+to = "carol"
+converter = "mptn_lu62"
+destination_lu = "QACAROL.SNAC"
+"#;
+        let parsed = parse(config);
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed
+                .gateway_routes("bob")
+                .into_iter()
+                .map(|(route, lu)| (route.to.as_str(), lu))
+                .collect::<Vec<_>>(),
+            vec![("alice", "QAALICE.SNAA"), ("carol", "QACAROL.SNAC")]
+        );
+        assert!(
+            parse(&config.replace("QACAROL.SNAC\"\n[[route]]", "QAALICE.SNAA\"\n[[route]]"))
+                .validate()
+                .is_err()
+        );
+        assert!(parse(&config.replace(
+            "destination_lu = \"QACAROL.SNAC\"",
+            "destination_lu = \"QAALICE.SNAA\""
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate TCP62 gateway destination"));
+        assert!(parse(&config.replace(
+            "from = \"bob\"\nto = \"carol\"",
+            "from = \"bob\"\nto = \"carol\"\nbidirectional = false"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("must be bidirectional"));
     }
 
     #[test]
@@ -1222,13 +1378,11 @@ peer_ip = "127.0.0.5"
 from = "mptn"
 to = "hpr"
 "#;
-        assert!(
-            parse(mixed)
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported route")
-        );
+        assert!(parse(mixed)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported route"));
     }
 
     #[test]
@@ -1249,11 +1403,22 @@ from = "east"
 to = "west"
 "#;
         parse(relay).validate().unwrap();
-        assert!(toml::from_str::<RouterConfig>(&relay.replace("profile = \"relay\"\n", "")).is_err());
+        assert!(
+            toml::from_str::<RouterConfig>(&relay.replace("profile = \"relay\"\n", "")).is_err()
+        );
         assert!(toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[anynet]]")).is_err());
-        assert!(toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[mptn_gateway]]")).is_err());
-        assert!(toml::from_str::<RouterConfig>(&relay.replace("profile = \"relay\"", "profile = \"gateway\"")).is_err());
-        assert!(toml::from_str::<RouterConfig>(&relay.replace("peer_ip = \"127.0.0.3\"", "peer_ip = \"127.0.0.3\"\nlocal_cp = \"SOLNET.SNAA\"")).is_err());
+        assert!(
+            toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[mptn_gateway]]")).is_err()
+        );
+        assert!(toml::from_str::<RouterConfig>(
+            &relay.replace("profile = \"relay\"", "profile = \"gateway\"")
+        )
+        .is_err());
+        assert!(toml::from_str::<RouterConfig>(&relay.replace(
+            "peer_ip = \"127.0.0.3\"",
+            "peer_ip = \"127.0.0.3\"\nlocal_cp = \"SOLNET.SNAA\""
+        ))
+        .is_err());
     }
 
     #[test]
@@ -1278,23 +1443,19 @@ from = "east"
 to = "west"
 "#;
         parse(strict).validate().unwrap();
-        assert!(
-            parse(&strict.replace(
-                "remote_lu = \"SOLNET.SNAA\"",
-                "remote_lu = \"SOLNET.OTHER\""
-            ))
+        assert!(parse(&strict.replace(
+            "remote_lu = \"SOLNET.SNAA\"",
+            "remote_lu = \"SOLNET.OTHER\""
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("policy mismatch"));
+        assert!(parse(&strict.replace("local_lu = \"SOLNET.SNAA\"", ""))
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("policy mismatch")
-        );
-        assert!(
-            parse(&strict.replace("local_lu = \"SOLNET.SNAA\"", ""))
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires both")
-        );
+            .contains("requires both"));
     }
 
     #[test]
@@ -1325,11 +1486,9 @@ to = "ip"
                 .to_string()
                 .contains("experimental")
         );
-        assert!(
-            parse(&mixed.replace("to = \"ip\"", "to = \"lan\""))
-                .validate()
-                .is_err()
-        );
+        assert!(parse(&mixed.replace("to = \"ip\"", "to = \"lan\""))
+            .validate()
+            .is_err());
         assert!(
             parse(&mixed.replace("[[ee]]", "[[mptn]]\nprofile = \"relay\""))
                 .validate()
@@ -1359,18 +1518,14 @@ converter = "mptn_lu62"
         let error = parse(gateway).validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("MPTN session gateway"));
-        assert!(
-            parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported route")
-        );
-        assert!(
-            toml::from_str::<RouterConfig>(
-                &gateway.replace("converter = \"mptn_lu62\"", "converter = \"unknown\"")
-            )
-            .is_err()
-        );
+        assert!(parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported route"));
+        assert!(toml::from_str::<RouterConfig>(
+            &gateway.replace("converter = \"mptn_lu62\"", "converter = \"unknown\"")
+        )
+        .is_err());
     }
 }
