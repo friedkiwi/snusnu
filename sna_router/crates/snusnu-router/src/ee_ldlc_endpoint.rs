@@ -22,7 +22,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use transport_ip_sna::ee::{Datagram, EeSockets, LdlcKind, CONTROL_PORT, HIGH_PORT, LOW_PORT};
+use transport_ip_sna::ee::{Datagram, EeSockets, LdlcKind, CONTROL_PORT, LOW_PORT, NETWORK_PORT};
 
 const LIVE_INTERVAL: Duration = Duration::from_secs(10);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
@@ -270,7 +270,7 @@ impl EeLdlcEndpoint {
     /// Send one complete NLP on the requested EE priority port only after
     /// negotiated LDLC activation. RTP owns ANR routing and reliability.
     pub(crate) fn send_nlp(&self, priority_port: u16, nlp: &[u8]) -> io::Result<()> {
-        if self.phase() != Phase::Active || !(HIGH_PORT..=LOW_PORT).contains(&priority_port) {
+        if self.phase() != Phase::Active || !(NETWORK_PORT..=LOW_PORT).contains(&priority_port) {
             return Err(invalid("EE NLP send before activation or wrong priority"));
         }
         let agreement = self
@@ -900,11 +900,9 @@ mod tests {
         let bootstrap = endpoint.control_bootstrap().unwrap().unwrap();
         assert_eq!(bootstrap.peer.cp.to_string(), "SOLNET.SNAB");
         assert_eq!(bootstrap.outbound_cp_label(), [0xa4, 0]);
-        let priority = UdpSocket::bind((peer_ip, transport_ip_sna::ee::MEDIUM_PORT)).unwrap();
+        let priority = UdpSocket::bind((peer_ip, NETWORK_PORT)).unwrap();
         priority.set_nonblocking(true).unwrap();
-        endpoint
-            .send_nlp(transport_ip_sna::ee::MEDIUM_PORT, &[0xc6, 0, 0xa4])
-            .unwrap();
+        endpoint.send_nlp(NETWORK_PORT, &[0xc6, 0, 0xa4]).unwrap();
         let mut priority_reply = [0u8; 64];
         let (size, _) = priority.recv_from(&mut priority_reply).unwrap();
         assert_eq!(&priority_reply[..size], &[4, 4, 3, 0xc6, 0, 0xa4]);
