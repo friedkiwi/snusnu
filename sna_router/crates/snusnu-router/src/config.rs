@@ -80,9 +80,6 @@ pub(crate) struct LlcConfig {
     pub(crate) id: String,
     pub(crate) interface: String,
     pub(crate) guest_mac: String,
-    /// Optional for concentrator routes, where the target's managed MAC is
-    /// learned from the server before the LLC association is activated.
-    pub(crate) proxy_mac: Option<String>,
     pub(crate) local_cp: Option<String>,
     #[serde(default)]
     pub(crate) lus: Vec<String>,
@@ -188,11 +185,9 @@ impl RouterConfig {
     /// Address presented to one local LLC peer for its configured route.
     /// `None` means the concentrator must supply the managed target address.
     pub(crate) fn llc_proxy_mac(&self, llc_id: &str) -> io::Result<Option<[u8; 6]>> {
-        let peer = self
-            .llc
-            .iter()
-            .find(|peer| peer.id == llc_id)
-            .ok_or_else(|| invalid(format!("unknown LLC peer {llc_id}")))?;
+        if !self.llc.iter().any(|peer| peer.id == llc_id) {
+            return Err(invalid(format!("unknown LLC peer {llc_id}")));
+        }
         let route = self
             .route
             .iter()
@@ -203,8 +198,7 @@ impl RouterConfig {
         } else {
             route.from.as_str()
         };
-        let explicit = route.proxy_mac.as_deref().or(peer.proxy_mac.as_deref());
-        if let Some(mac) = explicit {
+        if let Some(mac) = route.proxy_mac.as_deref() {
             return Ok(Some(parse_mac(mac)?));
         }
         if let Some(target) = self.llc.iter().find(|target| target.id == target_id) {
@@ -259,20 +253,7 @@ impl RouterConfig {
                 return Err(invalid(format!("duplicate port ID {}", peer.id)));
             }
             kinds.insert(&peer.id, "llc");
-            let guest = parse_mac(&peer.guest_mac)?;
-            let proxy = peer.proxy_mac.as_deref().map(parse_mac).transpose()?;
-            if proxy == Some(guest) {
-                return Err(invalid(format!(
-                    "LLC peer {} has equal guest and proxy MACs",
-                    peer.id
-                )));
-            }
-            if !peers.insert((peer.interface.as_str(), guest, proxy)) {
-                return Err(invalid(format!(
-                    "duplicate LLC association on {}",
-                    peer.interface
-                )));
-            }
+            parse_mac(&peer.guest_mac)?;
             if let Some(local_cp) = &peer.local_cp {
                 parse_cp(local_cp)?;
             } else if !peer.lus.is_empty() {
@@ -635,14 +616,6 @@ impl RouterConfig {
                 .ok_or_else(|| {
                     invalid(format!("remote {} must attach to an LLC peer", remote.id))
                 })?;
-            if let Some(proxy) = peer.proxy_mac.as_deref().map(parse_mac).transpose()? {
-                if proxy[..3] != [0x02, 0x53, 0x4e] {
-                    return Err(invalid(format!(
-                        "remote LLC peer {} must use assigned 02:53:4e virtual MAC",
-                        peer.id
-                    )));
-                }
-            }
             let owned_cp = peer.local_cp.as_ref().ok_or_else(|| {
                 invalid(format!(
                     "concentrator {} cannot publish CP without local_cp on LLC peer {}",
@@ -674,19 +647,6 @@ impl RouterConfig {
         }
         let mut resolved_associations = HashSet::new();
         for peer in &self.llc {
-            let route = self
-                .route
-                .iter()
-                .find(|route| {
-                    route.from == peer.id || (route.to == peer.id && route.bidirectional)
-                })
-                .ok_or_else(|| invalid(format!("LLC peer {} has no route", peer.id)))?;
-            if peer.proxy_mac.is_some() && route.proxy_mac.is_some() {
-                return Err(invalid(format!(
-                    "LLC peer {} has proxy_mac on both [[llc]] and [[route]]",
-                    peer.id
-                )));
-            }
             let guest = parse_mac(&peer.guest_mac)?;
             let proxy = self.llc_proxy_mac(&peer.id)?;
             if !resolved_associations.insert((peer.interface.as_str(), guest, proxy)) {
@@ -824,13 +784,11 @@ mod tests {
 id = "a"
 interface = "sol5"
 guest_mac = "02:00:00:00:00:01"
-proxy_mac = "02:53:4e:00:00:02"
 
 [[llc]]
 id = "b"
 interface = "sol5"
 guest_mac = "02:00:00:00:00:03"
-proxy_mac = "02:53:4e:00:00:04"
 
 [[route]]
 from = "a"
@@ -839,18 +797,14 @@ to = "b"
 
     #[test]
     fn permits_multiple_peers_on_one_interface() {
-        parse(GOOD).validate().unwrap();
-        let missing_proxy = GOOD.replace("proxy_mac = \"02:53:4e:00:00:02\"\n", "");
-        let derived = parse(&missing_proxy);
+        let derived = parse(GOOD);
         derived.validate().unwrap();
         assert_eq!(
             derived.llc_proxy_mac("a").unwrap(),
             Some(parse_mac("02:00:00:00:00:03").unwrap())
         );
-        let both_derived = parse(&missing_proxy.replace("proxy_mac = \"02:53:4e:00:00:04\"\n", ""));
-        both_derived.validate().unwrap();
         assert_eq!(
-            both_derived.llc_proxy_mac("b").unwrap(),
+            derived.llc_proxy_mac("b").unwrap(),
             Some(parse_mac("02:00:00:00:00:01").unwrap())
         );
         let ambiguous = GOOD.replace("to = \"b\"", "to = \"b\"\nproxy_mac = \"02:53:4e:00:00:05\"");
@@ -909,22 +863,18 @@ proxy_mac = "02:53:4e:00:00:06"
             .validate()
             .is_ok()
         );
-        assert!(parse(&format!("{GOOD}\n[[llc]]\nid=\"c\"\ninterface=\"sol6\"\nguest_mac=\"02:00:00:00:00:05\"\nproxy_mac=\"02:53:4e:00:00:06\"\n[[route]]\nfrom=\"a\"\nto=\"c\"\n")).validate().is_err());
+        assert!(parse(&format!("{GOOD}\n[[llc]]\nid=\"c\"\ninterface=\"sol6\"\nguest_mac=\"02:00:00:00:00:05\"\n[[route]]\nfrom=\"a\"\nto=\"c\"\n")).validate().is_err());
     }
 
     #[test]
     fn rejects_duplicate_association_and_malformed_mac() {
         assert!(
-            parse(
-                &GOOD
-                    .replace("02:00:00:00:00:03", "02:00:00:00:00:01")
-                    .replace("02:53:4e:00:00:04", "02:53:4e:00:00:02")
-            )
+            parse(&GOOD.replace("02:00:00:00:00:03", "02:00:00:00:00:01"))
             .validate()
             .is_err()
         );
         assert!(
-            parse(&GOOD.replace("02:53:4e:00:00:04", "03:53:4e:00:00:04"))
+            parse(&GOOD.replace("02:00:00:00:00:03", "03:00:00:00:00:03"))
                 .validate()
                 .is_err()
         );
@@ -938,28 +888,38 @@ proxy_mac = "02:53:4e:00:00:06"
 id = "a1"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:01"
 [[llc]]
 id = "a2"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:02"
 [[llc]]
 id = "b1"
 interface = "sol4"
 guest_mac = "02:00:35:27:23:02"
-proxy_mac = "02:53:4e:00:00:03"
 [[llc]]
 id = "b2"
 interface = "sol4"
 guest_mac = "02:00:35:27:23:02"
-proxy_mac = "02:53:4e:00:00:04"
 [[route]]
 from = "a1"
 to = "b1"
+bidirectional = false
+proxy_mac = "02:53:4e:00:00:01"
+[[route]]
+from = "b1"
+to = "a1"
+bidirectional = false
+proxy_mac = "02:53:4e:00:00:03"
 [[route]]
 from = "a2"
 to = "b2"
+bidirectional = false
+proxy_mac = "02:53:4e:00:00:02"
+[[route]]
+from = "b2"
+to = "a2"
+bidirectional = false
+proxy_mac = "02:53:4e:00:00:04"
 "#,
         );
         config.validate().unwrap();
@@ -986,7 +946,6 @@ to = "west"
 id = "a"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:01"
 [[ee]]
 id = "east"
 local_ip = "127.0.0.2"
@@ -1011,7 +970,6 @@ to = "east"
 id = "a"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:01"
 local_cp = "SOLNET.SNAA"
 lus = ["SOLNET.LUA"]
 lu_types = { "SOLNET.LUA" = ["lu_6_2"] }
@@ -1027,12 +985,8 @@ to = "upstream"
 "#;
         let parsed = parse(config);
         parsed.validate().unwrap();
-        let managed_proxy = parse(&config.replace("proxy_mac = \"02:53:4e:00:00:01\"\n", ""));
-        managed_proxy.validate().unwrap();
-        assert!(managed_proxy.llc[0].proxy_mac.is_none());
-        assert_eq!(managed_proxy.llc_proxy_mac("a").unwrap(), None);
+        assert_eq!(parsed.llc_proxy_mac("a").unwrap(), None);
         let route_proxy = config
-            .replace("proxy_mac = \"02:53:4e:00:00:01\"\n", "")
             .replace("to = \"upstream\"", "to = \"upstream\"\nproxy_mac = \"02:53:4e:00:00:09\"");
         let route_proxy = parse(&route_proxy);
         route_proxy.validate().unwrap();
@@ -1040,14 +994,11 @@ to = "upstream"
             route_proxy.llc_proxy_mac("a").unwrap(),
             Some(parse_mac("02:53:4e:00:00:09").unwrap())
         );
-        assert!(parse(&config.replace(
-            "to = \"upstream\"",
-            "to = \"upstream\"\nproxy_mac = \"02:53:4e:00:00:09\""
+        assert!(toml::from_str::<RouterConfig>(&config.replace(
+            "guest_mac = \"02:00:35:27:23:01\"",
+            "guest_mac = \"02:00:35:27:23:01\"\nproxy_mac = \"02:53:4e:00:00:09\""
         ))
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("both [[llc]] and [[route]]"));
+        .is_err());
         assert_eq!(
             parsed.concentrator_local_id(&parsed.remote[0]).unwrap(),
             "a"
@@ -1065,11 +1016,11 @@ to = "upstream"
             vec![ConfiguredLuType::Lu6_2]
         );
         assert!(
-            parse(&config.replace("02:53:4e", "02:00:4e"))
+            parse(&config.replace("02:00:35:27:23:01", "03:00:35:27:23:01"))
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("virtual MAC")
+                .contains("invalid unicast MAC")
         );
         assert!(
             parse(&config.replace("target_cp = \"DSTNET.SNAB\"", ""))
@@ -1117,14 +1068,12 @@ to = "upstream"
 id = "a"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:01"
 local_cp = "SOLNET.SNAA"
 lus = ["SOLNET.LUA"]
 [[llc]]
 id = "b"
 interface = "sol6"
 guest_mac = "02:00:35:27:23:02"
-proxy_mac = "02:53:4e:00:00:02"
 local_cp = "SOLNET.SNAB"
 lus = ["SOLNET.LUB"]
 [[concentrator]]
@@ -1322,7 +1271,6 @@ to = "ip"
 id = "lan"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:02"
 [[anynet]]
 id = "mptn"
 local_ip = "127.0.0.2"
