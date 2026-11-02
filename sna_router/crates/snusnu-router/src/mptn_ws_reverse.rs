@@ -230,10 +230,33 @@ pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
 /// socket is a clone of that gateway's sole bound UDP/397 socket.
 pub(crate) fn run_from_open(
     config: &ReverseWsConfig,
+    native: WsNativeResponder<WsRoutePort>,
+    socket: UdpSocket,
+    open: InboundOpen,
+    setup_deadline: Instant,
+) -> io::Result<()> {
+    run_from_open_with_tp(config, native, socket, open, setup_deadline, false)
+}
+
+/// Automatic routes learn the transaction program from the first validated
+/// native FMH-5 Attach, so no QA-specific TP has to appear in router config.
+pub(crate) fn run_from_open_dynamic_tp(
+    config: &ReverseWsConfig,
+    native: WsNativeResponder<WsRoutePort>,
+    socket: UdpSocket,
+    open: InboundOpen,
+    setup_deadline: Instant,
+) -> io::Result<()> {
+    run_from_open_with_tp(config, native, socket, open, setup_deadline, true)
+}
+
+fn run_from_open_with_tp(
+    config: &ReverseWsConfig,
     mut native: WsNativeResponder<WsRoutePort>,
     socket: UdpSocket,
     open: InboundOpen,
     setup_deadline: Instant,
+    dynamic_tp: bool,
 ) -> io::Result<()> {
     tracing::info!(
         circuit_id = ?open.circuit_id,
@@ -269,19 +292,20 @@ pub(crate) fn run_from_open(
         &config.source_lu,
         &config.hosted_lu,
     )?;
-    let bridge = Bridge::new(
-        BindPolicy {
-            plu: config.source_lu.clone(),
-            slu: config.hosted_lu.clone(),
-            mode: None,
-            allow_blank_mode: true,
-            max_pending_bytes: MAX_RECORD,
-        },
-        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?,
-        management,
-        config.user_tp,
-        1,
-    )?;
+    let policy = BindPolicy {
+        plu: config.source_lu.clone(),
+        slu: config.hosted_lu.clone(),
+        mode: None,
+        allow_blank_mode: true,
+        max_pending_bytes: MAX_RECORD,
+    };
+    let available = CompensationSet::from_codes(&TCP62_REQUIRED)
+        .map_err(|error| invalid(error.to_string()))?;
+    let bridge = if dynamic_tp {
+        Bridge::new_dynamic_tp(policy, available, management, 1)?
+    } else {
+        Bridge::new(policy, available, management, config.user_tp, 1)?
+    };
     let connect =
         connect_template_for_route(&config.source_lu, &config.hosted_lu, new_correlator()?)?;
     let mut oob = OutboundUdp::new(config.endpoint, connect.clone())?;
