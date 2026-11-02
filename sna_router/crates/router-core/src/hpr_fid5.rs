@@ -8,6 +8,7 @@
 //! it can classify a BIND's LU names and mode for route policy.
 
 use crate::fid2_bind::{classify_reduced_bind, BindError, BindIdentity};
+use crate::session::{SessionError, SessionUnit};
 
 const FID5_TH_LEN: usize = 12;
 const RH_LEN: usize = 3;
@@ -38,6 +39,17 @@ pub struct Fid5WholeBiu<'a> {
 }
 
 impl<'a> Fid5WholeBiu<'a> {
+    /// Preserve the SNA sequence field, RH, and RU for the carrier-neutral
+    /// session boundary. The caller must already have verified the RTP
+    /// connection and directional session-address ownership.
+    pub fn session_unit(&self) -> Result<SessionUnit, SessionError> {
+        let mut reduced = Vec::with_capacity(2 + RH_LEN + self.ru.len());
+        reduced.extend_from_slice(&self.th[2..4]);
+        reduced.extend_from_slice(&self.rh);
+        reduced.extend_from_slice(self.ru);
+        SessionUnit::from_reduced(&reduced)
+    }
+
     /// Extract LU 6.2 BIND identity from a complete whole BIU. The FID5
     /// session address stays opaque; this only interprets RH and RU.
     pub fn classify_bind(&self) -> Result<Option<BindIdentity>, BindError> {
@@ -99,6 +111,10 @@ mod tests {
         assert_eq!(fid5.rh, [0x6b, 0x80, 0]);
         assert_eq!(fid5.ru.len(), 132);
         assert_eq!(fid5.ru[0], 0x31);
+        let unit = fid5.session_unit().unwrap();
+        assert_eq!(unit.snf(), &[0x80, 0x01]);
+        assert_eq!(unit.rh(), &[0x6b, 0x80, 0]);
+        assert_eq!(unit.ru(), fid5.ru);
     }
 
     #[test]
