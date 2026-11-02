@@ -76,6 +76,7 @@ enum Phase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Fid5AddressAssociation {
     scope: RtpAssociationScope,
+    bind_tcid: u64,
     phase: Phase,
 }
 
@@ -83,8 +84,25 @@ impl Fid5AddressAssociation {
     pub fn new(scope: RtpAssociationScope) -> Self {
         Self {
             scope,
+            bind_tcid: scope.initial_plu_tcid,
             phase: Phase::AwaitBind,
         }
+    }
+
+    /// A fresh LU session can start after RTP setup on the established
+    /// PLU-to-SLU TCID. The caller must have validated that this TCID belongs
+    /// to the live RTP generation. Each BIND still creates an independent
+    /// address association and must carry a new PLU-assigned session address.
+    pub fn new_subsequent(scope: RtpAssociationScope) -> Self {
+        Self {
+            scope,
+            bind_tcid: scope.subsequent_plu_tcid,
+            phase: Phase::AwaitBind,
+        }
+    }
+
+    pub fn bind_tcid(&self) -> u64 {
+        self.bind_tcid
     }
 
     fn check(&self, observation: RtpObservation, tcid: u64) -> Result<(), AssociationError> {
@@ -107,7 +125,7 @@ impl Fid5AddressAssociation {
         observation: RtpObservation,
         fid5: Fid5WholeBiu<'_>,
     ) -> Result<(), AssociationError> {
-        self.check(observation, self.scope.initial_plu_tcid)?;
+        self.check(observation, self.bind_tcid)?;
         if !matches!(self.phase, Phase::AwaitBind) {
             return Err(AssociationError::UnexpectedPhase);
         }
@@ -244,6 +262,7 @@ impl Fid5AddressAssociation {
             return Err(AssociationError::StaleGeneration);
         }
         self.scope = scope;
+        self.bind_tcid = scope.initial_plu_tcid;
         self.phase = Phase::AwaitBind;
         Ok(())
     }

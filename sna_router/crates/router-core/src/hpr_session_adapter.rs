@@ -118,6 +118,44 @@ impl HprSessionAdapter {
         local_cp: Option<QualifiedName>,
         peer_cp: Option<QualifiedName>,
     ) -> Result<Self, HprAdapterError> {
+        Self::with_association(
+            role,
+            scope,
+            Fid5AddressAssociation::new(scope),
+            local_assigned_sa,
+            local_cp,
+            peer_cp,
+        )
+    }
+
+    /// Start a distinct LU session on an already established, validated RTP
+    /// connection. BIND uses the subsequent PLU TCID; data and responses
+    /// retain the same directional TCIDs and independent FID5 SA exchange.
+    pub fn new_subsequent(
+        role: HprSessionRole,
+        scope: RtpAssociationScope,
+        local_assigned_sa: u64,
+        local_cp: Option<QualifiedName>,
+        peer_cp: Option<QualifiedName>,
+    ) -> Result<Self, HprAdapterError> {
+        Self::with_association(
+            role,
+            scope,
+            Fid5AddressAssociation::new_subsequent(scope),
+            local_assigned_sa,
+            local_cp,
+            peer_cp,
+        )
+    }
+
+    fn with_association(
+        role: HprSessionRole,
+        scope: RtpAssociationScope,
+        association: Fid5AddressAssociation,
+        local_assigned_sa: u64,
+        local_cp: Option<QualifiedName>,
+        peer_cp: Option<QualifiedName>,
+    ) -> Result<Self, HprAdapterError> {
         if local_assigned_sa & (ASSIGNOR | RESERVED) != ASSIGNOR
             || local_assigned_sa & !(ASSIGNOR | RESERVED) == 0
         {
@@ -126,7 +164,7 @@ impl HprSessionAdapter {
         Ok(Self {
             role,
             scope,
-            association: Fid5AddressAssociation::new(scope),
+            association,
             local_assigned_sa,
             local_cp,
             peer_cp,
@@ -350,7 +388,7 @@ impl HprSessionAdapter {
                 self.association.observe_bind_request(
                     RtpObservation {
                         generation: self.scope.generation,
-                        tcid: self.scope.initial_plu_tcid,
+                        tcid: self.association.bind_tcid(),
                     },
                     fid5,
                 )?;
@@ -359,7 +397,7 @@ impl HprSessionAdapter {
                 return Ok(Some(HprEgress {
                     observation: RtpObservation {
                         generation: self.scope.generation,
-                        tcid: self.scope.initial_plu_tcid,
+                        tcid: self.association.bind_tcid(),
                     },
                     message,
                 }));
@@ -1367,6 +1405,67 @@ mod tests {
         assert_eq!(
             reject_cp.ingest_verified(observation(s.initial_plu_tcid), &cp_management),
             Err(HprAdapterError::ManagementBind)
+        );
+    }
+
+    #[test]
+    fn captured_v5r4_second_bind_starts_independent_session_on_established_rtp() {
+        // The guest sent this BIND on the same validated user RTP TCID after
+        // its SNASVCMG/CNOS exchange. Its newly assigned SA differs from the
+        // management session's SA; RTP setup was not repeated.
+        let hex = concat!(
+            "5d00000080020800f0f100026b800031001307b0b0513303838c8c8303060200",
+            "000000000000944340000be2d6d3d5c5e34be2d5c1c22d000902404040404040",
+            "404009030124ebc708ef80000c04e2d6d3d5c5e34be2d5c1c20a1300b024ebc7",
+            "08ef8000000be2d5e4e2d5e44bd7c9d5c76014cec370e7b283a2c40be2d6d3d5",
+            "c5e34be2d5c1c22c0a01087bc3d6d5d5c5c3e3",
+        );
+        let message: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(message.len(), 147);
+        let s = RtpAssociationScope {
+            subsequent_plu_tcid: 0x0000_0002_0000_0008,
+            ..scope()
+        };
+        let mut second = HprSessionAdapter::new_subsequent(
+            HprSessionRole::PeerPlu,
+            s,
+            SLU_SA,
+            Some(cp("SNUSNU.SVC")),
+            Some(cp("SOLNET.SNAB")),
+        )
+        .unwrap();
+        assert_eq!(
+            second.ingest_verified(observation(s.initial_plu_tcid), &message),
+            Err(HprAdapterError::InvalidAssociation(
+                AssociationError::WrongRtpConnection
+            ))
+        );
+        let ingress = second
+            .ingest_verified(observation(s.subsequent_plu_tcid), &message)
+            .unwrap();
+        let identity = ingress.identity.unwrap();
+        assert_eq!(identity.source_lu, cp("SOLNET.SNAB"));
+        assert_eq!(identity.target_lu, cp("SNUSNU.PING"));
+        assert!(matches!(ingress.event, SessionEvent::BindRequest(_)));
+        assert_eq!(second.phase(), HprSessionPhase::AwaitBindResult);
+
+        let mut initial = HprSessionAdapter::new(
+            HprSessionRole::PeerPlu,
+            s,
+            SLU_SA,
+            Some(cp("SNUSNU.SVC")),
+            Some(cp("SOLNET.SNAB")),
+        )
+        .unwrap();
+        assert_eq!(
+            initial.ingest_verified(observation(s.subsequent_plu_tcid), &message),
+            Err(HprAdapterError::InvalidAssociation(
+                AssociationError::WrongRtpConnection
+            ))
         );
     }
 }
