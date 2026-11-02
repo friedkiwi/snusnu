@@ -7,9 +7,12 @@
 //! subsequent management traffic until it is understood and implemented.
 
 use crate::{
-    fid2_bind::BindClass, fid2_session_control::request_fqpcid,
-    hpr_control_bootstrap::HprControlBootstrap, hpr_fid5::Fid5WholeBiu,
-    hpr_session_address::RtpObservation, session::QualifiedName, ConnectionGeneration,
+    fid2_bind::BindClass,
+    fid2_session_control::request_fqpcid,
+    hpr_control_bootstrap::HprControlBootstrap,
+    hpr_fid5::Fid5WholeBiu,
+    hpr_session_address::{RtpAssociationScope, RtpObservation},
+    session::QualifiedName,
 };
 use std::{error::Error, fmt};
 
@@ -26,6 +29,7 @@ pub enum CpManagementError {
     InvalidBind,
     WrongIdentity,
     UnsupportedBind,
+    InvalidCapabilities,
     UnexpectedUnit,
 }
 
@@ -39,56 +43,70 @@ impl Error for CpManagementError {}
 
 #[derive(Clone, Debug)]
 struct Bound {
-    origin_tcid: u64,
     bind: Vec<u8>,
     response: Vec<u8>,
+    request_sa: u64,
+    assigned_sa: u64,
+    capabilities: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CpManagementResponder {
     local: QualifiedName,
     peer: QualifiedName,
-    generation: ConnectionGeneration,
+    scope: RtpAssociationScope,
     bound: Option<Bound>,
 }
 
 impl CpManagementResponder {
-    pub fn new(bootstrap: HprControlBootstrap) -> Self {
-        Self::for_peers(bootstrap.local.cp, bootstrap.peer.cp, bootstrap.generation)
+    pub fn new(bootstrap: HprControlBootstrap, scope: RtpAssociationScope) -> Self {
+        Self::for_peers(bootstrap.local.cp, bootstrap.peer.cp, scope)
     }
 
-    fn for_peers(
-        local: QualifiedName,
-        peer: QualifiedName,
-        generation: ConnectionGeneration,
-    ) -> Self {
+    fn for_peers(local: QualifiedName, peer: QualifiedName, scope: RtpAssociationScope) -> Self {
         Self {
             local,
             peer,
-            generation,
+            scope,
             bound: None,
         }
     }
 
-    /// A replay of the exact BIND gets the same response. Other units are
-    /// rejected until a CP-CP management parser can handle them safely.
+    /// A replay of the exact BIND or CP Capabilities Attach gets the same
+    /// response. Every other management command is rejected explicitly.
     pub fn ingest(
         &mut self,
         observation: RtpObservation,
         bytes: &[u8],
     ) -> Result<Vec<Vec<u8>>, CpManagementError> {
-        if observation.generation != self.generation {
+        if observation.generation != self.scope.generation {
             return Err(CpManagementError::StaleGeneration);
         }
-        if let Some(bound) = &self.bound {
-            if observation.tcid != bound.origin_tcid {
+        if let Some(bound) = &mut self.bound {
+            if observation.tcid == self.scope.initial_plu_tcid && bytes == bound.bind {
+                return Ok(vec![bound.response.clone()]);
+            }
+            if observation.tcid != self.scope.subsequent_plu_tcid {
                 return Err(CpManagementError::WrongConnection);
             }
-            return if bytes == bound.bind {
-                Ok(vec![bound.response.clone()])
-            } else {
-                Err(CpManagementError::UnexpectedUnit)
-            };
+            let fid5 =
+                Fid5WholeBiu::parse_complete(bytes).map_err(|_| CpManagementError::InvalidBiu)?;
+            if u64::from_be_bytes(fid5.session_address) != bound.assigned_sa & !ASSIGNOR {
+                return Err(CpManagementError::WrongConnection);
+            }
+            if let Some((request, response)) = &bound.capabilities {
+                return if bytes == request {
+                    Ok(vec![response.clone()])
+                } else {
+                    Err(CpManagementError::UnexpectedUnit)
+                };
+            }
+            let reply = Self::reply_capabilities(fid5, bound.request_sa)?;
+            bound.capabilities = Some((bytes.to_vec(), reply.clone()));
+            return Ok(vec![reply]);
+        }
+        if observation.tcid != self.scope.initial_plu_tcid {
+            return Err(CpManagementError::WrongConnection);
         }
         let fid5 =
             Fid5WholeBiu::parse_complete(bytes).map_err(|_| CpManagementError::InvalidBiu)?;
@@ -113,9 +131,11 @@ impl CpManagementResponder {
         }
         let response = self.positive_bind(fid5)?;
         self.bound = Some(Bound {
-            origin_tcid: observation.tcid,
             bind: bytes.to_vec(),
             response: response.clone(),
+            request_sa: u64::from_be_bytes(fid5.session_address) & !(ASSIGNOR | RESERVED),
+            assigned_sa: ASSIGNOR | (self.scope.generation.get() & !(ASSIGNOR | RESERVED)),
+            capabilities: None,
         });
         Ok(vec![response])
     }
@@ -139,7 +159,7 @@ impl CpManagementResponder {
         let request_sa = u64::from_be_bytes(fid5.session_address) & !(ASSIGNOR | RESERVED);
         // One CP-CP session per RTP connection. The generation prevents a
         // restarted link from reusing an address on an active generation.
-        let assigned_sa = ASSIGNOR | (self.generation.get() & !(ASSIGNOR | RESERVED));
+        let assigned_sa = ASSIGNOR | (self.scope.generation.get() & !(ASSIGNOR | RESERVED));
         let mut response_ru = ru[..27].to_vec();
         response_ru[8] = 0;
         response_ru[9] = 0x80;
@@ -169,6 +189,55 @@ impl CpManagementResponder {
         response.extend_from_slice(&response_ru);
         Ok(response)
     }
+
+    fn reply_capabilities(
+        fid5: Fid5WholeBiu<'_>,
+        request_sa: u64,
+    ) -> Result<Vec<u8>, CpManagementError> {
+        // V5R4 REQ_CP_CAP_TP X'22F0F0F1' carries an X'12C1' GDS
+        // immediately after its 17-byte basic FMH-5 Attach. The PLU gives
+        // change direction (CD); this reply closes the bracket (CEB).
+        const ATTACH: [u8; 17] = [
+            0x11, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 4, 0x22, 0xf0, 0xf0, 0xf1, 0, 0, 0,
+        ];
+        if fid5.expedited
+            || fid5.rh != [0x0b, 0x91, 0x20]
+            || fid5.sequence_number != 1
+            || fid5.ru.len() < ATTACH.len() + 12
+            || fid5.ru[..ATTACH.len()] != ATTACH
+        {
+            return Err(CpManagementError::UnexpectedUnit);
+        }
+        let gds = &fid5.ru[ATTACH.len()..];
+        if gds.len() > 128
+            || gds.len() != usize::from(u16::from_be_bytes([gds[0], gds[1]]))
+            || gds[2..4] != [0x12, 0xc1]
+            || gds[8] & 0xe0 != 0x80 // End-node CP.
+            || gds[9] & 0x80 == 0
+            || gds[11] != 0
+        {
+            return Err(CpManagementError::InvalidCapabilities);
+        }
+        let mut cursor = 12;
+        while cursor < gds.len() {
+            let length = usize::from(gds[cursor]);
+            if length != 6 || gds.get(cursor + 1) != Some(&0x33) || cursor + length > gds.len() {
+                return Err(CpManagementError::InvalidCapabilities);
+            }
+            cursor += length;
+        }
+        // NNCP retired indicator 111, retired bit in byte 9, no optional
+        // services claimed. We do not assert topology, MS, or registration
+        // support before those handlers exist.
+        const LOCAL_CAPABILITIES: [u8; 12] = [0, 12, 0x12, 0xc1, 0, 0, 0, 0, 0xe0, 0x80, 0, 0];
+        let mut reply = Vec::with_capacity(15 + LOCAL_CAPABILITIES.len());
+        reply.extend_from_slice(&[0x5c, 0]);
+        reply.extend_from_slice(&1u16.to_be_bytes());
+        reply.extend_from_slice(&request_sa.to_be_bytes());
+        reply.extend_from_slice(&[0x03, 0x91, 0x01]);
+        reply.extend_from_slice(&LOCAL_CAPABILITIES);
+        Ok(reply)
+    }
 }
 
 fn encode_name(name: &QualifiedName) -> Result<Vec<u8>, CpManagementError> {
@@ -189,6 +258,7 @@ fn encode_name(name: &QualifiedName) -> Result<Vec<u8>, CpManagementError> {
 mod tests {
     use super::*;
     use crate::hpr_session_address::{Fid5AddressAssociation, RtpAssociationScope};
+    use crate::ConnectionGeneration;
 
     fn live_shape_bind() -> Vec<u8> {
         // Sanitized V5R4 CP-CP BIND. Instance IDs and PCID are synthetic;
@@ -227,14 +297,20 @@ mod tests {
     #[test]
     fn responds_to_v5r4_cp_management_bind_and_replays_exactly() {
         let generation = ConnectionGeneration::new(7).unwrap();
+        let scope = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: 0x80e8_992c_8f00_0020,
+            subsequent_plu_tcid: 0x0000_0001_0000_0001,
+            slu_tcid: 0x00e8_992c_8f00_0020,
+        };
         let mut responder = CpManagementResponder::for_peers(
             "SNUSNU.SVC".parse().unwrap(),
             "SOLNET.SNAB".parse().unwrap(),
-            generation,
+            scope,
         );
         let observation = RtpObservation {
             generation,
-            tcid: 0x80e8_992c_8f00_0020,
+            tcid: scope.initial_plu_tcid,
         };
         let bind = live_shape_bind();
         let response = responder.ingest(observation, &bind).unwrap().pop().unwrap();
@@ -250,19 +326,14 @@ mod tests {
             .ru
             .windows(10)
             .any(|window| window == [0x62, 8, 0x80, 0, 0, 0, 0, 0, 0, 7]));
-        let mut association = Fid5AddressAssociation::new(RtpAssociationScope {
-            generation,
-            initial_plu_tcid: observation.tcid,
-            subsequent_plu_tcid: observation.tcid & !ASSIGNOR,
-            slu_tcid: observation.tcid & !ASSIGNOR,
-        });
+        let mut association = Fid5AddressAssociation::new(scope);
         association
             .observe_bind_request(observation, Fid5WholeBiu::parse_complete(&bind).unwrap())
             .unwrap();
         association
             .observe_bind_response(
                 RtpObservation {
-                    tcid: observation.tcid & !ASSIGNOR,
+                    tcid: scope.slu_tcid,
                     ..observation
                 },
                 parsed,
@@ -271,6 +342,44 @@ mod tests {
         assert_eq!(
             responder.ingest(observation, &bind).unwrap(),
             vec![response]
+        );
+        let mut capabilities = vec![0x5c, 0, 0, 1];
+        capabilities.extend_from_slice(&generation.get().to_be_bytes());
+        capabilities.extend_from_slice(&[0x0b, 0x91, 0x20]);
+        capabilities.extend_from_slice(&[
+            0x11, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 4, 0x22, 0xf0, 0xf0, 0xf1, 0, 0, 0, 0, 30, 0x12,
+            0xc1, 0, 0, 0, 0, 0x82, 0x84, 0, 0, 6, 0x33, 0x80, 0, 0, 0xf3, 6, 0x33, 0x80, 0, 0,
+            0xf4, 6, 0x33, 0x80, 0, 0, 0xf6,
+        ]);
+        let continued = RtpObservation {
+            tcid: scope.subsequent_plu_tcid,
+            ..observation
+        };
+        association
+            .observe_data(
+                crate::hpr_session_address::Direction::PluToSlu,
+                continued,
+                Fid5WholeBiu::parse_complete(&capabilities).unwrap(),
+            )
+            .unwrap();
+        let capability_reply = responder
+            .ingest(continued, &capabilities)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let parsed_reply = Fid5WholeBiu::parse_complete(&capability_reply).unwrap();
+        assert_eq!(
+            parsed_reply.session_address,
+            0x0002_0100_f0f1_0001u64.to_be_bytes()
+        );
+        assert_eq!(parsed_reply.rh, [3, 0x91, 1]);
+        assert_eq!(
+            parsed_reply.ru,
+            [0, 12, 0x12, 0xc1, 0, 0, 0, 0, 0xe0, 0x80, 0, 0]
+        );
+        assert_eq!(
+            responder.ingest(continued, &capabilities).unwrap(),
+            vec![capability_reply]
         );
         assert_eq!(
             responder.ingest(

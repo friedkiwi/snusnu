@@ -88,7 +88,7 @@ struct DirectHprRuntime {
     rtp: HprRtpPort,
     route_setup: Option<DirectRouteSetupService>,
     route_reply: Option<PreparedRouteSetupReply>,
-    cp_management: CpManagementResponder,
+    cp_management: Option<CpManagementResponder>,
     pending_cp_replies: VecDeque<Vec<u8>>,
     pending_cp_reply_bytes: usize,
     switch: SessionSwitch,
@@ -106,7 +106,7 @@ impl DirectHprRuntime {
         switch.register(WS_ADAPTER);
         Self {
             rtp: HprRtpPort::new(bootstrap.clone()),
-            cp_management: CpManagementResponder::new(bootstrap.clone()),
+            cp_management: None,
             bootstrap,
             route_setup: None,
             route_reply: None,
@@ -168,7 +168,17 @@ impl DirectHprRuntime {
                 "HPR CP management response pending",
             ));
         }
-        let mut candidate = self.cp_management.clone();
+        let responder = match self.cp_management.as_ref() {
+            Some(responder) => responder.clone(),
+            None => {
+                let scope = self
+                    .rtp
+                    .cp_scope()
+                    .ok_or_else(|| protocol("HPR CP management RTP scope missing"))?;
+                CpManagementResponder::new(self.bootstrap.clone(), scope)
+            }
+        };
+        let mut candidate = responder;
         let replies = candidate
             .ingest(message.observation, &message.bytes)
             .map_err(|error| protocol(format!("HPR CP management BIU rejected: {error}")))?;
@@ -179,7 +189,7 @@ impl DirectHprRuntime {
         if replies.len() > MAX_PENDING_CP_REPLIES || reply_bytes > MAX_PENDING_CP_REPLY_BYTES {
             return Err(protocol("HPR CP management response exceeds queue limits"));
         }
-        self.cp_management = candidate;
+        self.cp_management = Some(candidate);
         self.pending_cp_reply_bytes = reply_bytes;
         self.pending_cp_replies.extend(replies);
         Ok(())
