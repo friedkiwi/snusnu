@@ -675,5 +675,14 @@ mod tests {
         state.borrow_mut().completed = 2;
         leg.complete_egress().unwrap();
         assert_eq!(leg.management.phase(), ManagementPhase::CnosComplete);
+        leg.process_information(vec![0x2c, 0, 1, 2, 0, 0, 0x83, 1, 0])
+            .unwrap();
+        leg.process_information(vec![0x2c, 0, 1, 2, 0, 2, 0x4b, 0x91, 0, 0x70])
+            .unwrap();
+        assert_eq!(state.borrow().information.len(), 5);
+        assert_eq!(leg.management.phase(), ManagementPhase::AwaitBisAck);
+        state.borrow_mut().completed = 2;
+        leg.complete_egress().unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::BisComplete);
     }
 }
