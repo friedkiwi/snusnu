@@ -11,6 +11,7 @@ type FixedPacing struct {
 	sendLeft, receiveLeft                         byte
 	sendFirst, receiveFirst                       bool
 	awaiting, nextSend, grantPending, nextReceive bool
+	pendingSend, pendingPI                        bool
 }
 
 func NewFixedPacing(sendWindow, receiveWindow byte) (*FixedPacing, error) {
@@ -20,20 +21,35 @@ func NewFixedPacing(sendWindow, receiveWindow byte) (*FixedPacing, error) {
 	return &FixedPacing{sendWindow: sendWindow, receiveWindow: receiveWindow, sendLeft: sendWindow, receiveLeft: receiveWindow, sendFirst: true, receiveFirst: true}, nil
 }
 
-func (p *FixedPacing) SendRequest() (bool, error) {
-	if p.sendLeft == 0 {
-		if !p.nextSend {
-			return false, ErrPacing
-		}
-		p.nextSend, p.sendLeft, p.sendFirst = false, p.sendWindow, true
+// PrepareSendRequest selects the PI bit without consuming pacing credit.
+// MarkRequestSent follows a successful transport send of that request.
+func (p *FixedPacing) PrepareSendRequest() (bool, error) {
+	if p.pendingSend || p.sendLeft == 0 && !p.nextSend {
+		return false, ErrPacing
 	}
-	pi := p.sendFirst
+	p.pendingPI = p.sendFirst || p.sendLeft == 0
+	p.pendingSend = true
+	return p.pendingPI, nil
+}
+
+func (p *FixedPacing) MarkRequestSent(pi bool) error {
+	if !p.pendingSend || pi != p.pendingPI {
+		return ErrPacing
+	}
+	if p.sendLeft == 0 {
+		p.nextSend, p.sendLeft = false, p.sendWindow
+	}
+	p.pendingSend = false
 	p.sendFirst = false
 	p.sendLeft--
 	if pi {
 		p.awaiting = true
 	}
-	return pi, nil
+	return nil
+}
+
+func (p *FixedPacing) CancelPreparedRequest() {
+	p.pendingSend = false
 }
 
 func (p *FixedPacing) ReceiveIPR() error {

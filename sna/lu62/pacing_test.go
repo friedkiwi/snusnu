@@ -22,21 +22,41 @@ func TestFixedPacingNeedsExplicitWindowGrants(t *testing.T) {
 	if err := p.ReceiveRequest(true); err != nil {
 		t.Fatal(err)
 	}
-	pi, err := p.SendRequest()
+	pi, err := p.PrepareSendRequest()
 	if err != nil || !pi {
 		t.Fatalf("first send PI: %v %v", pi, err)
+	}
+	if p.SendRemaining() != 3 || p.ReceiveIPR() == nil {
+		t.Fatal("uncommitted request consumed credit")
+	}
+	if err := p.MarkRequestSent(pi); err != nil {
+		t.Fatal(err)
 	}
 	if err := p.ReceiveIPR(); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		pi, err = p.SendRequest()
+		pi, err = p.PrepareSendRequest()
 		if err != nil || pi {
 			t.Fatalf("send %d: %v %v", i, pi, err)
 		}
+		if err := p.MarkRequestSent(pi); err != nil {
+			t.Fatal(err)
+		}
 	}
-	pi, err = p.SendRequest()
+	pi, err = p.PrepareSendRequest()
 	if err != nil || !pi {
 		t.Fatalf("next window: %v %v", pi, err)
+	}
+	if err := p.MarkRequestSent(false); err == nil || p.SendRemaining() != 0 {
+		t.Fatal("mismatched PI committed")
+	}
+	p.CancelPreparedRequest()
+	pi, err = p.PrepareSendRequest()
+	if err != nil || !pi {
+		t.Fatalf("retry: %v %v", pi, err)
+	}
+	if err := p.MarkRequestSent(pi); err != nil {
+		t.Fatal(err)
 	}
 }
