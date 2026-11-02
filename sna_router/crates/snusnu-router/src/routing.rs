@@ -29,6 +29,8 @@ impl PortId {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RouteAddress {
     Mac([u8; 6]),
+    /// Address selection waits for the concentrator's managed CP binding.
+    UnboundManagedMac,
     ControlPoint {
         netid: String,
         name: String,
@@ -48,6 +50,7 @@ impl fmt::Display for RouteAddress {
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             ),
+            Self::UnboundManagedMac => write!(f, "pending-managed-mac"),
             Self::ControlPoint { netid, name } => write!(f, "{netid}.{name}"),
             Self::LogicalUnit { netid, cp, name } => match cp {
                 Some(cp) => write!(f, "{netid}.{cp}.{name}"),
@@ -447,7 +450,9 @@ impl Router {
                 "managed MAC is outside the SNUSNU namespace",
             ));
         }
-        let Some(old @ RouteAddress::Mac(_)) = self.destinations.get(peer) else {
+        let Some(old @ (RouteAddress::Mac(_) | RouteAddress::UnboundManagedMac)) =
+            self.destinations.get(peer)
+        else {
             return Ok(None);
         };
         let new = RouteAddress::Mac(mac);
@@ -946,7 +951,7 @@ mod tests {
             )
             .unwrap();
         router.bind_destination(&source, cp).unwrap();
-        let initial = RouteAddress::Mac([0x02, 0x53, 0x4e, 0, 0, 1]);
+        let initial = RouteAddress::UnboundManagedMac;
         router
             .add_address_route(&a_id, initial.clone(), &source)
             .unwrap();
