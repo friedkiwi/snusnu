@@ -45,4 +45,87 @@ func TestUserSessionGatesFirstAttachOnBindAck(t *testing.T) {
 	if err := s.MarkAttachGrantSent(grant); err != nil || s.Phase() != UserActive || s.TPName() != "APINGD" {
 		t.Fatalf("active: %v", err)
 	}
+	version, _ := hex.DecodeString("000f12ff01022b02d6e261f4f0f000")
+	request := append([]byte{0x2e, 0, 2, 2, 0, 2, 1, 0x95, 0x20}, version...)
+	responseRU, _ := hex.DecodeString("000e12ff01022b024f532f343030")
+	grant, reply, err = s.PrepareMappedTurn(request, responseRU)
+	if err != nil || !bytes.Equal(grant, []byte{0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0}) ||
+		!bytes.Equal(reply, append([]byte{0x2e, 0, 2, 2, 0, 1, 3, 0x91, 0x20}, responseRU...)) {
+		t.Fatalf("version turn: %x %x %v", grant, reply, err)
+	}
+	if err := s.MarkTurnSent(grant, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckTurn(); err != nil || s.Phase() != UserActive {
+		t.Fatalf("turn ACK: %v", err)
+	}
+	if err := s.ReceiveIPR([]byte{0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	packet, _ := hex.DecodeString("001412ff00000000000000000000000000000000")
+	request = append([]byte{0x2e, 0, 2, 2, 0, 3, 3, 0x91, 0x20}, packet...)
+	grant, reply, err = s.PrepareMappedTurn(request, packet)
+	if err != nil || len(grant) != 9 || !bytes.Equal(reply, append([]byte{0x2e, 0, 2, 2, 0, 2, 3, 0x90, 0x20}, packet...)) {
+		t.Fatalf("echo turn: %x %x %v", grant, reply, err)
+	}
+	if err := s.MarkTurnSent(grant, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckTurn(); err != nil {
+		t.Fatal(err)
+	}
+	noEcho, _ := hex.DecodeString("000812ff00000000000812ff00000000")
+	request = append([]byte{0x2e, 0, 2, 2, 0, 4, 3, 0xa1, 0}, noEcho...)
+	grant, reply, err = s.PrepareMappedTurn(request, nil)
+	if err != nil || len(grant) != 9 || len(reply) != 0 {
+		t.Fatalf("no-echo turn: %x %x %v", grant, reply, err)
+	}
+	if err := s.MarkTurnSent(grant, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckTurn(); err != nil || s.Phase() != UserActive {
+		t.Fatalf("no-echo ACK: %v", err)
+	}
+	confirm := []byte{0x2e, 0, 2, 2, 0, 5, 0x4b, 0xa0, 1, 4, 0, 6}
+	reply, err = s.PrepareConfirm(confirm)
+	if err != nil || !bytes.Equal(reply, []byte{0x2e, 0, 2, 2, 0x80, 0, 0xcb, 0xa0, 0, 4}) {
+		t.Fatalf("confirm: %x %v", reply, err)
+	}
+	if err := s.MarkConfirmSent(reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckConfirm(); err != nil || s.Phase() != UserConfirmed {
+		t.Fatalf("confirm ACK: %v", err)
+	}
+	bis := []byte{0x2e, 0, 2, 2, 0, 6, 0x4b, 0x91, 0, 0x70}
+	grant, reply, err = s.PrepareBIS(bis)
+	if err != nil || len(grant) != 9 || !bytes.Equal(reply, []byte{0x2e, 0, 2, 2, 0, 3, 0x4b, 0xb0, 0, 0x70}) {
+		t.Fatalf("BIS: %x %x %v", grant, reply, err)
+	}
+	if err := s.MarkBISSent(grant, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckBIS(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckBIS(); err != nil || s.Phase() != UserBISComplete {
+		t.Fatalf("BIS ACK: %v", err)
+	}
+	unbind := append([]byte{0x2f, 0, 2, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}, s.FQPCID()...)
+	reply, err = s.PrepareUnbind(unbind)
+	if err != nil || !bytes.Equal(reply, []byte{0x2f, 0, 2, 2, 0, 0, 0xeb, 0x80, 0, 0x32}) {
+		t.Fatalf("UNBIND: %x %v", reply, err)
+	}
+	if err := s.MarkUnbindSent(reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckUnbind(); err != nil || s.Phase() != UserClosed {
+		t.Fatalf("UNBIND ACK: %v", err)
+	}
 }
