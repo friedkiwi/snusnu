@@ -220,6 +220,24 @@ impl<P: RoutePort> WsNativeResponder<P> {
                 "native information before verified XID3 and LinkReady",
             ));
         }
+        // SNASVCMG can release its own session after the user BIND has been
+        // accepted. Its SC UNBIND still belongs to management, even when the
+        // user session is waiting for its first FMH-5 Attach.
+        if piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32 {
+            if self.management.phase() != ManagementPhase::BisComplete {
+                return Err(invalid("native management UNBIND outside BIS boundary"));
+            }
+            let response = self
+                .management
+                .prepare_unbind_response(&piu)
+                .map_err(protocol)?
+                .to_vec();
+            self.send_information(response.clone(), Egress::ManagementUnbind)?;
+            self.management
+                .mark_unbind_enqueued(&response)
+                .map_err(protocol)?;
+            return Ok(());
+        }
         if self.user_offer.is_some() && self.user_bind_acked {
             if !self.first_attach_seen {
                 parse_first_user_attach(&piu, self.user_offer.as_ref().unwrap())
@@ -684,5 +702,29 @@ mod tests {
         state.borrow_mut().completed = 2;
         leg.complete_egress().unwrap();
         assert_eq!(leg.management.phase(), ManagementPhase::BisComplete);
+        // The live Alice→Bob run accepted this user BIND, then received a
+        // management UNBIND before the first user FMH-5 Attach.
+        let user_bind = decoded_hex(concat!(
+            "2d00020200006b800031001307b0b051330383c7c7830306020000000000000094434000",
+            "0cd8c1c1d3c9c3c54be2d5c1c12e0009024040404040404040090301247e7f02818000",
+            "0d04d8c1c1d3c9c3c54be2d5c1c10a1300b0247e7f02818000000ad8c1c2d6c24be2d5c1c2",
+            "6015d8e7221f0a531d860cd8c1c1d3c9c3c54be2d5c1c12c0a01087bc3d6d5d5c5c3e3"
+        ));
+        leg.process_information(user_bind).unwrap();
+        assert!(leg.user_offer.is_some());
+        leg.user_bind_acked = true;
+        let mut unbind = vec![0x2d, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0];
+        unbind.extend_from_slice(leg.management_bind().unwrap().fqpcid());
+        leg.process_information(unbind).unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::AwaitUnbindAck);
+        assert_eq!(
+            state.borrow().information.last().unwrap(),
+            &[0x2d, 0, 2, 1, 0, 0, 0xeb, 0x80, 0, 0x32]
+        );
+        assert!(leg.user_offer.is_some());
+        assert!(!leg.first_attach_seen);
+        state.borrow_mut().completed = 1;
+        leg.complete_egress().unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::Closed);
     }
 }
