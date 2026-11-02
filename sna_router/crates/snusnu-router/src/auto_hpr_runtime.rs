@@ -188,6 +188,9 @@ impl DirectHprRuntime {
     }
 
     fn try_open_reciprocal_cp(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        if !self.reciprocal_cp_ready() {
+            return Ok(());
+        }
         if self.reciprocal_cp.is_none() {
             let nonce = reciprocal_nonce();
             self.reciprocal_cp = Some(
@@ -212,6 +215,14 @@ impl DirectHprRuntime {
                 "HPR reciprocal CP BIND transmitted");
         }
         Ok(())
+    }
+
+    fn reciprocal_cp_ready(&self) -> bool {
+        self.pending_cp_replies.is_empty()
+            && self
+                .cp_management
+                .as_ref()
+                .is_some_and(CpManagementResponder::ready_for_reciprocal)
     }
 
     fn reciprocal_cp_message(&mut self, message: &RtpIngress) -> io::Result<()> {
@@ -1130,6 +1141,8 @@ mod tests {
         )
         .unwrap();
         let mut runtime = DirectHprRuntime::new(bootstrap);
+        assert!(!runtime.reciprocal_cp_ready());
+        assert!(runtime.reciprocal_cp.is_none());
         runtime.pending_cp_replies.push_back(vec![0x5d, 0]);
         runtime.pending_cp_reply_bytes = 2;
         let bind = RtpIngress {
@@ -1146,6 +1159,7 @@ mod tests {
         );
         assert_eq!(runtime.pending_cp_replies.len(), 1);
         assert_eq!(runtime.pending_cp_reply_bytes, 2);
+        assert!(!runtime.reciprocal_cp_ready());
         assert!(runtime.route_setup.is_none());
         assert!(!runtime.user_route_authorized);
     }

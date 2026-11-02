@@ -74,6 +74,16 @@ impl CpManagementResponder {
         }
     }
 
+    /// The EN has activated its CP contention-winner session once its
+    /// capabilities transaction and adaptive pacing grant have been
+    /// validated. The runtime also waits until our replies are transmitted
+    /// before originating the reciprocal NN contention-winner BIND.
+    pub fn ready_for_reciprocal(&self) -> bool {
+        self.bound
+            .as_ref()
+            .is_some_and(|bound| bound.capabilities.is_some() && bound.pacing_grant.is_some())
+    }
+
     /// A replay of the exact BIND or CP Capabilities Attach gets the same
     /// response. Every other management command is rejected explicitly.
     pub fn ingest(
@@ -355,7 +365,9 @@ mod tests {
             tcid: scope.initial_plu_tcid,
         };
         let bind = live_shape_bind();
+        assert!(!responder.ready_for_reciprocal());
         let response = responder.ingest(observation, &bind).unwrap().pop().unwrap();
+        assert!(!responder.ready_for_reciprocal());
         let parsed = Fid5WholeBiu::parse_complete(&response).unwrap();
         assert_eq!(parsed.rh, [0xeb, 0x80, 0]);
         assert_eq!(parsed.sequence_number, 0);
@@ -410,6 +422,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
+        assert!(!responder.ready_for_reciprocal());
         let parsed_reply = Fid5WholeBiu::parse_complete(&capability_reply).unwrap();
         assert_eq!(
             parsed_reply.session_address,
@@ -428,6 +441,7 @@ mod tests {
         ipm.extend_from_slice(&generation.get().to_be_bytes());
         ipm.extend_from_slice(&[0x83, 1, 0, 0, 0, 1]);
         assert!(responder.ingest(continued, &ipm).unwrap().is_empty());
+        assert!(responder.ready_for_reciprocal());
         assert!(responder.ingest(continued, &ipm).unwrap().is_empty());
         let mut wrong_window = ipm.clone();
         *wrong_window.last_mut().unwrap() = 0;
