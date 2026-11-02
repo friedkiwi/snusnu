@@ -200,6 +200,10 @@ impl OutboundUdp {
         self.pending.as_ref().map(|pending| pending.sequence)
     }
 
+    pub(crate) fn pending_compensation(&self) -> Option<Compensation> {
+        self.pending.as_ref().map(|pending| pending.compensation)
+    }
+
     /// Re-offer a request when the native edge previously returned Busy.
     pub(crate) fn unsubmitted_delivery(&self) -> Option<OutboundUdpAction> {
         self.pending

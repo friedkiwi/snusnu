@@ -669,6 +669,17 @@ fn udp_expedited_completion_waits_for_exact_native_ack() {
     edge.poll_native_once().unwrap();
     assert!(edge.take_completed_udp_expedited());
     assert!(!edge.take_completed_udp_expedited());
+
+    let unbind = [0, 0, 0x6b, 0x80, 0, 0x32, 1];
+    edge.submit_udp_abort(&unbind).unwrap();
+    assert!(!edge.take_completed_udp_abort());
+    assert_eq!(&edge.native_mut().sent.last().unwrap()[4..], &unbind);
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    assert!(edge.take_completed_udp_abort());
+    assert!(!edge.take_completed_udp_abort());
 }
 
 #[test]

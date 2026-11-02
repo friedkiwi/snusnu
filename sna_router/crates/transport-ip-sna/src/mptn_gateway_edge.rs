@@ -37,6 +37,7 @@ enum NativeReply {
     Ipr,
     UserNormal,
     UdpExpedited,
+    UdpAbort,
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +67,8 @@ pub struct GatewayEdge<L: NativeLeg> {
     attach_fully_sent: bool,
     udp_expedited_pending: Option<usize>,
     udp_expedited_completed: bool,
+    udp_abort_pending: bool,
+    udp_abort_completed: bool,
     closed: bool,
 }
 
@@ -93,6 +96,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             attach_fully_sent: false,
             udp_expedited_pending: None,
             udp_expedited_completed: false,
+            udp_abort_pending: false,
+            udp_abort_completed: false,
             closed: false,
         }
     }
@@ -144,6 +149,41 @@ impl<L: NativeLeg> GatewayEdge<L> {
 
     pub fn take_completed_udp_expedited(&mut self) -> bool {
         std::mem::take(&mut self.udp_expedited_completed)
+    }
+
+    /// Queue an X'83' Abort UNBIND on the native leg. A positive UDP reply
+    /// becomes eligible after the exact LLC completion. An Abort without
+    /// termination data closes the native leg and completes immediately.
+    pub fn submit_udp_abort(&mut self, reduced: &[u8]) -> io::Result<()> {
+        if self.closed
+            || !self.first_attach_delivery_complete()
+            || self.bridge.phase() != Phase::Active
+            || self.native_reply.is_some()
+            || self.udp_expedited_pending.is_some()
+            || self.udp_abort_pending
+            || self.udp_abort_completed
+            || self.ipr_ack_outstanding
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native UDP abort delivery is busy",
+            ));
+        }
+        match self.bridge.next_mptn_udp_abort(reduced)? {
+            Some(piu) => {
+                self.native_reply = Some((NativeReply::UdpAbort, piu));
+                self.drive_queues()
+            }
+            None => {
+                self.native.close()?;
+                self.udp_abort_completed = true;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn take_completed_udp_abort(&mut self) -> bool {
+        std::mem::take(&mut self.udp_abort_completed)
     }
 
     pub fn poll_native_once(&mut self) -> io::Result<()> {
@@ -220,6 +260,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     } else if let Some(bytes) = self.udp_expedited_pending.take() {
                         self.bridge.complete_mptn_udp_expedited(bytes)?;
                         self.udp_expedited_completed = true;
+                    } else if self.udp_abort_pending {
+                        self.udp_abort_pending = false;
+                        self.udp_abort_completed = true;
                     } else if self.bridge.phase() == Phase::AwaitNativeNormalAck {
                         self.bridge.acknowledge_native_normal(n)?;
                     } else {
@@ -385,6 +428,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                 }
                 NativeReply::UserNormal => self.bridge.mark_native_normal_enqueued(&piu)?,
                 NativeReply::UdpExpedited => self.udp_expedited_pending = Some(piu.len()),
+                NativeReply::UdpAbort => self.udp_abort_pending = true,
             }
         }
         if let Some(record) = self.connect.take() {
@@ -474,6 +518,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.attach_fully_sent = false;
             self.udp_expedited_pending = None;
             self.udp_expedited_completed = false;
+            self.udp_abort_pending = false;
+            self.udp_abort_completed = false;
             self.native.close()?;
         }
         Ok(())

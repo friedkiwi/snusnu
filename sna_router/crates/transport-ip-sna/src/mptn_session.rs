@@ -157,7 +157,8 @@ pub fn connect_template_for_route(
         destination: encode_lu_name(destination_lu)?,
         correlator: correlator.to_vec(),
         requirements: TransportRequirements {
-            max_record: MAX_RECORD as u32,
+            // Match the V5R4 user Connect profile observed on Solstice.
+            max_record: 0x8005,
             max_expedited: 0x76,
             max_termination: 0x76,
         },
@@ -181,11 +182,6 @@ pub fn connect_template_for_route(
                 kind: 0x19,
                 processing: 0x0a,
                 value: vec![0x00, 0x20, 0x01, 0x03, 0x10, 0x83],
-            },
-            OptionalField {
-                kind: 0x1a,
-                processing: 0,
-                value: vec![0x84],
             },
         ],
     };
@@ -537,6 +533,36 @@ impl GatewaySession {
         self.expedited.complete_native_delivery(reduced)
     }
 
+    /// Build a native UNBIND from UDP X'83' termination data. An empty Abort
+    /// closes the circuit without a native PIU. Only normal-end UNBIND is
+    /// admitted; other session-control RUs need their own converter.
+    pub fn mptn_udp_abort(&mut self, reduced: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let State::Established { native } = self.state else {
+            return Err(state_error("gateway session not established"));
+        };
+        let piu = if reduced.is_empty() {
+            None
+        } else {
+            if reduced.len() < 7
+                || reduced[2..7] != [0x6b, 0x80, 0, 0x32, 0x01]
+                || reduced.len() > MAX_RECORD - 4
+            {
+                return Err(invalid("UDP X'83' Abort is not supported UNBIND"));
+            }
+            let mut piu = Vec::with_capacity(reduced.len() + 4);
+            piu.extend_from_slice(&[
+                0x2d | (u8::from(native.odai) << 1),
+                0,
+                native.oaf,
+                native.daf,
+            ]);
+            piu.extend_from_slice(reduced);
+            Some(piu)
+        };
+        self.close();
+        Ok(piu)
+    }
+
     /// Without the UDP out-of-band fallback, an expired expedited ACK
     /// deadline retires the entire bridged session.
     pub fn expedited_ack_timed_out(&mut self) -> io::Result<()> {
@@ -683,7 +709,7 @@ mod tests {
                 .iter()
                 .map(|field| field.kind)
                 .collect::<Vec<_>>(),
-            [0x05, 0x0a, 0x18, 0x19, 0x1a]
+            [0x05, 0x0a, 0x18, 0x19]
         );
 
         let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();

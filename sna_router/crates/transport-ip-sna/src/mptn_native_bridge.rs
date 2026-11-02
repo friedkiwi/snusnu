@@ -422,6 +422,15 @@ impl Bridge {
         self.gateway.complete_native_expedited_delivery(piu_bytes)
     }
 
+    pub fn next_mptn_udp_abort(&mut self, reduced: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        let piu = self.gateway.mptn_udp_abort(reduced)?;
+        self.phase = Phase::Closed;
+        Ok(piu)
+    }
+
     /// Commit the exact PIU after it enters the native LLC egress queue.
     /// Failed enqueue attempts leave both the prepared PIU and TCP credit.
     pub fn mark_native_normal_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {

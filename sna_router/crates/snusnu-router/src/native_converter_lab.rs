@@ -425,9 +425,8 @@ fn observe_udp(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
-/// The sustained reverse diagnostic can answer node-pair keepalives. An
-/// X'83' request is admitted by correlator and held without a positive ACK
-/// until the native edge gains an expedited/abort delivery API.
+/// The sustained reverse diagnostic answers node-pair keepalives and holds
+/// X'83' positive responses until native delivery is confirmed.
 fn observe_outbound_udp(
     socket: &UdpSocket,
     oob: &mut OutboundUdp,
@@ -439,12 +438,16 @@ fn observe_outbound_udp(
         reduced,
     }) = oob.unsubmitted_delivery()
     {
-        if compensation == transport_ip_sna::mptn_oob::Compensation::Expedited {
-            match edge.submit_udp_expedited(&reduced) {
-                Ok(()) => oob.mark_native_submitted(sequence)?,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
+        let submit = match compensation {
+            transport_ip_sna::mptn_oob::Compensation::Expedited => {
+                edge.submit_udp_expedited(&reduced)
             }
+            transport_ip_sna::mptn_oob::Compensation::Abort => edge.submit_udp_abort(&reduced),
+        };
+        match submit {
+            Ok(()) => oob.mark_native_submitted(sequence)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
         }
     }
     let mut packet = [0u8; MAX_RECORD];
@@ -461,21 +464,23 @@ fn observe_outbound_udp(
                 sequence,
                 compensation,
                 reduced,
-            } => match compensation {
-                transport_ip_sna::mptn_oob::Compensation::Expedited => {
-                    match edge.submit_udp_expedited(&reduced) {
-                        Ok(()) => oob.mark_native_submitted(sequence)?,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                        Err(error) => return Err(error),
+            } => {
+                let submit = match compensation {
+                    transport_ip_sna::mptn_oob::Compensation::Expedited => {
+                        edge.submit_udp_expedited(&reduced)
                     }
-                    tracing::debug!(source = %source, sequence, "outbound UDP X'83' expedited queued to native LLC");
-                    Ok(())
+                    transport_ip_sna::mptn_oob::Compensation::Abort => {
+                        edge.submit_udp_abort(&reduced)
+                    }
+                };
+                match submit {
+                    Ok(()) => oob.mark_native_submitted(sequence)?,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
                 }
-                transport_ip_sna::mptn_oob::Compensation::Abort => Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "native UDP X'83' abort delivery is unavailable",
-                )),
-            },
+                tracing::debug!(source = %source, sequence, ?compensation, "outbound UDP X'83' queued to native LLC");
+                Ok(())
+            }
         },
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
         Err(error) => Err(error),
@@ -486,8 +491,20 @@ fn complete_outbound_udp(
     socket: &UdpSocket,
     oob: &mut OutboundUdp,
     edge: &mut GatewayEdge<NativeLlcPort>,
-) -> io::Result<()> {
-    if edge.take_completed_udp_expedited() {
+) -> io::Result<bool> {
+    let expedited = edge.take_completed_udp_expedited();
+    let abort = edge.take_completed_udp_abort();
+    if expedited || abort {
+        let expected = if abort {
+            transport_ip_sna::mptn_oob::Compensation::Abort
+        } else {
+            transport_ip_sna::mptn_oob::Compensation::Expedited
+        };
+        if oob.pending_compensation() != Some(expected) {
+            return Err(invalid(
+                "native UDP completion type differs from X'83' request",
+            ));
+        }
         let sequence = oob
             .pending_sequence()
             .ok_or_else(|| invalid("native UDP completion has no X'83' request"))?;
@@ -496,8 +513,12 @@ fn complete_outbound_udp(
             return Err(invalid("partial MPTN UDP X'83' acknowledgement"));
         }
         tracing::debug!(sequence, peer = %peer, "outbound UDP X'83' acknowledged after native LLC completion");
+        if abort {
+            edge.close()?;
+            return Ok(true);
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Inspect one reverse TCP/397 connection from the configured V5 peer. A
@@ -733,7 +754,7 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
         remote_ip = %remote_ip,
         local_lu = %local_lu,
         remote_lu = %remote_lu,
-        "experimental V5 flow lab opened; X83 expedited enabled, abort unavailable; no production route advertised"
+        "experimental V5 flow lab opened; X83 expedited and UNBIND abort enabled; no production route advertised"
     );
     let mut first_attach_seen = false;
     let outcome = (|| -> io::Result<&'static str> {
@@ -760,7 +781,9 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
             let before = flow_snapshot(&edge);
             edge.poll_native_once()?;
             log_flow_change(&edge, before, "native", remote_ip);
-            complete_outbound_udp(&udp, &mut outbound_udp, &mut edge)?;
+            if complete_outbound_udp(&udp, &mut outbound_udp, &mut edge)? {
+                return Ok("remote UDP abort");
+            }
             if edge.is_closed() {
                 return Ok("native peer closed");
             }
