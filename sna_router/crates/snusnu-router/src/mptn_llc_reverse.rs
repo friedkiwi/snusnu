@@ -13,7 +13,7 @@ use crate::{
     runtime::LlcPeer,
     STOP,
 };
-use router_core::{xid3::Role, xid3_local::LocalLlcProfile};
+use router_core::{fid2_session_control::ManagementBind, xid3::Role, xid3_local::LocalLlcProfile};
 use std::{
     fs::File,
     io::{self, Read},
@@ -243,24 +243,45 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
         .management_bind()
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "native management BIND timed out"))?
         .clone();
-    let bridge = Bridge::new(
+    run_bridge(
+        native,
+        socket,
+        config.endpoint,
+        &config.interface,
+        &config.source_lu,
+        &config.destination_lu,
+        Some(config.user_tp),
+        management,
+    )
+}
+
+fn run_bridge(
+    native: NativeLlcPort,
+    socket: UdpSocket,
+    endpoint: OutboundEndpoint,
+    interface: &str,
+    source_lu: &str,
+    destination_lu: &str,
+    user_tp: Option<[u8; 4]>,
+    management: ManagementBind,
+) -> io::Result<()> {
+    let policy =
         BindPolicy {
-            plu: config.source_lu.clone(),
-            slu: config.destination_lu.clone(),
+            plu: source_lu.to_owned(),
+            slu: destination_lu.to_owned(),
             mode: None,
             allow_blank_mode: true,
             max_pending_bytes: MAX_RECORD,
-        },
-        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?,
-        management,
-        config.user_tp,
-        1,
-    )?;
-    let connect =
-        connect_template_for_route(&config.source_lu, &config.destination_lu, new_correlator()?)?;
-    let mut oob = OutboundUdp::new(config.endpoint, connect.clone())?;
-    let mut edge = config
-        .endpoint
+        };
+    let available = CompensationSet::from_codes(&TCP62_REQUIRED)
+        .map_err(|error| invalid(error.to_string()))?;
+    let bridge = match user_tp {
+        Some(tp) => Bridge::new(policy, available, management, tp, 1)?,
+        None => Bridge::new_dynamic_tp(policy, available, management, 1)?,
+    };
+    let connect = connect_template_for_route(source_lu, destination_lu, new_correlator()?)?;
+    let mut oob = OutboundUdp::new(endpoint, connect.clone())?;
+    let mut edge = endpoint
         .open_edge(Duration::from_secs(5), native, bridge, connect)?;
     let mut first_attach_seen = false;
     let result = (|| -> io::Result<()> {
@@ -276,7 +297,7 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
             edge.flush_tcp()?;
             if !first_attach_seen && edge.first_attach_delivery_complete() {
                 first_attach_seen = true;
-                tracing::info!(interface = %config.interface, peer_ip = %config.endpoint.peer_ip, source_lu = %config.source_lu, destination_lu = %config.destination_lu, "first LU6.2 Attach delivered to MPTN peer");
+                tracing::info!(interface, peer_ip = %endpoint.peer_ip, source_lu, destination_lu, "first LU6.2 Attach delivered to MPTN peer");
             }
             if first_attach_seen || !edge.ipr_ack_outstanding() {
                 match edge.poll_tcp_once() {
@@ -302,8 +323,65 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
             "MPTN session ended before first Attach",
         ));
     }
-    tracing::info!(interface = %config.interface, peer_ip = %config.endpoint.peer_ip, first_attach_seen, "LLC to MPTN reverse session closed");
+    tracing::info!(interface, peer_ip = %endpoint.peer_ip, first_attach_seen, "LLC to MPTN reverse session closed");
     Ok(())
+}
+
+/// Run an automatic LLC-originated circuit from an already selected native
+/// association and an exclusive UDP/397 socket. The management BIND supplies
+/// the network-qualified LU pair; the first validated Attach supplies the TP.
+/// The caller retains ownership of listener admission and destination choice.
+pub(crate) fn run_with_native(
+    mut native: NativeLlcPort,
+    socket: UdpSocket,
+    endpoint: OutboundEndpoint,
+    interface: &str,
+    timeout: Duration,
+) -> io::Result<()> {
+    if timeout.is_zero() || timeout > Duration::from_secs(600) {
+        return Err(invalid("automatic LLC to MPTN setup timeout is invalid"));
+    }
+    socket.set_nonblocking(true)?;
+    let deadline = Instant::now() + timeout;
+    while native.management_bind().is_none()
+        && !STOP.load(Ordering::Relaxed)
+        && Instant::now() < deadline
+    {
+        match native.receive_once()? {
+            None => thread::sleep(IDLE_POLL),
+            Some(NativeLlcEvent::Closed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "native contact closed before management BIND",
+                ));
+            }
+            Some(_) => return Err(invalid("native user event before management BIND")),
+        }
+    }
+    let management = native
+        .management_bind()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "native management BIND timed out"))?
+        .clone();
+    let source_lu = management.plu().to_owned();
+    let destination_lu = management.slu().to_owned();
+    parse_cp(&source_lu)?;
+    parse_cp(&destination_lu)?;
+    endpoint.establish_v5_management(
+        timeout.min(Duration::from_secs(5)),
+        &source_lu,
+        &destination_lu,
+    )?;
+    tracing::info!(interface, peer_ip = %endpoint.peer_ip, source_lu, destination_lu, "automatic LLC to MPTN management established");
+    run_bridge(
+        native,
+        socket,
+        endpoint,
+        interface,
+        &source_lu,
+        &destination_lu,
+        None,
+        management,
+    )
 }
 
 fn format_mac(mac: [u8; 6]) -> String {
