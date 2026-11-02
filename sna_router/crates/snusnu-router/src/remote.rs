@@ -1837,8 +1837,10 @@ impl AutoDirectory {
     pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName) -> io::Result<Option<[u8; 6]>> {
         let mut found = None;
         for (mac, (name, candidates)) in &self.managed {
-            if name != cp || !candidates.iter().any(|candidate|
-                self.route_for_reference(candidate).is_some())
+            if name != cp || !candidates.iter().any(|candidate| matches!(
+                self.route_for_reference(candidate).and_then(|route| route.resource.as_ref()),
+                Some(wire::route_export::Resource::ControlPoint(route_cp)) if route_cp == cp
+            ))
             { continue; }
             if found.replace(*mac).is_some() {
                 return Err(protocol("ambiguous managed MAC for CP"));
