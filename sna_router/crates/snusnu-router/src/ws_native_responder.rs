@@ -445,12 +445,19 @@ impl<P: RoutePort> NativeLeg for WsNativeResponder<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use router_core::{xid3::Role, xid3_local::LocalLlcProfile};
+    use crate::native_type1::NativeType1;
+    use router_core::{
+        xid3::{Role, Xid3},
+        xid3_activation::Phase,
+        xid3_local::LocalLlcProfile,
+    };
     use std::{cell::RefCell, rc::Rc};
 
     #[derive(Default)]
     struct State {
         type1: Vec<Vec<u8>>,
+        information: Vec<Vec<u8>>,
+        completed: usize,
         disconnected: bool,
     }
 
@@ -464,8 +471,10 @@ mod tests {
             Ok(Vec::new())
         }
         fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> {
-            if let RoutedUnit::DlcType1(pdu) = unit {
-                self.0.borrow_mut().type1.push(pdu);
+            match unit {
+                RoutedUnit::DlcType1(pdu) => self.0.borrow_mut().type1.push(pdu),
+                RoutedUnit::SnaInformation(piu) => self.0.borrow_mut().information.push(piu),
+                _ => return Err(invalid("unexpected fake route unit")),
             }
             Ok(true)
         }
@@ -477,6 +486,9 @@ mod tests {
         }
         fn on_peer_ready(&mut self) -> io::Result<()> {
             Ok(())
+        }
+        fn take_completed_information_count(&mut self) -> usize {
+            std::mem::take(&mut self.0.borrow_mut().completed)
         }
         fn disconnect(&mut self) -> io::Result<()> {
             self.0.borrow_mut().disconnected = true;
@@ -511,6 +523,44 @@ mod tests {
             "QABOB.SNAB",
         )
         .unwrap()
+    }
+
+    fn decoded_hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn make_ready(leg: &mut WsNativeResponder<FakePort>) {
+        let peer_xid = LocalLlcProfile {
+            cp_name: "QAALICE.SNAA".into(),
+            station_name: "ALICE".into(),
+            node_id: [0, 0, 0, 1],
+            tg_number: 1,
+            max_receive_btu: 1496,
+            max_iframes_before_ack: 1,
+            role: Role::Primary,
+        }
+        .build()
+        .unwrap();
+        let mut peer = NativeType1::new(peer_xid).unwrap();
+        leg.arm_inbound().unwrap();
+        let mut next = leg.inner.0.borrow().type1.last().unwrap().clone();
+        for _ in 0..8 {
+            let reply = peer.on_pdu(&next).unwrap().unwrap();
+            peer.confirm_sent(&reply).unwrap();
+            let response = leg.cp.receive_type1(&reply.pdu).unwrap().unwrap();
+            leg.cp.confirm_sent(&response).unwrap();
+            next = response;
+            if peer.phase() == Phase::ReadyForSabme && leg.cp.xid_ready() {
+                break;
+            }
+        }
+        assert_eq!(peer.phase(), Phase::ReadyForSabme);
+        leg.cp.receive_link_ready().unwrap();
+        assert!(leg.cp.ready());
     }
 
     #[test]
@@ -550,5 +600,33 @@ mod tests {
             "QABOB.SNAB",
         )
         .is_err());
+    }
+
+    #[test]
+    fn management_bind_response_requires_exact_websocket_completion() {
+        let state = Rc::new(RefCell::new(State::default()));
+        let mut leg = responder(state.clone());
+        make_ready(&mut leg);
+        // Sanitized QAALICE to QABOB SNASVCMG BIND from the native lab.
+        let bind = decoded_hex(concat!(
+            "2d00010200006b800031001307b0b0513307878686870706020000000000000094434000",
+            "0cd8c1c1d3c9c3c54be2d5c1c12e000902e2d5c1e2e5c3d4c7",
+            "09030123f4fd39d800000d04d8c1c1d3c9c3c54be2d5c1c1",
+            "0a1300b023f4fd39d80000000ad8c1c2d6c24be2d5c1c2",
+            "6015d8e7221f0a531d820cd8c1c1d3c9c3c54be2d5c1c1",
+            "2c0a04087bc3d6d5d5c5c3e3"
+        ));
+        leg.process_information(bind).unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::AwaitBindAck);
+        assert_eq!(state.borrow().information.len(), 1);
+        assert_eq!(
+            &state.borrow().information[0][..9],
+            &[0x2d, 0, 2, 1, 0, 0, 0xeb, 0x80, 0]
+        );
+        leg.complete_egress().unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::AwaitBindAck);
+        state.borrow_mut().completed = 1;
+        leg.complete_egress().unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::AwaitAttach);
     }
 }
