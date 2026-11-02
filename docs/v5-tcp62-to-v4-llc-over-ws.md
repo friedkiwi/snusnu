@@ -20,7 +20,7 @@ The difficult part was A's virtual APPN CP/link and management-session behavior.
 
 ## Open-time source identity
 
-The v2 `OpenRequest` includes both target and source `RouteReference` values. Go verifies that the source LU belongs to the authenticated router's current route snapshot and the target LU is live; `IncomingOpen` carries the validated source reference. For a local LLC route, Rust currently selects a destination with `[[concentrator]] target_lu = "DSTNET.LUB"` and `target_cp = "DSTNET.CPB"`. A TCP62 gateway derives that selection from its local `[[mptn_gateway]]` definition. The additive fields are:
+The v2 `OpenRequest` includes both target and source `RouteReference` values. Go verifies that the source LU belongs to the authenticated router's current route snapshot and the target LU is live; `IncomingOpen` carries the validated source reference. For a local LLC route, Rust currently selects a destination with `[[concentrator]] target_lu = "DSTNET.LUB"` and `target_cp = "DSTNET.CPB"`. A TCP62 gateway derives that selection from its local `[[mptn]] profile = "gateway"` definition, which accepts an IBM AnyNet/400 peer. The additive fields are:
 
 ```protobuf
 message OpenRequest {

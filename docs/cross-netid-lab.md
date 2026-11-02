@@ -52,16 +52,17 @@ Configure only the copied OS/400 guests after they reach Main Menu:
 The end-to-end route reached the remote V4R4 Sign On twice; the eighth run
 remained active past the former 180-second lab deadline. It currently uses
 the opt-in `--mptn-ws-gateway-lab` path. The ordinary `--config` runtime
-keeps `[[mptn_gateway]]` gated because native session addressing still uses
+keeps the `[[mptn]] profile = "gateway"` path gated because native session addressing still uses
 the QA fixture's address and the gateway handles one user session per run.
 The X'83' UDP completion and teardown handlers are implemented and covered
 by focused tests, but have not been exercised against a live OS/400 UDP
 exchange. The `SOLNET` regression guests remain separate from this lab.
 The preserved QA router TOML files record the exact successful run but need
 conversion before reuse: their `[[remote]]` entries repeat local export
-fields that the current loader rejects. Use `[[concentrator]]` with `url`,
+fields that the current loader rejects, and Bob's old `[[mptn_gateway]]`
+section predates the unified MPTN config. Use `[[concentrator]]` with `url`,
 `token`, and any needed destination selector; declare the local CP and LUs
-on `[[llc]]` or `[[mptn_gateway]]` once. See
+on `[[llc]]` or `[[mptn]] profile = "gateway"` once. See
 [router configuration](router-config.md).
 
 ## Prepared clone state

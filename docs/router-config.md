@@ -60,12 +60,13 @@ lu_types = { "SOLNET.PAYROLL" = ["lu_6_2"] }
 
 Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, and `lu_6_2`. These values are publisher declarations, not proof of a successful BIND negotiation.
 
-The opt-in V5R4 TCP62 gateway uses its `[[mptn_gateway]]` definition as the
+The opt-in V5R4 TCP62 gateway uses its `[[mptn]]` gateway definition as the
 source of local CP/LU exports and the remote destination names. It therefore
 needs no CP/LU fields or Ethernet MAC address on `[[concentrator]]`:
 
 ```toml
-[[mptn_gateway]]
+[[mptn]]
+profile = "gateway"
 id = "bob-v5"
 local_ip = "10.99.4.11"
 peer_ip = "10.99.4.3"
@@ -141,19 +142,23 @@ to = "ee_b"
 
 The loader requires `experimental = true` and rejects HPR LAN routes to LLC, AnyNet, WebSocket or another HPR LAN port. It still returns an explicit unsupported error for the HPR LAN to EE pair. The HPR LAN adapter negotiates its HPR SAP from XID3; no fixed `0xC8` SAP is configured. The [direct V5R4 HPR LAN baseline](hpr-lan-lab.md) documents the guest configuration used to validate the adapter.
 
-## Constrained AnyNet relay
+## MPTN support for IBM AnyNet peers
 
-Two `[[anynet]]` ports can form a standalone AnyNet↔AnyNet route. Each port binds TCP and UDP port 397 on its `local_ip` and accepts only the configured `peer_ip`. The adapter handles **one TCP62 LU6.2 session at a time** and validates complete MPTN records before forwarding them. It also validates and rewrites IPv4 UDP/397 node-pair keepalives (`0x84`), including response correlation. UDP/397 expedited traffic (`0x83`) and unknown datagrams close the routed session because their session semantics are not yet supported. This is a constrained AnyNet relay, not a general MPTN gateway.
+IBM calls its implementation of Multiprotocol Transport Networking (MPTN) **AnyNet**; the Rust config uses the protocol name. A `relay` profile forwards MPTN records between two IP peers, while a `gateway` profile converts one MPTN LU6.2 session to a native SNA circuit. These profiles need different session handling, so the `profile` field is required. [IBM's glossary](https://www.ibm.com/docs/en/i/7.4.0?topic=glossary-) describes the AnyNet and MPTN relationship.
+
+Two `[[mptn]]` relay ports can form a standalone IP-to-IP route for AnyNet peers. Each port binds TCP and UDP port 397 on its `local_ip` and accepts only the configured `peer_ip`. The adapter handles **one TCP62 LU6.2 session at a time** and validates complete MPTN records before forwarding them. It also validates and rewrites IPv4 UDP/397 node-pair keepalives (`0x84`), including response correlation. UDP/397 expedited traffic (`0x83`) and unknown datagrams close the routed session because their session semantics are not yet supported. This is a constrained MPTN relay.
 
 ```toml
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "mptn_a"
 local_ip = "192.0.2.1"
 peer_ip = "192.0.2.11"
 local_lu = "SOLNET.SNAA"
 remote_lu = "SOLNET.SNAB"
 
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "mptn_b"
 local_ip = "192.0.2.2"
 peer_ip = "192.0.2.12"
@@ -165,11 +170,11 @@ from = "mptn_a"
 to = "mptn_b"
 ```
 
-Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 397 requires root or `CAP_NET_BIND_SERVICE`. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate AnyNet listener IPs and routes between AnyNet and LLC, EE or WebSocket profiles until a session converter is implemented. IBM's AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
+Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 397 requires root or `CAP_NET_BIND_SERVICE`. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate MPTN listener IPs and routes between a relay profile and LLC, EE or WebSocket profiles until a session converter is implemented. IBM AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
 
 The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the configured TCP relay.
 
-## LLC to AnyNet gateway route intent
+## LLC to MPTN gateway route intent
 
 The route syntax reserves an explicit converter for a future native LU6.2 to MPTN gateway:
 

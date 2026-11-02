@@ -1,6 +1,6 @@
 # AnyNet V5R4 baseline
 
-Two V5R4 OS/400 guests completed a direct AnyNet pass-through and a second pass-through through the Rust AnyNet↔AnyNet proxy on 2026-11-01. A's `STRPASTHR RMTLOCNAME(SNAB)` reached B's remote Sign On and Main Menu; `ENDPASTHR` returned to A in both runs. These are TCP62 peer baselines and do not demonstrate LLC2↔AnyNet conversion.
+Two V5R4 OS/400 guests completed a direct AnyNet pass-through and a second pass-through through the Rust MPTN relay on 2026-11-01. A's `STRPASTHR RMTLOCNAME(SNAB)` reached B's remote Sign On and Main Menu; `ENDPASTHR` returned to A in both runs. These are TCP62 peer baselines and do not demonstrate LLC2↔AnyNet conversion. The current Rust config calls this `[[mptn]] profile = "relay"`; IBM's AnyNet is the guest implementation.
 
 The guests were writable clones of a private V5R4 network template. They had distinct Ethernet MACs and IP addresses: A `SOLNET.SNAA` / `10.99.4.2` on `sol6`, B `SOLNET.SNAB` / `10.99.4.3` on `sol7`. Only these two TAPs were connected by an isolated `br-ip-sna` bridge. See the [EE lab](ee-lab.md) for the clone identity and IP setup; HPRIP controllers were varied off for this AnyNet run.
 
@@ -22,19 +22,21 @@ The unfiltered `sol6` capture showed a TCP connection from A to B port 397, a 23
 
 The Rust [TCP62 codec](../sna_router/crates/transport-ip-sna/src/mptn_connect.rs) now accepts both observed Connect headers. Its BIND-to-FID2 converter is limited to complete normal PIUs after session establishment. The full LLC2↔AnyNet gateway still needs APPN control handling, BIND/session correlation, pacing, expedited traffic, segmentation, UDP keepalive, and teardown behavior.
 
-## Rust AnyNet proxy
+## Rust MPTN relay for AnyNet peers
 
 For the proxy run, remove `sol6` and `sol7` from the direct bridge. Assign `10.99.4.10/32` to `sol6` and `10.99.4.11/32` to `sol7`, with host routes to guest A `.2` via `sol6` and guest B `.3` via `sol7`, as in the [EE lab](ee-lab.md). Change A's host alias `SNAB.SOLNET.SNA.IBM.COM` to `.10` and B's `SNAA.SOLNET.SNA.IBM.COM` alias to `.11`. Keep the HPRIP controllers off and vary the AnyNet controllers on after starting the router.
 
 ```toml
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "mptn_a"
 local_ip = "10.99.4.10"
 peer_ip = "10.99.4.2"
 local_lu = "SOLNET.SNAA"
 remote_lu = "SOLNET.SNAB"
 
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "mptn_b"
 local_ip = "10.99.4.11"
 peer_ip = "10.99.4.3"
