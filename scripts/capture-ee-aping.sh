@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture the complete Solstice TAP while an operator runs one EE APING trial.
+# Capture the complete TAP while an operator runs one EE APING trial.
 # OS/400 emits IPv4 inside 802.3 SNAP frames, so a tcpdump UDP filter misses it.
 set -euo pipefail
 
