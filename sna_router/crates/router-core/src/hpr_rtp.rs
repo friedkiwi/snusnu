@@ -22,6 +22,8 @@ pub enum RtpError {
     UnsupportedConnectionQualifier,
     InvalidConnectionQualifier,
     InvalidOptionalSegments,
+    InvalidConnectionIdentifierExchange,
+    DuplicateConnectionIdentifierExchange,
 }
 
 /// A word-aligned RTP optional segment. The payload includes any segment
@@ -221,6 +223,33 @@ impl<'a> RtpPacket<'a> {
             remaining = &remaining[length..];
         }
         Ok(segments)
+    }
+
+    /// Read the optional Connection Identifier Exchange (X'10') segment, if
+    /// present. IBM SNA Formats GA27-3136-20, p. 2-18, defines its 12-byte
+    /// shape and full 64-bit assigned TCID. This is evidence only: it neither
+    /// correlates a connection nor accepts the assignment or sends a reply.
+    pub fn connection_identifier_exchange(self) -> Result<Option<u64>, RtpError> {
+        let mut assigned = None;
+        for segment in self.optional_segments()? {
+            if segment.key != 0x10 {
+                continue;
+            }
+            if assigned.is_some() {
+                return Err(RtpError::DuplicateConnectionIdentifierExchange);
+            }
+            if segment.data.len() != 10 || segment.data[..2] != [0, 0] {
+                return Err(RtpError::InvalidConnectionIdentifierExchange);
+            }
+            let tcid = u64::from_be_bytes(segment.data[2..10].try_into().unwrap());
+            // CIE carries a sender-assigned TCID (bit 0 set); bit 1 is
+            // reserved. Those are the two high-order bits of the 64-bit ID.
+            if tcid & 0xc000_0000_0000_0000 != 0x8000_0000_0000_0000 {
+                return Err(RtpError::InvalidConnectionIdentifierExchange);
+            }
+            assigned = Some(tcid);
+        }
+        Ok(assigned)
     }
 }
 
@@ -464,6 +493,25 @@ mod tests {
 
     fn fragment<'a>(bytes: &'a [u8]) -> RtpPacket<'a> {
         RtpPacket::parse(bytes).unwrap()
+    }
+
+    fn synthetic_cie_header(segments: &[u8]) -> Vec<u8> {
+        assert_eq!(segments.len() % 4, 0);
+        let mut nlp = vec![0xc2, 0x08, 0xa4, 0, 0xff, 0];
+        let mut thdr = [0u8; 20];
+        thdr[..8].copy_from_slice(&0x0015_f7e9_1300_0040u64.to_be_bytes());
+        thdr[9] = 0x04; // OSI
+        thdr[10..12].copy_from_slice(&((20 + segments.len()) as u16 / 4).to_be_bytes());
+        nlp.extend_from_slice(&thdr);
+        nlp.extend_from_slice(segments);
+        nlp
+    }
+
+    fn synthetic_cie(tcid: u64) -> [u8; 12] {
+        let mut segment = [0u8; 12];
+        segment[..2].copy_from_slice(&[3, 0x10]);
+        segment[4..12].copy_from_slice(&tcid.to_be_bytes());
+        segment
     }
 
     #[test]
@@ -814,6 +862,67 @@ mod tests {
         assert_eq!(
             assembler.observe(fragment(&other)),
             Err(AssemblyError::WrongConnection)
+        );
+    }
+
+    #[test]
+    fn reads_full_cie_tcid_from_sanitized_v5r4_reply_shape() {
+        // The capture's first reverse packet has a 20-byte STATUS segment
+        // followed by a 12-byte CIE. All IDs and segment bodies here are
+        // synthetic; no application data is retained.
+        let assigned = 0x8000_0001_0000_0002u64;
+        let mut segments = vec![5, 0x0e];
+        segments.resize(20, 0);
+        segments.extend_from_slice(&synthetic_cie(assigned));
+        let nlp = synthetic_cie_header(&segments);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Ok(Some(assigned))
+        );
+        let no_cie = synthetic_cie_header(&segments[..20]);
+        assert_eq!(fragment(&no_cie).connection_identifier_exchange(), Ok(None));
+    }
+
+    #[test]
+    fn cie_rejects_truncation_reserved_fields_and_duplicates() {
+        let assigned = 0x8000_0001_0000_0002u64;
+        let mut segment = synthetic_cie(assigned);
+        segment[0] = 4; // Claims four words but THDR contains three.
+        let nlp = synthetic_cie_header(&segment);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Err(RtpError::InvalidOptionalSegments)
+        );
+        let nlp = synthetic_cie_header(&[2, 0x10, 0, 0, 0x80, 0, 0, 1]);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Err(RtpError::InvalidConnectionIdentifierExchange)
+        );
+        let mut segment = synthetic_cie(assigned);
+        segment[2] = 1;
+        let nlp = synthetic_cie_header(&segment);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Err(RtpError::InvalidConnectionIdentifierExchange)
+        );
+        let segment = synthetic_cie(0xc000_0001_0000_0002);
+        let nlp = synthetic_cie_header(&segment);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Err(RtpError::InvalidConnectionIdentifierExchange)
+        );
+        let segment = synthetic_cie(0x0000_0001_0000_0002);
+        let nlp = synthetic_cie_header(&segment);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Err(RtpError::InvalidConnectionIdentifierExchange)
+        );
+        let mut segments = synthetic_cie(assigned).to_vec();
+        segments.extend_from_slice(&synthetic_cie(assigned));
+        let nlp = synthetic_cie_header(&segments);
+        assert_eq!(
+            fragment(&nlp).connection_identifier_exchange(),
+            Err(RtpError::DuplicateConnectionIdentifierExchange)
         );
     }
 }
