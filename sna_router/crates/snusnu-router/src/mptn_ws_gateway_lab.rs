@@ -254,6 +254,10 @@ pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> i
     // until STOP or a correlated transport/session close.
     while !STOP.load(Ordering::Relaxed) && (tcp.user_active() || Instant::now() < deadline) {
         pump_virtual(&mut virtual_port)?;
+        if virtual_port.user_closed() {
+            tracing::info!("TCP62 user session closed after native teardown");
+            return Ok(());
+        }
         if virtual_port.take_expedited_native_completed() {
             tcp.complete_tcp_expedited()?;
         }
@@ -325,6 +329,10 @@ pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> i
                         pending_udp_input = Some((sequence, reduced, true));
                     }
                 }
+                GatewayEvent::OutboundUdpAbortAcknowledged => {
+                    virtual_port.complete_udp_abort_response()?;
+                    tracing::info!("native UNBIND acknowledged by TCP62 UDP peer");
+                }
                 GatewayEvent::Closed => {
                     if virtual_port.user_closed() {
                         tracing::info!("TCP62 user session closed after native teardown");
@@ -341,6 +349,11 @@ pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> i
             }
         }
         if tcp.user_active() {
+            if let Some(record) = virtual_port.udp_abort_record().cloned() {
+                if tcp.queue_udp_abort(&record)? {
+                    virtual_port.mark_udp_abort_enqueued(&record)?;
+                }
+            }
             if let Some(record) = virtual_port.tcp_user_record().cloned() {
                 if tcp.queue_user_record(&record)? {
                     virtual_port.mark_tcp_user_record_enqueued(&record)?;
