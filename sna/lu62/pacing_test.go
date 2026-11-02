@@ -5,6 +5,7 @@ import "testing"
 func TestPacingResponseForms(t *testing.T) {
 	for _, data := range [][]byte{
 		{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0},
+		{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0, 0, 0, 3},
 		{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0, 0, 0, 6},
 	} {
 		if !IsPacingResponse(data) {

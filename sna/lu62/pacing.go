@@ -8,10 +8,10 @@ import (
 var ErrPacing = errors.New("invalid fixed SNA pacing")
 
 // IsPacingResponse recognizes the empty form and the three-byte pacing
-// parameter observed from V4R4. Session code validates the FID2 addresses.
+// parameters observed from V4R4. Session code validates the FID2 addresses.
 func IsPacingResponse(data []byte) bool {
 	return len(data) == 9 && bytes.Equal(data[6:], []byte{0x83, 1, 0}) ||
-		len(data) == 12 && bytes.Equal(data[6:], []byte{0x83, 1, 0, 0, 0, 6})
+		len(data) == 12 && bytes.Equal(data[6:11], []byte{0x83, 1, 0, 0, 0}) && (data[11] == 3 || data[11] == 6)
 }
 
 // FixedPacing tracks one-stage session pacing in both directions. The caller

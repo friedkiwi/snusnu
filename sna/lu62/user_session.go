@@ -46,6 +46,7 @@ type UserSession struct {
 	turnGrant          []byte
 	turnReply          []byte
 	turnPI             bool
+	turnPositive       bool
 	turnAcks           uint8
 	turnAckGoal        uint8
 	confirmReply       []byte
@@ -175,7 +176,9 @@ func (s *UserSession) PrepareMappedTurn(request, responseRU []byte) ([]byte, []b
 	}
 	var reply []byte
 	var pi bool
-	if !noEcho {
+	if noEcho {
+		reply = []byte{request[0], 0, s.bindRequest[3], s.bindRequest[2], 0x80, 0, 0x83, 0xa0, 0}
+	} else {
 		var err error
 		pi, err = trial.PrepareSendRequest()
 		if err != nil {
@@ -189,7 +192,7 @@ func (s *UserSession) PrepareMappedTurn(request, responseRU []byte) ([]byte, []b
 		reply = append(reply, responseRU...)
 	}
 	s.pacing = &trial
-	s.turnGrant, s.turnReply, s.turnPI = grant, reply, pi
+	s.turnGrant, s.turnReply, s.turnPI, s.turnPositive = grant, reply, pi, noEcho
 	s.phase = UserTurnPrepared
 	return append([]byte(nil), grant...), append([]byte(nil), reply...), nil
 }
@@ -203,7 +206,7 @@ func (s *UserSession) MarkTurnSent(grant, reply []byte) error {
 			return err
 		}
 	}
-	if len(reply) != 0 {
+	if len(reply) != 0 && !s.turnPositive {
 		if err := s.pacing.MarkRequestSent(s.turnPI); err != nil {
 			return err
 		}
@@ -228,6 +231,7 @@ func (s *UserSession) AckTurn() error {
 	s.turnAcks++
 	if s.turnAcks == s.turnAckGoal {
 		s.turnGrant, s.turnReply = nil, nil
+		s.turnPositive = false
 		s.turnAcks, s.turnAckGoal = 0, 0
 		s.phase = UserActive
 	}

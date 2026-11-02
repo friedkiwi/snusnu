@@ -242,11 +242,12 @@ func TestLocalSNAAdapterActivatesStampedPeer(t *testing.T) {
 	noEcho, _ := hex.DecodeString("000812ff00000000000812ff00000000")
 	sendInfo(append([]byte{0x2e, 0, 2, 2, 0, 4, 3, 0xa1, 0}, noEcho...))
 	noEchoGrant := readInfo()
-	if !bytes.Equal(noEchoGrant, attachGrant) {
-		t.Fatalf("no-echo grant: %x", noEchoGrant)
+	noEchoResponse := readInfo()
+	if !bytes.Equal(noEchoGrant, attachGrant) || !bytes.Equal(noEchoResponse, []byte{0x2e, 0, 2, 2, 0x80, 0, 0x83, 0xa0, 0}) {
+		t.Fatalf("no-echo responses: %x %x", noEchoGrant, noEchoResponse)
 	}
 	expectTestBody(t, conn, "credit")
-	outbound += len(noEchoGrant)
+	outbound += len(noEchoGrant) + len(noEchoResponse)
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
 	sendInfo([]byte{0x2e, 0, 2, 2, 0, 5, 0x4b, 0xa0, 1, 4, 0, 6})
 	confirmReply := readInfo()

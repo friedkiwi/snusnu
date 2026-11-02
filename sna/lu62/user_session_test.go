@@ -83,10 +83,13 @@ func TestUserSessionGatesFirstAttachOnBindAck(t *testing.T) {
 	noEcho, _ := hex.DecodeString("000812ff00000000000812ff00000000")
 	request = append([]byte{0x2e, 0, 2, 2, 0, 4, 3, 0xa1, 0}, noEcho...)
 	grant, reply, err = s.PrepareMappedTurn(request, nil)
-	if err != nil || len(grant) != 9 || len(reply) != 0 {
+	if err != nil || len(grant) != 9 || !bytes.Equal(reply, []byte{0x2e, 0, 2, 2, 0x80, 0, 0x83, 0xa0, 0}) {
 		t.Fatalf("no-echo turn: %x %x %v", grant, reply, err)
 	}
 	if err := s.MarkTurnSent(grant, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckTurn(); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AckTurn(); err != nil || s.Phase() != UserActive {
