@@ -10,13 +10,13 @@ fi
 check_go=false
 check_rust=false
 check_protocol=false
-if grep -Eq '^(concentrator/|sna/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/go\.yml$)' <<< "$staged_paths"; then
+if grep -Eq '^(concentrator/|sna/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/go\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
   check_go=true
 fi
-if grep -Eq '^(sna_router/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/rust\.yml$)' <<< "$staged_paths"; then
+if grep -Eq '^(sna_router/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/rust\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
   check_rust=true
 fi
-if grep -Eq '^(docs/protocol\.md$|docs/test-vectors/|\.github/workflows/protocol\.yml$)' <<< "$staged_paths"; then
+if grep -Eq '^(docs/protocol\.md$|docs/test-vectors/|\.github/workflows/protocol\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
   check_protocol=true
 fi
 if ! $check_go && ! $check_rust && ! $check_protocol; then
@@ -75,6 +75,7 @@ if $check_protocol; then
   test -f "$check_dir/tree/docs/protocol.md"
   test -d "$check_dir/tree/docs/test-vectors"
   test -f "$check_dir/tree/docs/test-vectors/README.md"
+  grep -q '## Goals and proposed invariants' "$check_dir/tree/docs/protocol.md"
   grep -q 'No vectors are invented before the layout is defined' "$check_dir/tree/docs/test-vectors/README.md"
 fi
 
