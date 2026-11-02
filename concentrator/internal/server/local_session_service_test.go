@@ -68,11 +68,9 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 	}
 	outbound := uint64(len(bindResult.ReducedUnit))
 	ack(outbound)
-	attach := []byte{0, 1, 0x0a, 0x91, 0}
-	ru := []byte{0x2f, 5, 2, 0xff, 0, 3, 0xd1, 0, 0x40, 6, 0xc1, 0xd7, 0xc9, 0xd5, 0xc7, 0xc4}
-	for len(ru) < 47 {
-		ru = append(ru, 0)
-	}
+	attach := []byte{0, 1, 0x0a, 0x90, 0}
+	// Carrier-neutral form of the live V5R4 EE APINGD FMH-5 Attach.
+	ru, _ := hex.DecodeString("2f0502ff0003d1004006c1d7c9d5c7c400140be2d6d3d5c5e34be2d5c1c2e385edf404aa000108b024ee8df83c8000")
 	attach = append(attach, ru...)
 	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: attach}}})
 	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 {

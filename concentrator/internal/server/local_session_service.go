@@ -281,6 +281,13 @@ func (s *localSNAService) sessionManagementBIS(c *localSNACircuit, request []byt
 
 func (s *localSNAService) sessionInformation(c *localSNACircuit, request []byte) error {
 	if c.user.Phase() == lu62.UserAwaitAttach {
+		// The HPR adapter carries pacing separately and clears the carrier PI
+		// bit. The first APINGD FMH-5 Attach starts a receive window, so
+		// restore PI only for the virtual FID2 parser and pacing state.
+		if len(request) < 9 || request[6] != 0x0a || request[7] != 0x90 || request[8] != 0 {
+			return errLocalSNA
+		}
+		request[7] |= 1
 		attach, grant, err := c.user.PrepareAttach(request)
 		if err != nil || attach.TPName != "APINGD" {
 			return errLocalSNA
