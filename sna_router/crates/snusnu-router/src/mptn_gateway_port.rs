@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::local_status::{now_ms, LocalPeerStatus};
+use router_core::session::{QualifiedName, SessionIdentity};
 use std::time::Instant;
 use transport_ip_sna::{
     anynet::{bind_udp, listen_tcp, TcpKind, TcpRecord, TcpSession, MAX_RECORD},
@@ -150,9 +151,17 @@ impl MptnGatewayPort {
     /// The caller uses the destination to select one circuit egress; the
     /// source is the identity learned from the peer, not a configured alias.
     pub(crate) fn offer_lus(offer: &IngressOffer) -> io::Result<(String, String)> {
+        let source = offer.connect().source.qualified_lu()?;
+        let destination = offer.connect().destination.qualified_lu()?;
+        let identity = SessionIdentity::new(
+            source.parse::<QualifiedName>().map_err(io::Error::other)?,
+            destination
+                .parse::<QualifiedName>()
+                .map_err(io::Error::other)?,
+        );
         Ok((
-            offer.connect().source.qualified_lu()?,
-            offer.connect().destination.qualified_lu()?,
+            identity.source_lu.to_string(),
+            identity.target_lu.to_string(),
         ))
     }
 

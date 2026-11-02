@@ -17,6 +17,7 @@ pub mod llc_type1;
 pub mod native_management;
 pub mod native_management_initiator;
 pub mod packet_log;
+pub mod session;
 pub mod user_bind;
 pub mod user_fmh5;
 pub mod user_pacing;
