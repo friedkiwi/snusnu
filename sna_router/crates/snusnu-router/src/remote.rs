@@ -336,6 +336,7 @@ pub(crate) struct WsRoutePort {
     target_lu: Option<wire::SnaName>,
     target: Option<wire::RouteReference>,
     source_route: Option<wire::RouteReference>,
+    profile: wire::CircuitProfile,
     require_managed_binding: bool,
     managed_binding_seen: bool,
     managed_mac: Option<[u8; 6]>,
@@ -347,6 +348,7 @@ pub(crate) struct WsRoutePort {
     retry_delay: Duration,
     pending_type1: VecDeque<Vec<u8>>,
     pending_information: VecDeque<Vec<u8>>,
+    pending_session: VecDeque<(wire::SessionEvent, usize)>,
     // Each unit forwarded into the LLC endpoint remains retained here until
     // that endpoint's ACK releases its queue/pending I-frame slot.
     downstream_sizes: VecDeque<usize>,
@@ -355,6 +357,90 @@ pub(crate) struct WsRoutePort {
     outbound_completions: OutboundCompletions,
     inbound_open: Option<InboundOpen>,
     auto_owned: bool,
+}
+
+/// One authenticated, carrier-neutral LU session on the automatic hub's
+/// existing WebSocket. The link adapter owns RTP and local pacing; this port
+/// owns only ordered session events and circuit byte credit.
+#[allow(dead_code)] // The automatic HPR runtime will own this port after endpoint activation.
+pub(crate) struct SessionWsPort {
+    inner: WsRoutePort,
+    opened_reported: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) enum SessionWsUpdate {
+    Opened,
+    Event(wire::SessionEvent),
+    Closed,
+}
+
+#[allow(dead_code)]
+impl SessionWsPort {
+    pub(crate) fn is_open(&self) -> bool {
+        self.inner.circuit.as_ref().is_some_and(|c| c.ready)
+    }
+
+    pub(crate) fn poll(&mut self) -> io::Result<Option<SessionWsUpdate>> {
+        self.inner.maybe_open()?;
+        let result = RoutePort::poll(&mut self.inner, true)?;
+        if let Some((event, cost)) = self.inner.pending_session.pop_front() {
+            if cost != 0 {
+                self.inner.downstream_sizes.push_back(cost);
+            }
+            return Ok(Some(SessionWsUpdate::Event(event)));
+        }
+        if result.as_ref().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RouterEvent::Closed))
+        }) {
+            self.opened_reported = false;
+            return Ok(Some(SessionWsUpdate::Closed));
+        }
+        if self.is_open() && !self.opened_reported {
+            self.opened_reported = true;
+            return Ok(Some(SessionWsUpdate::Opened));
+        }
+        Ok(None)
+    }
+
+    /// False means the circuit is not ready or its byte allowance is full.
+    /// Pacing-credit events consume no circuit byte allowance.
+    pub(crate) fn send(&mut self, event: wire::SessionEvent) -> io::Result<bool> {
+        let cost = session_event_cost(&event)?;
+        let Some(circuit) = self.inner.circuit.as_ref().filter(|c| c.ready) else {
+            return Ok(false);
+        };
+        if circuit.sent_bytes.saturating_add(cost as u64) > circuit.send_allowance {
+            return Ok(false);
+        }
+        self.inner
+            .send_event(wire::circuit_event::Event::SessionEvent(event))?;
+        if let Some(circuit) = self.inner.circuit.as_mut() {
+            circuit.sent_bytes += cost as u64;
+        }
+        if cost != 0 {
+            self.inner.outbound_completions.sent(cost)?;
+        }
+        self.inner.record_circuit_status();
+        Ok(true)
+    }
+
+    /// Grant byte allowance after the destination adapter has accepted the
+    /// corresponding nonempty session units. Zero-cost pacing events need no
+    /// completion call.
+    pub(crate) fn complete_received(&mut self, count: usize) -> io::Result<()> {
+        self.inner.on_downstream_completed(count)
+    }
+
+    pub(crate) fn take_completed_send_count(&mut self) -> usize {
+        self.inner.outbound_completions.take_completed()
+    }
+
+    pub(crate) fn close(&mut self) -> io::Result<()> {
+        self.inner.disconnect()
+    }
 }
 
 impl Drop for WsRoutePort {
@@ -772,6 +858,7 @@ impl WsRoutePort {
                 source_route: source_routes
                     .as_ref()
                     .and_then(|routes| routes[index].clone()),
+                profile: wire::CircuitProfile::NativeDlc,
                 require_managed_binding,
                 managed_binding_seen: false,
                 managed_mac: None,
@@ -783,6 +870,7 @@ impl WsRoutePort {
                 retry_delay: FIRST_OPEN_RETRY,
                 pending_type1: VecDeque::new(),
                 pending_information: VecDeque::new(),
+                pending_session: VecDeque::new(),
                 downstream_sizes: VecDeque::new(),
                 outbound_completions: OutboundCompletions::default(),
                 inbound_open: None,
@@ -807,7 +895,7 @@ impl WsRoutePort {
         }
         if self.circuit.is_some()
             || self.opening
-            || self.pending_type1.is_empty()
+            || (self.profile == wire::CircuitProfile::NativeDlc && self.pending_type1.is_empty())
             || self.retry_at.is_some_and(|at| Instant::now() < at)
             || (self.require_managed_binding && self.managed_mac.is_none())
         {
@@ -839,7 +927,7 @@ impl WsRoutePort {
             target: Some(target),
             receive_allowance_bytes: INITIAL_ALLOWANCE,
             source_route: self.source_route.clone(),
-            profile: wire::CircuitProfile::NativeDlc as i32,
+            profile: self.profile as i32,
         }))
     }
 
@@ -1190,13 +1278,13 @@ impl WsRoutePort {
         };
         let accept = target_ok
             && source_ok
-            && incoming.profile == wire::CircuitProfile::NativeDlc as i32
+            && incoming.profile == self.profile as i32
             && self.circuit.is_none()
             && !self.opening
             && (!self.require_managed_binding || self.managed_mac.is_some());
         let reason = if accept {
             wire::OpenFailure::Unspecified
-        } else if incoming.profile != wire::CircuitProfile::NativeDlc as i32 {
+        } else if incoming.profile != self.profile as i32 {
             wire::OpenFailure::Unsupported
         } else if v2
             && self.target_lu.is_some()
@@ -1376,8 +1464,21 @@ impl WsRoutePort {
                 self.record_circuit_status();
                 Ok(Vec::new())
             }
-            wire::circuit_event::Event::SessionEvent(_) => {
-                Err(protocol("session event on native circuit"))
+            wire::circuit_event::Event::SessionEvent(session) => {
+                if self.profile != wire::CircuitProfile::SessionV1 {
+                    return Err(protocol("session event on native circuit"));
+                }
+                let cost = session_event_cost(&session)?;
+                if self.pending_session.len() >= MAX_PENDING_EVENTS {
+                    return Err(protocol("session event backlog full"));
+                }
+                let circuit = self.checked_circuit_mut(&event.circuit_id)?;
+                if circuit.received_bytes.saturating_add(cost as u64) > circuit.receive_allowance {
+                    return Err(protocol("session event exceeds receive allowance"));
+                }
+                circuit.received_bytes += cost as u64;
+                self.pending_session.push_back((session, cost));
+                Ok(Vec::new())
             }
         }
     }
@@ -1435,6 +1536,7 @@ impl WsRoutePort {
         self.opening = false;
         self.pending_type1.clear();
         self.pending_information.clear();
+        self.pending_session.clear();
         self.downstream_sizes.clear();
         self.outbound_completions = OutboundCompletions::default();
         self.local_ready = false;
@@ -1619,6 +1721,41 @@ impl RoutePort for WsRoutePort {
 
 fn envelope(body: wire::ws_envelope::Body) -> wire::WsEnvelope {
     wire::WsEnvelope { body: Some(body) }
+}
+
+fn session_event_cost(event: &wire::SessionEvent) -> io::Result<usize> {
+    use wire::session_event::Event;
+    let reduced = match event
+        .event
+        .as_ref()
+        .ok_or_else(|| protocol("empty session event"))?
+    {
+        Event::BindRequest(unit) | Event::Unbind(unit) => {
+            if unit.len() <= 5 {
+                return Err(protocol("session control has no RU"));
+            }
+            Some(unit.as_slice())
+        }
+        Event::BindResult(result) => Some(result.reduced_unit.as_slice()),
+        Event::Information(info) => Some(info.reduced_unit.as_slice()),
+        Event::PacingCredit(credit) => {
+            if credit.normal > 1 << 20
+                || credit.expedited > 1 << 20
+                || credit.normal + credit.expedited == 0
+            {
+                return Err(protocol("invalid session pacing credit"));
+            }
+            None
+        }
+    };
+    if let Some(unit) = reduced {
+        if !(5..=16 * 1024).contains(&unit.len()) {
+            return Err(protocol("invalid reduced session unit size"));
+        }
+        Ok(unit.len())
+    } else {
+        Ok(0)
+    }
 }
 
 fn retryable_open_failure(reason: i32) -> bool {
@@ -2306,6 +2443,41 @@ impl AutoWsHub {
         .map(Some)
     }
 
+    /// Start one LU 6.2 session against a live target LU. A locally published
+    /// source LU is required; Go revalidates its owner and route generation at
+    /// OPEN. The first poll sends OPEN and retries transient RouteGone races.
+    #[allow(dead_code)]
+    pub(crate) fn open_session_lu(
+        &mut self,
+        target_lu: &wire::SnaName,
+        source_lu: &wire::SnaName,
+    ) -> io::Result<Option<SessionWsPort>> {
+        let Some(source_ref) = self.local_reference_lu(source_lu) else {
+            return Ok(None);
+        };
+        let source_is_lu62 = self
+            .local_route(&source_ref)
+            .and_then(|route| match route.resource.as_ref() {
+                Some(wire::route_export::Resource::LogicalUnit(lu)) => Some(lu),
+                _ => None,
+            })
+            .is_some_and(|lu| {
+                lu.supported_types
+                    .contains(&(wire::LuType::LuType62 as i32))
+            });
+        if !source_is_lu62 {
+            return Err(protocol("session source LU is not published as LU 6.2"));
+        }
+        let Some(mut port) = self.open_lu(target_lu, source_lu)? else {
+            return Ok(None);
+        };
+        port.profile = wire::CircuitProfile::SessionV1;
+        Ok(Some(SessionWsPort {
+            inner: port,
+            opened_reported: false,
+        }))
+    }
+
     fn local_hosting_cp(&self, reference: &wire::RouteReference) -> io::Result<wire::SnaName> {
         match self
             .local_routes
@@ -2381,6 +2553,34 @@ impl AutoWsHub {
         &mut self,
         open: wire::IncomingOpen,
     ) -> io::Result<Option<WsRoutePort>> {
+        if open.profile != wire::CircuitProfile::NativeDlc as i32 {
+            return Ok(None);
+        }
+        self.accept_incoming_profile(open, wire::CircuitProfile::NativeDlc)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn accept_session_incoming(
+        &mut self,
+        open: wire::IncomingOpen,
+    ) -> io::Result<Option<SessionWsPort>> {
+        if open.profile != wire::CircuitProfile::SessionV1 as i32 {
+            return Ok(None);
+        }
+        self.accept_incoming_profile(open, wire::CircuitProfile::SessionV1)
+            .map(|port| {
+                port.map(|inner| SessionWsPort {
+                    inner,
+                    opened_reported: false,
+                })
+            })
+    }
+
+    fn accept_incoming_profile(
+        &mut self,
+        open: wire::IncomingOpen,
+        profile: wire::CircuitProfile,
+    ) -> io::Result<Option<WsRoutePort>> {
         let Some(local_ref) = open.target.as_ref() else {
             return Ok(None);
         };
@@ -2432,6 +2632,7 @@ impl AutoWsHub {
             }
             Err(error) => return Err(error),
         };
+        port.profile = profile;
         port.target = Some(source_ref.clone());
         port.incoming_open(open)?;
         Ok(Some(port))
@@ -2474,6 +2675,7 @@ impl AutoWsHub {
             target_lu,
             target: None,
             source_route,
+            profile: wire::CircuitProfile::NativeDlc,
             require_managed_binding: false,
             managed_binding_seen: false,
             managed_mac: None,
@@ -2485,6 +2687,7 @@ impl AutoWsHub {
             retry_delay: FIRST_OPEN_RETRY,
             pending_type1: VecDeque::new(),
             pending_information: VecDeque::new(),
+            pending_session: VecDeque::new(),
             downstream_sizes: VecDeque::new(),
             outbound_completions: OutboundCompletions::default(),
             inbound_open: None,
@@ -2749,6 +2952,265 @@ mod tests {
             netid: netid.into(),
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn session_v1_port_roundtrips_events_and_credit_on_shared_hub() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let circuit_id = vec![0x44; 16];
+        let server_id = circuit_id.clone();
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |_: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL_V2),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, body| {
+                socket
+                    .send(WsMessage::Binary(envelope(body).encode_to_vec().into()))
+                    .unwrap();
+            };
+            let read = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>| {
+                let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                    panic!("binary envelope expected")
+                };
+                wire::WsEnvelope::decode(payload).unwrap().body.unwrap()
+            };
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                    router_id: vec![7; 16],
+                    connection_epoch: vec![8; 16],
+                    max_message_bytes: 65536,
+                    max_circuits: 4,
+                    display_name: "session broker".into(),
+                    allowed_netid: "OWNED".into(),
+                    software_update_available: None,
+                }),
+            );
+            let wire::ws_envelope::Body::PublishRoutes(snapshot) = read(&mut socket) else {
+                panic!("source snapshot expected")
+            };
+            assert!(snapshot.routes.iter().any(|route| matches!(
+                route.resource.as_ref(),
+                Some(wire::route_export::Resource::LogicalUnit(lu))
+                    if lu.lu.as_ref() == Some(&name("OWNED", "LUA"))
+                        && lu.supported_types.contains(&(wire::LuType::LuType62 as i32))
+            )));
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16],
+                        revision: 1,
+                        routes: vec![wire::RouteExport {
+                            id: 2,
+                            generation: 1,
+                            resource: Some(wire::route_export::Resource::LogicalUnit(
+                                wire::LuReachability {
+                                    lu: Some(name("SNUSNU", "PING")),
+                                    hosting_cp: Some(name("SNUSNU", "SVC")),
+                                    supported_types: vec![wire::LuType::LuType62 as i32],
+                                },
+                            )),
+                        }],
+                    }),
+                }),
+            );
+            let wire::ws_envelope::Body::OpenRequest(open) = read(&mut socket) else {
+                panic!("session open expected")
+            };
+            assert_eq!(open.profile, wire::CircuitProfile::SessionV1 as i32);
+            assert_eq!(open.source_route.as_ref().unwrap().router_id, vec![7; 16]);
+            assert_eq!(open.target.as_ref().unwrap().route_id, 2);
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OpenResult(wire::OpenResult {
+                    request_id: open.request_id,
+                    circuit_id: server_id.clone(),
+                    accepted: true,
+                    peer_receive_allowance_bytes: 1500,
+                    reason: wire::OpenFailure::Unspecified as i32,
+                }),
+            );
+            let wire::ws_envelope::Body::CircuitEvent(bind) = read(&mut socket) else {
+                panic!("BIND expected")
+            };
+            let bind_bytes = bind
+                .event
+                .as_ref()
+                .and_then(|event| match event {
+                    wire::circuit_event::Event::SessionEvent(e) => Some(e),
+                    _ => None,
+                })
+                .and_then(|e| match e.event.as_ref() {
+                    Some(wire::session_event::Event::BindRequest(unit)) => Some(unit.clone()),
+                    _ => None,
+                });
+            assert_eq!(bind_bytes, Some(vec![0, 1, 0x6b, 0x80, 0, 0x31]));
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitCredit(wire::CircuitCredit {
+                    circuit_id: server_id.clone(),
+                    allowance_bytes: 1506,
+                }),
+            );
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitEvent(wire::CircuitEvent {
+                    circuit_id: server_id.clone(),
+                    event: Some(wire::circuit_event::Event::SessionEvent(
+                        wire::SessionEvent {
+                            event: Some(wire::session_event::Event::BindResult(
+                                wire::SessionBindResult {
+                                    accepted: true,
+                                    reduced_unit: vec![0, 1, 0xeb, 0x80, 0, 0x31],
+                                },
+                            )),
+                        },
+                    )),
+                }),
+            );
+            let wire::ws_envelope::Body::CircuitCredit(credit) = read(&mut socket) else {
+                panic!("BIND receive credit expected")
+            };
+            assert_eq!(credit.allowance_bytes, 1506);
+            let wire::ws_envelope::Body::CircuitEvent(info) = read(&mut socket) else {
+                panic!("information expected")
+            };
+            assert!(matches!(
+                info.event.as_ref().and_then(|event| match event {
+                    wire::circuit_event::Event::SessionEvent(e) => e.event.as_ref(),
+                    _ => None,
+                }),
+                Some(wire::session_event::Event::Information(value))
+                    if value.reduced_unit == [0, 2, 3, 0x91, 0x20, 0x42]
+            ));
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitEvent(wire::CircuitEvent {
+                    circuit_id: server_id.clone(),
+                    event: Some(wire::circuit_event::Event::SessionEvent(
+                        wire::SessionEvent {
+                            event: Some(wire::session_event::Event::PacingCredit(
+                                wire::SessionPacingCredit {
+                                    normal: 1,
+                                    expedited: 0,
+                                },
+                            )),
+                        },
+                    )),
+                }),
+            );
+            let wire::ws_envelope::Body::CircuitEvent(unbind) = read(&mut socket) else {
+                panic!("UNBIND expected")
+            };
+            assert!(matches!(
+                unbind.event.as_ref().and_then(|event| match event {
+                    wire::circuit_event::Event::SessionEvent(e) => e.event.as_ref(),
+                    _ => None,
+                }),
+                Some(wire::session_event::Event::Unbind(unit)) if unit == &[0, 0, 0x6b, 0x80, 0, 0x32]
+            ));
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitReset(wire::CircuitReset {
+                    circuit_id: server_id,
+                    reason: wire::ResetReason::RemoteLink as i32,
+                }),
+            );
+        });
+        let source = name("OWNED", "LUA");
+        let target = name("SNUSNU", "PING");
+        let mut hub = AutoWsHub::connect(
+            &url,
+            "",
+            &[name("OWNED", "CPA")],
+            &[wire::LuReachability {
+                lu: Some(source.clone()),
+                hosting_cp: Some(name("OWNED", "CPA")),
+                supported_types: vec![wire::LuType::LuType62 as i32],
+            }],
+        )
+        .unwrap();
+        for _ in 0..1000 {
+            hub.poll_incoming().unwrap();
+            if hub.resolve_lu(&target).unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let mut port = hub.open_session_lu(&target, &source).unwrap().unwrap();
+        for _ in 0..1000 {
+            if matches!(port.poll().unwrap(), Some(SessionWsUpdate::Opened)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(port.is_open());
+        let bind = wire::SessionEvent {
+            event: Some(wire::session_event::Event::BindRequest(vec![
+                0, 1, 0x6b, 0x80, 0, 0x31,
+            ])),
+        };
+        assert!(port.send(bind).unwrap());
+        for _ in 0..1000 {
+            match port.poll().unwrap() {
+                Some(SessionWsUpdate::Event(event)) => {
+                    assert!(matches!(
+                        event.event,
+                        Some(wire::session_event::Event::BindResult(_))
+                    ));
+                    break;
+                }
+                _ => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(port.take_completed_send_count(), 1);
+        port.complete_received(1).unwrap();
+        assert!(port
+            .send(wire::SessionEvent {
+                event: Some(wire::session_event::Event::Information(
+                    wire::SessionInformation {
+                        expedited: false,
+                        reduced_unit: vec![0, 2, 3, 0x91, 0x20, 0x42],
+                    }
+                )),
+            })
+            .unwrap());
+        for _ in 0..1000 {
+            if matches!(port.poll().unwrap(), Some(SessionWsUpdate::Event(event)) if matches!(event.event, Some(wire::session_event::Event::PacingCredit(_))))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(port
+            .send(wire::SessionEvent {
+                event: Some(wire::session_event::Event::Unbind(vec![
+                    0, 0, 0x6b, 0x80, 0, 0x32,
+                ])),
+            })
+            .unwrap());
+        for _ in 0..1000 {
+            if matches!(port.poll().unwrap(), Some(SessionWsUpdate::Closed)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!port.is_open());
+        server.join().unwrap();
     }
 
     #[test]
