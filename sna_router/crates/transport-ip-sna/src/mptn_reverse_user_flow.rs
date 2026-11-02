@@ -35,6 +35,7 @@ struct PendingTcp {
 pub struct ReverseUserFlow {
     address: NativeAddress,
     receive_window: u8,
+    adaptive_native_grant: bool,
     pacing: FixedPacing,
     segments: Reassembler,
     deferred_normal: Option<TcpRecord>,
@@ -71,6 +72,10 @@ impl ReverseUserFlow {
         Ok(Self {
             address,
             receive_window,
+            // This is the native QA V4 user BIND profile observed in the
+            // direct V5-to-V4 trace. Its pacing response carries a three-byte
+            // next-window count, unlike the canonical empty-RU IPR.
+            adaptive_native_grant: address.odai && send_window == 3 && receive_window == 1,
             pacing,
             segments: Reassembler::default(),
             deferred_normal: None,
@@ -359,7 +364,8 @@ impl ReverseUserFlow {
     }
 
     /// Reserve a native receive window only when the downstream TCP queue and
-    /// native egress have capacity. The IPR is committed after exact enqueue.
+    /// native egress have capacity. The adaptive IPM count never exceeds the
+    /// actual reserved window. The grant is committed after exact enqueue.
     pub fn prepare_native_grant(&mut self, available_slots: usize) -> io::Result<Option<&[u8]>> {
         if self.closed || self.pending_tcp.is_some() || self.pending_native.is_some() {
             return Err(blocked());
@@ -374,20 +380,24 @@ impl ReverseUserFlow {
             let mut next = self.pacing.clone();
             next.grant_receive_window()
                 .map_err(|_| invalid("native receive pacing grant is not pending"))?;
-            self.grant = Some((
-                vec![
-                    0x2d | (u8::from(self.address.odai) << 1),
-                    0,
-                    self.address.daf,
-                    self.address.oaf,
-                    0,
-                    0,
-                    0x83,
-                    1,
-                    0,
-                ],
-                next,
-            ));
+            let mut piu = vec![
+                0x2d | (u8::from(self.address.odai) << 1),
+                0,
+                self.address.daf,
+                self.address.oaf,
+                0,
+                0,
+                0x83,
+                1,
+                0,
+            ];
+            if self.adaptive_native_grant {
+                // The captured peer uses RU 000006. We currently reserve one
+                // receive slot, so advertise 000001 until the caller can
+                // reserve a larger bounded window and pacing state tracks it.
+                piu.extend_from_slice(&[0, 0, self.receive_window]);
+            }
+            self.grant = Some((piu, next));
         }
         Ok(self.grant.as_ref().map(|(piu, _)| piu.as_slice()))
     }
@@ -622,5 +632,30 @@ mod tests {
             ipr[mutation] ^= mask;
             assert!(flow.prepare_native_input(&ipr).is_err());
         }
+    }
+
+    #[test]
+    fn live_v4_adaptive_ipm_grants_only_the_reserved_receive_slot() {
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        let mut flow = ReverseUserFlow::new(address, 3, 1).unwrap();
+        let request = [0x2e, 0, 2, 2, 0, 1, 3, 1, 0, 0xbb];
+        let NativeInput::TcpRecord(record) = flow.prepare_native_input(&request).unwrap() else {
+            panic!("expected native user request");
+        };
+        let record = record.clone();
+        flow.mark_tcp_enqueued(&record).unwrap();
+        assert_eq!(
+            flow.prepare_native_grant(0).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let grant = flow.prepare_native_grant(1).unwrap().unwrap().to_vec();
+        assert_eq!(grant, [0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0, 0, 0, 1]);
+        assert!(flow.mark_native_grant_enqueued(&grant[..9]).is_err());
+        flow.mark_native_grant_enqueued(&grant).unwrap();
+        assert!(flow.prepare_native_grant(1).unwrap().is_none());
     }
 }
