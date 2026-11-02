@@ -62,7 +62,22 @@ impl<'de> Deserialize<'de> for RouterConfig {
         for peer in raw.mptn {
             match peer {
                 MptnConfig::Relay(peer) => anynet.push(peer),
-                MptnConfig::Gateway(peer) => mptn_gateway.push(peer),
+                MptnConfig::Gateway(mut peer) => {
+                    if peer.source_lu.is_empty() {
+                        peer.source_lu.clone_from(&peer.local_cp);
+                    }
+                    if peer.destination_lu.is_empty() {
+                        peer.destination_lu.clone_from(&peer.peer_cp);
+                    }
+                    if peer.local_station.is_empty() {
+                        peer.local_station = peer
+                            .local_cp
+                            .rsplit_once('.')
+                            .map_or(peer.local_cp.as_str(), |(_, name)| name)
+                            .to_owned();
+                    }
+                    mptn_gateway.push(peer);
+                }
             }
         }
         Ok(Self {
@@ -105,10 +120,14 @@ pub(crate) struct MptnGatewayConfig {
     pub(crate) peer_ip: IpAddr,
     pub(crate) local_cp: String,
     pub(crate) peer_cp: String,
+    #[serde(default)]
     pub(crate) source_lu: String,
+    #[serde(default)]
     pub(crate) destination_lu: String,
+    #[serde(default)]
     pub(crate) local_station: String,
     pub(crate) local_node_id: String,
+    #[serde(default = "default_tg_number")]
     pub(crate) tg_number: u8,
 }
 
@@ -225,6 +244,10 @@ impl ConfiguredLuType {
 
 fn default_bidirectional() -> bool {
     true
+}
+
+fn default_tg_number() -> u8 {
+    1
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -456,18 +479,12 @@ impl RouterConfig {
         }
         let remote = &self.remote[0];
         let gateway = &self.mptn_gateway[0];
-        let source_cp = remote
-            .target_cp
-            .as_deref()
-            .ok_or_else(|| invalid("concentrator to MPTN requires target_cp"))?;
-        let source_lu = remote
-            .target_lu
-            .as_deref()
-            .ok_or_else(|| invalid("concentrator to MPTN requires target_lu"))?;
         let selected = route
             .destination_lu
             .as_deref()
             .unwrap_or(&gateway.destination_lu);
+        let source_cp = remote.target_cp.as_deref().unwrap_or(&gateway.peer_cp);
+        let source_lu = remote.target_lu.as_deref().unwrap_or(selected);
         if source_cp != gateway.peer_cp || source_lu != selected {
             return Err(invalid("concentrator source CP/LU must match TCP62 gateway peer CP and route destination LU"));
         }
@@ -1582,6 +1599,40 @@ timeout_seconds = 120
         assert!(parse(&config.replace("user_tp_hex = \"D7C1E2E3\"", ""))
             .validate()
             .is_err());
+    }
+
+    #[test]
+    fn single_target_duplex_gateway_derives_repeated_peer_identity() {
+        let config = parse(
+            r#"
+[[mptn]]
+profile = "gateway"
+id = "bob"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+local_node_id = "FFF12345"
+[[concentrator]]
+id = "upstream"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+[[route]]
+from = "bob"
+to = "upstream"
+converter = "mptn_lu62"
+user_tp_hex = "30f0f0f5"
+"#,
+        );
+        config.validate().unwrap();
+        let gateway = &config.mptn_gateway[0];
+        assert_eq!(gateway.source_lu, "QABOB.SNAB");
+        assert_eq!(gateway.destination_lu, "QAALICE.SNAA");
+        assert_eq!(gateway.local_station, "SNAB");
+        assert_eq!(gateway.tg_number, 1);
+        let duplex = config.bidirectional_gateway_config().unwrap().unwrap();
+        assert_eq!(duplex.reverse.source_cp, "QAALICE.SNAA");
+        assert_eq!(duplex.reverse.source_lu, "QAALICE.SNAA");
+        assert_eq!(duplex.reverse.remote.bearer, "");
     }
 
     #[test]

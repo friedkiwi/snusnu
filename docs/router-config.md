@@ -60,9 +60,9 @@ lu_types = { "SOLNET.PAYROLL" = ["lu_6_2"] }
 
 Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, and `lu_6_2`. These values are publisher declarations, not proof of a successful BIND negotiation.
 
-The opt-in V5R4 TCP62 gateway uses its `[[mptn]]` gateway definition as the
-source of local CP/LU exports and the remote destination names. It therefore
-needs no CP/LU fields or Ethernet MAC address on `[[concentrator]]`:
+This single-target V5R4 TCP62 gateway accepts initiation from either side.
+The `[[mptn]]` definition supplies its local CP/LU export and target identity;
+the concentrator entry needs only its URL and optional token:
 
 ```toml
 [[mptn]]
@@ -72,11 +72,7 @@ local_ip = "10.99.4.11"
 peer_ip = "10.99.4.3"
 local_cp = "QABOB.SNAB"
 peer_cp = "QAALICE.SNAA"
-source_lu = "QABOB.SNAB"
-destination_lu = "QAALICE.SNAA"
-local_station = "BOB"
 local_node_id = "FFF12345"
-tg_number = 1
 
 [[concentrator]]
 id = "upstream"
@@ -87,13 +83,17 @@ token = "replace-with-bob-router-credential"
 from = "bob-v5"
 to = "upstream"
 converter = "mptn_lu62"
+user_tp_hex = "30f0f0f5"
 ```
 
-For a single MPTN peer and concentrator target, add the reverse target's
-`user_tp_hex` and use one bidirectional route. This runs with ordinary
-`--config` and accepts initiation from either side. The current native user
-address allocation is specific to the QA fixture, and the gateway serves one
-active user session at a time. See [the cross-NETID lab](cross-netid-lab.md).
+For a gateway, omitted `source_lu` and `destination_lu` default to `local_cp`
+and `peer_cp` respectively. Set either LU explicitly when it differs from
+its CP. The local XID station defaults to the local CP name and the TG number
+defaults to 1. `bidirectional = true` and `timeout_seconds = 600` are route
+defaults. `user_tp_hex` is the four-byte transaction program used when the
+concentrator initiates; it is required for that direction. The current native
+user address allocation is specific to the QA fixture, and the gateway serves
+one active user session at a time. See [the cross-NETID lab](cross-netid-lab.md).
 
 ### Several destinations on one TCP62 listener
 
@@ -153,30 +153,6 @@ match, and destination LUs must be unique on the listener. This multiple
 destination configuration remains an opt-in QA gateway configuration. The
 `peer_cp` and gateway `destination_lu` describe the original single-target
 profile; each additional route supplies its own exact target LU and CP.
-
-### One gateway with initiation from either side
-
-Replace the route in the preceding single-target example with this one, then
-run `snusnu-router --config bob.toml`:
-
-```toml
-[[route]]
-from = "bob-v5"
-to = "upstream"
-bidirectional = true
-converter = "mptn_lu62"
-destination_lu = "QAALICE.SNAA"
-user_tp_hex = "30f0f0f5"
-timeout_seconds = 300
-```
-
-`user_tp_hex` is the four-byte transaction program sent to the local MPTN
-peer when the concentrator initiates. The route also lets the MPTN peer
-initiate toward the configured concentrator target. The router advertises
-the hosted LU once on a shared WebSocket connection. One user session can
-be active at a time; after it closes, the router creates fresh circuit state
-for either direction. Simultaneous opposite-direction sessions are not yet
-served by this adapter.
 
 ### Initiating toward a local MPTN peer
 
