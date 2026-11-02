@@ -63,6 +63,18 @@ impl CpGate {
                 format!("guest XID3 lacks CP identity: {error}"),
             )
         })?;
+        let expected_netid = self.expected.split_once('.').map(|(netid, _)| netid);
+        let observed_netid = observed.split_once('.').map(|(netid, _)| netid);
+        if observed_netid != expected_netid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "guest XID3 NETID {} differs from assigned {}",
+                    observed_netid.unwrap_or("<missing>"),
+                    expected_netid.unwrap_or("<missing>")
+                ),
+            ));
+        }
         if observed != self.expected {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -790,6 +802,14 @@ to = "upstream"
             io::ErrorKind::PermissionDenied
         );
         assert!(!wrong.verified);
+        let mut wrong_netid = CpGate {
+            expected: "OTHNET.SNAB".into(),
+            verified: false,
+        };
+        let error = wrong_netid.observe(&pdu).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("NETID SOLNET differs from assigned OTHNET"));
+        assert!(!wrong_netid.verified);
         let mut malformed = pdu;
         malformed[4] = 0x2e; // Declared XID length no longer matches.
         assert_eq!(
