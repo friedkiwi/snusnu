@@ -1,6 +1,6 @@
 use std::{
     env, io, process,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{atomic::{AtomicBool, Ordering}, OnceLock},
     thread,
     time::Duration,
 };
@@ -18,6 +18,10 @@ mod hpr_lan_port;
 mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
+#[cfg(target_os = "linux")]
+mod local_status;
+#[cfg(target_os = "linux")]
+mod local_web;
 #[cfg(target_os = "linux")]
 mod mptn_bidirectional_gateway;
 #[cfg(target_os = "linux")]
@@ -56,6 +60,13 @@ mod virtual_ws_port;
 mod ws_native_responder;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static LOCAL_STATUS: OnceLock<local_status::LocalStatus> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn status() -> Option<&'static local_status::LocalStatus> {
+    LOCAL_STATUS.get()
+}
 
 extern "C" fn handle_signal(_: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -114,6 +125,17 @@ fn run() -> io::Result<()> {
         }
         let config = config::load(std::path::Path::new(&path))?;
         install_signals();
+        let cache_path = std::path::Path::new(&path).with_extension("peers.toml");
+        let status = local_status::LocalStatus::with_cache(&cache_path).unwrap_or_else(|error| {
+            tracing::warn!(path = %cache_path.display(), error = %error, "local peer cache unavailable");
+            local_status::LocalStatus::new()
+        });
+        LOCAL_STATUS.set(status.clone()).map_err(|_| {
+            io::Error::new(io::ErrorKind::AlreadyExists, "local status already initialized")
+        })?;
+        if let Some(web) = &config.web {
+            let _web_thread = local_web::start(web, status)?;
+        }
         return runtime::run_config(&config);
     }
     #[cfg(target_os = "linux")]

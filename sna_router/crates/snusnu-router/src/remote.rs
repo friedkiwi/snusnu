@@ -1,7 +1,10 @@
 //! WebSocket circuit adapter. The routing core sees the same SNA units as it
 //! does on a local LLC port; only this module knows the concentrator protocol.
 
-use crate::routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent};
+use crate::{
+    local_status::{self, ConcentratorStatus},
+    routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent},
+};
 use router_core::packet_log::{decode_llc_pdu, decode_sna_information, hex_dump};
 use std::{
     cell::RefCell,
@@ -91,6 +94,27 @@ struct SharedWs {
     gateway_inbound: Option<GatewayInbound>,
 }
 
+impl Drop for SharedWs {
+    fn drop(&mut self) {
+        if let Some(status) = crate::status() {
+            let snapshot = status.snapshot();
+            for origin in snapshot.upstream_routes.iter().map(|route| &route.origin_router_id) {
+                status.withdraw_origin(origin);
+            }
+            status.replace_managed_macs(Vec::new());
+            for circuit in &snapshot.circuits {
+                status.remove_circuit(&circuit.id);
+            }
+            if let Some(mut concentrator) = snapshot.concentrator {
+                concentrator.state = "disconnected".into();
+                concentrator.connection_epoch = None;
+                concentrator.last_change_ms = local_status::now_ms();
+                status.set_concentrator(Some(concentrator));
+            }
+        }
+    }
+}
+
 impl SharedWs {
     fn dequeue(&mut self, index: usize) -> io::Result<Option<wire::ws_envelope::Body>> {
         use wire::ws_envelope::Body;
@@ -139,13 +163,33 @@ impl SharedWs {
         let body = message.body.ok_or_else(|| protocol("empty envelope"))?;
         use wire::ws_envelope::Body;
         match &body {
-            Body::OriginRoutes(_) | Body::OriginWithdraw(_) => {
+            Body::OriginRoutes(origin) => {
+                if origin.router_id.len() != 16
+                    || origin.snapshot.as_ref().is_none_or(|snapshot| snapshot.epoch.len() != 16)
+                {
+                    return Err(protocol("invalid origin route snapshot"));
+                }
+                if let Some(status) = crate::status() {
+                    status.observe_origin_snapshot(origin);
+                }
+                for inbox in &mut self.inbox {
+                    inbox.push_back(body.clone());
+                }
+            }
+            Body::OriginWithdraw(withdraw) => {
+                if let Some(status) = crate::status() {
+                    status.withdraw_origin_bytes(&withdraw.router_id);
+                }
                 for inbox in &mut self.inbox {
                     inbox.push_back(body.clone());
                 }
             }
             Body::ManagedCpBindings(bindings) => {
                 accept_managed_revision(&mut self.last_managed_revision, bindings.revision)?;
+                validate_managed_bindings(&bindings.bindings)?;
+                if let Some(status) = crate::status() {
+                    status.observe_managed_snapshot(bindings);
+                }
                 for inbox in &mut self.inbox {
                     inbox.push_back(body.clone());
                 }
@@ -614,6 +658,17 @@ impl WsRoutePort {
             last_managed_revision: 0,
             gateway_inbound,
         }));
+        if let Some(status) = crate::status() {
+            status.set_concentrator(Some(ConcentratorStatus {
+                state: "connected".into(),
+                authority: server_authority(&primary.url).into(),
+                router_id: Some(format_uuid(&welcome.router_id)),
+                allowed_netid: Some(welcome.allowed_netid.clone()),
+                connection_epoch: Some(format_uuid(&welcome.connection_epoch)),
+                last_change_ms: local_status::now_ms(),
+                last_error: None,
+            }));
+        }
         Ok(configs
             .into_iter()
             .zip(local_route_ids)
@@ -1599,12 +1654,13 @@ fn format_mac(mac: &[u8]) -> String {
 }
 
 fn server_authority(url: &str) -> &str {
-    url.split_once("://")
+    let authority = url.split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url)
         .split(['/', '?', '#'])
         .next()
-        .unwrap_or("unknown")
+        .unwrap_or("unknown");
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
 }
 
 fn protocol(message: &'static str) -> io::Error {
