@@ -9,11 +9,13 @@
 use std::collections::HashMap;
 
 use router_core::{
-    session::{SessionEvent, SessionIdentity, SessionUnit},
+    session::{Flow, SessionEvent, SessionIdentity, SessionUnit},
     session_fabric::{
         AdapterId, FabricError, FabricLimits, FabricSessionId, Reachability, SessionFabric,
     },
 };
+use std::io;
+use transport_ws::wire;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SwitchError {
@@ -212,6 +214,59 @@ impl SessionSwitch {
     }
 }
 
+/// The `session_v1` WebSocket profile carries the same complete reduced SNA
+/// unit as the fabric. Transport byte credit is handled by SessionWsPort;
+/// this conversion does not grant or consume application pacing credit.
+pub(crate) fn to_session_wire(event: &SessionEvent) -> Option<wire::SessionEvent> {
+    use wire::session_event::Event;
+    let event = match event {
+        SessionEvent::BindRequest(unit) => Event::BindRequest(unit.as_reduced().to_vec()),
+        SessionEvent::BindResult { accepted, unit } => Event::BindResult(wire::SessionBindResult {
+            accepted: *accepted,
+            reduced_unit: unit.as_reduced().to_vec(),
+        }),
+        SessionEvent::Information { flow, unit } => Event::Information(wire::SessionInformation {
+            expedited: *flow == Flow::Expedited,
+            reduced_unit: unit.as_reduced().to_vec(),
+        }),
+        SessionEvent::Credit { normal, expedited } => {
+            Event::PacingCredit(wire::SessionPacingCredit {
+                normal: *normal,
+                expedited: *expedited,
+            })
+        }
+        SessionEvent::Unbind(unit) => Event::Unbind(unit.as_reduced().to_vec()),
+        SessionEvent::Reset => return None,
+    };
+    Some(wire::SessionEvent { event: Some(event) })
+}
+
+pub(crate) fn from_session_wire(value: wire::SessionEvent) -> io::Result<SessionEvent> {
+    use wire::session_event::Event;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid session_v1 event");
+    let unit = |bytes: Vec<u8>| SessionUnit::from_reduced(&bytes).map_err(|_| invalid());
+    match value.event.ok_or_else(invalid)? {
+        Event::BindRequest(bytes) => Ok(SessionEvent::BindRequest(unit(bytes)?)),
+        Event::BindResult(result) => Ok(SessionEvent::BindResult {
+            accepted: result.accepted,
+            unit: unit(result.reduced_unit)?,
+        }),
+        Event::Information(info) => Ok(SessionEvent::Information {
+            flow: if info.expedited {
+                Flow::Expedited
+            } else {
+                Flow::Normal
+            },
+            unit: unit(info.reduced_unit)?,
+        }),
+        Event::PacingCredit(credit) => Ok(SessionEvent::Credit {
+            normal: credit.normal,
+            expedited: credit.expedited,
+        }),
+        Event::Unbind(bytes) => Ok(SessionEvent::Unbind(unit(bytes)?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +394,30 @@ mod tests {
             .unwrap();
         switch.withdraw(AdapterId(1));
         assert_eq!(switch.session_count(), 0);
+    }
+
+    #[test]
+    fn session_wire_roundtrips_reduced_snf_rh_ru_and_credit() {
+        for event in [
+            SessionEvent::BindRequest(unit(0x31)),
+            SessionEvent::BindResult {
+                accepted: true,
+                unit: unit(0x31),
+            },
+            SessionEvent::Information {
+                flow: Flow::Expedited,
+                unit: unit(0x01),
+            },
+            SessionEvent::Credit {
+                normal: 8,
+                expedited: 1,
+            },
+            SessionEvent::Unbind(unit(0x32)),
+        ] {
+            let wire = to_session_wire(&event).unwrap();
+            assert_eq!(from_session_wire(wire).unwrap(), event);
+        }
+        assert!(to_session_wire(&SessionEvent::Reset).is_none());
+        assert!(from_session_wire(wire::SessionEvent { event: None }).is_err());
     }
 }
