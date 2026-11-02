@@ -48,6 +48,16 @@ pub enum SetupError {
     WrongReplyTcid,
     MissingCie,
     WrongPeerTcid,
+    InvalidTopic,
+}
+
+/// IBM SNA Formats GA27-3136-20 p. 9-39: CV X'28' identifies the traffic
+/// carried by an RTP connection. User traffic contains a COS/TPF X'2C' CV.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RtpSetupTopic {
+    RouteSetup,
+    CpSvcMg,
+    User { cos_tpf: Vec<u8> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +70,7 @@ pub struct RtpInboundSetup {
     /// retained as evidence, not decoded into a routable peer identity.
     source_qualifier: Vec<u8>,
     assigned_tcid: Option<u64>,
+    topic: Option<RtpSetupTopic>,
 }
 
 impl RtpInboundSetup {
@@ -81,6 +92,7 @@ impl RtpInboundSetup {
             origin_tcid: None,
             source_qualifier: Vec::new(),
             assigned_tcid: None,
+            topic: None,
         })
     }
 
@@ -90,6 +102,10 @@ impl RtpInboundSetup {
 
     pub fn source_qualifier(&self) -> Option<&[u8]> {
         (!self.source_qualifier.is_empty()).then_some(&self.source_qualifier)
+    }
+
+    pub fn topic(&self) -> Option<&RtpSetupTopic> {
+        self.topic.as_ref()
     }
 
     fn check_generation(&self, generation: ConnectionGeneration) -> Result<(), SetupError> {
@@ -129,10 +145,11 @@ impl RtpInboundSetup {
         }
         let setup = segments.iter().find(|s| s.key == 0x0d).unwrap();
         let si = segments.iter().find(|s| s.key == 0x14).unwrap();
-        validate_setup(*setup, &self.target)?;
+        let topic = validate_setup(*setup, &self.target)?;
         validate_switching_information(*si)?;
         self.origin_tcid = Some(packet.tcid);
         self.source_qualifier = source_qualifier;
+        self.topic = Some(topic);
         self.phase = SetupPhase::AwaitReplySent;
         Ok(())
     }
@@ -207,6 +224,7 @@ impl RtpInboundSetup {
         self.origin_tcid = None;
         self.assigned_tcid = None;
         self.source_qualifier.clear();
+        self.topic = None;
     }
 
     pub fn reset(&mut self, generation: ConnectionGeneration) -> Result<(), SetupError> {
@@ -218,6 +236,7 @@ impl RtpInboundSetup {
         self.origin_tcid = None;
         self.assigned_tcid = None;
         self.source_qualifier.clear();
+        self.topic = None;
         Ok(())
     }
 }
@@ -242,7 +261,7 @@ fn lt_vectors(mut bytes: &[u8]) -> Result<Vec<(u8, &[u8])>, SetupError> {
 fn validate_setup(
     segment: RtpOptionalSegment<'_>,
     local: &RtpLocalTarget,
-) -> Result<(), SetupError> {
+) -> Result<RtpSetupTopic, SetupError> {
     let data = segment.data;
     if data.len() < 6 || data[..2] != [1, 1] || data[2] & !0x04 != 0x98 || data[3..6] != [0, 0, 0] {
         return Err(SetupError::InvalidSetup);
@@ -252,17 +271,51 @@ fn validate_setup(
     // are untrusted and cannot authorize a route or release packet data.
     if vectors.len() != 4
         || vectors.iter().map(|(key, _)| *key).collect::<Vec<_>>() != [0x28, 0x03, 0x00, 0x39]
-        || vectors[0].1.is_empty()
     {
         return Err(SetupError::InvalidSetup);
     }
+    let topic = parse_topic(vectors[0].1)?;
     if vectors[1].1 != local.network_id
         || vectors[2].1 != local.node_id
         || vectors[3].1 != local.nce_instance
     {
         return Err(SetupError::WrongTarget);
     }
-    Ok(())
+    Ok(topic)
+}
+
+fn parse_topic(body: &[u8]) -> Result<RtpSetupTopic, SetupError> {
+    const RSETUP: [u8; 6] = [0xd9, 0xe2, 0xc5, 0xe3, 0xe4, 0xd7];
+    const CPSVCMG: [u8; 7] = [0xc3, 0xd7, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
+    let (&indicator, value) = body.split_first().ok_or(SetupError::InvalidTopic)?;
+    match indicator {
+        0 if value == RSETUP => Ok(RtpSetupTopic::RouteSetup),
+        0 if value == CPSVCMG => Ok(RtpSetupTopic::CpSvcMg),
+        0x80 if value.len() >= 2 && usize::from(value[0]) == value.len() && value[1] == 0x2c => {
+            Ok(RtpSetupTopic::User {
+                cos_tpf: value.to_vec(),
+            })
+        }
+        _ => Err(SetupError::InvalidTopic),
+    }
+}
+
+/// Read CV X'28' to choose the control or user parser before constructing an
+/// endpoint. This classification is untrusted until the caller validates the
+/// EE adjacency and the endpoint checks CS target, peer qualifier and path.
+pub fn classify_setup_topic(packet: RtpPacket<'_>) -> Result<RtpSetupTopic, SetupError> {
+    let segments = packet.optional_segments().map_err(SetupError::InvalidRtp)?;
+    let mut setups = segments.iter().filter(|segment| segment.key == 0x0d);
+    let setup = setups.next().ok_or(SetupError::InvalidSetup)?;
+    if setups.next().is_some() || setup.data.len() < 6 || setup.data[..2] != [1, 1] {
+        return Err(SetupError::InvalidSetup);
+    }
+    let vectors = lt_vectors(&setup.data[6..])?;
+    let (key, body) = vectors.first().ok_or(SetupError::InvalidTopic)?;
+    if *key != 0x28 {
+        return Err(SetupError::InvalidTopic);
+    }
+    parse_topic(body)
 }
 
 fn validate_switching_information(segment: RtpOptionalSegment<'_>) -> Result<(), SetupError> {
@@ -323,7 +376,7 @@ mod tests {
 
     fn setup_segments(local: &RtpLocalTarget) -> Vec<u8> {
         let mut cs = vec![1, 1, 0x98, 0, 0, 0];
-        cs.extend_from_slice(&lt(0x28, b"\0RSETUP"));
+        cs.extend_from_slice(&lt(0x28, &[0, 0xd9, 0xe2, 0xc5, 0xe3, 0xe4, 0xd7]));
         cs.extend_from_slice(&lt(0x03, &local.network_id));
         cs.extend_from_slice(&lt(0x00, &local.node_id));
         cs.extend_from_slice(&lt(0x39, &local.nce_instance));
@@ -379,6 +432,11 @@ mod tests {
             .observe_inbound_setup(generation(1), packet(&setup))
             .unwrap();
         assert_eq!(state.phase(), SetupPhase::AwaitReplySent);
+        assert_eq!(state.topic(), Some(&RtpSetupTopic::RouteSetup));
+        assert_eq!(
+            classify_setup_topic(packet(&setup)),
+            Ok(RtpSetupTopic::RouteSetup)
+        );
         assert!(state.source_qualifier().is_some());
         let reply = reply();
         state
@@ -390,6 +448,26 @@ mod tests {
             .observe_inbound_peer_use(generation(1), packet(&peer))
             .unwrap();
         assert_eq!(state.phase(), SetupPhase::PeerUsingAssignedId);
+    }
+
+    #[test]
+    fn topic_identifier_separates_control_and_user_rtp() {
+        assert_eq!(
+            parse_topic(&[0, 0xc3, 0xd7, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]),
+            Ok(RtpSetupTopic::CpSvcMg)
+        );
+        let user = [
+            0x80, 0x0c, 0x2c, 0x01, 0x08, 0x7b, 0xc3, 0xd6, 0xd5, 0xd5, 0xc5, 0xc3, 0xe3,
+        ];
+        assert_eq!(
+            parse_topic(&user),
+            Ok(RtpSetupTopic::User {
+                cos_tpf: user[1..].to_vec()
+            })
+        );
+        assert_eq!(parse_topic(&[0, b'R']), Err(SetupError::InvalidTopic));
+        assert_eq!(parse_topic(&[0x80, 3, 0x2c]), Err(SetupError::InvalidTopic));
+        assert_eq!(parse_topic(&[0x40, 0]), Err(SetupError::InvalidTopic));
     }
 
     #[test]

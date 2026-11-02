@@ -14,7 +14,7 @@ use crate::{
         encode_setup_reply_from_snapshot, ReplyEncodeError, ReplyPath, StatusExchange,
     },
     hpr_rtp_send::{parse_peer_status, ReliableSendWindow, SendError, StatusEffect},
-    hpr_rtp_setup::{RtpInboundSetup, RtpLocalTarget, SetupError},
+    hpr_rtp_setup::{RtpInboundSetup, RtpLocalTarget, RtpSetupTopic, SetupError},
     ConnectionGeneration,
 };
 
@@ -37,7 +37,10 @@ pub struct EndpointPeer {
     /// adjacency. `node_id` is the encoded CP name, not the XID fixed ID.
     pub network_id: Vec<u8>,
     pub node_id: Vec<u8>,
-    pub nce_id: Vec<u8>,
+    /// Control RTP uses the known CV61 NCE label. A user RTP connection may
+    /// have a different sender-owned NCE; use `None` only after the caller
+    /// has authorized its RouteSetup/Topic and bound the adjacent CP/path.
+    pub nce_id: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +209,9 @@ pub struct RtpInboundEndpoint {
     phase: EndpointPhase,
     setup: RtpInboundSetup,
     origin_tcid: Option<u64>,
+    source_nce_id: Option<Vec<u8>>,
+    initial_setup_nlp: Option<Vec<u8>>,
+    sent_setup_reply: Option<Vec<u8>>,
     pending_setup_reply: Option<Vec<u8>>,
     pending_data: Option<Vec<u8>>,
     pending_status: Option<Vec<u8>>,
@@ -227,8 +233,11 @@ impl RtpInboundEndpoint {
             || config.peer.network_id.len() > 8
             || config.peer.node_id.is_empty()
             || config.peer.node_id.len() > 8
-            || config.peer.nce_id.is_empty()
-            || config.peer.nce_id.len() > 8
+            || config
+                .peer
+                .nce_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 8)
             || config.max_nlp_bytes < 768
             || config.max_nlp_bytes > MAX_NLP
             || config.path.priority > 3
@@ -253,6 +262,9 @@ impl RtpInboundEndpoint {
             phase: EndpointPhase::AwaitSetup,
             setup,
             origin_tcid: None,
+            source_nce_id: None,
+            initial_setup_nlp: None,
+            sent_setup_reply: None,
             pending_setup_reply: None,
             pending_data: None,
             pending_status: None,
@@ -280,6 +292,31 @@ impl RtpInboundEndpoint {
         (self.phase != EndpointPhase::AwaitSetup).then_some(self.config.assigned_tcid & !ASSIGNOR)
     }
 
+    /// Qualified originator TCID, including the assignor bit, only after
+    /// setup validation. The caller can use this with the link generation to
+    /// scope an initial FID5 BIND carried by the setup packet.
+    pub fn origin_tcid(&self) -> Option<u64> {
+        self.origin_tcid
+    }
+
+    /// Sender-owned NCE label from the validated source qualifier. A user
+    /// connection with no preknown label binds this value only after the
+    /// caller's RouteSetup/Topic policy has authorized the connection.
+    pub fn source_nce_id(&self) -> Option<&[u8]> {
+        self.source_nce_id.as_deref()
+    }
+
+    /// Validated by the setup observer against the local target. An
+    /// application still applies its own RouteSetup/Topic and LU policy.
+    pub fn topic(&self) -> Option<&RtpSetupTopic> {
+        self.setup.topic()
+    }
+
+    /// TCID the peer uses after our CIE, without the sender-assignor bit.
+    pub fn assigned_tcid(&self) -> Option<u64> {
+        self.inbound_tcid()
+    }
+
     /// Accept a qualified setup NLP only after the caller has validated the
     /// EE neighbor, priority, directional SAP, active link generation, and
     /// bootstrap target label. Returns an NLP to transmit on that adjacency.
@@ -298,7 +335,12 @@ impl RtpInboundEndpoint {
             .ok_or(EndpointError::WrongPeer)?;
         if qualifier.network_id != self.config.peer.network_id
             || qualifier.node_id != self.config.peer.node_id
-            || qualifier.nce_id != self.config.peer.nce_id
+            || self
+                .config
+                .peer
+                .nce_id
+                .as_ref()
+                .is_some_and(|expected| qualifier.nce_id != expected)
         {
             return Err(EndpointError::WrongPeer);
         }
@@ -355,6 +397,8 @@ impl RtpInboundEndpoint {
         self.setup = setup;
         self.assembly = assembly;
         self.origin_tcid = Some(packet.tcid);
+        self.source_nce_id = Some(qualifier.nce_id.to_vec());
+        self.initial_setup_nlp = Some(nlp.to_vec());
         self.receive = Some(receive);
         self.arb = Some(arb);
         self.pending_messages = initial_messages;
@@ -392,8 +436,25 @@ impl RtpInboundEndpoint {
         self.next_sync = self.next_sync.wrapping_add(1);
         self.send = Some(send);
         self.pending_setup_reply = None;
+        self.sent_setup_reply = Some(nlp.to_vec());
         self.phase = EndpointPhase::AwaitPeerStatus;
         Ok(std::mem::take(&mut self.pending_messages))
+    }
+
+    /// An EE peer can retransmit its identical qualified setup if the
+    /// STATUS+CIE reply was lost. Return the same reply without re-delivering
+    /// Route Setup or BIND to the session layer. The caller still confirms a
+    /// real UDP send and keeps the link generation unchanged.
+    pub fn reply_to_duplicate_setup(&self, nlp: &[u8]) -> Option<&[u8]> {
+        if matches!(
+            self.phase,
+            EndpointPhase::AwaitPeerStatus | EndpointPhase::Active
+        ) && self.initial_setup_nlp.as_deref() == Some(nlp)
+        {
+            self.sent_setup_reply.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Process one unqualified NLP. The first packet must both use the
@@ -670,6 +731,9 @@ impl RtpInboundEndpoint {
         self.setup.close();
         self.pending_messages.clear();
         self.pending_setup_reply = None;
+        self.initial_setup_nlp = None;
+        self.sent_setup_reply = None;
+        self.source_nce_id = None;
         self.pending_data = None;
         self.pending_status = None;
         self.pending_retransmission = None;
@@ -772,7 +836,7 @@ mod tests {
             peer: EndpointPeer {
                 network_id: b"SRC001".to_vec(),
                 node_id: b"ORIG".to_vec(),
-                nce_id: vec![0x12, 0x34],
+                nce_id: Some(vec![0x12, 0x34]),
             },
             path: EndpointPath {
                 peer_anr_label: vec![0xa4, 0],
@@ -808,7 +872,7 @@ mod tests {
             0, 0, 4, 0x26, 0x12, 0x34, 6, 0x39, 0, 0, 0, 8, 0, 0,
         ];
         let mut cs = vec![1, 1, 0x98, 0, 0, 0];
-        cs.extend_from_slice(&lt(0x28, b"\0RSETUP"));
+        cs.extend_from_slice(&lt(0x28, &[0, 0xd9, 0xe2, 0xc5, 0xe3, 0xe4, 0xd7]));
         cs.extend_from_slice(&lt(0x03, &cfg.local_target.network_id));
         cs.extend_from_slice(&lt(0x00, &cfg.local_target.node_id));
         cs.extend_from_slice(&lt(0x39, &cfg.local_target.nce_instance));
@@ -874,6 +938,10 @@ mod tests {
         assert_eq!(endpoint.phase(), EndpointPhase::AwaitSetup);
         let reply = endpoint.prepare_inbound_setup(&setup).unwrap();
         assert_eq!(endpoint.phase(), EndpointPhase::AwaitReplySent);
+        assert_eq!(endpoint.origin_tcid(), Some(ORIGIN));
+        assert_eq!(endpoint.assigned_tcid(), Some(ASSIGNED & !ASSIGNOR));
+        assert_eq!(endpoint.source_nce_id(), Some(&[0x12, 0x34][..]));
+        assert_eq!(endpoint.topic(), Some(&RtpSetupTopic::RouteSetup));
         assert_eq!(
             endpoint.confirm_setup_reply_sent(&setup),
             Err(EndpointError::InvalidTransmittedPacket)
@@ -897,6 +965,11 @@ mod tests {
         assert!(event.messages.is_empty());
         assert_eq!(event.inbound_tcid, ASSIGNED & !ASSIGNOR);
         assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 0);
+        assert_eq!(
+            endpoint.reply_to_duplicate_setup(&setup),
+            Some(reply.as_slice())
+        );
+        assert_eq!(endpoint.reply_to_duplicate_setup(&peer), None);
     }
 
     #[test]
@@ -1051,5 +1124,19 @@ mod tests {
                 .rseq,
             113
         );
+    }
+
+    #[test]
+    fn user_nce_can_bind_after_caller_validated_route_setup() {
+        let mut cfg = config();
+        cfg.peer.nce_id = None;
+        let mut setup = setup_packet(&cfg);
+        let nce = setup.windows(2).position(|pair| pair == [4, 0x26]).unwrap();
+        setup[nce + 2..nce + 4].copy_from_slice(&[0xbe, 0xef]);
+        let mut endpoint = RtpInboundEndpoint::new(cfg).unwrap();
+        endpoint.prepare_inbound_setup(&setup).unwrap();
+        assert_eq!(endpoint.source_nce_id(), Some(&[0xbe, 0xef][..]));
+        endpoint.close();
+        assert_eq!(endpoint.source_nce_id(), None);
     }
 }

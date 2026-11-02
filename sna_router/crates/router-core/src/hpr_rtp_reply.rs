@@ -213,7 +213,7 @@ mod tests {
             0, 0, 4, 0x26, 0x12, 0x34, 6, 0x39, 0, 0, 0, 8, 0, 0,
         ];
         let mut cs = vec![1, 1, 0x98, 0, 0, 0];
-        cs.extend_from_slice(&lt(0x28, b"\0RSETUP"));
+        cs.extend_from_slice(&lt(0x28, &[0, 0xd9, 0xe2, 0xc5, 0xe3, 0xe4, 0xd7]));
         cs.extend_from_slice(&lt(0x03, &target.network_id));
         cs.extend_from_slice(&lt(0x00, &target.node_id));
         cs.extend_from_slice(&lt(0x39, &target.nce_instance));
