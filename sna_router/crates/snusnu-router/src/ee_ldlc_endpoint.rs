@@ -13,6 +13,7 @@ use router_core::{
     hpr_setmode::XidDone,
     hpr_xid_evidence::HprXidEvidence,
     hpr_xid_leg::{local_ee_tg_descriptor, Side},
+    packet_log::hex_dump,
     session::QualifiedName,
     xid3::{ControlVector, ExchangeState, Role, Xid3},
     ConnectionGeneration,
@@ -296,7 +297,14 @@ impl EeLdlcEndpoint {
         ]);
         bytes.extend_from_slice(nlp);
         let datagram = Datagram::decode(priority_port, bytes)?;
-        self.sockets.send(self.peer_ip, &datagram)
+        self.sockets.send(self.peer_ip, &datagram)?;
+        tracing::debug!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+            source_port=priority_port, destination_port=priority_port,
+            dsap=format_args!("0x{:02x}", datagram.dsap),
+            ssap=format_args!("0x{:02x}", datagram.ssap),
+            bytes=datagram.payload.len(), hex=%hex_dump(&datagram.payload),
+            generation=self.generation, "EE NLP sent");
+        Ok(())
     }
 
     /// Returns an NLP only after link/SAP validation. The caller must still
@@ -319,6 +327,12 @@ impl EeLdlcEndpoint {
                 source_ip=%source.ip(), "EE control packet from wrong peer discarded");
             return Ok(None);
         }
+        tracing::debug!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+            source_port=source.port(), destination_port=packet.port,
+            dsap=format_args!("0x{:02x}", packet.dsap),
+            ssap=format_args!("0x{:02x}", packet.ssap),
+            kind=?packet.kind, bytes=packet.payload.len(),
+            hex=%hex_dump(&packet.payload), "EE datagram received");
         match self.process(packet, now) {
             Ok(result) => Ok(result),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -344,6 +358,8 @@ impl EeLdlcEndpoint {
                     &[],
                 )?;
                 self.down();
+                tracing::info!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                    generation=self.generation, "EE peer disconnected link");
                 Ok(None)
             }
             LdlcKind::Dm => {
@@ -409,7 +425,8 @@ impl EeLdlcEndpoint {
         }
         let was_active = self.phase() == Phase::Active;
         let previous = self.activation.clone();
-        self.activation
+        let remote_observation = self
+            .activation
             .observe_xid(Side::Remote, information)
             .map_err(|_| invalid("remote EE XID rejected"))?;
         if let Err(error) = self.send_control(
@@ -421,7 +438,8 @@ impl EeLdlcEndpoint {
             self.activation = previous;
             return Err(error);
         }
-        self.activation
+        let local_observation = self
+            .activation
             .observe_xid(Side::Local, response)
             .map_err(|_| invalid("local EE XID profile rejected"))?;
         if information.is_empty() || information[9] & 0x0c == 0x08 {
@@ -434,6 +452,18 @@ impl EeLdlcEndpoint {
             }
         } else {
             self.peer_np = Some(information.to_vec());
+        }
+        if remote_observation == Observation::Agreement
+            || local_observation == Observation::Agreement
+        {
+            let agreement = self
+                .activation
+                .agreement()
+                .ok_or_else(|| invalid("EE XID agreement disappeared"))?;
+            tracing::info!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                local_cp=%agreement.local.cp_name, peer_cp=%agreement.remote.cp_name,
+                tg=agreement.local.tg_number, max_btu=agreement.max_btu,
+                generation=self.generation, "EE XID3 agreement reached");
         }
         Ok(None)
     }
@@ -470,6 +500,9 @@ impl EeLdlcEndpoint {
                     .map_err(|_| invalid("EE XID_DONE response rejected"))?;
                 if observed == Observation::Activated {
                     self.next_live = Some(now + LIVE_INTERVAL);
+                    tracing::info!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                        peer_cp=?self.peer_cp(), tg=?self.tg_number(),
+                        generation=self.generation, "EE LDLC link active");
                 }
                 return Ok(None);
             }
@@ -502,6 +535,8 @@ impl EeLdlcEndpoint {
             self.retry_at = None;
             self.retries = 0;
             self.next_live = Some(now + LIVE_INTERVAL);
+            tracing::debug!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                generation=self.generation, "EE TEST liveness completed");
         } else {
             self.activation
                 .observe_test(Side::Remote, false)
@@ -532,6 +567,9 @@ impl EeLdlcEndpoint {
             return Ok(());
         }
         if self.retry_at.is_some() && self.retries >= RETRY_LIMIT {
+            tracing::warn!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                retries=self.retries, generation=self.generation,
+                "EE TEST liveness failed; link deactivated");
             self.down();
             return Ok(());
         }
@@ -540,6 +578,9 @@ impl EeLdlcEndpoint {
             .observe_test(Side::Local, false)
             .map_err(|_| invalid("local EE TEST request rejected"))?;
         self.retries += 1;
+        tracing::debug!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+            attempt=self.retries, generation=self.generation,
+            "EE TEST liveness request sent");
         self.retry_at = Some(now + RETRY_INTERVAL);
         self.next_live = None;
         Ok(())
@@ -550,7 +591,14 @@ impl EeLdlcEndpoint {
         bytes.extend_from_slice(&[dsap, ssap, control]);
         bytes.extend_from_slice(information);
         let packet = Datagram::decode(CONTROL_PORT, bytes)?;
-        self.sockets.send(self.peer_ip, &packet)
+        self.sockets.send(self.peer_ip, &packet)?;
+        tracing::debug!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+            source_port=CONTROL_PORT, destination_port=CONTROL_PORT,
+            dsap=format_args!("0x{dsap:02x}"), ssap=format_args!("0x{ssap:02x}"),
+            kind=?packet.kind, bytes=packet.payload.len(),
+            hex=%hex_dump(&packet.payload), generation=self.generation,
+            "EE control datagram sent");
+        Ok(())
     }
 
     fn down(&mut self) {
