@@ -55,7 +55,7 @@ pub(crate) fn fresh_management(local_cp: &str, peer_cp: &str) -> io::Result<Nati
     .map_err(|error| invalid(format!("native management: {error}")))
 }
 
-pub(crate) fn pump_virtual(port: &mut VirtualWsPort<WsRoutePort>) -> io::Result<()> {
+pub(crate) fn pump_virtual<P: RoutePort>(port: &mut VirtualWsPort<P>) -> io::Result<()> {
     if let Some(events) = port.poll(false)? {
         for event in events {
             match event {

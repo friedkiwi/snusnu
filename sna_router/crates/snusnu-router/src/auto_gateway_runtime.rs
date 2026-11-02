@@ -13,6 +13,7 @@ use crate::{
     mptn_outbound_port::OutboundEndpoint,
     mptn_ws_reverse::{AutoReverseWsSession, ReverseWsConfig},
     remote::{Config as RemoteConfig, WsRoutePort},
+    routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent},
     virtual_ws_port::VirtualWsPort,
     ws_native_responder::WsNativeResponder,
 };
@@ -309,6 +310,35 @@ impl<'a> AutoMptnGateway<'a> {
         seed: &[u8],
         timeout: Duration,
     ) -> io::Result<()> {
+        self.start_to_native(association, offer, Box::new(ws), local_cp, target_cp,
+            seed, timeout, "concentrator")
+    }
+
+    pub(crate) fn start_to_local(
+        &mut self,
+        association: u64,
+        offer: IngressOffer,
+        llc: Box<dyn RoutePort>,
+        local_cp: &wire::SnaName,
+        target_cp: &wire::SnaName,
+        seed: &[u8],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.start_to_native(association, offer, llc, local_cp, target_cp,
+            seed, timeout, "llc")
+    }
+
+    fn start_to_native(
+        &mut self,
+        association: u64,
+        offer: IngressOffer,
+        native: Box<dyn RoutePort>,
+        local_cp: &wire::SnaName,
+        target_cp: &wire::SnaName,
+        seed: &[u8],
+        timeout: Duration,
+        egress_transport: &str,
+    ) -> io::Result<()> {
         if self.udp_leased || self.sessions.contains_key(&association) || timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 "TCP62 association already active or timeout invalid"));
@@ -328,7 +358,7 @@ impl<'a> AutoMptnGateway<'a> {
         )?;
         let local = format!("{}.{}", local_cp.netid, local_cp.name);
         let target = format!("{}.{}", target_cp.netid, target_cp.name);
-        let mut port = VirtualWsPort::new(ws, xid, &local, &target)?;
+        let mut port = VirtualWsPort::new(NativePort(native), xid, &local, &target)?;
         port.attach_management(fresh_management(&local, &target)?)?;
         let status_id = format!("mptn:{}:{association}", self.config.id);
         self.sessions.insert(association, MptnToWsSession {
@@ -343,12 +373,12 @@ impl<'a> AutoMptnGateway<'a> {
         });
         tracing::info!(gateway = %self.config.id, association, source_lu, destination_lu,
             local_cp = %local, target_cp = %target,
-            "automatic TCP62 circuit selected WebSocket destination");
+            egress_transport, "automatic TCP62 circuit selected destination");
         if let Some(status) = crate::status() {
             status.upsert_circuit(CircuitStatus {
                 id: status_id,
                 ingress: format!("mptn:{}:{source_lu}", self.config.id),
-                egress: format!("concentrator:{destination_lu}"),
+                egress: format!("{egress_transport}:{destination_lu}"),
                 state: "opening".into(), bytes_in: 0, bytes_out: 0,
                 last_change_ms: local_status::now_ms(),
             });
@@ -483,12 +513,45 @@ impl<'a> AutoMptnGateway<'a> {
 struct MptnToWsSession {
     association: u64,
     status_id: String,
-    port: VirtualWsPort<WsRoutePort>,
+    port: VirtualWsPort<NativePort>,
     pending_offer: Option<IngressOffer>,
     pending_tcp: Option<TcpRecord>,
     pending_udp: Option<(u16, Vec<u8>, bool)>,
     user_started: bool,
     setup_deadline: Instant,
+}
+
+/// Keep each converter's native circuit independent while allowing either a
+/// WebSocket or a local LLC egress behind the same semantic MPTN converter.
+struct NativePort(Box<dyn RoutePort>);
+
+impl RoutePort for NativePort {
+    fn poll(&mut self, credit: bool) -> io::Result<Option<Vec<RouterEvent>>> {
+        self.0.poll(credit)
+    }
+    fn tick(&mut self) -> io::Result<Vec<RouterEvent>> { self.0.tick() }
+    fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> { self.0.send(unit) }
+    fn has_capacity(&self) -> bool { self.0.has_capacity() }
+    fn available_receive_slots(&self) -> usize { self.0.available_receive_slots() }
+    fn on_downstream_capacity(&mut self, slots: usize) -> io::Result<()> {
+        self.0.on_downstream_capacity(slots)
+    }
+    fn take_completed_information_count(&mut self) -> usize {
+        self.0.take_completed_information_count()
+    }
+    fn on_downstream_completed(&mut self, count: usize) -> io::Result<()> {
+        self.0.on_downstream_completed(count)
+    }
+    fn set_ingress_busy(&mut self, busy: bool) -> io::Result<()> {
+        self.0.set_ingress_busy(busy)
+    }
+    fn on_peer_ready(&mut self) -> io::Result<()> { self.0.on_peer_ready() }
+    fn on_managed_mac(&mut self, mac: [u8; 6]) -> io::Result<()> {
+        self.0.on_managed_mac(mac)
+    }
+    fn failure_scope(&self, error: &io::Error) -> FailureScope { self.0.failure_scope(error) }
+    fn disconnect(&mut self) -> io::Result<()> { self.0.disconnect() }
+    fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 
 impl MptnToWsSession {
