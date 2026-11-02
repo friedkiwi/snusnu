@@ -1685,6 +1685,119 @@ pub(crate) fn automatic_route_snapshot(
     })
 }
 
+/// Complete downstream directory received on one authenticated WebSocket.
+/// The lookup deliberately returns an error for duplicate names, since a
+/// guessed route could deliver an SNA session to the wrong endpoint.
+#[derive(Default)]
+pub(crate) struct AutoDirectory {
+    origins: HashMap<Vec<u8>, (Vec<u8>, Vec<wire::RouteExport>)>,
+    managed: HashMap<[u8; 6], (wire::SnaName, Vec<wire::RouteReference>)>,
+}
+
+impl AutoDirectory {
+    pub(crate) fn replace_origin(&mut self, origin: &wire::OriginRouteSnapshot) -> io::Result<()> {
+        if origin.router_id.len() != 16 {
+            return Err(protocol("invalid origin ID"));
+        }
+        let snapshot = origin.snapshot.as_ref().ok_or_else(|| protocol("missing route snapshot"))?;
+        if snapshot.epoch.len() != 16 || snapshot.revision == 0 {
+            return Err(protocol("invalid origin route snapshot"));
+        }
+        let mut ids = HashSet::new();
+        for route in &snapshot.routes {
+            if route.id == 0 || route.generation == 0 || !ids.insert(route.id) {
+                return Err(protocol("invalid or duplicate origin route ID"));
+            }
+            match route.resource.as_ref() {
+                Some(wire::route_export::Resource::ControlPoint(cp)) => validate_name(cp)?,
+                Some(wire::route_export::Resource::LogicalUnit(lu)) => {
+                    validate_name(lu.lu.as_ref().ok_or_else(|| protocol("LU route missing name"))?)?;
+                    if let Some(host) = &lu.hosting_cp { validate_name(host)?; }
+                }
+                None => return Err(protocol("origin route missing resource")),
+            }
+        }
+        self.origins.insert(origin.router_id.clone(),
+            (snapshot.epoch.clone(), snapshot.routes.clone()));
+        Ok(())
+    }
+
+    pub(crate) fn withdraw(&mut self, withdraw: &wire::OriginWithdraw) -> io::Result<()> {
+        if withdraw.router_id.len() != 16 || withdraw.epoch.len() != 16 {
+            return Err(protocol("invalid origin withdrawal"));
+        }
+        if self.origins.get(&withdraw.router_id)
+            .is_some_and(|(epoch, _)| epoch == &withdraw.epoch)
+        {
+            self.origins.remove(&withdraw.router_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replace_managed(&mut self, bindings: &wire::ManagedCpBindingSnapshot) -> io::Result<()> {
+        validate_managed_bindings(&bindings.bindings)?;
+        let mut next = HashMap::new();
+        for binding in &bindings.bindings {
+            let mac: [u8; 6] = binding.virtual_mac.as_slice().try_into()
+                .map_err(|_| protocol("invalid managed virtual MAC"))?;
+            let cp = binding.control_point.clone().ok_or_else(|| protocol("managed CP missing name"))?;
+            next.insert(mac, (cp, binding.candidates.clone()));
+        }
+        self.managed = next;
+        Ok(())
+    }
+
+    pub(crate) fn resolve_cp(&self, name: &wire::SnaName) -> io::Result<Option<wire::RouteReference>> {
+        self.resolve(|resource| matches!(resource,
+            wire::route_export::Resource::ControlPoint(cp) if cp == name))
+    }
+
+    pub(crate) fn resolve_lu(&self, name: &wire::SnaName) -> io::Result<Option<wire::RouteReference>> {
+        self.resolve(|resource| matches!(resource,
+            wire::route_export::Resource::LogicalUnit(lu) if lu.lu.as_ref() == Some(name)))
+    }
+
+    pub(crate) fn resolve_mac(&self, mac: &[u8; 6]) -> io::Result<Option<wire::RouteReference>> {
+        let Some((name, candidates)) = self.managed.get(mac) else { return Ok(None) };
+        let mut found = Vec::new();
+        for candidate in candidates {
+            if self.origins.get(&candidate.router_id).is_some_and(|(epoch, routes)| {
+                epoch == &candidate.epoch && routes.iter().any(|route| {
+                    route.id == candidate.route_id
+                        && route.generation == candidate.route_generation
+                        && matches!(route.resource.as_ref(),
+                            Some(wire::route_export::Resource::ControlPoint(cp)) if cp == name)
+                })
+            }) {
+                found.push(candidate.clone());
+            }
+        }
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(found.pop()),
+            _ => Err(protocol("ambiguous managed MAC destination")),
+        }
+    }
+
+    fn resolve(&self, matches: impl Fn(&wire::route_export::Resource) -> bool) -> io::Result<Option<wire::RouteReference>> {
+        let mut found = None;
+        for (router_id, (epoch, routes)) in &self.origins {
+            for route in routes {
+                if route.resource.as_ref().is_some_and(&matches) {
+                    if found.is_some() {
+                        return Err(protocol("ambiguous upstream SNA destination"));
+                    }
+                    found = Some(wire::RouteReference {
+                        router_id: router_id.clone(), epoch: epoch.clone(),
+                        route_id: route.id, route_generation: route.generation,
+                    });
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
 fn accept_managed_revision(last: &mut u64, next: u64) -> io::Result<()> {
     if next == 0 || next <= *last {
         return Err(protocol("managed CP binding revision is not increasing"));
@@ -1839,6 +1952,43 @@ mod tests {
         )));
         assert!(automatic_route_snapshot(&[7; 16], 2, "OWNED", &[], &[])
             .unwrap().routes.is_empty());
+    }
+
+    #[test]
+    fn automatic_directory_resolves_unique_lu_and_fences_withdrawal_epoch() {
+        let mut directory = AutoDirectory::default();
+        let route = wire::RouteExport {
+            id: 41, generation: 2,
+            resource: Some(wire::route_export::Resource::LogicalUnit(wire::LuReachability {
+                lu: Some(name("TARGET", "LUA")),
+                hosting_cp: Some(name("TARGET", "CPA")),
+                supported_types: Vec::new(),
+            })),
+        };
+        let origin = wire::OriginRouteSnapshot {
+            router_id: vec![1; 16],
+            snapshot: Some(wire::RouteSnapshot {
+                epoch: vec![2; 16], revision: 1, routes: vec![route.clone()],
+            }),
+        };
+        directory.replace_origin(&origin).unwrap();
+        assert_eq!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap()
+            .unwrap().route_id, 41);
+        directory.withdraw(&wire::OriginWithdraw {
+            router_id: vec![1; 16], epoch: vec![9; 16],
+        }).unwrap();
+        assert!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap().is_some());
+        let mut another = origin.clone();
+        another.router_id = vec![3; 16];
+        directory.replace_origin(&another).unwrap();
+        assert!(directory.resolve_lu(&name("TARGET", "LUA")).is_err());
+        directory.withdraw(&wire::OriginWithdraw {
+            router_id: vec![3; 16], epoch: vec![2; 16],
+        }).unwrap();
+        directory.withdraw(&wire::OriginWithdraw {
+            router_id: vec![1; 16], epoch: vec![2; 16],
+        }).unwrap();
+        assert!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap().is_none());
     }
 
     #[test]
