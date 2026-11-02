@@ -209,5 +209,8 @@ session open. The same NETID-qualified pass-through reached Alice's remote
 `Sign On` again on Bob's console, with blank credentials. The two private
 captures, `combined8-sol9.pcap` and `combined8-sol8.pcap`, contain 13 and
 87 packets and had zero capture drops. Both captures were stopped while
-the guest screen and QA concentrator/router processes remained running for
-an uptime check beyond the earlier 180-second deadline.
+the guest screen and QA concentrator/router processes remained running.
+At 00:22:08 UTC the Bob router process had been alive for 3 minutes 8
+seconds, past the earlier 180-second deadline, and Bob still displayed
+Alice's remote `Sign On` with blank credentials. Both QA router processes,
+the concentrator, and both writable QA guests were left running.
