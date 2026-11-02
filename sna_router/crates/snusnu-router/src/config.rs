@@ -80,7 +80,9 @@ pub(crate) struct LlcConfig {
     pub(crate) id: String,
     pub(crate) interface: String,
     pub(crate) guest_mac: String,
-    pub(crate) proxy_mac: String,
+    /// Optional for concentrator routes, where the target's managed MAC is
+    /// learned from the server before the LLC association is activated.
+    pub(crate) proxy_mac: Option<String>,
     pub(crate) local_cp: Option<String>,
     #[serde(default)]
     pub(crate) lus: Vec<String>,
@@ -222,8 +224,8 @@ impl RouterConfig {
             }
             kinds.insert(&peer.id, "llc");
             let guest = parse_mac(&peer.guest_mac)?;
-            let proxy = parse_mac(&peer.proxy_mac)?;
-            if guest == proxy {
+            let proxy = peer.proxy_mac.as_deref().map(parse_mac).transpose()?;
+            if proxy == Some(guest) {
                 return Err(invalid(format!(
                     "LLC peer {} has equal guest and proxy MACs",
                     peer.id
@@ -303,7 +305,7 @@ impl RouterConfig {
                     peer.id
                 )));
             }
-            if !peers.insert((peer.interface.as_str(), guest, proxy)) {
+            if !peers.insert((peer.interface.as_str(), guest, Some(proxy))) {
                 return Err(invalid(format!(
                     "duplicate LAN association on {}",
                     peer.interface
@@ -582,12 +584,13 @@ impl RouterConfig {
                 .ok_or_else(|| {
                     invalid(format!("remote {} must attach to an LLC peer", remote.id))
                 })?;
-            let proxy = parse_mac(&peer.proxy_mac)?;
-            if proxy[..3] != [0x02, 0x53, 0x4e] {
-                return Err(invalid(format!(
-                    "remote LLC peer {} must use assigned 02:53:4e virtual MAC",
-                    peer.id
-                )));
+            if let Some(proxy) = peer.proxy_mac.as_deref().map(parse_mac).transpose()? {
+                if proxy[..3] != [0x02, 0x53, 0x4e] {
+                    return Err(invalid(format!(
+                        "remote LLC peer {} must use assigned 02:53:4e virtual MAC",
+                        peer.id
+                    )));
+                }
             }
             let owned_cp = peer.local_cp.as_ref().ok_or_else(|| {
                 invalid(format!(
@@ -616,6 +619,19 @@ impl RouterConfig {
                 if !exported_lus.insert((name.netid, name.name)) {
                     return Err(invalid("duplicate local LU export"));
                 }
+            }
+        }
+        for peer in &self.llc {
+            if peer.proxy_mac.is_none()
+                && !self.remote.iter().any(|remote| {
+                    directed.get(peer.id.as_str()) == Some(&remote.id.as_str())
+                        && directed.get(remote.id.as_str()) == Some(&peer.id.as_str())
+                })
+            {
+                return Err(invalid(format!(
+                    "LLC peer {} requires proxy_mac without a concentrator route",
+                    peer.id
+                )));
             }
         }
         for id in ids {
@@ -745,6 +761,12 @@ to = "b"
     #[test]
     fn permits_multiple_peers_on_one_interface() {
         parse(GOOD).validate().unwrap();
+        let missing_proxy = GOOD.replace("proxy_mac = \"02:53:4e:00:00:02\"\n", "");
+        assert!(parse(&missing_proxy)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires proxy_mac"));
     }
 
     #[test]
@@ -879,6 +901,9 @@ to = "upstream"
 "#;
         let parsed = parse(config);
         parsed.validate().unwrap();
+        let managed_proxy = parse(&config.replace("proxy_mac = \"02:53:4e:00:00:01\"\n", ""));
+        managed_proxy.validate().unwrap();
+        assert!(managed_proxy.llc[0].proxy_mac.is_none());
         assert_eq!(
             parsed.concentrator_local_id(&parsed.remote[0]).unwrap(),
             "a"
