@@ -268,12 +268,8 @@ fn concentrator_llc<'a>(
         })
 }
 
-fn configured_proxy_mac(peer: &config::LlcConfig) -> io::Result<[u8; 6]> {
-    peer.proxy_mac
-        .as_deref()
-        .map(config::parse_mac)
-        .transpose()
-        .map(|mac| mac.unwrap_or([0; 6]))
+fn configured_proxy_mac(config: &RouterConfig, peer: &config::LlcConfig) -> io::Result<[u8; 6]> {
+    Ok(config.llc_proxy_mac(&peer.id)?.unwrap_or([0; 6]))
 }
 
 /// Start all configured local associations and the optional concentrator hop.
@@ -289,11 +285,11 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     while !crate::STOP.load(Ordering::Relaxed) {
         let mut registry = EndpointRegistry::default();
         for peer in &config.llc {
-            if peer.proxy_mac.is_some() {
+            if config.llc_proxy_mac(&peer.id)?.is_some() {
                 registry.register(
                     &peer.interface,
                     config::parse_mac(&peer.guest_mac)?,
-                    configured_proxy_mac(peer)?,
+                    configured_proxy_mac(config, peer)?,
                 )?;
             }
         }
@@ -307,7 +303,7 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                     LlcPeer {
                         interface: &peer.interface,
                         guest_mac: config::parse_mac(&peer.guest_mac)?,
-                        proxy_mac: configured_proxy_mac(peer)?,
+                        proxy_mac: configured_proxy_mac(config, peer)?,
                     },
                     registry.clone(),
                     peer.local_cp.as_deref(),
@@ -460,8 +456,8 @@ fn install_config_route(
     target: &PortId,
 ) -> io::Result<()> {
     let address = if let Some(peer) = config.llc.iter().find(|peer| peer.id == source.0) {
-        Some(match peer.proxy_mac.as_deref() {
-            Some(mac) => RouteAddress::Mac(config::parse_mac(mac)?),
+        Some(match config.llc_proxy_mac(&peer.id)? {
+            Some(mac) => RouteAddress::Mac(mac),
             None => RouteAddress::UnboundManagedMac,
         })
     } else if let Some(peer) = config.hpr_lan.iter().find(|peer| peer.id == source.0) {
