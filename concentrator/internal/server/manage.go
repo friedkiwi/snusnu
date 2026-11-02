@@ -297,6 +297,17 @@ func (a *App) setRole(w http.ResponseWriter, r *http.Request, u store.User, s st
 	}
 	http.Redirect(w, r, "/admin/users", 303)
 }
+func (a *App) adminVerifyUser(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
+	if err := a.DB.AdminVerifyUser(r.Context(), u.ID, r.FormValue("id")); err != nil {
+		if errors.Is(err, store.ErrNotAdmin) {
+			http.Error(w, "admin role required", http.StatusForbidden)
+			return
+		}
+		dbError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/admin/users", http.StatusSeeOther)
+}
 func (a *App) apiDirectory(w http.ResponseWriter, r *http.Request, u store.User) {
 	items, err := a.DB.ListExports(r.Context(), "")
 	if err != nil {

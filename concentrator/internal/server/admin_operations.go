@@ -212,12 +212,7 @@ type adminRouterSession struct {
 	OutboundDropped                                                             uint64
 }
 
-type adminCircuit struct {
-	ID, SourceID, SourceName, TargetID, TargetName, State    string
-	SourceSent, SourceAllowance, TargetSent, TargetAllowance uint64
-}
-
-func (h *routerHub) adminSnapshot() ([]adminRouterSession, []adminCircuit) {
+func (h *routerHub) adminRouterSessions() []adminRouterSession {
 	routers := make([]adminRouterSession, 0, h.sessionCount())
 	for _, c := range h.sessions() {
 		c.mu.Lock()
@@ -233,22 +228,13 @@ func (h *routerHub) adminSnapshot() ([]adminRouterSession, []adminCircuit) {
 		c.mu.Unlock()
 		routers = append(routers, item)
 	}
-	sort.Slice(routers, func(i, j int) bool { return routers[i].Name < routers[j].Name })
-	var circuits []adminCircuit
-	h.circuits.Range(func(key, value any) bool {
-		id, c := key.(string), value.(*wsCircuit)
-		c.mu.Lock()
-		sourceRouter, targetRouter := c.source.routerSnapshot(), c.target.routerSnapshot()
-		item := adminCircuit{ID: id, SourceID: sourceRouter.ID, SourceName: sourceRouter.DisplayName, TargetID: targetRouter.ID, TargetName: targetRouter.DisplayName, State: "Active", SourceAllowance: c.allowance[0], TargetAllowance: c.allowance[1], SourceSent: c.sent[0], TargetSent: c.sent[1]}
-		if c.pending {
-			item.State = "Pending"
+	sort.Slice(routers, func(i, j int) bool {
+		if routers[i].Name == routers[j].Name {
+			return routers[i].ID < routers[j].ID
 		}
-		c.mu.Unlock()
-		circuits = append(circuits, item)
-		return true
+		return routers[i].Name < routers[j].Name
 	})
-	sort.Slice(circuits, func(i, j int) bool { return circuits[i].ID < circuits[j].ID })
-	return routers, circuits
+	return routers
 }
 
 func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -257,7 +243,6 @@ func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.Us
 		dbError(w, err)
 		return
 	}
-	routers, circuits := a.hub.adminSnapshot()
 	policyVersion, policyRouters, policyBlocks := uint64(0), 0, 0
 	if policy := a.hub.policy.Load(); policy != nil {
 		policyVersion, policyRouters, policyBlocks = policy.version, len(policy.routers), len(policy.blocks)
@@ -266,7 +251,7 @@ func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.Us
 	a.historyMu.Lock()
 	pendingHistory := len(a.historyPending)
 	a.historyMu.Unlock()
-	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "RouterLogStale": a.routerLogStale.Load(), "HistoryPending": pendingHistory, "HistoryArchived": a.historyArchived.Load(), "HistoryPersisted": a.historyPersisted.Load(), "HistoryRetries": a.historyRetries.Load(), "HistoryFailed": a.historyFailed.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
+	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "RouterLogStale": a.routerLogStale.Load(), "HistoryPending": pendingHistory, "HistoryArchived": a.historyArchived.Load(), "HistoryPersisted": a.historyPersisted.Load(), "HistoryRetries": a.historyRetries.Load(), "HistoryFailed": a.historyFailed.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
 }
 
 func (a *App) runMaintenanceTask(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {

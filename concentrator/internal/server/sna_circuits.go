@@ -361,7 +361,7 @@ func (a *App) renderSNACircuits(w http.ResponseWriter, r *http.Request, u store.
 		return
 	}
 	history.Pending = a.pendingCircuitHistory(u.ID, all, history)
-	a.render(w, "sna_circuits", map[string]any{"User": u, "CSRF": s.CSRF, "Active": a.hub.liveCircuits(u.ID, all), "History": history, "All": all})
+	a.render(w, "sna_circuits", map[string]any{"User": u, "CSRF": s.CSRF, "Active": activeCircuitPage(r, a.hub.liveCircuits(u.ID, all)), "History": history, "All": all})
 }
 
 func (a *App) snaCircuits(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {

@@ -1,0 +1,12 @@
+package server
+
+func init() {
+	pages["admin_router_sessions"] = `{{define "content"}}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3"><div><h1 class="mb-1">Router sessions</h1><p class="text-muted mb-0">Routers currently connected to this concentrator instance.</p></div><a class="btn btn-outline-primary" href="/admin/router-sessions">Refresh</a></div>
+<section class="card shadow-sm"><div class="card-body">
+<form method="get" class="row g-2 align-items-end mb-3"><div class="col-md-6"><label class="form-label" for="session-q">Search</label><input class="form-control" id="session-q" name="q" value="{{.Page.Search}}" placeholder="Router name, ID, IP, protocol or epoch"></div><div class="col-md-2"><label class="form-label" for="session-size">Rows</label><select class="form-select" id="session-size" name="page_size"><option {{if eq .Page.PageSize 25}}selected{{end}}>25</option><option {{if eq .Page.PageSize 50}}selected{{end}}>50</option><option {{if eq .Page.PageSize 100}}selected{{end}}>100</option><option {{if eq .Page.PageSize 200}}selected{{end}}>200</option></select></div><div class="col-auto"><button class="btn btn-primary">Apply</button> <a class="btn btn-link" href="/admin/router-sessions">Clear</a></div></form>
+<div class="d-flex justify-content-between align-items-center mb-2"><span>{{.Page.Total}} matching router session(s) · page {{.Page.Number}} of {{.Page.Pages}}</span><div>{{if .Page.PrevURL}}<a class="btn btn-outline-secondary btn-sm" href="{{.Page.PrevURL}}">Previous</a>{{end}} {{if .Page.NextURL}}<a class="btn btn-outline-secondary btn-sm" href="{{.Page.NextURL}}">Next</a>{{end}}</div></div>
+<div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><th>Router</th><th>Connection</th><th>Routes</th><th>Dynamic outbound queue</th><th>Queued data</th></tr></thead><tbody>{{range .Page.Items}}<tr><td><a href="/routers/{{.ID}}">{{.Name}}</a><br><small><code>{{.ID}}</code></small></td><td><code>{{.IP}}</code><br><small>{{.Protocol}} · since {{date .ConnectedAt}}<br>epoch <code>{{.Epoch}}</code></small></td><td>{{.RouteCount}} at revision {{.RouteRevision}}</td><td>{{.OutboundQueued}} / {{.OutboundLimit}} messages · {{.OutboundBytes}} bytes<br><small>high-water {{.OutboundHighWater}} · dropped {{.OutboundDropped}}</small></td><td>{{.DataQueued}} bytes</td></tr>{{else}}<tr><td colspan="5">No connected routers match this search.</td></tr>{{end}}</tbody></table></div>
+</div></section>
+{{end}}`
+}

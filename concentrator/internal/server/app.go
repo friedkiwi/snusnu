@@ -165,10 +165,12 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /admin/users/{id}/delete", a.admin(a.adminDeleteUser))
 	m.HandleFunc("GET /admin/routers", a.admin(a.adminRouters))
 	m.HandleFunc("GET /admin/operations", a.admin(a.adminOperations))
+	m.HandleFunc("GET /admin/router-sessions", a.admin(a.adminRouterSessionsPage))
 	m.HandleFunc("GET /admin/circuits", a.admin(a.adminSNACircuits))
 	m.HandleFunc("POST /admin/circuits/{id}/reset", a.admin(a.adminResetSNACircuit))
 	m.HandleFunc("POST /admin/operations/{task}/run", a.admin(a.runMaintenanceTask))
 	m.HandleFunc("POST /admin/users/role", a.admin(a.setRole))
+	m.HandleFunc("POST /admin/users/verify", a.admin(a.adminVerifyUser))
 	m.HandleFunc("POST /admin/users/reset-password", a.admin(a.adminResetPassword))
 	m.HandleFunc("POST /admin/directory", a.admin(a.createDirectory))
 	m.HandleFunc("POST /admin/directory/update", a.admin(a.updateDirectory))
@@ -658,7 +660,7 @@ func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/clients">API clients</a>`, "", 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/flows">Flows</a>`, `<a class="nav-link" href="/flows">Flows</a><a class="nav-link" href="/circuits">SNA circuits</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `>All MACs</a>`, `>LLC allocations</a>`, 1)
-	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/admin/routers">All routers</a>`, `<a class="dropdown-item" href="/admin/routers">All routers</a><a class="dropdown-item" href="/admin/circuits">All SNA circuits</a><a class="dropdown-item" href="/admin/operations">Operations</a>`, 1)
+	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/admin/routers">All routers</a>`, `<a class="dropdown-item" href="/admin/routers">All routers</a><a class="dropdown-item" href="/admin/router-sessions">Router sessions</a><a class="dropdown-item" href="/admin/circuits">All SNA circuits</a><a class="dropdown-item" href="/admin/operations">Operations</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/settings">Settings</a>`, `<a class="dropdown-item" href="/settings">Settings</a><a class="dropdown-item" href="/clients">API keys</a>`, 1)
 	t, err := template.New("page").Funcs(template.FuncMap{"date": func(unix int64) string {
 		if unix == 0 {

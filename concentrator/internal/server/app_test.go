@@ -166,8 +166,12 @@ func TestAdminOperationsRunsAndReportsMaintenance(t *testing.T) {
 	cookie := &http.Cookie{Name: "snusnu_session", Value: token}
 
 	page := uiGet(t, a, "/admin/operations", cookie)
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Maintenance tasks") || !strings.Contains(page.Body.String(), "Router sessions") || !strings.Contains(page.Body.String(), "Never run") {
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Maintenance tasks") || !strings.Contains(page.Body.String(), "Never run") || strings.Contains(page.Body.String(), "No routers are connected to this concentrator instance") {
 		t.Fatalf("operations page: %d %s", page.Code, page.Body.String())
+	}
+	page = uiGet(t, a, "/admin/router-sessions", cookie)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "No connected routers match this search") || !strings.Contains(page.Body.String(), "name=\"page_size\"") {
+		t.Fatalf("router sessions page: %d %s", page.Code, page.Body.String())
 	}
 	w := postForm(a, "/admin/operations/expired-records/run", url.Values{"csrf": {session.CSRF}}, cookie)
 	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/admin/operations" {
@@ -191,6 +195,9 @@ func TestAdminOperationsRunsAndReportsMaintenance(t *testing.T) {
 	userCookie := &http.Cookie{Name: "snusnu_session", Value: userToken}
 	if got := uiGet(t, a, "/admin/operations", userCookie).Code; got != http.StatusForbidden {
 		t.Fatalf("non-admin operations read: %d", got)
+	}
+	if got := uiGet(t, a, "/admin/router-sessions", userCookie).Code; got != http.StatusForbidden {
+		t.Fatalf("non-admin router sessions read: %d", got)
 	}
 	if got := postForm(a, "/admin/operations/router-log-retention/run", url.Values{"csrf": {userSession.CSRF}}, userCookie).Code; got != http.StatusForbidden {
 		t.Fatalf("non-admin maintenance run: %d", got)

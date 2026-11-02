@@ -9,6 +9,41 @@ import (
 var ErrLastAdmin = errors.New("cannot delete the last admin account")
 var ErrNotAdmin = errors.New("admin role required")
 
+// AdminVerifyUser marks an account verified and invalidates any outstanding
+// email code in one transaction. The actor's current role is checked here as
+// well as by the HTTP handler.
+func (s *Store) AdminVerifyUser(ctx context.Context, actorID, targetID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Serialize this role check with role changes and account deletion.
+	if _, err = tx.ExecContext(ctx, "UPDATE users SET role=role WHERE role='admin'"); err != nil {
+		return err
+	}
+	var role string
+	if err = tx.QueryRowContext(ctx, s.Q("SELECT role FROM users WHERE id=?"), actorID).Scan(&role); err != nil {
+		return err
+	}
+	if role != "admin" {
+		return ErrNotAdmin
+	}
+	var verifiedAt int64
+	if err = tx.QueryRowContext(ctx, s.Q("SELECT verified_at FROM users WHERE id=?"), targetID).Scan(&verifiedAt); err != nil {
+		return err
+	}
+	if verifiedAt == 0 {
+		if _, err = tx.ExecContext(ctx, s.Q("UPDATE users SET verified_at=? WHERE id=? AND verified_at=0"), Now(), targetID); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, s.Q("DELETE FROM email_tokens WHERE user_id=?"), targetID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // SetUserRole serializes role changes with account deletion and checks the
 // acting admin again inside the transaction.
 func (s *Store) SetUserRole(ctx context.Context, actorID, targetID, role string) error {
