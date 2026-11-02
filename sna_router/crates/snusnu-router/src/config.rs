@@ -155,6 +155,15 @@ pub(crate) struct RouteConfig {
     pub(crate) timeout_seconds: Option<u64>,
 }
 
+/// One configured gateway and concentrator share a route whose MPTN and
+/// native sides can each initiate a separate LU6.2 session.
+pub(crate) struct BidirectionalGatewayConfig<'a> {
+    pub(crate) gateway: &'a MptnGatewayConfig,
+    pub(crate) concentrator: &'a RemoteConfig,
+    pub(crate) route: &'a RouteConfig,
+    pub(crate) reverse: ReverseWsConfig,
+}
+
 /// A route names a converter explicitly before two different session
 /// profiles can be joined. No converter is currently enabled at runtime.
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -404,6 +413,34 @@ impl RouterConfig {
         }) else {
             return Ok(None);
         };
+        self.reverse_ws_for_route(route).map(Some)
+    }
+
+    /// Select the same physical gateway and WebSocket hop for initiation on
+    /// either side. A route TP is the explicit opt-in for the combined
+    /// runtime; older inbound-only lab configurations remain distinct.
+    pub(crate) fn bidirectional_gateway_config(
+        &self,
+    ) -> io::Result<Option<BidirectionalGatewayConfig<'_>>> {
+        let Some(route) = self.route.iter().find(|route| {
+            self.mptn_gateway
+                .iter()
+                .any(|gateway| gateway.id == route.from)
+                && self.remote.iter().any(|remote| remote.id == route.to)
+                && route.user_tp_hex.is_some()
+        }) else {
+            return Ok(None);
+        };
+        let reverse = self.reverse_ws_for_route(route)?;
+        Ok(Some(BidirectionalGatewayConfig {
+            gateway: &self.mptn_gateway[0],
+            concentrator: &self.remote[0],
+            route,
+            reverse,
+        }))
+    }
+
+    fn reverse_ws_for_route(&self, route: &RouteConfig) -> io::Result<ReverseWsConfig> {
         if !self.llc.is_empty()
             || !self.ee.is_empty()
             || !self.anynet.is_empty()
@@ -469,7 +506,7 @@ impl RouterConfig {
             timeout: Duration::from_secs(timeout),
         };
         config.validate()?;
-        Ok(Some(config))
+        Ok(config)
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
@@ -784,7 +821,9 @@ impl RouterConfig {
             if (route.user_tp_hex.is_some() || route.timeout_seconds.is_some())
                 && !matches!(
                     (source_kind, target_kind),
-                    ("llc", "mptn_gateway") | ("remote", "mptn_gateway")
+                    ("llc", "mptn_gateway")
+                        | ("remote", "mptn_gateway")
+                        | ("mptn_gateway", "remote")
                 )
             {
                 return Err(invalid(format!(
@@ -822,6 +861,10 @@ impl RouterConfig {
                 {
                     if source_kind == "remote" {
                         self.reverse_ws_config()?;
+                    } else if route.user_tp_hex.is_some() {
+                        self.bidirectional_gateway_config()?.ok_or_else(|| {
+                            invalid("bidirectional TCP62 gateway route is absent")
+                        })?;
                     }
                     if source_kind != "mptn_gateway" {
                         add_directed(&mut directed, &route.from, &route.to)?;
@@ -1522,8 +1565,14 @@ timeout_seconds = 120
             "from = \"upstream\"\nto = \"bob\"",
             "from = \"bob\"\nto = \"upstream\"",
         ));
-        inbound.validate().unwrap_err();
+        inbound.validate().unwrap();
         assert!(inbound.reverse_ws_config().unwrap().is_none());
+        let duplex = inbound.bidirectional_gateway_config().unwrap().unwrap();
+        assert_eq!(duplex.gateway.id, "bob");
+        assert_eq!(duplex.concentrator.id, "upstream");
+        assert_eq!(duplex.reverse.hosted_lu, "QABOB.SNAB");
+        assert_eq!(duplex.reverse.source_lu, "QAALICE.SNAA");
+        assert_eq!(duplex.route.destination_lu.as_deref(), Some("QAALICE.SNAA"));
         assert!(parse(&config.replace(
             "target_lu = \"QAALICE.SNAA\"",
             "target_lu = \"QAALICE.OTHER\""
