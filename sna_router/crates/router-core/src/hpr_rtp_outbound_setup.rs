@@ -63,8 +63,10 @@ pub fn encode_cp_setup(
     append_cv(&mut qualifier, 0x00, &local_cp)?;
     append_cv(&mut qualifier, 0x26, &bootstrap.local.tower.cp_nce_label)?;
     append_cv(&mut qualifier, 0x39, &bootstrap.local.tower.cp_nce_instance)?;
-    // The final nested CV39's word padding belongs to parent CV05.
-    qualifier[0] = u8::try_from(qualifier.len()).map_err(|_| OutboundSetupError::TooLarge)?;
+    // CV05's LT length excludes the final nested CV39's two word-padding
+    // bytes, while those bytes still align the following X0D segment. The
+    // preserved V5R4 qualified setup uses length 0x1e followed by two zeroes.
+    qualifier[0] = u8::try_from(qualifier.len() - 2).map_err(|_| OutboundSetupError::TooLarge)?;
     align4(&mut qualifier);
 
     let mut cs = vec![0, 0x0d, 1, 1, 0x98, 0, 0, 0];
@@ -226,6 +228,11 @@ mod tests {
         )
         .unwrap();
         let packet = RtpPacket::parse(&wire).unwrap();
+        // NHDR (6 bytes), THDR fixed (20 bytes), then CV05. Its LT length is
+        // 30, and the two trailing zero bytes align the following segment.
+        assert_eq!(&wire[..6], &[0xc6, 8, 0xa4, 0, 0xff, 0]);
+        assert_eq!(&wire[26..30], &[0x1e, 0x05, 0x80, 0]);
+        assert_eq!(&wire[56..58], &[0, 0]);
         assert_eq!(packet.data, bind.prepare_bind().unwrap());
         assert_eq!(packet.byte_sequence_number, 0);
         assert!(packet.start_of_message && packet.end_of_message);
