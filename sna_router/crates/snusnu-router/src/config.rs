@@ -451,6 +451,13 @@ impl RouterConfig {
                 "all concentrator circuits must share one bearer token",
             ));
         }
+        if self.remote.iter().any(|entry| entry.target_lu.is_some())
+            && self.remote.iter().any(|entry| entry.target_lu.is_none())
+        {
+            return Err(invalid(
+                "all concentrator circuits on one WebSocket must use the same protocol version",
+            ));
+        }
         let mut directed = HashMap::<&str, &str>::new();
         for route in &self.route {
             if !ids.contains(route.from.as_str())
@@ -929,6 +936,48 @@ to = "upstream"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn concentrator_circuits_cannot_mix_protocol_versions() {
+        let config = r#"
+[[llc]]
+id = "a"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+proxy_mac = "02:53:4e:00:00:01"
+local_cp = "SOLNET.SNAA"
+lus = ["SOLNET.LUA"]
+[[llc]]
+id = "b"
+interface = "sol6"
+guest_mac = "02:00:35:27:23:02"
+proxy_mac = "02:53:4e:00:00:02"
+local_cp = "SOLNET.SNAB"
+lus = ["SOLNET.LUB"]
+[[concentrator]]
+id = "upstream_a"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+target_cp = "DSTNET.PEERA"
+target_lu = "DSTNET.LUA"
+token = "shared"
+[[concentrator]]
+id = "upstream_b"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+target_cp = "DSTNET.PEERB"
+token = "shared"
+[[route]]
+from = "a"
+to = "upstream_a"
+[[route]]
+from = "b"
+to = "upstream_b"
+"#;
+        assert!(parse(config)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("same protocol version"));
     }
 
     #[test]

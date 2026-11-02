@@ -236,9 +236,25 @@ impl RoutePort for LlcPort {
     }
 }
 
-/// Start all configured local associations and the optional remote hop. The
-/// route table is checked before any raw socket is opened, so a typo cannot
-/// leave a partially attached router running.
+fn concentrator_llc<'a>(
+    config: &'a RouterConfig,
+    entry: &config::RemoteConfig,
+) -> io::Result<&'a config::LlcConfig> {
+    let local_id = config.concentrator_local_id(entry)?;
+    config
+        .llc
+        .iter()
+        .find(|peer| peer.id == local_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "concentrator requires LLC peer",
+            )
+        })
+}
+
+/// Start all configured local associations and the optional concentrator hop.
+/// The route table is checked before any raw socket is opened.
 pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     config.validate()?;
     if !config.mptn_gateway.is_empty() {
@@ -305,21 +321,25 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
         // Opening the WebSocket publishes local CP/LU routes immediately.
         // Keep that publication behind successful local port initialization.
         let remote_ports = if let Some(remote) = config.remote.first() {
-            let bearer = std::env::var("SNUSNU_ROUTER_TOKEN").map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SNUSNU_ROUTER_TOKEN is required",
-                )
-            })?;
             let options = config
                 .remote
                 .iter()
                 .map(|entry| {
+                    let peer = concentrator_llc(config, entry)?;
                     Ok(RemoteConfig {
                         url: entry.url.clone(),
-                        bearer: bearer.clone(),
-                        local_cp: config::parse_cp(&entry.local_cp)?,
-                        target_cp: config::parse_cp(&entry.target_cp)?,
+                        bearer: entry.bearer_token()?,
+                        local_cp: config::parse_cp(peer.local_cp.as_deref().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "LLC peer has no local CP")
+                        })?)?,
+                        target_cp: config::parse_cp(entry.target_cp.as_deref().ok_or_else(
+                            || {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "concentrator has no target CP",
+                                )
+                            },
+                        )?)?,
                         target_lu: entry
                             .target_lu
                             .as_deref()
@@ -328,30 +348,34 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
                     })
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            let logical_units = config
-                .remote
-                .iter()
-                .flat_map(|entry| {
-                    entry.lus.iter().map(|name| {
-                        Ok(transport_ws::wire::LuReachability {
-                            lu: Some(config::parse_cp(name)?),
-                            hosting_cp: Some(config::parse_cp(&entry.local_cp)?),
-                            supported_types: entry
-                                .lu_types
-                                .get(name)
-                                .into_iter()
-                                .flatten()
-                                .map(|lu_type| lu_type.wire_value())
-                                .collect(),
-                        })
-                    })
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let connected = if config.remote[0].source_lu.is_some() {
+            let mut logical_units = Vec::new();
+            for entry in &config.remote {
+                let peer = concentrator_llc(config, entry)?;
+                let hosting_cp = config::parse_cp(peer.local_cp.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "LLC peer has no local CP")
+                })?)?;
+                for name in &peer.lus {
+                    logical_units.push(transport_ws::wire::LuReachability {
+                        lu: Some(config::parse_cp(name)?),
+                        hosting_cp: Some(hosting_cp.clone()),
+                        supported_types: peer
+                            .lu_types
+                            .get(name)
+                            .into_iter()
+                            .flatten()
+                            .map(|lu_type| lu_type.wire_value())
+                            .collect(),
+                    });
+                }
+            }
+            let connected = if config.remote[0].target_lu.is_some() {
                 let source_lus = config
                     .remote
                     .iter()
-                    .map(|entry| entry.source_lu.as_deref().map(config::parse_cp).transpose())
+                    .map(|entry| {
+                        let peer = concentrator_llc(config, entry)?;
+                        peer.lus.first().map(|lu| config::parse_cp(lu)).transpose()
+                    })
                     .collect::<io::Result<Vec<_>>>()?;
                 WsRoutePort::connect_many_v2(options, logical_units, source_lus)
             } else {
@@ -415,7 +439,10 @@ fn install_config_route(
     } else if let Some(peer) = config.hpr_lan.iter().find(|peer| peer.id == source.0) {
         Some(RouteAddress::Mac(config::parse_mac(&peer.proxy_mac)?))
     } else if let Some(remote) = config.remote.iter().find(|remote| remote.id == source.0) {
-        let cp = config::parse_cp(&remote.local_cp)?;
+        let peer = concentrator_llc(config, remote)?;
+        let cp = config::parse_cp(peer.local_cp.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "LLC peer has no local CP")
+        })?)?;
         Some(RouteAddress::ControlPoint {
             netid: cp.netid,
             name: cp.name,
@@ -546,7 +573,7 @@ mod reconnect_tests {
     }
 
     #[test]
-    fn rejects_unowned_remote_export_before_opening_local_or_upstream_port() {
+    fn rejects_missing_local_cp_before_opening_local_or_upstream_port() {
         let config: RouterConfig = toml::from_str(
             r#"
 [[llc]]
@@ -554,12 +581,11 @@ id = "guest"
 interface = "definitely-missing-sna-tap"
 guest_mac = "02:00:35:27:23:01"
 proxy_mac = "02:53:4e:00:00:02"
-local_cp = "SOLNET.SNAA"
-[[remote]]
+[[concentrator]]
 id = "upstream"
 url = "ws://127.0.0.1:9/router/v1/ws"
-local_cp = "SOLNET.OTHER"
 target_cp = "SOLNET.SNAB"
+token = ""
 [[route]]
 from = "guest"
 to = "upstream"
@@ -568,7 +594,7 @@ to = "upstream"
         .unwrap();
         let error = run_config(&config).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("not owned"));
+        assert!(error.to_string().contains("cannot publish CP"));
     }
 
     #[test]
