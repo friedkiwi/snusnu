@@ -176,3 +176,18 @@ Alice, then stopped on Alice's first 12-byte native pacing PIU
 `/tmp/snusnu-cross-netid/combined4-sol9.pcap` and `combined4-sol8.pcap`
 (13 and 70 packets, zero capture drops). The next gateway step is to
 consume that native pacing response locally and continue the user session.
+
+The sixth combined run consumed Alice's first 12-byte pacing IPR and
+advanced to a live V4 target session: Alice's `SNAB` controller and devices
+became active, with mode `BLANK` shown as `ACTIVE/TARGET *PASSTHR`. Bob's
+console selected virtual device `QPADEV0001` on Alice's system but remained
+at pass-through initialization until its APPC timeout
+`E01A8002000032FE`; no remote Sign On appeared. The wire trace narrowed
+the stall: after Alice's 82-byte FMD response, Rust sent a nine-byte empty
+native IPR `2f0002020000830100` and a nine-byte positive response. In the
+successful direct V4R4 baseline the originator instead sent a 12-byte IPR
+`2f0002020000830100000006` before the destination produced its display
+record; the positive response matched. The missing three-byte pacing grant
+is the next live gateway question. Private captures are
+`combined6-sol9.pcap` and `combined6-sol8.pcap` in the lab directory (18
+and 109 packets, zero capture drops).
