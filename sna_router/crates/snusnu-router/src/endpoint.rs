@@ -505,7 +505,11 @@ impl Endpoint {
     }
 }
 
-fn build_ethernet_frame(guest_mac: [u8; 6], proxy_mac: [u8; 6], pdu: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn build_ethernet_frame(
+    guest_mac: [u8; 6],
+    proxy_mac: [u8; 6],
+    pdu: &[u8],
+) -> io::Result<Vec<u8>> {
     if proxy_mac == [0; 6] {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,

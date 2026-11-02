@@ -4,7 +4,7 @@
 //! resolves that MAC, a separate endpoint owns the link and its LLC2 credit.
 
 use crate::{
-    endpoint::{format_mac, validate_mac_pair, Endpoint, Event},
+    endpoint::{build_ethernet_frame, format_mac, validate_mac_pair, Endpoint, Event},
     local_status::{now_ms, LocalPeerStatus},
     routing::{IdentityObservation, RoutePort, RoutedUnit, RouterEvent},
 };
@@ -15,18 +15,21 @@ use router_core::{
     xid3::Xid3,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const CONNECT_BARRIER: Duration = Duration::from_millis(200);
+const NATIVE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct LlcAutoListener {
     port: PacketPort,
     interface: String,
     guest_mac: [u8; 6],
     allowed_proxy_macs: HashSet<[u8; 6]>,
+    native_proxy_macs: HashSet<[u8; 6]>,
+    native_pending: HashMap<[u8; 6], Instant>,
     active_proxy_macs: HashSet<[u8; 6]>,
 }
 
@@ -51,6 +54,8 @@ impl LlcAutoListener {
             interface: interface.to_owned(),
             guest_mac,
             allowed_proxy_macs: HashSet::new(),
+            native_proxy_macs: HashSet::new(),
+            native_pending: HashMap::new(),
             active_proxy_macs: HashSet::new(),
         })
     }
@@ -61,12 +66,24 @@ impl LlcAutoListener {
         Ok(())
     }
 
+    /// Native converters need the peer CP before they can construct their
+    /// local APPN identity. Answer the guest's preliminary null XID here and
+    /// offer the session only when its XID3 reveals the peer CP.
+    pub(crate) fn allow_native_proxy_mac(&mut self, mac: [u8; 6]) -> io::Result<()> {
+        self.allow_proxy_mac(mac)?;
+        self.native_proxy_macs.insert(mac);
+        Ok(())
+    }
+
     pub(crate) fn withdraw_proxy_mac(&mut self, mac: [u8; 6]) {
         self.allowed_proxy_macs.remove(&mac);
+        self.native_proxy_macs.remove(&mac);
+        self.native_pending.remove(&mac);
     }
 
     pub(crate) fn release(&mut self, mac: [u8; 6]) {
         self.active_proxy_macs.remove(&mac);
+        self.native_pending.remove(&mac);
     }
 
     /// Reserve a destination before an upstream-initiated circuit opens its
@@ -84,12 +101,22 @@ impl LlcAutoListener {
     /// Poll one frame and offer its destination at most once while its
     /// association is active. A private endpoint receives subsequent frames.
     pub(crate) fn poll_offer(&mut self) -> io::Result<Option<LlcIngressOffer>> {
+        self.native_pending
+            .retain(|_, started| started.elapsed() < NATIVE_BOOTSTRAP_TIMEOUT);
         let mut bytes = [0u8; MAX_FRAME_LEN];
         let length = match self.port.receive_frame(&mut bytes) {
             Ok(length) => length,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
+        let destination: [u8; 6] =
+            match bytes[..length].get(..6).and_then(|mac| mac.try_into().ok()) {
+                Some(mac) => mac,
+                None => return Ok(None),
+            };
+        if self.native_proxy_macs.contains(&destination) {
+            return self.poll_native_frame(&bytes[..length]);
+        }
         let classified = classify_offer(
             &bytes[..length],
             self.guest_mac,
@@ -114,6 +141,101 @@ impl LlcAutoListener {
             peer_cp,
             first_frame: bytes[..length].to_vec(),
         }))
+    }
+
+    fn poll_native_frame(&mut self, bytes: &[u8]) -> io::Result<Option<LlcIngressOffer>> {
+        let action = match classify_native_offer(
+            bytes,
+            self.guest_mac,
+            &self.native_proxy_macs,
+            &self.active_proxy_macs,
+        ) {
+            Ok(action) => action,
+            Err(error) => {
+                tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), error = %error, "invalid native LLC bootstrap ignored");
+                return Ok(None);
+            }
+        };
+        match action {
+            NativeOfferAction::Ignore => Ok(None),
+            NativeOfferAction::Reply { proxy_mac, pdu } => {
+                let frame = build_ethernet_frame(self.guest_mac, proxy_mac, &pdu)?;
+                self.port.send_frame(&frame)?;
+                self.native_pending.insert(proxy_mac, Instant::now());
+                tracing::debug!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), proxy_mac = %format_mac(proxy_mac), "answered native LLC bootstrap Type1");
+                Ok(None)
+            }
+            NativeOfferAction::Offer { proxy_mac, peer_cp } => {
+                self.native_pending.remove(&proxy_mac);
+                self.active_proxy_macs.insert(proxy_mac);
+                tracing::info!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), proxy_mac = %format_mac(proxy_mac), peer_cp = %peer_cp, "native LLC session offered after XID3");
+                Ok(Some(LlcIngressOffer {
+                    interface: self.interface.clone(),
+                    guest_mac: self.guest_mac,
+                    proxy_mac,
+                    peer_cp: Some(peer_cp),
+                    first_frame: bytes.to_vec(),
+                }))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum NativeOfferAction {
+    Ignore,
+    Reply { proxy_mac: [u8; 6], pdu: Vec<u8> },
+    Offer { proxy_mac: [u8; 6], peer_cp: String },
+}
+
+fn classify_native_offer(
+    bytes: &[u8],
+    guest_mac: [u8; 6],
+    native_proxy_macs: &HashSet<[u8; 6]>,
+    active_proxy_macs: &HashSet<[u8; 6]>,
+) -> io::Result<NativeOfferAction> {
+    let Ok(frame) = parse_8023(bytes) else {
+        return Ok(NativeOfferAction::Ignore);
+    };
+    if frame.source != guest_mac
+        || !frame.is_sna()
+        || !native_proxy_macs.contains(&frame.destination)
+        || active_proxy_macs.contains(&frame.destination)
+    {
+        return Ok(NativeOfferAction::Ignore);
+    }
+    let Control::Unnumbered { byte } = frame.control else {
+        return Ok(NativeOfferAction::Ignore);
+    };
+    let command = frame.ssap & 1 == 0;
+    match byte & !0x10 {
+        0xaf if command && frame.information.is_empty() => Ok(NativeOfferAction::Reply {
+            proxy_mac: frame.destination,
+            pdu: vec![4, 5, 0xaf | (byte & 0x10)],
+        }),
+        0xe3 if command => {
+            let mut pdu = vec![4, 5, byte];
+            pdu.extend_from_slice(frame.information);
+            Ok(NativeOfferAction::Reply {
+                proxy_mac: frame.destination,
+                pdu,
+            })
+        }
+        0xaf if frame.information.first() == Some(&0x32) => {
+            let peer_cp = Xid3::decode(frame.information)
+                .and_then(|xid| xid.cp_name())
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("native peer XID3 has no valid CP: {error}"),
+                    )
+                })?;
+            Ok(NativeOfferAction::Offer {
+                proxy_mac: frame.destination,
+                peer_cp,
+            })
+        }
+        _ => Ok(NativeOfferAction::Ignore),
     }
 }
 
@@ -416,6 +538,38 @@ mod tests {
             )
             .unwrap(),
             Some((proxy, Some("SOLNET.SNAB".into())))
+        );
+        let native = HashSet::from([proxy]);
+        assert_eq!(
+            classify_native_offer(
+                &frame(proxy, guest, &[4, 4, 0xbf]),
+                guest,
+                &native,
+                &HashSet::new()
+            )
+            .unwrap(),
+            NativeOfferAction::Reply {
+                proxy_mac: proxy,
+                pdu: vec![4, 5, 0xbf]
+            }
+        );
+        assert_eq!(
+            classify_native_offer(&frame(proxy, guest, &pdu), guest, &native, &HashSet::new())
+                .unwrap(),
+            NativeOfferAction::Offer {
+                proxy_mac: proxy,
+                peer_cp: "SOLNET.SNAB".into()
+            }
+        );
+        assert_eq!(
+            classify_native_offer(
+                &frame(proxy, guest, &pdu),
+                guest,
+                &native,
+                &HashSet::from([proxy])
+            )
+            .unwrap(),
+            NativeOfferAction::Ignore
         );
     }
 
