@@ -916,6 +916,7 @@ dependencies = [
  "prost",
  "router-core",
  "serde",
+ "serde_json",
  "socket2",
  "toml",
  "tracing",
