@@ -168,6 +168,53 @@ impl Router {
         Ok(())
     }
 
+    /// Register a circuit as two private ports. Credit and delivery
+    /// completion then stay within this circuit even when many circuits use
+    /// the same physical listener or upstream connection.
+    pub(crate) fn register_pair(
+        &mut self,
+        left_id: PortId,
+        left: Box<dyn RoutePort>,
+        right_id: PortId,
+        right: Box<dyn RoutePort>,
+    ) -> io::Result<()> {
+        if left_id == right_id
+            || self.ports.contains_key(&left_id)
+            || self.ports.contains_key(&right_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "duplicate circuit port",
+            ));
+        }
+        self.register_port(left_id.clone(), left)?;
+        self.register_port(right_id.clone(), right)?;
+        self.add_route(&left_id, &right_id)?;
+        self.add_route(&right_id, &left_id)?;
+        Ok(())
+    }
+
+    /// Remove a disconnected private circuit without disturbing other pairs.
+    /// Callers must finish or abort outstanding delivery before removal.
+    pub(crate) fn remove_pair(&mut self, left: &PortId, right: &PortId) -> io::Result<()> {
+        if self.target(left)? != right || self.target(right)? != left {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ports are not a circuit pair",
+            ));
+        }
+        for id in [left, right] {
+            self.ports.remove(id);
+            self.routes.remove(id);
+            self.destinations.remove(id);
+            self.address_routes.retain(|(source, _), _| source != id);
+            self.failures.remove(id);
+            self.order.retain(|entry| entry != id);
+            tracing::info!(port = %id.0, "router circuit port removed");
+        }
+        Ok(())
+    }
+
     pub(crate) fn add_route(&mut self, source: &PortId, target: &PortId) -> io::Result<()> {
         self.check_route_ports(source, target)?;
         if self.address_routes.keys().any(|(port, _)| port == source) {
@@ -274,7 +321,7 @@ impl Router {
         Ok(())
     }
 
-    fn poll_once(&mut self) -> io::Result<bool> {
+    pub(crate) fn poll_once(&mut self) -> io::Result<bool> {
         let mut received = false;
         let mut polled = HashSet::new();
         for source in self.order.clone() {
@@ -1170,5 +1217,47 @@ mod tests {
         assert!(router.failures.is_empty());
         assert_eq!(a.borrow().disconnect_count, 0);
         assert_eq!(b.borrow().disconnect_count, 0);
+    }
+
+    #[test]
+    fn dynamically_registered_pair_can_be_removed_without_affecting_another() {
+        let mut router = Router::new();
+        let a = Rc::new(RefCell::new(State::default()));
+        let b = Rc::new(RefCell::new(State::default()));
+        let c = Rc::new(RefCell::new(State::default()));
+        let d = Rc::new(RefCell::new(State::default()));
+        router
+            .register_pair(
+                PortId::new("a"),
+                Box::new(FakePort(a)),
+                PortId::new("b"),
+                Box::new(FakePort(b)),
+            )
+            .unwrap();
+        router
+            .register_pair(
+                PortId::new("c"),
+                Box::new(FakePort(c.clone())),
+                PortId::new("d"),
+                Box::new(FakePort(d.clone())),
+            )
+            .unwrap();
+        router.validate_routes().unwrap();
+        assert!(router
+            .register_pair(
+                PortId::new("a"),
+                Box::new(FakePort(Rc::new(RefCell::new(State::default())))),
+                PortId::new("new"),
+                Box::new(FakePort(Rc::new(RefCell::new(State::default()))))
+            )
+            .is_err());
+        router
+            .remove_pair(&PortId::new("a"), &PortId::new("b"))
+            .unwrap();
+        router.validate_routes().unwrap();
+        router.poll_once().unwrap();
+        assert_eq!(c.borrow().poll_count, 1);
+        assert_eq!(d.borrow().poll_count, 1);
+        assert!(router.port(&PortId::new("a")).is_err());
     }
 }
