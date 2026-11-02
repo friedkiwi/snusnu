@@ -1168,6 +1168,44 @@ mod tests {
     }
 
     #[test]
+    fn qa_user_pacing_grant_uses_one_slot_adaptive_ipm() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::new(
+            inner,
+            xid("QABOB.SNAB", Role::Secondary),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+        )
+        .unwrap();
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        port.user_flow = Some(ReverseUserFlow::new(address, 3, 1).unwrap());
+        port.native_user_input = Some(hex("2e0002020001030100bb"));
+        port.drive_user_flow().unwrap();
+        let record = port.tcp_user_record().unwrap().clone();
+        assert_eq!(record.bytes, hex("0000000b000001030000bb"));
+        port.mark_tcp_user_record_enqueued(&record).unwrap();
+        port.drive_user_flow().unwrap();
+        assert_eq!(
+            port.inner.information,
+            vec![hex("2f0002020000830100000001")]
+        );
+        assert_eq!(port.inner.inbound_completed, 1);
+        port.inner.completed = 1;
+        port.complete_management_egress().unwrap();
+    }
+
+    #[test]
     fn native_management_starts_after_link_and_waits_for_exact_remote_llc_credit() {
         let inner = MockWs {
             incoming: VecDeque::new(),
