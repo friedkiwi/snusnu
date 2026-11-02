@@ -2,7 +2,7 @@
 //! does on a local LLC port; only this module knows the concentrator protocol.
 
 use crate::{
-    local_status::{self, ConcentratorStatus},
+    local_status::{self, CircuitStatus, ConcentratorStatus},
     routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent},
 };
 use router_core::packet_log::{decode_llc_pdu, decode_sna_information, hex_dump};
@@ -965,6 +965,7 @@ impl WsRoutePort {
                 }
                 circuit.ready = true;
                 info!(circuit_id = %format_uuid(&ready.circuit_id), "incoming circuit ready");
+                self.record_circuit_status();
                 self.flush_type1()?;
             }
             Body::OpenResult(result) => {
@@ -1120,6 +1121,7 @@ impl WsRoutePort {
                 receive_allowance: INITIAL_ALLOWANCE,
                 received_bytes: 0,
             });
+            self.record_circuit_status();
         }
         Ok(())
     }
@@ -1182,6 +1184,7 @@ impl WsRoutePort {
             .borrow_mut()
             .circuit_owners
             .insert(result.circuit_id, self.index);
+        self.record_circuit_status();
         self.flush_type1()
     }
 
@@ -1230,6 +1233,7 @@ impl WsRoutePort {
                     "received SNA information over WebSocket"
                 );
                 self.pending_information.push_back(data);
+                self.record_circuit_status();
                 Ok(Vec::new())
             }
         }
@@ -1242,10 +1246,43 @@ impl WsRoutePort {
             .ok_or_else(|| protocol("unknown circuit ID"))
     }
 
+    fn record_circuit_status(&self) {
+        let (Some(status), Some(circuit)) = (crate::status(), self.circuit.as_ref()) else {
+            return;
+        };
+        let (ingress, egress) = if let Some(inbound) = self
+            .inbound_open
+            .as_ref()
+            .filter(|inbound| inbound.circuit_id == circuit.id)
+        {
+            (
+                format!("router {}", format_uuid(&inbound.source_router_id)),
+                format!("local {}", format_cp(&self.local_cp)),
+            )
+        } else {
+            (
+                format!("local {}", format_cp(&self.local_cp)),
+                format!("concentrator {}", format_cp(&self.target_cp)),
+            )
+        };
+        status.upsert_circuit(CircuitStatus {
+            id: format_uuid(&circuit.id),
+            ingress,
+            egress,
+            state: if circuit.ready { "ready" } else { "opening" }.into(),
+            bytes_in: circuit.received_bytes,
+            bytes_out: circuit.sent_bytes,
+            last_change_ms: local_status::now_ms(),
+        });
+    }
+
     fn clear_circuit(&mut self) {
         let mut shared = self.shared.borrow_mut();
         if let Some(circuit) = &self.circuit {
             shared.retire_circuit(&circuit.id);
+            if let Some(status) = crate::status() {
+                status.remove_circuit(&format_uuid(&circuit.id));
+            }
         }
         if self.opening {
             shared.retire_request(self.request_id);
@@ -1349,6 +1386,7 @@ impl RoutePort for WsRoutePort {
                 );
                 self.send_event(wire::circuit_event::Event::SnaInformation(data))?;
                 self.outbound_completions.sent(bytes)?;
+                self.record_circuit_status();
                 Ok(true)
             }
             RoutedUnit::AnyNetTcpRecord(_)
@@ -1383,6 +1421,9 @@ impl RoutePort for WsRoutePort {
         if let Some(circuit) = self.circuit.take() {
             self.shared.borrow_mut().retire_circuit(&circuit.id);
             info!(circuit_id = %format_uuid(&circuit.id), "closing circuit");
+            if let Some(status) = crate::status() {
+                status.remove_circuit(&format_uuid(&circuit.id));
+            }
             self.send_body(wire::ws_envelope::Body::CircuitClose(wire::CircuitClose {
                 circuit_id: circuit.id,
             }))?;
