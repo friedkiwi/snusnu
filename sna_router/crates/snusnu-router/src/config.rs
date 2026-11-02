@@ -256,8 +256,14 @@ pub(crate) enum ConfiguredLuType {
     Lu2,
     #[serde(rename = "lu_3")]
     Lu3,
+    #[serde(rename = "lu_4")]
+    Lu4,
+    #[serde(rename = "lu_6_1")]
+    Lu6_1,
     #[serde(rename = "lu_6_2")]
     Lu6_2,
+    #[serde(rename = "lu_7")]
+    Lu7,
 }
 
 impl ConfiguredLuType {
@@ -267,7 +273,10 @@ impl ConfiguredLuType {
             Self::Lu1 => wire::LuType::LuType1 as i32,
             Self::Lu2 => wire::LuType::LuType2 as i32,
             Self::Lu3 => wire::LuType::LuType3 as i32,
+            Self::Lu4 => wire::LuType::LuType4 as i32,
+            Self::Lu6_1 => wire::LuType::LuType61 as i32,
             Self::Lu6_2 => wire::LuType::LuType62 as i32,
+            Self::Lu7 => wire::LuType::LuType7 as i32,
         }
     }
 }
@@ -1593,6 +1602,19 @@ to = "upstream"
         assert_eq!(
             parsed.llc[0].lu_types["SOLNET.LUA"],
             vec![ConfiguredLuType::Lu6_2]
+        );
+        let all_types = config.replace(
+            "[\"lu_6_2\"]",
+            "[\"lu_0\", \"lu_1\", \"lu_2\", \"lu_3\", \"lu_4\", \"lu_6_1\", \"lu_6_2\", \"lu_7\"]",
+        );
+        let all_types = parse(&all_types);
+        all_types.validate().unwrap();
+        assert_eq!(
+            all_types.llc[0].lu_types["SOLNET.LUA"]
+                .iter()
+                .map(|lu_type| lu_type.wire_value())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 6, 7, 5, 8]
         );
         assert!(
             parse(&config.replace("02:00:35:27:23:01", "03:00:35:27:23:01"))

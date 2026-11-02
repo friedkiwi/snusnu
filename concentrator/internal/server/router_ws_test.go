@@ -378,6 +378,44 @@ func TestRouterWebSocketRejectsUnownedNETID(t *testing.T) {
 	}
 }
 
+func TestRouterPublishesEveryDeclaredLUType(t *testing.T) {
+	a := testApp(t)
+	ctx := context.Background()
+	owner := store.RandomUUID()
+	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "all-lu-types@example.com", "unused", store.Now(), "OWNNET"); err != nil {
+		t.Fatal(err)
+	}
+	router, _, err := a.DB.CreateRouter(ctx, owner, "All LU types")
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := a.DB.BeginRouterEpoch(ctx, router.ID, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &routerSession{router: router, epoch: epoch, allowedNetID: "OWNNET", history: map[uint64]routeSignature{}}
+	a.hub.clients.Store(router.ID, c)
+	defer a.hub.clients.Delete(router.ID)
+	all := []wire.LuType{wire.LuType_LU_TYPE_0, wire.LuType_LU_TYPE_1, wire.LuType_LU_TYPE_2, wire.LuType_LU_TYPE_3, wire.LuType_LU_TYPE_4, wire.LuType_LU_TYPE_6_1, wire.LuType_LU_TYPE_6_2, wire.LuType_LU_TYPE_7}
+	snapshot := &wire.RouteSnapshot{Epoch: uuidBytes(epoch), Revision: 1, Routes: []*wire.RouteExport{{Id: 1, Generation: 1, Resource: &wire.RouteExport_LogicalUnit{LogicalUnit: &wire.LuReachability{Lu: &wire.SnaName{Netid: "OWNNET", Name: "PRINTER"}, SupportedTypes: all}}}}}
+	if err := a.hub.publish(c, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	exports, err := a.DB.ListExports(ctx, owner)
+	if err != nil || len(exports) != 1 || strings.Join(exports[0].LUTypes, ",") != "LU 0,LU 1,LU 2,LU 3,LU 4,LU 6.1,LU 6.2,LU 7" {
+		t.Fatalf("LU capability labels: %+v, %v", exports, err)
+	}
+	snapshot.Revision = 2
+	snapshot.Routes[0].GetLogicalUnit().SupportedTypes = []wire.LuType{wire.LuType_LU_TYPE_4, wire.LuType_LU_TYPE_4}
+	if err := a.hub.publish(c, snapshot); err == nil {
+		t.Fatal("duplicate LU type accepted")
+	}
+	snapshot.Routes[0].GetLogicalUnit().SupportedTypes = []wire.LuType{wire.LuType(99)}
+	if err := a.hub.publish(c, snapshot); err == nil {
+		t.Fatal("unknown LU type accepted")
+	}
+}
+
 func TestRouterWebSocketV2SourceLUBinding(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()

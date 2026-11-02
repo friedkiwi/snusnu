@@ -72,7 +72,7 @@ lus = ["SOLNET.PAYROLL"]
 lu_types = { "SOLNET.PAYROLL" = ["lu_6_2"] }
 ```
 
-Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, and `lu_6_2`. These values are publisher declarations, not proof of a successful BIND negotiation.
+Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, `lu_4`, `lu_6_1`, `lu_6_2`, and `lu_7`. IBM defines types 1, 2, 3, 4, 6.1, 6.2, and 7; `lu_0` is the conventional label for a protocol outside those definitions. Existing protobuf numbers are preserved, and the new types are appended. These values are publisher declarations, not proof of a successful BIND negotiation or support for the type's session protocol. [IBM LU type taxonomy](https://www.ibm.com/docs/en/zos/3.1.0?topic=networks-logical-units).
 
 This single-target V5R4 TCP62 gateway accepts initiation from either side.
 The `[[mptn]]` definition supplies its local CP/LU export and target identity;

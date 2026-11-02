@@ -69,11 +69,14 @@ message LuReachability {
 
 enum LuType {
   LU_TYPE_UNSPECIFIED = 0;
-  LU_TYPE_0 = 1;
+  LU_TYPE_0 = 1; // Conventional name for non-SNA-defined LU session protocols.
   LU_TYPE_1 = 2;
   LU_TYPE_2 = 3;
   LU_TYPE_3 = 4;
   LU_TYPE_6_2 = 5;
+  LU_TYPE_4 = 6;
+  LU_TYPE_6_1 = 7;
+  LU_TYPE_7 = 8;
 }
 
 // Included in a circuit OPEN, which also carries its own circuit ID. The

@@ -909,8 +909,14 @@ func (h *routerHub) publish(c *routerSession, snapshot *wire.RouteSnapshot) erro
 					label = "LU 2"
 				case wire.LuType_LU_TYPE_3:
 					label = "LU 3"
+				case wire.LuType_LU_TYPE_4:
+					label = "LU 4"
+				case wire.LuType_LU_TYPE_6_1:
+					label = "LU 6.1"
 				case wire.LuType_LU_TYPE_6_2:
 					label = "LU 6.2"
+				case wire.LuType_LU_TYPE_7:
+					label = "LU 7"
 				default:
 					return errors.New("unsupported LU type")
 				}

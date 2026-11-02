@@ -25,11 +25,14 @@ type LuType int32
 
 const (
 	LuType_LU_TYPE_UNSPECIFIED LuType = 0
-	LuType_LU_TYPE_0           LuType = 1
+	LuType_LU_TYPE_0           LuType = 1 // Conventional name for non-SNA-defined LU session protocols.
 	LuType_LU_TYPE_1           LuType = 2
 	LuType_LU_TYPE_2           LuType = 3
 	LuType_LU_TYPE_3           LuType = 4
 	LuType_LU_TYPE_6_2         LuType = 5
+	LuType_LU_TYPE_4           LuType = 6
+	LuType_LU_TYPE_6_1         LuType = 7
+	LuType_LU_TYPE_7           LuType = 8
 )
 
 // Enum value maps for LuType.
@@ -41,6 +44,9 @@ var (
 		3: "LU_TYPE_2",
 		4: "LU_TYPE_3",
 		5: "LU_TYPE_6_2",
+		6: "LU_TYPE_4",
+		7: "LU_TYPE_6_1",
+		8: "LU_TYPE_7",
 	}
 	LuType_value = map[string]int32{
 		"LU_TYPE_UNSPECIFIED": 0,
@@ -49,6 +55,9 @@ var (
 		"LU_TYPE_2":           3,
 		"LU_TYPE_3":           4,
 		"LU_TYPE_6_2":         5,
+		"LU_TYPE_4":           6,
+		"LU_TYPE_6_1":         7,
+		"LU_TYPE_7":           8,
 	}
 )
 
@@ -870,14 +879,17 @@ const file_snusnu_routes_v1_proto_rawDesc = "" +
 	"virtualMac\x12A\n" +
 	"\n" +
 	"candidates\x18\x04 \x03(\v2!.snusnu.control.v1.RouteReferenceR\n" +
-	"candidates*n\n" +
+	"candidates*\x9d\x01\n" +
 	"\x06LuType\x12\x17\n" +
 	"\x13LU_TYPE_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tLU_TYPE_0\x10\x01\x12\r\n" +
 	"\tLU_TYPE_1\x10\x02\x12\r\n" +
 	"\tLU_TYPE_2\x10\x03\x12\r\n" +
 	"\tLU_TYPE_3\x10\x04\x12\x0f\n" +
-	"\vLU_TYPE_6_2\x10\x05BJZHgithub.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1;routesv1b\x06proto3"
+	"\vLU_TYPE_6_2\x10\x05\x12\r\n" +
+	"\tLU_TYPE_4\x10\x06\x12\x0f\n" +
+	"\vLU_TYPE_6_1\x10\a\x12\r\n" +
+	"\tLU_TYPE_7\x10\bBJZHgithub.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1;routesv1b\x06proto3"
 
 var (
 	file_snusnu_routes_v1_proto_rawDescOnce sync.Once

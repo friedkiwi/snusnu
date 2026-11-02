@@ -83,7 +83,7 @@ func (s *Store) ReplaceRouterSnapshot(ctx context.Context, routerID, epoch strin
 		}
 		seenTypes := map[string]bool{}
 		for _, luType := range x.LUTypes {
-			if (luType != "LU 0" && luType != "LU 1" && luType != "LU 2" && luType != "LU 3" && luType != "LU 6.2") || seenTypes[luType] {
+			if (luType != "LU 0" && luType != "LU 1" && luType != "LU 2" && luType != "LU 3" && luType != "LU 4" && luType != "LU 6.1" && luType != "LU 6.2" && luType != "LU 7") || seenTypes[luType] {
 				return errors.New("invalid or duplicate LU type")
 			}
 			seenTypes[luType] = true
