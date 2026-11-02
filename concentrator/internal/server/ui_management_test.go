@@ -109,9 +109,15 @@ func TestFlowsAndBlocklistsAreScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, entry := range []store.LogEntry{{RouterID: ra.ID, PeerUserID: bob, Direction: "inbound", Level: "info", EventType: "PIU", SourceIP: "192.0.2.10", Summary: "ALICE_FLOW"}, {RouterID: rb.ID, PeerUserID: alice, Direction: "outbound", Level: "info", EventType: "PIU", SourceIP: "192.0.2.11", Summary: "BOB_FLOW"}} {
+	for _, entry := range []store.LogEntry{{RouterID: ra.ID, PeerUserID: bob, Direction: "inbound", Level: "info", EventType: "PIU", SourceIP: "192.0.2.10", Summary: "ALICE_FLOW", DetailsJSON: `{"information_hex_prefix":"0102","bytes":2}`}, {RouterID: rb.ID, PeerUserID: alice, Direction: "outbound", Level: "info", EventType: "PIU", SourceIP: "192.0.2.11", Summary: "BOB_FLOW"}} {
 		if err := a.DB.AppendRouterLog(ctx, entry); err != nil {
 			t.Fatal(err)
+		}
+	}
+	aliceFlows := uiGet(t, a, "/flows", aliceCookie).Body.String()
+	for _, want := range []string{`table-layout:fixed`, `white-space:pre-wrap`, "&#34;information_hex_prefix&#34;: &#34;0102&#34;", "\n  &#34;bytes&#34;: 2"} {
+		if !strings.Contains(aliceFlows, want) {
+			t.Fatalf("flow presentation missing %q: %s", want, aliceFlows)
 		}
 	}
 	for _, tc := range []struct {

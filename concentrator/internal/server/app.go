@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
@@ -621,7 +622,7 @@ func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 			return "Never"
 		}
 		return time.Unix(unix, 0).UTC().Format(time.RFC3339)
-	}}).Parse(layout + nodeAddressTemplate + pages[name])
+	}, "prettyJSON": prettyJSON}).Parse(layout + nodeAddressTemplate + pages[name])
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "template error", 500)
@@ -631,4 +632,12 @@ func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 	if err = t.Execute(w, data); err != nil {
 		log.Print(err)
 	}
+}
+
+func prettyJSON(raw string) string {
+	var out bytes.Buffer
+	if err := json.Indent(&out, []byte(raw), "", "  "); err != nil {
+		return raw
+	}
+	return out.String()
 }
