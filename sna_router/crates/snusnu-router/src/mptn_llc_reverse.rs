@@ -185,6 +185,19 @@ fn poll_udp(
 /// after its first Attach; callers may start a new circuit with fresh IDs.
 pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
     config.validate()?;
+    tracing::info!(
+        interface = %config.interface,
+        guest_mac = %format_mac(config.guest_mac),
+        proxy_mac = %format_mac(config.proxy_mac),
+        guest_cp = %config.guest_cp,
+        local_cp = %config.local_cp,
+        source_lu = %config.source_lu,
+        destination_lu = %config.destination_lu,
+        local_ip = %config.endpoint.local_ip,
+        peer_ip = %config.endpoint.peer_ip,
+        timeout_seconds = config.timeout.as_secs(),
+        "LLC to MPTN reverse session starting"
+    );
     let deadline = Instant::now() + config.timeout;
     let socket = UdpSocket::bind(SocketAddr::new(config.endpoint.local_ip, 397))?;
     socket.set_nonblocking(true)?;
@@ -193,6 +206,7 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
         &config.source_lu,
         &config.destination_lu,
     )?;
+    tracing::debug!(peer_ip = %config.endpoint.peer_ip, source_lu = %config.source_lu, destination_lu = %config.destination_lu, "MPTN management complete");
     let xid = config
         .profile()
         .build()
@@ -265,7 +279,10 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
                 return Ok(());
             }
             edge.flush_tcp()?;
-            first_attach_seen |= edge.first_attach_delivery_complete();
+            if !first_attach_seen && edge.first_attach_delivery_complete() {
+                first_attach_seen = true;
+                tracing::info!(interface = %config.interface, peer_ip = %config.endpoint.peer_ip, source_lu = %config.source_lu, destination_lu = %config.destination_lu, "first LU6.2 Attach delivered to MPTN peer");
+            }
             if first_attach_seen || !edge.ipr_ack_outstanding() {
                 match edge.poll_tcp_once() {
                     Ok(()) => {}
@@ -290,7 +307,15 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
             "MPTN session ended before first Attach",
         ));
     }
+    tracing::info!(interface = %config.interface, peer_ip = %config.endpoint.peer_ip, first_attach_seen, "LLC to MPTN reverse session closed");
     Ok(())
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 /// The staged Solstice diagnostic uses the same session runner as a future
