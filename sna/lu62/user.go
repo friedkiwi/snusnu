@@ -53,6 +53,25 @@ func CandidateUserResponse(request []byte, expectedPLU, expectedSLU string, mana
 // profile after an HPR adapter has established its own control plane. The
 // native FID2 service keeps the older strict candidate profile above.
 func CandidateStandaloneUserResponse(request []byte, expectedPLU, expectedSLU string, receiveWindow byte) ([]byte, error) {
+	// OS/400 uses SNASVCMG for the APING session addressed to the server's
+	// PING LU. The carrier adapter has already established CP control flow;
+	// this BIND is admitted only for that exact local service identity. Keep
+	// native user sessions and CPSVCMG control sessions on their own paths.
+	if expectedSLU == "SNUSNU.PING" {
+		bind, err := ParseBind(request)
+		if err == nil && bind != nil && bind.Mode == "SNASVCMG" {
+			response, err := CandidateManagementResponse(request, expectedPLU, expectedSLU, receiveWindow)
+			if err != nil {
+				return nil, ErrUserBind
+			}
+			// The guest accepts the CP response when these negotiated profile
+			// bytes retain its supported security, synchronization, and
+			// limited-resource settings. The response still selects a bounded
+			// receive window in CandidateManagementResponse.
+			copy(response[9+23:9+26], request[9+23:9+26])
+			return response, nil
+		}
+	}
 	return candidateUserResponse(request, expectedPLU, expectedSLU, nil, receiveWindow, true)
 }
 
