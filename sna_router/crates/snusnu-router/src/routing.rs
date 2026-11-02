@@ -269,6 +269,20 @@ impl AutomaticFabric {
         self.sessions.remove(&session_id);
         Ok(())
     }
+
+    /// Remove a pair whose shared transport has already failed. Calling its
+    /// disconnect method could re-enter the broken socket and stop unrelated
+    /// local circuits, so dropping its private ports is the recovery action.
+    pub(crate) fn abort_pair(&mut self, session_id: u64) -> io::Result<()> {
+        let (ingress, egress) = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session is absent"))?
+            .clone();
+        self.router.remove_pair(&ingress, &egress)?;
+        self.sessions.remove(&session_id);
+        Ok(())
+    }
 }
 
 /// The SNA content passed between encapsulations. A DLC control frame keeps
@@ -1695,5 +1709,60 @@ mod tests {
             }]
         );
         assert!(fabric.take_identity_observations().is_empty());
+    }
+
+    #[test]
+    fn automatic_fabric_can_drop_failed_shared_pair_without_local_disconnect() {
+        let mut fabric = AutomaticFabric::new();
+        let source = PortId::new("local");
+        let target = PortId::new("upstream");
+        let destination = RouteAddress::ControlPoint {
+            netid: "NETB".into(),
+            name: "CPB".into(),
+        };
+        fabric
+            .directory_mut()
+            .replace(target.clone(), [destination.clone()]);
+        let failed = Rc::new(RefCell::new(State {
+            poll_failures_remaining: 1,
+            shared_failure: true,
+            free_slots: 1,
+            ..State::default()
+        }));
+        let surviving = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            ..State::default()
+        }));
+        fabric
+            .open_pair(
+                1,
+                &source,
+                &destination,
+                &target,
+                Box::new(FakePort(failed.clone())),
+                Box::new(FakePort(Rc::new(RefCell::new(State {
+                    free_slots: 1,
+                    ..State::default()
+                })))),
+            )
+            .unwrap();
+        fabric
+            .open_pair(
+                2,
+                &source,
+                &destination,
+                &target,
+                Box::new(FakePort(surviving.clone())),
+                Box::new(FakePort(Rc::new(RefCell::new(State {
+                    free_slots: 1,
+                    ..State::default()
+                })))),
+            )
+            .unwrap();
+        assert!(fabric.poll_once().is_err());
+        fabric.abort_pair(1).unwrap();
+        fabric.poll_once().unwrap();
+        assert_eq!(failed.borrow().disconnect_count, 0);
+        assert_eq!(surviving.borrow().poll_count, 1);
     }
 }

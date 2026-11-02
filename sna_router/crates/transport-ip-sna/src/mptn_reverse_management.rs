@@ -129,7 +129,9 @@ pub fn classify_reverse_management_connect(
     let user = &data[cursor..cursor + user_len];
     if user[..11] != [0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]
         || user[11..14] != [9, 3, 1]
-        || user[14] != 0x23
+        // V5R4 has emitted both X'23' and X'24' PLU-generated session
+        // instances. The matching X'13' copy below still binds the token.
+        || !matches!(user[14], 0x23 | 0x24)
         // Both X'80' (earlier reverse capture) and X'00' (QABOB-initiated
         // cross-NETID capture) occur in this dynamic token flag.
         || !matches!(user[19], 0 | 0x80)
@@ -317,6 +319,50 @@ mod tests {
             classify_reverse_management_connect(request, "QABOB.SNAB", "QAALICE.SNAA", None)
                 .unwrap();
         assert_eq!(admitted.fqpcid(), fqpcid);
+    }
+
+    #[test]
+    fn admits_captured_bob_management_token_24_with_matching_repeated_token() {
+        // Sanitized 2026-11-02 Solstice management Connect shape: the live
+        // PLU generated X'24', its dynamic flag was 00, and X'13' repeated
+        // the seven-byte token exactly. All other fixed fields are generated
+        // by the same validated V5R4 management request constructor.
+        let source = ebcdic_lu("QABOB.SNAB").unwrap();
+        let mut fqpcid = vec![0x60, (9 + source.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(source.len() as u8);
+        fqpcid.extend_from_slice(&source);
+        let initiated = ManagementInitiator::new(
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            fqpcid,
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let mut request = Connect::decode(initiated.connect_request()).unwrap();
+        let user_start = 32 + 1 + source.len() + 1;
+        {
+            let data = &mut request.options[1].value;
+            data[user_start + 14] = 0x24;
+            data[user_start + 19] = 0;
+            data[user_start + 27 + source.len()] = 0x24;
+            data[user_start + 32 + source.len()] = 0;
+        }
+        assert!(classify_reverse_management_connect(
+            request.clone(),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            None
+        )
+        .is_ok());
+        request.options[1].value[user_start + 27 + source.len()] = 0x23;
+        assert!(
+            classify_reverse_management_connect(request, "QABOB.SNAB", "QAALICE.SNAA", None)
+                .is_err()
+        );
     }
 
     fn captured_shape() -> Connect {

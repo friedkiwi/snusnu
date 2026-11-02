@@ -58,6 +58,10 @@ impl NativeLlcPort {
         self.receive_once_with_capacity(true)
     }
 
+    pub(crate) fn replay_user_bind(&mut self, piu: Vec<u8>) -> io::Result<()> {
+        self.inner.replay_converter_user_bind(piu)
+    }
+
     fn receive_once_with_capacity(
         &mut self,
         can_accept_information: bool,

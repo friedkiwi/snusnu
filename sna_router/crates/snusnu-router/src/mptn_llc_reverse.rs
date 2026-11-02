@@ -13,7 +13,10 @@ use crate::{
     runtime::LlcPeer,
     STOP,
 };
-use router_core::{fid2_session_control::ManagementBind, xid3::Role, xid3_local::LocalLlcProfile};
+use router_core::{
+    fid2_bind::classify_bind, fid2_session_control::ManagementBind, xid3::Role,
+    xid3_local::LocalLlcProfile,
+};
 use std::{
     fs::File,
     io::{self, Read},
@@ -386,16 +389,56 @@ pub(crate) fn run_with_native(
         .management_bind()
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "native management BIND timed out"))?
         .clone();
-    let source_lu = management.plu().to_owned();
-    let destination_lu = management.slu().to_owned();
-    parse_cp(&source_lu)?;
-    parse_cp(&destination_lu)?;
+    let management_plu = management.plu().to_owned();
+    let management_slu = management.slu().to_owned();
+    parse_cp(&management_plu)?;
+    parse_cp(&management_slu)?;
     endpoint.establish_v5_management(
         timeout.min(Duration::from_secs(5)),
-        &source_lu,
-        &destination_lu,
+        &management_plu,
+        &management_slu,
     )?;
-    tracing::info!(interface, peer_ip = %endpoint.peer_ip, source_lu, destination_lu, "automatic LLC to MPTN management established");
+    tracing::info!(interface, peer_ip = %endpoint.peer_ip, management_plu, management_slu,
+        "automatic LLC to MPTN management established");
+    let user_bind = loop {
+        if cancel.load(Ordering::Relaxed) || STOP.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "automatic local circuit cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "native user BIND timed out",
+            ));
+        }
+        match native.receive_once()? {
+            Some(NativeLlcEvent::UserBind(piu)) => break piu,
+            Some(NativeLlcEvent::Closed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "native contact closed before user BIND",
+                ))
+            }
+            Some(_) => return Err(invalid("native user event before user BIND")),
+            None => thread::sleep(IDLE_POLL),
+        }
+    };
+    let bind = classify_bind(&user_bind)
+        .map_err(|error| invalid(format!("native user BIND: {error}")))?
+        .ok_or_else(|| invalid("native user BIND is absent"))?;
+    let source_lu = bind.plu;
+    let destination_lu = bind.slu;
+    parse_cp(&source_lu)?;
+    parse_cp(&destination_lu)?;
+    native.replay_user_bind(user_bind)?;
+    tracing::info!(
+        interface,
+        source_lu,
+        destination_lu,
+        "automatic native user LU pair selected"
+    );
     run_bridge(
         native,
         socket,

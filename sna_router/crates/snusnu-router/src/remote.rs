@@ -2047,9 +2047,6 @@ impl AutoWsHub {
         Ok(hub)
     }
 
-    pub(crate) fn router_id(&self) -> &[u8] {
-        &self.welcome.router_id
-    }
     pub(crate) fn allowed_netid(&self) -> &str {
         &self.welcome.allowed_netid
     }

@@ -209,6 +209,26 @@ impl NativePeerPort {
         self.converter_events.pop_front()
     }
 
+    pub(crate) fn replay_converter_user_bind(&mut self, piu: Vec<u8>) -> io::Result<()> {
+        if self
+            .converter_offer
+            .as_ref()
+            .is_none_or(|offer| offer.request() != piu)
+            || self
+                .converter_events
+                .iter()
+                .any(|event| matches!(event, NativeLlcEvent::UserBind(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "converter user BIND cannot be replayed",
+            ));
+        }
+        self.converter_events
+            .push_front(NativeLlcEvent::UserBind(piu));
+        Ok(())
+    }
+
     /// Begin XID from this fixed-role link toward a passive OS/400 controller.
     /// The caller must enable this explicitly for an inbound routed session;
     /// a responder-only port continues waiting for the guest's first XID.
@@ -471,6 +491,21 @@ impl NativePeerPort {
     }
 
     fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
+        if self.converter_dynamic
+            && self.converter_offer.is_none()
+            && self.management.as_ref().is_some_and(|management| {
+                matches!(
+                    management.phase(),
+                    ManagementPhase::AwaitBisAck
+                        | ManagementPhase::BisComplete
+                        | ManagementPhase::Closed
+                )
+            })
+        {
+            if let Some(bind) = classify_bind(&piu).map_err(management_error)? {
+                self.converter_policy = Some((bind.plu, bind.slu));
+            }
+        }
         let management = self.management.as_mut().expect("management mode");
         let management_unbind = piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32;
         if self.converter_policy.is_some() && management.phase() == ManagementPhase::Closed {

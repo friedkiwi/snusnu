@@ -26,6 +26,7 @@ const IDLE_POLL: Duration = Duration::from_micros(200);
 struct LlcSession {
     ingress: Option<(usize, [u8; 6])>,
     egress: Option<(usize, [u8; 6])>,
+    upstream: bool,
 }
 
 /// Keep automatic mode separate from the explicit pair router. Each selected
@@ -197,10 +198,16 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(error = %error, "automatic concentrator directory disconnected");
+                    retire_upstream_pairs(&mut fabric, &mut sessions, &mut listeners)?;
                     hub = None;
                     next_connect = Instant::now() + connect_delay;
                     if let Some(remote) = remote {
                         fabric.directory_mut().withdraw(&PortId::new(&remote.id));
+                    }
+                    for mac in remote_macs.drain() {
+                        for listener in &mut listeners {
+                            listener.withdraw_proxy_mac(mac);
+                        }
                     }
                 }
             }
@@ -229,7 +236,26 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 .directory_mut()
                 .replace(PortId::new(&remote.id), addresses);
         }
-        let mut active = fabric.poll_once()?;
+        let mut active = match fabric.poll_once() {
+            Ok(active) => active,
+            Err(error) if remote.is_some() => {
+                tracing::warn!(error = %error,
+                    "automatic upstream circuit failed; retaining local routes");
+                retire_upstream_pairs(&mut fabric, &mut sessions, &mut listeners)?;
+                hub = None;
+                next_connect = Instant::now() + connect_delay;
+                if let Some(remote) = remote {
+                    fabric.directory_mut().withdraw(&PortId::new(&remote.id));
+                }
+                for mac in remote_macs.drain() {
+                    for listener in &mut listeners {
+                        listener.withdraw_proxy_mac(mac);
+                    }
+                }
+                true
+            }
+            Err(error) => return Err(error),
+        };
         for closed in fabric.take_closed_sessions() {
             if let Some(session) = sessions.remove(&closed) {
                 if let Some((ingress, proxy)) = session.ingress {
@@ -378,6 +404,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     LlcSession {
                         ingress: Some((ingress, ingress_proxy)),
                         egress: Some((egress, egress_proxy)),
+                        upstream: false,
                     },
                 );
                 observe_circuit(next_id, &ingress_id.0, &target.0);
@@ -470,8 +497,11 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                                 "local LLC target is busy",
                             ));
                         }
-                        let seed = format!("{}:{}", gateway.id(), target_id.0);
-                        let local_cp = virtual_cp_for_source(&source, seed.as_bytes(), None)?;
+                        let seed = format!("{}:{}.{}", gateway.id(), source.netid, source.name);
+                        let local_cp =
+                            gateway.configured_local_cp()?.map(Ok).unwrap_or_else(|| {
+                                virtual_cp_for_source(&source, seed.as_bytes(), None)
+                            })?;
                         let local = AutoLlcPort::open_outbound(
                             &config.llc[index].interface,
                             config::parse_mac(&config.llc[index].guest_mac)?,
@@ -515,8 +545,11 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 let target_cp = target_cp.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "TCP62 target LU has no hosting CP")
                 })?;
-                let seed = format!("{}:{:?}", gateway.id(), connected.router_id());
-                let local_cp = virtual_cp_for_source(&source, seed.as_bytes(), None)?;
+                let seed = format!("{}:{}.{}", gateway.id(), source.netid, source.name);
+                let local_cp = gateway
+                    .configured_local_cp()?
+                    .map(Ok)
+                    .unwrap_or_else(|| virtual_cp_for_source(&source, seed.as_bytes(), None))?;
                 mptn_exports.insert(
                     format!("{}:{}.{}", gateway.id(), source.netid, source.name),
                     (
@@ -557,6 +590,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         }
         if let Some(connected) = hub.as_mut() {
             if refresh_mptn_exports(
+                config,
                 &learned_mptn_lus,
                 connected,
                 &mut mptn_exports,
@@ -576,6 +610,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
 }
 
 fn refresh_mptn_exports(
+    config: &RouterConfig,
     learned: &HashMap<String, HashSet<(String, String)>>,
     hub: &AutoWsHub,
     exports: &mut HashMap<String, (wire::SnaName, wire::LuReachability)>,
@@ -606,8 +641,14 @@ fn refresh_mptn_exports(
                 netid: netid.clone(),
                 name: name.clone(),
             };
-            let seed = format!("{}:{:?}", gateway_id, hub.router_id());
-            let cp = virtual_cp_for_source(&source, seed.as_bytes(), None)?;
+            let seed = format!("{}:{netid}.{name}", gateway_id);
+            let configured_cp = config
+                .mptn_gateway
+                .iter()
+                .find(|gateway| gateway.id == *gateway_id)
+                .map(|gateway| gateway.local_cp.as_str())
+                .filter(|value| !value.is_empty());
+            let cp = virtual_cp_for_source(&source, seed.as_bytes(), configured_cp)?;
             exports.insert(
                 key,
                 (
@@ -659,6 +700,32 @@ fn refresh_local_addresses(
         addresses.extend(bridge.local_addresses(&id));
         fabric.directory_mut().replace(id, addresses);
     }
+}
+
+fn retire_upstream_pairs(
+    fabric: &mut AutomaticFabric,
+    sessions: &mut HashMap<u64, LlcSession>,
+    listeners: &mut [LlcAutoListener],
+) -> io::Result<()> {
+    let upstream = sessions
+        .iter()
+        .filter_map(|(id, session)| session.upstream.then_some(*id))
+        .collect::<Vec<_>>();
+    for id in upstream {
+        fabric.abort_pair(id)?;
+        if let Some(session) = sessions.remove(&id) {
+            if let Some((index, mac)) = session.ingress {
+                listeners[index].release(mac);
+            }
+            if let Some((index, mac)) = session.egress {
+                listeners[index].release(mac);
+            }
+        }
+        if let Some(status) = crate::status() {
+            status.remove_circuit(&format!("auto-{id}"));
+        }
+    }
+    Ok(())
 }
 
 fn observe_circuit(id: u64, ingress: &str, egress: &str) {
@@ -833,6 +900,7 @@ fn open_incoming_llc(
             LlcSession {
                 ingress: None,
                 egress: Some((index, selected.proxy_mac)),
+                upstream: true,
             },
         );
         observe_circuit(id, &remote.id, &selected.attachment.0);
