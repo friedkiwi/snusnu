@@ -63,6 +63,15 @@ func Open(ctx context.Context, driver, dsn string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	var reservedCount int
+	if err = s.Row(ctx, "SELECT COUNT(*) FROM users WHERE netid='SNUSNU'").Scan(&reservedCount); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if reservedCount != 0 {
+		db.Close()
+		return nil, errors.New("NETID SNUSNU is reserved for concentrator services; reassign the existing user before starting")
+	}
 	return s, nil
 }
 
@@ -189,7 +198,10 @@ func scanUser(row *sql.Row) (User, error) {
 
 const userColumns = "id,email,password_hash,role,verified_at,remind_after,totp_secret,pending_totp,username,first_name,last_name,public_email,netid"
 
-func ValidNetID(value string) bool { return snaName.MatchString(value) }
+// SNUSNU is the concentrator's service namespace and cannot be assigned to a
+// user. Keep this check at the store boundary so registration and profile edits
+// enforce the same rule.
+func ValidNetID(value string) bool { return value != "SNUSNU" && snaName.MatchString(value) }
 
 // UpdateProfile changes profile fields and fences every owned live router when
 // the NETID changes so no advertisement from the previous namespace survives.

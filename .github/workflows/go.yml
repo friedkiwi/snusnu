@@ -1,9 +1,9 @@
 name: Go
 on:
   push:
-    paths: ['concentrator/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
+    paths: ['concentrator/**', 'sna/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
   pull_request:
-    paths: ['concentrator/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
+    paths: ['concentrator/**', 'sna/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
 permissions:
   contents: read
 jobs:
@@ -22,3 +22,9 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test ./...
+      - name: Verify reusable SNA module
+        working-directory: sna
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
