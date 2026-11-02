@@ -175,6 +175,12 @@ impl MptnGatewayPort {
         self.management_ready
     }
 
+    /// The duplex session manager owns UDP receive scheduling. A clone shares
+    /// the same bound socket; only one side may call recv during a circuit.
+    pub(crate) fn clone_udp_socket(&self) -> io::Result<UdpSocket> {
+        self.udp.try_clone()
+    }
+
     pub(crate) fn user_active(&self) -> bool {
         self.active
             .as_ref()
@@ -240,11 +246,26 @@ impl MptnGatewayPort {
         &mut self,
         can_accept_information: impl Fn(u64) -> bool,
     ) -> io::Result<Option<(u64, GatewayEvent)>> {
-        match self.poll_udp_for_association() {
-            Ok(Some(event)) => return Ok(Some(event)),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(error);
+        self.poll_association_with_credit(can_accept_information, true)
+    }
+
+    /// Poll TCP only while an outbound MPTN circuit owns UDP/397. The caller
+    /// must ensure the outbound circuit is the sole UDP receiver in this mode.
+    pub(crate) fn poll_tcp_only_with_credit(
+        &mut self,
+        can_accept_information: impl Fn(u64) -> bool,
+    ) -> io::Result<Option<(u64, GatewayEvent)>> {
+        self.poll_association_with_credit(can_accept_information, false)
+    }
+
+    fn poll_association_with_credit(
+        &mut self,
+        can_accept_information: impl Fn(u64) -> bool,
+        receive_udp: bool,
+    ) -> io::Result<Option<(u64, GatewayEvent)>> {
+        if receive_udp {
+            if let Some(event) = self.poll_udp_for_association()? {
+                return Ok(Some(event));
             }
         }
         // Give an already received UDP acknowledgement precedence over an
