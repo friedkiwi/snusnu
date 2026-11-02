@@ -30,6 +30,7 @@ import (
 
 type Config struct {
 	Origin, SMTPAddr, SMTPFrom, SMTPUser, SMTPPassword string
+	MetricsKey                                         string
 	CaptchaSiteKey, CaptchaSecret                      string
 	MFAKey                                             []byte
 	Development                                        bool
@@ -84,7 +85,11 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /livez", a.liveness)
 	m.HandleFunc("GET /readyz", a.readiness)
 	m.HandleFunc("GET /healthz", a.readiness)
-	m.HandleFunc("GET /metrics", a.metrics)
+	if a.Config.MetricsKey != "" {
+		m.HandleFunc("GET /metrics", a.metricsAuthenticated)
+	} else {
+		m.HandleFunc("GET /metrics", http.NotFound)
+	}
 	m.HandleFunc("GET /openapi.json", a.openAPISpec)
 	m.HandleFunc("GET /router/v1/ws", a.routerWebSocket)
 	m.HandleFunc("GET /", a.home)

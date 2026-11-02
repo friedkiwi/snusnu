@@ -37,6 +37,7 @@ If a user loses every MFA factor, an operator with database access can run `go r
 | `SNUSNU_DB_DSN` | SQLite filename (default `snusnu.db`) or PostgreSQL connection URL |
 | `SNUSNU_ORIGIN` | Public origin; HTTPS required outside development |
 | `SNUSNU_MFA_KEY` | Persistent 64-character hex key for TOTP secret encryption |
+| `SNUSNU_METRICS_KEY` | Optional bearer key for `GET /metrics`; the endpoint is disabled when unset |
 | `SNUSNU_DEV` | Set to `1` for local HTTP and verification-code logging |
 | `SNUSNU_SMTP_ADDR` | SMTP host and port with STARTTLS, required outside development |
 | `SNUSNU_SMTP_FROM` | Verified sender address, required outside development |

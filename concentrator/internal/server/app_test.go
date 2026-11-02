@@ -46,6 +46,34 @@ func postForm(a *App, path string, form url.Values, cookie *http.Cookie) *httpte
 	a.Handler().ServeHTTP(w, r)
 	return w
 }
+
+func TestMetricsAreDisabledOrBearerProtected(t *testing.T) {
+	a := testApp(t)
+	request := func(key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		if key != "" {
+			r.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		a.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if got := request("").Code; got != http.StatusNotFound {
+		t.Fatalf("metrics without configured key: %d", got)
+	}
+	a.Config.MetricsKey = "test-metrics-key"
+	if got := request("").Code; got != http.StatusUnauthorized {
+		t.Fatalf("metrics without bearer key: %d", got)
+	}
+	if got := request("wrong-key").Code; got != http.StatusUnauthorized {
+		t.Fatalf("metrics with wrong bearer key: %d", got)
+	}
+	w := request("test-metrics-key")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "snusnu_connected_routers") {
+		t.Fatalf("metrics with valid key: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestRegistrationVerificationAndMFAEnrollmentReminder(t *testing.T) {
 	a := testApp(t)
 	var logs bytes.Buffer

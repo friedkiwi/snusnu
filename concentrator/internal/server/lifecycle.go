@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -90,6 +93,22 @@ func (a *App) metrics(w http.ResponseWriter, _ *http.Request) {
 		stats := session.out.stats()
 		fmt.Fprintf(w, "snusnu_router_outbound_queue_depth{router_id=\"%s\"} %d\nsnusnu_router_outbound_queue_bytes{router_id=\"%s\"} %d\nsnusnu_router_outbound_queue_high_water{router_id=\"%s\"} %d\nsnusnu_router_outbound_queue_dropped_total{router_id=\"%s\"} %d\n", session.router.ID, stats.Depth, session.router.ID, stats.Bytes, session.router.ID, stats.HighWater, session.router.ID, stats.Dropped)
 	}
+}
+
+func (a *App) metricsAuthenticated(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="snusnu-metrics"`)
+		http.Error(w, "metrics bearer key required", http.StatusUnauthorized)
+		return
+	}
+	want, got := sha256.Sum256([]byte(a.Config.MetricsKey)), sha256.Sum256([]byte(parts[1]))
+	if subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="snusnu-metrics"`)
+		http.Error(w, "invalid metrics bearer key", http.StatusUnauthorized)
+		return
+	}
+	a.metrics(w, r)
 }
 
 func (h *routerHub) activeCircuitCount() int {

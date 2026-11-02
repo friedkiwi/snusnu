@@ -67,7 +67,7 @@ func main() {
 	if err != nil || len(key) != 32 {
 		log.Fatal("SNUSNU_MFA_KEY must be 64 hex characters")
 	}
-	app, err := server.NewApp(db, server.Config{Origin: env("SNUSNU_ORIGIN", "http://localhost:8080"), Development: os.Getenv("SNUSNU_DEV") == "1", MFAKey: key, SMTPAddr: os.Getenv("SNUSNU_SMTP_ADDR"), SMTPFrom: os.Getenv("SNUSNU_SMTP_FROM"), SMTPUser: os.Getenv("SNUSNU_SMTP_USER"), SMTPPassword: os.Getenv("SNUSNU_SMTP_PASSWORD"), CaptchaSiteKey: os.Getenv("SNUSNU_RECAPTCHA_SITE_KEY"), CaptchaSecret: os.Getenv("SNUSNU_RECAPTCHA_SECRET")})
+	app, err := server.NewApp(db, server.Config{Origin: env("SNUSNU_ORIGIN", "http://localhost:8080"), Development: os.Getenv("SNUSNU_DEV") == "1", MFAKey: key, MetricsKey: os.Getenv("SNUSNU_METRICS_KEY"), SMTPAddr: os.Getenv("SNUSNU_SMTP_ADDR"), SMTPFrom: os.Getenv("SNUSNU_SMTP_FROM"), SMTPUser: os.Getenv("SNUSNU_SMTP_USER"), SMTPPassword: os.Getenv("SNUSNU_SMTP_PASSWORD"), CaptchaSiteKey: os.Getenv("SNUSNU_RECAPTCHA_SITE_KEY"), CaptchaSecret: os.Getenv("SNUSNU_RECAPTCHA_SECRET")})
 	if err != nil {
 		log.Fatal(err)
 	}
