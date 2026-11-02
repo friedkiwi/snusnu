@@ -6,6 +6,7 @@
 
 use crate::{
     config::parse_mac,
+    mptn_outbound_port::{OutboundEndpoint, OutboundUdp, OutboundUdpAction},
     native_llc_port::NativeLlcPort,
     native_peer_port::NativeLlcEvent,
     native_probe::{parse_tp, ProbeConfig},
@@ -424,6 +425,37 @@ fn observe_udp(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
+/// The sustained reverse diagnostic can answer node-pair keepalives. An
+/// X'83' request is admitted by correlator and held without a positive ACK
+/// until the native edge gains an expedited/abort delivery API.
+fn observe_outbound_udp(socket: &UdpSocket, oob: &mut OutboundUdp) -> io::Result<()> {
+    let mut packet = [0u8; MAX_RECORD];
+    match socket.recv_from(&mut packet) {
+        Ok((length, source)) => match oob.receive(&packet[..length], source)? {
+            OutboundUdpAction::Reply(response) => {
+                if socket.send_to(&response, source)? != response.len() {
+                    return Err(invalid("partial MPTN UDP response"));
+                }
+                Ok(())
+            }
+            OutboundUdpAction::PendingDuplicate => Ok(()),
+            OutboundUdpAction::Deliver {
+                sequence,
+                compensation,
+                ..
+            } => {
+                tracing::warn!(source = %source, sequence, ?compensation, "outbound UDP X'83' requires native delivery before acknowledgement");
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "native UDP X'83' delivery is unavailable",
+                ))
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Inspect one reverse TCP/397 connection from the configured V5 peer. A
 /// TCP62 connection begins with MPTN_Connect (IBM TCP62 draft §5.3.1). This
 /// diagnostic deliberately provides no response or management session.
@@ -640,12 +672,15 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
     socket.connect_timeout(&remote.into(), Duration::from_secs(5))?;
     let stream: TcpStream = socket.into();
     let bridge = bridge(&native, &user_plu, &user_slu, tp)?;
-    let mut edge = GatewayEdge::new(
-        native,
-        TcpSession::new(stream)?,
-        bridge,
-        v5_template(&user_plu, &user_slu)?,
-    );
+    let user_connect = v5_template(&user_plu, &user_slu)?;
+    let mut outbound_udp = OutboundUdp::new(
+        OutboundEndpoint {
+            local_ip: local_ip.into(),
+            peer_ip: remote_ip.into(),
+        },
+        user_connect.clone(),
+    )?;
+    let mut edge = GatewayEdge::new(native, TcpSession::new(stream)?, bridge, user_connect);
     tracing::warn!(
         interface = %config.interface,
         guest_mac = %config.guest_mac,
@@ -677,7 +712,7 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
                     "reverse V5 management Connect requires a responder",
                 ));
             }
-            observe_udp(&udp)?;
+            observe_outbound_udp(&udp, &mut outbound_udp)?;
             let before = flow_snapshot(&edge);
             edge.poll_native_once()?;
             log_flow_change(&edge, before, "native", remote_ip);
@@ -708,7 +743,7 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
                     Err(error) => return Err(error),
                 }
             }
-            observe_udp(&udp)?;
+            observe_outbound_udp(&udp, &mut outbound_udp)?;
             thread::sleep(Duration::from_micros(200));
         }
     })();

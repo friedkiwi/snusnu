@@ -5,6 +5,7 @@
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    collections::VecDeque,
     fs::File,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpStream},
@@ -14,9 +15,167 @@ use transport_ip_sna::{
     anynet::{TcpSession, MAX_RECORD},
     mptn_connect::Connect,
     mptn_gateway_edge::{GatewayEdge, NativeLeg},
+    mptn_keepalive::{Keepalive, Kind as KeepaliveKind},
     mptn_management_initiator::ManagementInitiator,
     mptn_native_bridge::Bridge,
+    mptn_oob::{Compensation, Datagram as OobDatagram, Kind as OobKind},
 };
+
+const RECENT_OOB: usize = 64;
+
+/// A UDP packet is handed to the matching circuit before this decision is
+/// made. `Deliver` reserves one request until the native leg confirms it;
+/// only then may the caller send the positive response.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum OutboundUdpAction {
+    Reply(Vec<u8>),
+    Deliver {
+        sequence: u16,
+        compensation: Compensation,
+        reduced: Vec<u8>,
+    },
+    PendingDuplicate,
+}
+
+struct PendingOob {
+    sequence: u16,
+    packet: Vec<u8>,
+    response: Vec<u8>,
+}
+
+/// Session-local UDP/397 correlation for an outbound MPTN Connect. The
+/// caller owns the shared socket and native delivery acknowledgement.
+pub(crate) struct OutboundUdp {
+    endpoint: OutboundEndpoint,
+    connect: Connect,
+    pending: Option<PendingOob>,
+    completed: VecDeque<(u16, Vec<u8>, Vec<u8>)>,
+}
+
+impl OutboundUdp {
+    pub(crate) fn new(endpoint: OutboundEndpoint, connect: Connect) -> io::Result<Self> {
+        endpoint.validate()?;
+        if connect.source.qualified_lu().is_err()
+            || connect.destination.qualified_lu().is_err()
+            || connect.correlator.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "outbound UDP requires a qualified Connect identity",
+            ));
+        }
+        Ok(Self {
+            endpoint,
+            connect,
+            pending: None,
+            completed: VecDeque::new(),
+        })
+    }
+
+    pub(crate) fn receive(
+        &mut self,
+        packet: &[u8],
+        source: SocketAddr,
+    ) -> io::Result<OutboundUdpAction> {
+        if source.ip() != self.endpoint.peer_ip {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "UDP source differs from MPTN peer",
+            ));
+        }
+        match packet.get(4).copied() {
+            Some(0x84) => {
+                let keepalive = Keepalive::decode(packet)?;
+                keepalive.validate_ingress(source.ip(), self.endpoint.local_ip)?;
+                if keepalive.kind != KeepaliveKind::Request {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsolicited MPTN keepalive response",
+                    ));
+                }
+                Ok(OutboundUdpAction::Reply(
+                    Keepalive {
+                        kind: KeepaliveKind::Response,
+                        ..keepalive
+                    }
+                    .encode()
+                    .to_vec(),
+                ))
+            }
+            Some(0x83) => {
+                let oob = OobDatagram::decode(packet)?;
+                if oob.kind != OobKind::Request
+                    || !oob.options.is_empty()
+                    || !oob.matches_connect(&self.connect)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDP X'83' identity or profile differs from outbound Connect",
+                    ));
+                }
+                if let Some(pending) = &self.pending {
+                    if pending.sequence == oob.sequence && pending.packet == packet {
+                        return Ok(OutboundUdpAction::PendingDuplicate);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "another UDP X'83' delivery is pending",
+                    ));
+                }
+                if let Some((_, original, response)) = self
+                    .completed
+                    .iter()
+                    .find(|(sequence, _, _)| *sequence == oob.sequence)
+                {
+                    if original != packet {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "UDP X'83' retransmission changed",
+                        ));
+                    }
+                    return Ok(OutboundUdpAction::Reply(response.clone()));
+                }
+                let response = oob.positive_response()?;
+                let action = OutboundUdpAction::Deliver {
+                    sequence: oob.sequence,
+                    compensation: oob.compensation.expect("validated X'83' request"),
+                    reduced: oob.user_data.to_vec(),
+                };
+                self.pending = Some(PendingOob {
+                    sequence: oob.sequence,
+                    packet: packet.to_vec(),
+                    response,
+                });
+                Ok(action)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported MPTN UDP command",
+            )),
+        }
+    }
+
+    pub(crate) fn complete_native_delivery(&mut self, sequence: u16) -> io::Result<Vec<u8>> {
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.sequence != sequence)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP X'83' delivery is not pending",
+            ));
+        }
+        let pending = self.pending.take().unwrap();
+        let response = pending.response.clone();
+        if self.completed.len() == RECENT_OOB {
+            self.completed.pop_front();
+        }
+        self.completed
+            .push_back((pending.sequence, pending.packet, pending.response));
+        Ok(response)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OutboundEndpoint {
@@ -205,6 +364,40 @@ mod tests {
         net::{Ipv4Addr, TcpListener},
         thread,
     };
+    use transport_ip_sna::{
+        mptn_connect::{Address, Direction, TransportRequirements},
+        mptn_oob::build_request,
+    };
+
+    fn udp_fixture() -> (OutboundEndpoint, Connect, SocketAddr) {
+        let endpoint = OutboundEndpoint {
+            local_ip: "10.99.4.10".parse().unwrap(),
+            peer_ip: "10.99.4.3".parse().unwrap(),
+        };
+        let connect = Connect {
+            direction: Direction::Request,
+            processing: 0x0a,
+            ttl: 42,
+            source: Address {
+                node: vec![
+                    0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b, 0xe2, 0xd5, 0xc1, 0xc1,
+                ],
+            },
+            destination: Address {
+                node: vec![
+                    0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b, 0xe2, 0xd5, 0xc1, 0xc2,
+                ],
+            },
+            correlator: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            requirements: TransportRequirements {
+                max_record: 0x8005,
+                max_expedited: 0x76,
+                max_termination: 0x76,
+            },
+            options: Vec::new(),
+        };
+        (endpoint, connect, "10.99.4.3:397".parse().unwrap())
+    }
 
     #[test]
     fn rejects_ambiguous_or_unusable_endpoints_before_dial() {
@@ -280,5 +473,82 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn udp_oob_waits_for_native_delivery_and_replays_exact_ack() {
+        let (endpoint, connect, source) = udp_fixture();
+        let mut state = OutboundUdp::new(endpoint, connect.clone()).unwrap();
+        let packet =
+            build_request(&connect, 0, Compensation::Expedited, &[0, 0, 0, 0, 0, 0xc9]).unwrap();
+        assert_eq!(
+            state.receive(&packet, source).unwrap(),
+            OutboundUdpAction::Deliver {
+                sequence: 0,
+                compensation: Compensation::Expedited,
+                reduced: vec![0, 0, 0, 0, 0, 0xc9],
+            }
+        );
+        assert_eq!(
+            state.receive(&packet, source).unwrap(),
+            OutboundUdpAction::PendingDuplicate
+        );
+        let ack = state.complete_native_delivery(0).unwrap();
+        assert_eq!(
+            OobDatagram::decode(&ack).unwrap().kind,
+            OobKind::PositiveResponse
+        );
+        assert_eq!(
+            state.receive(&packet, source).unwrap(),
+            OutboundUdpAction::Reply(ack)
+        );
+        assert!(state.complete_native_delivery(0).is_err());
+    }
+
+    #[test]
+    fn udp_oob_rejects_wrong_peer_correlator_and_changed_retry() {
+        let (endpoint, connect, source) = udp_fixture();
+        let mut state = OutboundUdp::new(endpoint, connect.clone()).unwrap();
+        let packet = build_request(&connect, 4, Compensation::Abort, &[0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            state
+                .receive(&packet, "10.99.4.4:397".parse().unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut wrong = connect.clone();
+        wrong.correlator[0] ^= 0xff;
+        let wrong_packet = build_request(&wrong, 4, Compensation::Abort, &[0, 0, 0, 0, 0]).unwrap();
+        assert!(state.receive(&wrong_packet, source).is_err());
+        assert!(matches!(
+            state.receive(&packet, source).unwrap(),
+            OutboundUdpAction::Deliver { .. }
+        ));
+        state.complete_native_delivery(4).unwrap();
+        let changed = build_request(&connect, 4, Compensation::Abort, &[0, 0, 0, 0, 1]).unwrap();
+        assert_eq!(
+            state.receive(&changed, source).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn udp_keepalive_replies_to_valid_provider_pair() {
+        let (endpoint, connect, source) = udp_fixture();
+        let mut state = OutboundUdp::new(endpoint, connect).unwrap();
+        let request = Keepalive {
+            kind: KeepaliveKind::Request,
+            source: "10.99.4.3".parse().unwrap(),
+            destination: "10.99.4.10".parse().unwrap(),
+        }
+        .encode();
+        let OutboundUdpAction::Reply(reply) = state.receive(&request, source).unwrap() else {
+            panic!("no keepalive reply")
+        };
+        assert_eq!(
+            Keepalive::decode(&reply).unwrap().kind,
+            KeepaliveKind::Response
+        );
     }
 }
