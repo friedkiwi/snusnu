@@ -339,6 +339,47 @@ impl<P: RoutePort> WsNativeResponder<P> {
         }
         Ok(())
     }
+
+    /// Advance XID and management while retaining any early user BIND for
+    /// the GatewayEdge that will take ownership after management is ready.
+    pub(crate) fn poll_management_once(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "native circuit closed during management",
+            ));
+        }
+        if self.management_ready() {
+            return Ok(());
+        }
+        self.drive_once(false)
+    }
+
+    fn drive_once(&mut self, can_accept_information: bool) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        if !self.armed {
+            return Err(invalid(
+                "native responder has no authorized inbound circuit",
+            ));
+        }
+        self.complete_egress()?;
+        if !self.events.is_empty() {
+            return self.inner.flush();
+        }
+        let receive_credit = self.user_offer.is_none() || can_accept_information;
+        if let Some(events) = self.inner.poll(receive_credit)? {
+            for event in events {
+                self.process_event(event)?;
+            }
+        }
+        for event in self.inner.tick()? {
+            self.process_event(event)?;
+        }
+        self.complete_egress()?;
+        self.inner.flush()
+    }
 }
 
 impl WsNativeResponder<WsRoutePort> {
@@ -368,31 +409,7 @@ impl<P: RoutePort> NativeLeg for WsNativeResponder<P> {
         if let Some(event) = self.events.pop_front() {
             return Ok(Some(event));
         }
-        if self.closed {
-            return Ok(None);
-        }
-        if !self.armed {
-            return Err(invalid(
-                "native responder has no authorized inbound circuit",
-            ));
-        }
-        self.complete_egress()?;
-        if let Some(event) = self.events.pop_front() {
-            return Ok(Some(event));
-        }
-        // Keep management responsive even when the converter has no user
-        // credit. User records wait in the WebSocket port's bounded queue.
-        let receive_credit = self.user_offer.is_none() || can_accept_information;
-        if let Some(events) = self.inner.poll(receive_credit)? {
-            for event in events {
-                self.process_event(event)?;
-            }
-        }
-        for event in self.inner.tick()? {
-            self.process_event(event)?;
-        }
-        self.complete_egress()?;
-        self.inner.flush()?;
+        self.drive_once(can_accept_information)?;
         Ok(self.events.pop_front())
     }
 
