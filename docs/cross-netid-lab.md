@@ -286,7 +286,37 @@ both routers available made them `ACTIVE`.
 The return-home SysReq action did **not** complete normally. Bob's router
 exited with `TCP62 normal data is not an FM request` after a native FM
 response, and Alice reported a communications failure for `SNAB00`.
-Normal teardown in this direction remains unverified. After the test,
+At that point normal teardown in this direction remained unverified. After the test,
 Alice's controller was restored to `INLCNN(*ANS)` and varied on; both Rust
 routers and QA concentrator were stopped. Ports 397 and 8081 had no
 listeners. The isolated Solstice guests remain booted.
+
+### Final return-home retest
+
+The final retest used the transport fix that correlates V5's short TCP62
+FM positive response with Alice's outstanding definite-response request.
+Alice again reached Bob V5R4's **Sign On** (`S1054504`, `QBASE`,
+`QPADEV0001`) through LLC2, the QA WebSocket concentrator, and Bob's
+MPTN TCP/397 peer. The TCP session remained established while the screen
+was displayed. A fresh QA directory assigned Bob managed MAC
+`02:53:4e:00:00:01`, so Alice's `SNAB` `ADPTADR` was temporarily changed
+from `02534E000002` to `02534E000001` for this run.
+
+Alice's System Request generated three FM definite-response requests.
+For each, Bob sent native IPR, forwarded V5's `RH 83a000` positive response
+over the WebSocket, and Alice acknowledged that response on LLC2. The
+bounded `sol8` capture records the three request sequence numbers
+`0003`, `0004`, and `0005` and the corresponding LLC receive
+acknowledgments. Bob's router stayed running and no communications failure
+appeared. On Alice's local System Request menu, option `2` (End previous
+request) returned to its Main Menu with `Last request at level 3 ended.`
+Options `11` and `15` returned to the remote Sign On and did not end the
+pass-through request.
+
+Private evidence is in `/tmp/snusnu-cross-netid/ws-reverse-bob-final.log`,
+`ws-reverse-alice-final.log`, `ws-reverse-final-sol9.pcap` (43 packets), and
+`ws-reverse-sysreq-sol8.pcap` (24 packets); both captures had zero drops.
+Alice's `SNAB` was restored to `INLCNN(*ANS)` and `ADPTADR(02534E000002)`,
+verified by `DSPCTLD`. Both Rust routers and the QA concentrator were
+stopped, with no listeners on ports 397 or 8081. The isolated Solstice
+guests remain booted. No remote sign-on credentials were entered.
