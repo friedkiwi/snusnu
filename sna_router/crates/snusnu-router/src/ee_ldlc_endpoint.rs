@@ -102,9 +102,9 @@ impl LocalEeXids {
         let mut pre_fixed = [0u8; 29];
         pre_fixed[2..6].copy_from_slice(&node_id);
         pre_fixed[9] = 0x88 | if network_node { 0x40 } else { 0 };
-        pre_fixed[10] = 0xc0;
+        pre_fixed[10] = 0; // No FID2 adaptive BIND pacing on the EE link.
         pre_fixed[12] = 0x80;
-        pre_fixed[15] = 0x80;
+        pre_fixed[15] = 0; // One regular TG; no parallel TG claim.
         pre_fixed[16] = tg_number;
         pre_fixed[17] = 0x01; // Native IP DLC in the V5R4 EE XID profile.
         pre_fixed[18] = 0x0b;
@@ -659,6 +659,8 @@ mod tests {
         assert_eq!(np.role(), Ok(Role::Secondary));
         assert_eq!(xids.prenegotiation[9] & 0x40, 0x40); // NN assertion.
         assert_eq!(xids.negotiation[9] & 0x40, 0x40);
+        assert_eq!(xids.negotiation[10] & 0xc0, 0); // No FID2 adaptive BIND pacing.
+        assert_eq!(xids.negotiation[15] & 0x80, 0); // No parallel TGs.
         assert_eq!(
             HprXidEvidence::parse(&xids.negotiation, HprMedium::EnterpriseExtender)
                 .unwrap()
