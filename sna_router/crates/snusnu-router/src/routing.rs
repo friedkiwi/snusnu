@@ -60,6 +60,163 @@ impl fmt::Display for RouteAddress {
     }
 }
 
+/// Reachability learned from local attachments and an optional upstream.
+/// An automatic route is always a unicast decision for one session; it never
+/// fans a frame out to every matching transport.
+#[derive(Default)]
+pub(crate) struct AutomaticDirectory {
+    attachments: HashMap<PortId, HashSet<RouteAddress>>,
+}
+
+impl AutomaticDirectory {
+    pub(crate) fn replace(
+        &mut self,
+        attachment: PortId,
+        addresses: impl IntoIterator<Item = RouteAddress>,
+    ) {
+        self.attachments
+            .insert(attachment, addresses.into_iter().collect());
+    }
+
+    pub(crate) fn withdraw(&mut self, attachment: &PortId) {
+        self.attachments.remove(attachment);
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        ingress: &PortId,
+        destination: &RouteAddress,
+    ) -> io::Result<PortId> {
+        let mut matches = self
+            .attachments
+            .iter()
+            .filter_map(|(attachment, addresses)| {
+                (attachment != ingress
+                    && addresses
+                        .iter()
+                        .any(|address| address_matches(destination, address)))
+                .then_some(attachment)
+            });
+        let Some(first) = matches.next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no reachable destination {destination} from {}", ingress.0),
+            ));
+        };
+        if let Some(second) = matches.next() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "ambiguous destination {destination} from {}: {} and {}",
+                    ingress.0, first.0, second.0
+                ),
+            ));
+        }
+        Ok(first.clone())
+    }
+}
+
+fn address_matches(destination: &RouteAddress, advertised: &RouteAddress) -> bool {
+    match (destination, advertised) {
+        (
+            RouteAddress::LogicalUnit { netid, cp, name },
+            RouteAddress::LogicalUnit {
+                netid: advertised_netid,
+                cp: advertised_cp,
+                name: advertised_name,
+            },
+        ) => {
+            netid == advertised_netid
+                && name == advertised_name
+                && cp
+                    .as_ref()
+                    .is_none_or(|cp| advertised_cp.as_ref() == Some(cp))
+        }
+        _ => destination == advertised,
+    }
+}
+
+/// Owns the private route-port pair for each automatically selected circuit.
+/// Attachment listeners are held by the runtime and create these ports only
+/// after a destination has been resolved. This preserves credit isolation.
+pub(crate) struct AutomaticFabric {
+    router: Router,
+    directory: AutomaticDirectory,
+    sessions: HashMap<u64, (PortId, PortId)>,
+}
+
+impl AutomaticFabric {
+    pub(crate) fn new() -> Self {
+        Self {
+            router: Router::new(),
+            directory: AutomaticDirectory::default(),
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn directory_mut(&mut self) -> &mut AutomaticDirectory {
+        &mut self.directory
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        ingress: &PortId,
+        destination: &RouteAddress,
+    ) -> io::Result<PortId> {
+        self.directory.resolve(ingress, destination)
+    }
+
+    pub(crate) fn open_pair(
+        &mut self,
+        session_id: u64,
+        ingress_attachment: &PortId,
+        destination: &RouteAddress,
+        egress_attachment: &PortId,
+        ingress: Box<dyn RoutePort>,
+        egress: Box<dyn RoutePort>,
+    ) -> io::Result<()> {
+        if self.sessions.contains_key(&session_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "duplicate session ID",
+            ));
+        }
+        let selected = self.resolve(ingress_attachment, destination)?;
+        if selected != *egress_attachment {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "session egress {} differs from selected {}",
+                    egress_attachment.0, selected.0
+                ),
+            ));
+        }
+        let ingress_id = PortId::new(format!("session-{session_id}-ingress"));
+        let egress_id = PortId::new(format!("session-{session_id}-egress"));
+        self.router
+            .register_pair(ingress_id.clone(), ingress, egress_id.clone(), egress)?;
+        self.sessions.insert(session_id, (ingress_id, egress_id));
+        Ok(())
+    }
+
+    pub(crate) fn poll_once(&mut self) -> io::Result<bool> {
+        self.router.poll_once()
+    }
+
+    pub(crate) fn close_pair(&mut self, session_id: u64) -> io::Result<()> {
+        let (ingress, egress) = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session is absent"))?
+            .clone();
+        self.router.disconnect_port(&ingress)?;
+        self.router.disconnect_port(&egress)?;
+        self.router.remove_pair(&ingress, &egress)?;
+        self.sessions.remove(&session_id);
+        Ok(())
+    }
+}
+
 /// The SNA content passed between encapsulations. A DLC control frame keeps
 /// its original LLC PDU bytes so an LLC egress can reconstruct Ethernet.
 pub(crate) enum RoutedUnit {
@@ -1259,5 +1416,100 @@ mod tests {
         assert_eq!(c.borrow().poll_count, 1);
         assert_eq!(d.borrow().poll_count, 1);
         assert!(router.port(&PortId::new("a")).is_err());
+    }
+
+    #[test]
+    fn automatic_directory_selects_one_peer_and_rejects_ambiguity() {
+        let mut directory = AutomaticDirectory::default();
+        let alice = PortId::new("alice");
+        let bob = PortId::new("bob");
+        let carol = PortId::new("carol");
+        let lu = RouteAddress::LogicalUnit {
+            netid: "NETA".into(),
+            cp: Some("CPB".into()),
+            name: "LUB".into(),
+        };
+        let unqualified = RouteAddress::LogicalUnit {
+            netid: "NETA".into(),
+            cp: None,
+            name: "LUB".into(),
+        };
+        directory.replace(bob.clone(), [lu.clone()]);
+        assert_eq!(directory.resolve(&alice, &unqualified).unwrap(), bob);
+        assert_eq!(
+            directory.resolve(&bob, &lu).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        directory.replace(carol.clone(), [lu.clone()]);
+        assert_eq!(
+            directory.resolve(&alice, &unqualified).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        directory.withdraw(&carol);
+        assert_eq!(directory.resolve(&alice, &lu).unwrap(), bob);
+    }
+
+    #[test]
+    fn automatic_fabric_keeps_session_pairs_independent() {
+        let mut fabric = AutomaticFabric::new();
+        let alice = PortId::new("alice");
+        let bob = PortId::new("bob");
+        let destination = RouteAddress::Mac([2, 83, 78, 0, 0, 1]);
+        fabric
+            .directory_mut()
+            .replace(bob.clone(), [destination.clone()]);
+        let left1 = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            ..State::default()
+        }));
+        let right1 = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            ..State::default()
+        }));
+        let left2 = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            ..State::default()
+        }));
+        let right2 = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            ..State::default()
+        }));
+        for (id, left, right) in [
+            (1, left1.clone(), right1.clone()),
+            (2, left2.clone(), right2.clone()),
+        ] {
+            fabric
+                .open_pair(
+                    id,
+                    &alice,
+                    &destination,
+                    &bob,
+                    Box::new(FakePort(left)),
+                    Box::new(FakePort(right)),
+                )
+                .unwrap();
+        }
+        assert_eq!(fabric.sessions.len(), 2);
+        assert_eq!(
+            fabric
+                .open_pair(
+                    3,
+                    &alice,
+                    &destination,
+                    &alice,
+                    Box::new(FakePort(left1.clone())),
+                    Box::new(FakePort(right1.clone()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fabric.poll_once().unwrap();
+        assert_eq!(left1.borrow().poll_count, 1);
+        assert_eq!(left2.borrow().poll_count, 1);
+        fabric.close_pair(1).unwrap();
+        fabric.poll_once().unwrap();
+        assert_eq!(left1.borrow().poll_count, 1);
+        assert_eq!(left2.borrow().poll_count, 2);
     }
 }
