@@ -166,10 +166,10 @@ fn encode_management_name(name: &str) -> io::Result<Vec<u8>> {
     name.bytes()
         .map(|byte| {
             Ok(match byte {
-                b'A'..=b'I' => 0xc1 + byte - b'A',
-                b'J'..=b'R' => 0xd1 + byte - b'J',
-                b'S'..=b'Z' => 0xe2 + byte - b'S',
-                b'0'..=b'9' => 0xf0 + byte - b'0',
+                b'A'..=b'I' => 0xc1 + (byte - b'A'),
+                b'J'..=b'R' => 0xd1 + (byte - b'J'),
+                b'S'..=b'Z' => 0xe2 + (byte - b'S'),
+                b'0'..=b'9' => 0xf0 + (byte - b'0'),
                 b'.' => 0x4b,
                 _ => {
                     return Err(io::Error::new(
