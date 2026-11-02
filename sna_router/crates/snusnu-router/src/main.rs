@@ -15,6 +15,12 @@ mod auto_gateway_runtime;
 #[cfg(target_os = "linux")]
 mod auto_llc;
 #[cfg(target_os = "linux")]
+mod auto_llc_ws;
+#[cfg(target_os = "linux")]
+mod auto_local_converter;
+#[cfg(target_os = "linux")]
+mod auto_runtime;
+#[cfg(target_os = "linux")]
 mod config;
 #[cfg(target_os = "linux")]
 mod endpoint;

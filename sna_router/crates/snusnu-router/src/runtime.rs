@@ -336,10 +336,7 @@ fn configured_proxy_mac(config: &RouterConfig, peer: &config::LlcConfig) -> io::
 pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     config.validate()?;
     if config.automatic() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "automatic routing runtime is not connected yet",
-        ));
+        return crate::auto_runtime::run(config);
     }
     if let Some(duplex) = config.bidirectional_gateway_config()? {
         return run_bidirectional_gateway(duplex);
