@@ -1,6 +1,6 @@
-// Package printer handles the transport-independent 5250 printer application
-// records carried by an LU 6.2 conversation. A caller owns BIND, Attach,
-// pacing, acknowledgements, and persistence.
+// Package printer parses SCS and the 5250 printer pass-through records
+// described by RFC 2877. A 5494 uses additional LU 6.2 controller and
+// device-session protocols; this package does not implement those sessions.
 package printer
 
 import (

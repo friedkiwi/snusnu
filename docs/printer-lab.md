@@ -27,11 +27,13 @@ LU 6.2 BIND for that printer. LU 4 printer traffic is encapsulated inside the
 LU 6.2 device session. The service therefore needs both session directions
 and the controller notification before a writer can send spool data.
 
-The transport-independent Go `sna/services/printer` package now parses a
-bounded printer record stream and renders common SCS fixed-pitch text. It does
-not yet perform APPC session management, store jobs, or produce a PDF. The
-renderer retains no information about font, forms, or graphics orders, so
-raw SCS must be stored with any preview.
+The transport-independent Go `sna/services/printer` package now parses the
+RFC 2877 printer pass-through record shape and renders common SCS fixed-pitch
+text. The pass-through shape has not yet been verified against an actual 5494
+device session; the 5494's encapsulated LU 4 data may require a different
+envelope. The package does not perform APPC session management, store jobs, or
+produce a PDF. The renderer retains no information about font, forms, or
+graphics orders, so raw SCS must be stored with any preview.
 
 ## V5R4 guest setup and probe
 
