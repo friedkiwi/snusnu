@@ -1,6 +1,6 @@
 # Rust router configuration
 
-`snusnu-router --config FILE` starts multiple independent LLC2 associations and explicit routes. Each `[[llc]]` entry names one guest MAC and the proxy MAC that the guest addresses on one Linux Ethernet interface. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
+`snusnu-router --config FILE` starts multiple independent LLC2 associations and explicit routes. Each `[[llc]]` entry names the guest MAC on one Linux Ethernet interface. `guest_mac` is always required. Standalone LLC links also need an explicit `proxy_mac`, the local address the guest contacts. On an LLC link routed to `[[concentrator]]`, omit `proxy_mac` to use the concentrator's managed CP binding. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
 
 For the two V4R4 guests used in [the LLC lab](llc-lab.md), save this as `router.toml`:
 
@@ -32,7 +32,6 @@ An optional `[[concentrator]]` entry makes a WebSocket hop another named port. F
 id = "snaa"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:02"
 local_cp = "SOLNET.SNAA"
 lus = ["SOLNET.SNAA"]
 lu_types = { "SOLNET.SNAA" = ["lu_6_2"] }
@@ -50,7 +49,7 @@ to = "upstream"
 
 `token` is optional. Omit it or set `token = ""` to send no Authorization header. Keep a file containing a real token readable only by the router operator; the token is never printed in logs. The older `--remote-link` command still reads `SNUSNU_ROUTER_TOKEN` from the environment.
 
-Configured `[[concentrator]]` entries share one authenticated connection and publish one snapshot of CPs and LUs derived from their attached local peers. An LLC association declares its CP and LUs once on `[[llc]]`; the router uses those declarations for publication and verifies the CP against the guest's XID3 before LLC2 contact. The `target_cp` (and optional `target_lu`) on an LLC concentrator route currently selects one destination from the concentrator's advertised directory. These target fields are temporary per-circuit selection until the router can select a destination from each incoming session. Standalone LLC routes can omit identity declarations. The configured proxy MAC must be in the `02:53:4e` managed namespace and is updated to the server-assigned virtual MAC while its LLC association is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
+Configured `[[concentrator]]` entries share one WebSocket connection and publish one snapshot of CPs and LUs derived from their attached local peers. An LLC association declares its CP and LUs once on `[[llc]]`; the router uses those declarations for publication and verifies the CP against the guest's XID3 before LLC2 contact. The `target_cp` (and optional `target_lu`) on an LLC concentrator route currently selects one destination from the concentrator's advertised directory. These target fields are temporary per-circuit selection until the router can select a destination from each incoming session. Standalone LLC routes can omit identity declarations. With `proxy_mac` omitted, the LLC port starts unbound and waits for the server-assigned virtual MAC of the target CP before opening its Ethernet endpoint. An explicit managed-prefix `proxy_mac` remains a provisional legacy value and can be replaced by that binding while LLC is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
 
 An exported LU can optionally declare its supported type on its local peer for the global directory and remote route metadata. Omitted declarations remain `Unknown`; they are not inferred from the LU name. Keys must also appear in the same peer's `lus`, and duplicate or empty type lists are rejected:
 
@@ -63,7 +62,7 @@ Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, and `lu_6_2`. These values 
 
 The opt-in V5R4 TCP62 gateway uses its `[[mptn_gateway]]` definition as the
 source of local CP/LU exports and the remote destination names. It therefore
-needs no CP/LU fields on `[[concentrator]]`:
+needs no CP/LU fields or Ethernet MAC address on `[[concentrator]]`:
 
 ```toml
 [[mptn_gateway]]
