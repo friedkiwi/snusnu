@@ -6,10 +6,27 @@
 //! explicit operator hint); it cannot be guessed from the target LU name.
 
 use crate::config;
+use router_core::{xid3::{Role, Xid3}, xid3_local::LocalLlcProfile};
 use std::io;
 use transport_ws::wire;
 
 const BASE36: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+fn stable_hash(seed: &[u8], netid: &str, name: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in seed
+        .iter()
+        .copied()
+        .chain([0xff])
+        .chain(netid.bytes())
+        .chain([0xff])
+        .chain(name.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 /// Build the router-owned CP for one TCP62 attachment. `seed` should contain
 /// a stable router identity and attachment ID, so reconnects retain the name.
@@ -33,18 +50,7 @@ pub(crate) fn virtual_cp_for_source(
     }
     // FNV-1a has defined, repeatable output across runs and Rust versions.
     // The seven base-36 digits give a stable router-specific SNA name.
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in seed
-        .iter()
-        .copied()
-        .chain([0xff])
-        .chain(source.netid.bytes())
-        .chain([0xff])
-        .chain(source.name.bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    let mut hash = stable_hash(seed, &source.netid, &source.name);
     let mut name = [b'R'; 8];
     for position in (1..8).rev() {
         name[position] = BASE36[(hash % 36) as usize];
@@ -54,6 +60,43 @@ pub(crate) fn virtual_cp_for_source(
         netid: source.netid,
         name: String::from_utf8(name.to_vec()).expect("base36 is ASCII"),
     })
+}
+
+/// Build a virtual native APPN profile for a selected MPTN session. This
+/// node ID belongs to the router's virtual link, not to the OS/400 peer.
+pub(crate) fn virtual_xid(
+    cp: &wire::SnaName,
+    seed: &[u8],
+    configured_station: Option<&str>,
+    configured_node_id: Option<&str>,
+    tg_number: u8,
+) -> io::Result<Xid3> {
+    let cp_qualified = format!("{}.{}", cp.netid, cp.name);
+    config::parse_cp(&cp_qualified)?;
+    let station = configured_station
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&cp.name);
+    let node_id = if let Some(value) = configured_node_id.filter(|value| !value.is_empty()) {
+        if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "gateway local_node_id must be eight hex digits"));
+        }
+        u32::from_str_radix(value, 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid gateway local_node_id"))?
+    } else {
+        0xfff00000 | ((stable_hash(seed, &cp.netid, &cp.name) as u32) & 0x000fffff)
+    };
+    LocalLlcProfile {
+        cp_name: cp_qualified,
+        station_name: station.into(),
+        node_id: node_id.to_be_bytes(),
+        tg_number,
+        max_receive_btu: 1496,
+        max_iframes_before_ack: 1,
+        role: Role::Secondary,
+    }
+    .build()
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("virtual XID3: {error}")))
 }
 
 /// An LU route needs a proven hosting CP before native APPN conversion.
@@ -131,5 +174,13 @@ mod tests {
         );
         assert!(require_hosting_cp(&lu, Some(name("QAALICE", "HOST")), None).is_err());
         assert!(require_hosting_cp(&lu, Some(name("QABOB", "HOST")), Some("QABOB.OTHER")).is_err());
+    }
+
+    #[test]
+    fn generated_virtual_xid_uses_router_cp() {
+        let cp = virtual_cp_for_source(&name("QABOB", "SNAB"), b"seed", None).unwrap();
+        let xid = virtual_xid(&cp, b"seed", None, None, 1).unwrap();
+        assert_eq!(xid.cp_name().unwrap(), format!("{}.{}", cp.netid, cp.name));
+        assert!(virtual_xid(&cp, b"seed", None, Some("bad"), 1).is_err());
     }
 }
