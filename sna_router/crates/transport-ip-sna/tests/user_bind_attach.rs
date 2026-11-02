@@ -528,6 +528,30 @@ fn v5r4_rqe1_change_direction_follows_positive_response_without_new_dr() {
     bridge.acknowledge_native_normal(1).unwrap();
     assert_eq!(bridge.pending_bytes(), (0, 0));
     assert_eq!(bridge.phase(), BridgePhase::Active);
+
+    // Bob4: Alice later sent a 151-byte RH 03 A1 00 FM request, SNF 0002,
+    // after SysReq return-home. V5's matching positive response must return
+    // to the native leg without consuming another request pacing slot.
+    let mut native_dr = vec![0x40; 151];
+    native_dr[..19].copy_from_slice(&hex("2c000102000203a100008e12a0000004040000"));
+    let (outbound, _) = bridge.next_native_normal(&native_dr).unwrap();
+    assert_eq!(&outbound.bytes[5..10], &[0, 2, 3, 0xa0, 0]);
+    if let Some(ipr) = bridge.mark_normal_enqueued(&outbound, 1).unwrap() {
+        bridge.mark_ipr_enqueued(&ipr).unwrap();
+    }
+    bridge.complete_tcp_delivery(outbound.bytes.len()).unwrap();
+    let unmatched = TcpRecord::decode(hex("0000000a00900083a000")).unwrap();
+    assert!(bridge.next_mptn_normal(&unmatched).is_err());
+    assert_eq!(bridge.pending_bytes(), (0, 0));
+    // Captured sol9 TCP/397 reply to Bob4 return-home: ten bytes,
+    // normal record, SNF 8000, RH 83 A0 00.
+    let response = TcpRecord::decode(hex("0000000a00800083a000")).unwrap();
+    let prepared = bridge.next_mptn_normal(&response).unwrap().unwrap();
+    assert_eq!(prepared, hex("2c000201800083a000"));
+    bridge.mark_native_normal_enqueued(&prepared).unwrap();
+    bridge.acknowledge_native_normal(1).unwrap();
+    assert_eq!(bridge.phase(), BridgePhase::Active);
+    assert!(bridge.next_mptn_normal(&response).is_err());
 }
 
 #[test]

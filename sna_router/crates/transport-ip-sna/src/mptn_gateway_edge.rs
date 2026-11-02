@@ -352,6 +352,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     if !self.first_attach_delivery_complete()
                         || self.bridge.phase() != Phase::Active
                         || self.native_reply.is_some()
+                        || self.ipr_ack_outstanding
                         || self.udp_expedited_pending.is_some()
                         || self.udp_expedited_completed
                     {

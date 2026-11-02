@@ -44,6 +44,8 @@ pub struct Bridge {
     // The admitted first LU6.2 bracket is implied by BIND. A definite
     // response to its FM data uses SNF 0x8000, not the request's own SNF.
     outstanding_implied_bracket_dr: bool,
+    outstanding_native_dr: Option<[u8; 2]>,
+    native_response_prepared: bool,
     first_attach_complete: bool,
     phase: Phase,
 }
@@ -86,6 +88,8 @@ impl Bridge {
             positive_response: None,
             native_normal: None,
             outstanding_implied_bracket_dr: false,
+            outstanding_native_dr: None,
+            native_response_prepared: false,
             first_attach_complete: false,
             phase: Phase::Idle,
         })
@@ -266,6 +270,9 @@ impl Bridge {
         if piu.len() < 10 || piu[6] & 0xe0 != 0 {
             return Err(invalid("later native PIU is not an FM request"));
         }
+        if piu[7] & 0xb0 == 0xa0 && self.outstanding_native_dr.is_some() {
+            return Err(invalid("native definite response already outstanding"));
+        }
         let (record, pacing_requested) = self.gateway.native_normal_observe_pacing(piu)?;
         if self
             .pacing
@@ -294,6 +301,10 @@ impl Bridge {
             || self.normal.as_ref().map(|(pending, _)| pending) != Some(record)
         {
             return Err(wrong_phase());
+        }
+        let native_request = &self.normal.as_ref().unwrap().0;
+        if native_request.bytes[8] & 0xb0 == 0xa0 {
+            self.outstanding_native_dr = Some([native_request.bytes[5], native_request.bytes[6]]);
         }
         if self.normal.as_ref().unwrap().1 {
             let ipr = self
@@ -366,6 +377,36 @@ impl Bridge {
         let Some(piu) = self.gateway.mptn_normal(record)? else {
             return Ok(None);
         };
+        if piu.len() >= 9 && piu[6..9] == [0x83, 0xa0, 0] {
+            // An implied first LU6.2 bracket can answer a DR request with
+            // SNF 8000 even when the request itself used a normal sequence.
+            // Only one native DR may be outstanding, so this remains bounded.
+            if self.outstanding_native_dr.is_none()
+                || ([piu[4], piu[5]] != [0x80, 0]
+                    && self.outstanding_native_dr != Some([piu[4], piu[5]]))
+            {
+                self.gateway.complete_native_delivery(piu.len())?;
+                return Err(invalid(
+                    "TCP62 FM response has no matching native DR request",
+                ));
+            }
+            let prepared = match self
+                .pacing
+                .as_mut()
+                .unwrap()
+                .prepare_positive_response_send(&piu)
+            {
+                Ok(prepared) => prepared.to_vec(),
+                Err(_) => {
+                    self.gateway.complete_native_delivery(piu.len())?;
+                    return Err(invalid("TCP62 FM response violates native session"));
+                }
+            };
+            self.native_normal = Some((prepared.clone(), piu.len()));
+            self.native_response_prepared = true;
+            self.phase = Phase::NativeNormalPrepared;
+            return Ok(Some(prepared));
+        }
         if piu.len() < 10 || piu[6] & 0xe0 != 0 {
             self.gateway.complete_native_delivery(piu.len())?;
             return Err(invalid("TCP62 normal data is not an FM request"));
@@ -448,7 +489,9 @@ impl Bridge {
             .unwrap()
             .mark_egress_enqueued(piu)
             .map_err(|_| invalid("native normal egress differs from prepared PIU"))?;
-        if piu[7] & 0xb0 == 0xa0 {
+        if self.native_response_prepared {
+            self.outstanding_native_dr = None;
+        } else if piu[7] & 0xb0 == 0xa0 {
             self.outstanding_implied_bracket_dr = true;
         }
         self.phase = Phase::AwaitNativeNormalAck;
@@ -464,6 +507,7 @@ impl Bridge {
         let bytes = self.native_normal.as_ref().unwrap().1;
         self.gateway.complete_native_delivery(bytes)?;
         self.native_normal = None;
+        self.native_response_prepared = false;
         self.phase = Phase::Active;
         Ok(())
     }

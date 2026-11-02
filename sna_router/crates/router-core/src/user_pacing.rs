@@ -311,6 +311,27 @@ impl UserPacingSession {
         Ok(&self.pending.as_ref().unwrap().piu)
     }
 
+    /// Forward a correlated FM positive response. A response uses the
+    /// existing session address but does not consume a request pacing slot.
+    pub fn prepare_positive_response_send(&mut self, piu: &[u8]) -> Result<&[u8], UserPacingError> {
+        self.require_active_idle()?;
+        if piu.len() < 9
+            || piu.len() > 1496
+            || piu[0] != self.expedited_th0 & !0x01
+            || piu[1] != 0
+            || piu[2] != self.oaf
+            || piu[3] != self.daf
+            || piu[6..9] != [0x83, 0xa0, 0]
+        {
+            return Err(UserPacingError::UnsupportedPiu);
+        }
+        self.pending = Some(PendingEgress {
+            piu: piu.to_vec(),
+            pacing_after: self.pacing_ref()?.clone(),
+        });
+        Ok(&self.pending.as_ref().unwrap().piu)
+    }
+
     /// Commit a prepared IPR or normal request after the exact PIU enters a
     /// bounded egress queue. A failed queue attempt leaves pacing unchanged.
     pub fn mark_egress_enqueued(&mut self, piu: &[u8]) -> Result<(), UserPacingError> {
