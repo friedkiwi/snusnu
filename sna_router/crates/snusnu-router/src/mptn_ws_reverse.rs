@@ -55,6 +55,14 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 impl ReverseWsConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
+        self.validate_for_tp(true)
+    }
+
+    pub(crate) fn validate_dynamic_tp(&self) -> io::Result<()> {
+        self.validate_for_tp(false)
+    }
+
+    fn validate_for_tp(&self, fixed_tp: bool) -> io::Result<()> {
         let hosted_cp = parse_cp(&self.hosted_cp)?;
         let hosted_lu = parse_cp(&self.hosted_lu)?;
         let source_cp = parse_cp(&self.source_cp)?;
@@ -67,7 +75,7 @@ impl ReverseWsConfig {
             || source_lu == hosted_lu
             || self.local_station.is_empty()
             || self.tg_number == 0
-            || self.user_tp == [0; 4]
+            || (fixed_tp && self.user_tp == [0; 4])
             || self.timeout.is_zero()
             || self.timeout > Duration::from_secs(600)
             || self.endpoint.local_ip.is_unspecified()
@@ -181,6 +189,130 @@ fn poll_udp<L: NativeLeg>(
         }
     }
     Ok(())
+}
+
+/// A concentrator-initiated TCP62 conversion advanced by the automatic
+/// router's shared event loop. TCP62 setup may wait for the peer briefly,
+/// while established sessions never monopolize the other attachments.
+pub(crate) struct AutoReverseWsSession {
+    config: ReverseWsConfig,
+    phase: Option<AutoReversePhase>,
+}
+
+enum AutoReversePhase {
+    Management {
+        native: WsNativeResponder<WsRoutePort>,
+        socket: UdpSocket,
+        deadline: Instant,
+    },
+    Active {
+        edge: GatewayEdge<WsNativeResponder<WsRoutePort>>,
+        socket: UdpSocket,
+        oob: OutboundUdp,
+        first_attach_seen: bool,
+    },
+}
+
+impl AutoReverseWsSession {
+    pub(crate) fn new(
+        config: ReverseWsConfig,
+        mut native: WsNativeResponder<WsRoutePort>,
+        socket: UdpSocket,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        config.validate_dynamic_tp()?;
+        native.arm_inbound()?;
+        Ok(Self {
+            config,
+            phase: Some(AutoReversePhase::Management { native, socket, deadline }),
+        })
+    }
+
+    /// Returns false after the circuit ends; the caller may then remove it.
+    pub(crate) fn poll_once(&mut self) -> io::Result<bool> {
+        let phase = self.phase.take().ok_or_else(|| invalid("reverse circuit already closed"))?;
+        match phase {
+            AutoReversePhase::Management { mut native, socket, deadline } => {
+                if Instant::now() >= deadline {
+                    native.close()?;
+                    return Err(io::Error::new(io::ErrorKind::TimedOut,
+                        "automatic native management timed out"));
+                }
+                native.poll_management_once()?;
+                if !native.management_ready() {
+                    self.phase = Some(AutoReversePhase::Management { native, socket, deadline });
+                    return Ok(true);
+                }
+                let management = native.management_bind()
+                    .ok_or_else(|| invalid("native management BIND absent"))?.clone();
+                self.config.endpoint.establish_v5_management(
+                    self.config.timeout.min(Duration::from_secs(5)),
+                    &self.config.source_lu,
+                    &self.config.hosted_lu,
+                )?;
+                let bridge = Bridge::new_dynamic_tp(
+                    BindPolicy {
+                        plu: self.config.source_lu.clone(),
+                        slu: self.config.hosted_lu.clone(),
+                        mode: None,
+                        allow_blank_mode: true,
+                        max_pending_bytes: MAX_RECORD,
+                    },
+                    CompensationSet::from_codes(&TCP62_REQUIRED)
+                        .map_err(|error| invalid(error.to_string()))?,
+                    management,
+                    1,
+                )?;
+                let connect = connect_template_for_route(
+                    &self.config.source_lu, &self.config.hosted_lu, new_correlator()?)?;
+                let oob = OutboundUdp::new(self.config.endpoint, connect.clone())?;
+                let edge = self.config.endpoint.open_edge(
+                    Duration::from_secs(5), native, bridge, connect)?;
+                self.phase = Some(AutoReversePhase::Active {
+                    edge, socket, oob, first_attach_seen: false,
+                });
+                Ok(true)
+            }
+            AutoReversePhase::Active { mut edge, socket, mut oob, mut first_attach_seen } => {
+                let result = (|| -> io::Result<bool> {
+                    poll_udp(&socket, &mut oob, &mut edge)?;
+                    edge.poll_native_once()?;
+                    if edge.is_closed() { return Ok(false); }
+                    edge.flush_tcp()?;
+                    first_attach_seen |= edge.first_attach_delivery_complete();
+                    if first_attach_seen || !edge.ipr_ack_outstanding() {
+                        match edge.poll_tcp_once() {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof
+                                && first_attach_seen => return Ok(false),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    poll_udp(&socket, &mut oob, &mut edge)?;
+                    Ok(true)
+                })();
+                match result {
+                    Ok(true) => {
+                        self.phase = Some(AutoReversePhase::Active {
+                            edge, socket, oob, first_attach_seen,
+                        });
+                        Ok(true)
+                    }
+                    Ok(false) => {
+                        edge.close()?;
+                        if !first_attach_seen {
+                            Err(io::Error::new(io::ErrorKind::ConnectionAborted,
+                                "MPTN session ended before first Attach"))
+                        } else { Ok(false) }
+                    }
+                    Err(error) => {
+                        let _ = edge.close();
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Serve one authenticated inbound WebSocket circuit and its MPTN session.
@@ -379,6 +511,14 @@ mod tests {
             },
             timeout: Duration::from_secs(180),
         }
+    }
+
+    #[test]
+    fn automatic_reverse_route_accepts_tp_learned_from_attach() {
+        let mut route = config();
+        route.user_tp = [0; 4];
+        assert!(route.validate().is_err());
+        route.validate_dynamic_tp().unwrap();
     }
 
     #[test]
