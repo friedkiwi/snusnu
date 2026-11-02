@@ -41,7 +41,6 @@ enum TcpUserOutputKind {
     Normal,
     Expedited,
     ExpeditedAck,
-    NativeAbort,
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +79,8 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     tcp_user_output: Option<TcpRecord>,
     tcp_user_output_kind: Option<TcpUserOutputKind>,
     tcp_user_output_queued: bool,
+    udp_abort_output: Option<TcpRecord>,
+    udp_abort_output_queued: bool,
     expedited_ack: Option<TcpRecord>,
     expedited_native_completed: bool,
     user_teardown: Option<ReverseUserTeardown>,
@@ -128,6 +129,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
             tcp_user_output: None,
             tcp_user_output_kind: None,
             tcp_user_output_queued: false,
+            udp_abort_output: None,
+            udp_abort_output_queued: false,
             expedited_ack: None,
             expedited_native_completed: false,
             user_teardown: None,
@@ -263,6 +266,44 @@ impl<P: RoutePort> VirtualWsPort<P> {
             .flatten()
     }
 
+    /// A native-initiated UNBIND yields a validated X'10' Abort image whose
+    /// bytes after the TCP62 header become the outbound UDP X'83' payload.
+    pub(crate) fn udp_abort_record(&self) -> Option<&TcpRecord> {
+        (!self.udp_abort_output_queued)
+            .then_some(self.udp_abort_output.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn mark_udp_abort_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.udp_abort_output.as_ref() != Some(record) || self.udp_abort_output_queued {
+            return Err(protocol("UDP Abort differs from prepared native close"));
+        }
+        self.native_user_close
+            .as_mut()
+            .ok_or_else(|| protocol("native user close absent"))?
+            .mark_udp_abort_enqueued(record)?;
+        self.udp_abort_output_queued = true;
+        Ok(())
+    }
+
+    /// Call only after the gateway verified a positive X'83' UDP response
+    /// for this Abort's sequence and Connect identity.
+    pub(crate) fn complete_udp_abort_response(&mut self) -> io::Result<()> {
+        if !self.udp_abort_output_queued || self.native_user_output.is_some() {
+            return Err(protocol("native close has no acknowledged UDP Abort"));
+        }
+        let response = self
+            .native_user_close
+            .as_mut()
+            .ok_or_else(|| protocol("native user close absent"))?
+            .accept_udp_abort_response()?
+            .to_vec();
+        self.udp_abort_output = None;
+        self.native_user_output = Some(response);
+        self.native_user_output_kind = Some(NativeUserOutputKind::NativeCloseResponse);
+        Ok(())
+    }
+
     pub(crate) fn user_closed(&self) -> bool {
         self.user_closed
     }
@@ -340,25 +381,9 @@ impl<P: RoutePort> VirtualWsPort<P> {
     /// TCP record was written, in queue order.
     pub(crate) fn complete_tcp_user_records(&mut self, completed: usize) -> io::Result<()> {
         for _ in 0..completed {
-            let kind = self
-                .tcp_user_writes
+            self.tcp_user_writes
                 .pop_front()
                 .ok_or_else(|| protocol("untracked TCP62 user write completion"))?;
-            if matches!(kind, TcpUserOutputKind::NativeAbort) {
-                let close = self
-                    .native_user_close
-                    .as_mut()
-                    .ok_or_else(|| protocol("native user close absent"))?;
-                let abort = self
-                    .tcp_user_output
-                    .as_ref()
-                    .ok_or_else(|| protocol("native TCP62 Abort missing"))?;
-                let response = close.mark_tcp_abort_written(abort)?.to_vec();
-                self.native_user_output = Some(response);
-                self.native_user_output_kind = Some(NativeUserOutputKind::NativeCloseResponse);
-                self.tcp_user_output = None;
-                self.tcp_user_output_queued = false;
-            }
         }
         Ok(())
     }
@@ -379,11 +404,6 @@ impl<P: RoutePort> VirtualWsPort<P> {
             TcpUserOutputKind::Normal => flow.mark_tcp_enqueued(record)?,
             TcpUserOutputKind::Expedited => flow.mark_expedited_tcp_enqueued(record)?,
             TcpUserOutputKind::ExpeditedAck => {}
-            TcpUserOutputKind::NativeAbort => {
-                self.tcp_user_output_queued = true;
-                self.tcp_user_writes.push_back(kind);
-                return Ok(());
-            }
         }
         self.tcp_user_writes.push_back(kind);
         self.tcp_user_output = None;
@@ -417,6 +437,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.native_user_input = None;
         self.tcp_user_output = None;
         self.tcp_user_output_queued = false;
+        self.udp_abort_output = None;
+        self.udp_abort_output_queued = false;
         self.tcp_user_output_kind = None;
         self.expedited_ack = None;
         self.expedited_native_completed = false;
@@ -761,14 +783,13 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     flow.close();
                     self.user_closed = true;
                 } else if piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32 {
-                    self.tcp_user_output = Some(
+                    self.udp_abort_output = Some(
                         self.native_user_close
                             .as_mut()
                             .ok_or_else(|| protocol("native user close absent"))?
                             .accept_native_unbind(&piu)?
                             .clone(),
                     );
-                    self.tcp_user_output_kind = Some(TcpUserOutputKind::NativeAbort);
                     flow.close();
                 } else if piu.len() >= 9 && piu[0] & 1 != 0 && piu[6..9] != [0x83, 1, 0] {
                     self.tcp_user_output = Some(flow.prepare_native_expedited(&piu)?.clone());
@@ -1642,10 +1663,12 @@ mod tests {
             .incoming
             .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(native_unbind)));
         port.poll(false).unwrap();
-        let abort = port.tcp_user_record().unwrap().clone();
-        assert_eq!(abort.kind, TcpKind::Abort);
-        port.mark_tcp_user_record_enqueued(&abort).unwrap();
         assert!(port.tcp_user_record().is_none());
+        let abort = port.udp_abort_record().unwrap().clone();
+        assert_eq!(abort.kind, TcpKind::Abort);
+        assert!(port.complete_udp_abort_response().is_err());
+        port.mark_udp_abort_enqueued(&abort).unwrap();
+        assert!(port.udp_abort_record().is_none());
         assert!(!port.user_closed());
         port.complete_tcp_user_records(1).unwrap(); // Prior normal reply.
         port.complete_tcp_user_records(1).unwrap(); // Prior native request.
@@ -1654,7 +1677,8 @@ mod tests {
             port.inner.information.last().unwrap(),
             &hex("2d00020180004b8000c900010001")
         );
-        port.complete_tcp_user_records(1).unwrap(); // Abort is fully written.
+        port.complete_udp_abort_response().unwrap(); // Correlated UDP positive.
+        assert!(port.complete_udp_abort_response().is_err());
         port.poll(false).unwrap();
         assert_eq!(
             port.inner.information.last().unwrap(),

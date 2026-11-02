@@ -18,6 +18,7 @@ use crate::{
 pub enum Phase {
     Active,
     TcpAbortPrepared,
+    UdpAbortQueued,
     NativeResponsePrepared,
     Closed,
 }
@@ -119,6 +120,32 @@ impl NativeUserClose {
                 "TCP62 Abort differs from prepared native UNBIND conversion",
             ));
         }
+        Ok(self.prepare_native_response())
+    }
+
+    /// The gateway has accepted the exact reduced Abort image into its
+    /// bounded UDP queue. A positive native response still waits for the
+    /// correlated X'83' UDP acknowledgement.
+    pub fn mark_udp_abort_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.phase != Phase::TcpAbortPrepared || self.abort.as_ref() != Some(record) {
+            return Err(invalid(
+                "UDP Abort differs from prepared native UNBIND conversion",
+            ));
+        }
+        self.phase = Phase::UdpAbortQueued;
+        Ok(())
+    }
+
+    pub fn accept_udp_abort_response(&mut self) -> io::Result<&[u8]> {
+        if self.phase != Phase::UdpAbortQueued {
+            return Err(invalid(
+                "native user UNBIND lacks a correlated UDP Abort response",
+            ));
+        }
+        Ok(self.prepare_native_response())
+    }
+
+    fn prepare_native_response(&mut self) -> &[u8] {
         self.native_response = Some(vec![
             0x2d | (u8::from(self.address.odai) << 1),
             0,
@@ -132,7 +159,7 @@ impl NativeUserClose {
             0x32,
         ]);
         self.phase = Phase::NativeResponsePrepared;
-        Ok(self.native_response.as_deref().unwrap())
+        self.native_response.as_deref().unwrap()
     }
 
     pub fn mark_native_response_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {
@@ -224,6 +251,26 @@ mod tests {
         .concat();
         native[16] ^= 1;
         assert!(close.accept_native_unbind(&native).is_err());
+        assert_eq!(close.phase(), Phase::Closed);
+    }
+
+    #[test]
+    fn native_unbind_waits_for_correlated_udp_abort_ack() {
+        let mut close = fixture();
+        let native = [
+            vec![0x2f, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0],
+            hex("6014cec37477b5dc29a10be2d6d3d5c5e34be2d5c1c1"),
+        ]
+        .concat();
+        let abort = close.accept_native_unbind(&native).unwrap().clone();
+        assert!(close.accept_udp_abort_response().is_err());
+        close.mark_udp_abort_enqueued(&abort).unwrap();
+        assert!(close.mark_tcp_abort_written(&abort).is_err());
+        assert!(close.mark_udp_abort_enqueued(&abort).is_err());
+        let response = close.accept_udp_abort_response().unwrap().to_vec();
+        assert_eq!(response, [0x2f, 0, 2, 1, 0, 0, 0xeb, 0x80, 0, 0x32]);
+        assert!(close.accept_udp_abort_response().is_err());
+        close.mark_native_response_enqueued(&response).unwrap();
         assert_eq!(close.phase(), Phase::Closed);
     }
 }
