@@ -1,10 +1,11 @@
 //! Explicit experimental TCP62 to virtual native WebSocket gateway.
 //!
-//! X'83' UDP fallback remains fail closed. This lab only exercises peers that
-//! complete the captured TCP path without sending out-of-band datagrams.
+//! The socket adapter handles X'83' UDP expedited and Abort exchanges. This
+//! gateway remains opt-in because its native user address is QA-specific and
+//! the runtime handles one user session per invocation.
 
 use crate::{
-    config::{self, ConfiguredLuType},
+    config,
     mptn_gateway_port::{GatewayConfig, GatewayEvent, MptnGatewayPort},
     remote::{Config as RemoteConfig, WsRoutePort},
     routing::{RoutePort, RouterEvent},
@@ -54,17 +55,8 @@ fn check_shape(config: &config::RouterConfig) -> io::Result<()> {
         || !config.hpr_lan.is_empty()
     {
         return Err(invalid(
-            "experimental gateway requires one MPTN gateway, remote and route",
+            "experimental gateway requires one MPTN gateway, concentrator and route",
         ));
-    }
-    let gateway = &config.mptn_gateway[0];
-    let remote = &config.remote[0];
-    if !remote
-        .lu_types
-        .get(&gateway.source_lu)
-        .is_some_and(|types| types.contains(&ConfiguredLuType::Lu6_2))
-    {
-        return Err(invalid("source LU must be exported as LU6.2"));
     }
     Ok(())
 }
@@ -114,8 +106,7 @@ pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> i
     check_shape(&config)?;
     let gateway = &config.mptn_gateway[0];
     let remote = &config.remote[0];
-    let bearer = std::env::var("SNUSNU_ROUTER_TOKEN")
-        .map_err(|_| invalid("SNUSNU_ROUTER_TOKEN is required"))?;
+    let bearer = remote.bearer_token()?;
     let profile = LocalLlcProfile {
         cp_name: gateway.local_cp.clone(),
         station_name: gateway.local_station.clone(),
@@ -132,14 +123,9 @@ pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> i
     let route = RemoteConfig {
         url: remote.url.clone(),
         bearer,
-        local_cp: config::parse_cp(&remote.local_cp)?,
-        target_cp: config::parse_cp(&remote.target_cp)?,
-        target_lu: Some(config::parse_cp(
-            remote
-                .target_lu
-                .as_deref()
-                .ok_or_else(|| invalid("missing target LU"))?,
-        )?),
+        local_cp: config::parse_cp(&gateway.local_cp)?,
+        target_cp: config::parse_cp(&gateway.peer_cp)?,
+        target_lu: Some(config::parse_cp(&gateway.destination_lu)?),
     };
     let source = wire::LuReachability {
         lu: Some(source_lu.clone()),

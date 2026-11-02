@@ -4,7 +4,7 @@
 //! Alice LLC contact, and native SNASVCMG exchange before user admission.
 
 use crate::{
-    config::{self, ConfiguredLuType, RouterConfig},
+    config::{self, RouterConfig},
     remote::{Config as RemoteConfig, WsRoutePort},
     routing::{RoutePort, RouterEvent},
     virtual_ws_port::VirtualWsPort,
@@ -40,7 +40,6 @@ fn node_id(value: &str) -> io::Result<[u8; 4]> {
 
 fn one_gateway(
     config: &RouterConfig,
-    bearer: &str,
 ) -> io::Result<(RemoteConfig, wire::SnaName, LocalLlcProfile, String)> {
     if config.mptn_gateway.len() != 1
         || config.remote.len() != 1
@@ -51,20 +50,11 @@ fn one_gateway(
         || config.route.len() != 1
     {
         return Err(invalid(
-            "virtual management lab needs exactly one gateway, remote and route",
+            "virtual management lab needs exactly one gateway, concentrator and route",
         ));
     }
     let gateway = &config.mptn_gateway[0];
     let remote = &config.remote[0];
-    if !remote
-        .lu_types
-        .get(&gateway.source_lu)
-        .is_some_and(|types| types.contains(&ConfiguredLuType::Lu6_2))
-    {
-        return Err(invalid(
-            "virtual management lab requires an exported LU6.2 source",
-        ));
-    }
     let profile = LocalLlcProfile {
         cp_name: gateway.local_cp.clone(),
         station_name: gateway.local_station.clone(),
@@ -76,15 +66,10 @@ fn one_gateway(
     };
     let route = RemoteConfig {
         url: remote.url.clone(),
-        bearer: bearer.to_owned(),
-        local_cp: config::parse_cp(&remote.local_cp)?,
-        target_cp: config::parse_cp(&remote.target_cp)?,
-        target_lu: Some(config::parse_cp(
-            remote
-                .target_lu
-                .as_deref()
-                .ok_or_else(|| invalid("missing target LU"))?,
-        )?),
+        bearer: remote.bearer_token()?,
+        local_cp: config::parse_cp(&gateway.local_cp)?,
+        target_cp: config::parse_cp(&gateway.peer_cp)?,
+        target_lu: Some(config::parse_cp(&gateway.destination_lu)?),
     };
     Ok((
         route,
@@ -96,9 +81,7 @@ fn one_gateway(
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
     let config = config::load(path)?;
-    let bearer = std::env::var("SNUSNU_ROUTER_TOKEN")
-        .map_err(|_| invalid("SNUSNU_ROUTER_TOKEN is required"))?;
-    let (route, source_lu, profile, peer_cp) = one_gateway(&config, &bearer)?;
+    let (route, source_lu, profile, peer_cp) = one_gateway(&config)?;
     let local_cp = profile.cp_name.clone();
     let local_xid = profile
         .build()
@@ -184,7 +167,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lab_requires_one_qualified_source_lu62_and_fixed_secondary_profile() {
+    fn lab_derives_qualified_source_lu62_and_fixed_secondary_profile() {
         let input = r#"
 [[mptn_gateway]]
 id = "bob"
@@ -197,15 +180,10 @@ destination_lu = "QAALICE.SNAA"
 local_station = "BOB"
 local_node_id = "FFF12345"
 tg_number = 1
-[[remote]]
+[[concentrator]]
 id = "upstream"
 url = "ws://127.0.0.1:8081/router/v1/ws"
-local_cp = "QABOB.SNAB"
-target_cp = "QAALICE.SNAA"
-source_lu = "QABOB.SNAB"
-target_lu = "QAALICE.SNAA"
-lus = ["QABOB.SNAB"]
-lu_types = { "QABOB.SNAB" = ["lu_6_2"] }
+token = "test-token"
 [[route]]
 from = "bob"
 to = "upstream"
@@ -213,9 +191,10 @@ converter = "mptn_lu62"
 "#;
         let config: RouterConfig = toml::from_str(input).unwrap();
         config.validate().unwrap();
-        let (route, source, profile, peer) = one_gateway(&config, "test-token").unwrap();
+        let (route, source, profile, peer) = one_gateway(&config).unwrap();
         assert_eq!(source.netid, "QABOB");
         assert_eq!(route.target_lu.unwrap().netid, "QAALICE");
+        assert_eq!(route.bearer, "test-token");
         assert_eq!(profile.role, Role::Secondary);
         assert_eq!(profile.node_id, [0xff, 0xf1, 0x23, 0x45]);
         assert_eq!(peer, "QAALICE.SNAA");
