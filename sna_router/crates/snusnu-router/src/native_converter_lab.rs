@@ -733,7 +733,7 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
         remote_ip = %remote_ip,
         local_lu = %local_lu,
         remote_lu = %remote_lu,
-        "experimental V5 flow lab opened; X83 unavailable; no production route advertised"
+        "experimental V5 flow lab opened; X83 expedited enabled, abort unavailable; no production route advertised"
     );
     let mut first_attach_seen = false;
     let outcome = (|| -> io::Result<&'static str> {

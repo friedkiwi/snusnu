@@ -267,3 +267,32 @@ teardown was not verified in this run. After stopping the diagnostic, V4's
 `SNAB` controller and device and B's `SNAA00` device were varied off. This
 run verifies local LLC2-to-AnyNet conversion through remote Sign On; it does
 not exercise the concentrator or WebSocket route.
+
+On 2 November 2026, the staged `sol5`/`sol7` pair repeated the sustained
+reverse test with the current Rust tree. The first attempt exposed a V5R4
+SNASVCMG response whose fresh X'13' instance type was X'24'; the initiator
+had accepted only X'23'. The response matched the request's FQPCID and
+transport correlator. After accepting both observed instance types, the
+management/CNOS exchange completed. With the router listening on `sol5`,
+varying V4R4 A's `SNAB` controller off and on restored APPN contact. A's
+`STRPASTHR RMTLOCNAME(SNAB)` then reached V5R4 B's remote Sign On screen:
+system `S1054504`, subsystem `QBASE`, display `QPADEV0001`. The router log
+records XID3, LLC2, native management BIND, user BIND, and first Attach
+delivery. The TCP user connection from `10.99.4.10` to `10.99.4.3:397`
+remained established at the Sign On screen. No concentrator was running.
+The opt-in command was:
+
+```sh
+sudo sna_router/target/debug/snusnu-router \
+  --native-converter-v5-flow-lab /tmp/snusnu-native-v4a-user-pacing.toml \
+  10.99.4.10 10.99.4.3 --acknowledge-experimental-x83
+```
+
+The private runtime log is `/tmp/snusnu-reverse-20261102c.log`; the failed
+management attempt was captured at
+`/tmp/snusnu-reverse-20261102-sol7.pcap`. The diagnostic was stopped after
+the Sign On check. A returned to its local menu with a communications failure,
+and its `SNAB` controller and B's `SNAA00` device were varied off. This live
+run verifies the opt-in LLC2→TCP62 direction through Sign On. It did not
+exercise ordinary `--config`, normal `ENDPASTHR` teardown, UDP X'83', or the
+WebSocket concentrator.
