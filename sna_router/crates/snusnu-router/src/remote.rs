@@ -50,6 +50,32 @@ pub(crate) struct InboundOpen {
 struct GatewayInbound {
     hosted_route: wire::RouteReference,
     target_refs: Vec<Option<wire::RouteReference>>,
+    /// Duplex gateways reserve one private port for concentrator-initiated
+    /// circuits, even though both ports select the same remote LU.
+    inbound_owner: Option<usize>,
+}
+
+impl GatewayInbound {
+    fn owner(&self, open: &wire::IncomingOpen) -> Option<usize> {
+        if open.target.as_ref() != Some(&self.hosted_route) {
+            return None;
+        }
+        let source = open.source_route.as_ref()?;
+        if source.router_id != open.source_router_id {
+            return None;
+        }
+        if let Some(owner) = self.inbound_owner {
+            self.target_refs
+                .get(owner)?
+                .as_ref()
+                .filter(|known| *known == source)
+                .map(|_| owner)
+        } else {
+            self.target_refs
+                .iter()
+                .position(|known| known.as_ref() == Some(source))
+        }
+    }
 }
 
 struct SharedWs {
@@ -126,19 +152,7 @@ impl SharedWs {
             }
             Body::IncomingOpen(open) => {
                 let owner = if let Some(gateway) = &self.gateway_inbound {
-                    if open.target.as_ref() == Some(&gateway.hosted_route) {
-                        open.source_route.as_ref().and_then(|source| {
-                            if source.router_id != open.source_router_id {
-                                return None;
-                            }
-                            gateway
-                                .target_refs
-                                .iter()
-                                .position(|known| known.as_ref() == Some(source))
-                        })
-                    } else {
-                        None
-                    }
+                    gateway.owner(open)
                 } else {
                     open.target
                         .as_ref()
@@ -385,6 +399,42 @@ impl WsRoutePort {
         Self::connect_many_with_mode(configs, logical_units, false, Some(source_lus), true)
     }
 
+    /// A single hosted LU with separate circuit and credit owners for each
+    /// initiation direction. Both ports share the WebSocket and publication;
+    /// only the second port can accept an authenticated IncomingOpen.
+    pub(crate) fn connect_gateway_duplex_v2(
+        config: Config,
+        logical_units: Vec<wire::LuReachability>,
+        source_lu: wire::SnaName,
+    ) -> io::Result<(Self, Self)> {
+        if config.target_lu.is_none()
+            || logical_units.len() != 1
+            || logical_units[0].lu.as_ref() != Some(&source_lu)
+            || logical_units[0].hosting_cp.as_ref() != Some(&config.local_cp)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplex gateway requires one hosted LU and a target LU",
+            ));
+        }
+        let ports = Self::connect_many_with_mode(
+            vec![config.clone(), config],
+            logical_units,
+            false,
+            Some(vec![Some(source_lu.clone()), Some(source_lu)]),
+            true,
+        )?;
+        ports[0]
+            .shared
+            .borrow_mut()
+            .gateway_inbound
+            .as_mut()
+            .expect("shared gateway created")
+            .inbound_owner = Some(1);
+        let mut ports = ports.into_iter();
+        Ok((ports.next().unwrap(), ports.next().unwrap()))
+    }
+
     /// LLC-facing v2 ports may receive source-LU authenticated opens while
     /// still requiring the managed CP address binding on their local link.
     pub(crate) fn connect_many_v2(
@@ -547,6 +597,7 @@ impl WsRoutePort {
             Some(GatewayInbound {
                 hosted_route,
                 target_refs: vec![None; configs.len()],
+                inbound_owner: None,
             })
         } else {
             None
@@ -2750,6 +2801,40 @@ mod tests {
         assert!(accept_managed_revision(&mut last, 1).is_err());
         assert_eq!(last, 2);
         accept_managed_revision(&mut last, 3).unwrap();
+    }
+
+    #[test]
+    fn duplex_gateway_incoming_open_uses_responder_port_only() {
+        let hosted = wire::RouteReference {
+            router_id: vec![7; 16],
+            epoch: vec![8; 16],
+            route_id: 10,
+            route_generation: 1,
+        };
+        let source = wire::RouteReference {
+            router_id: vec![9; 16],
+            epoch: vec![11; 16],
+            route_id: 20,
+            route_generation: 1,
+        };
+        let gateway = GatewayInbound {
+            hosted_route: hosted.clone(),
+            target_refs: vec![Some(source.clone()), Some(source.clone())],
+            inbound_owner: Some(1),
+        };
+        let mut open = wire::IncomingOpen {
+            circuit_id: vec![1; 16],
+            source_router_id: source.router_id.clone(),
+            target: Some(hosted),
+            source_receive_allowance_bytes: 1500,
+            source_route: Some(source),
+        };
+        assert_eq!(gateway.owner(&open), Some(1));
+        open.source_router_id = vec![3; 16];
+        assert_eq!(gateway.owner(&open), None);
+        open.source_router_id = vec![9; 16];
+        open.target.as_mut().unwrap().route_generation = 2;
+        assert_eq!(gateway.owner(&open), None);
     }
 
     #[test]
