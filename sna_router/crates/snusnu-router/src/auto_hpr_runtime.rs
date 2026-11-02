@@ -7,7 +7,7 @@
 //! temporarily cannot send cannot lose an event popped from the fabric.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -29,6 +29,7 @@ use router_core::{
     hpr_control_bootstrap::HprControlBootstrap,
     hpr_cp_initiator::{CpInitiatorPhase, ReciprocalCpSession},
     hpr_cp_management::CpManagementResponder,
+    hpr_fid5::Fid5WholeBiu,
     hpr_ip_activation::Phase,
     hpr_route_setup::{RouteSetupGds, RouteSetupKind},
     hpr_route_setup_reply::{encode_stale_path_switch_negative, ReverseLinkMetrics},
@@ -49,6 +50,7 @@ const MAX_PENDING_RTP_MESSAGES: usize = 64;
 const MAX_PENDING_RTP_BYTES: usize = 128 * 1024;
 const MAX_PENDING_CP_REPLIES: usize = 16;
 const MAX_PENDING_CP_REPLY_BYTES: usize = 64 * 1024;
+const MAX_ACTIVE_HPR_SESSIONS: usize = 64;
 static NEXT_CP_NONCE: AtomicU64 = AtomicU64::new(1);
 static CP_NONCE_SEED: OnceLock<u64> = OnceLock::new();
 
@@ -92,6 +94,8 @@ fn user_nce_label(control: &[u8]) -> io::Result<Vec<u8>> {
 
 struct ActiveHprSession {
     handle: u64,
+    peer_sa: u64,
+    bind_message: Vec<u8>,
     fabric_id: FabricSessionId,
     identity: SessionIdentity,
     bind_request: SessionUnit,
@@ -115,10 +119,11 @@ struct DirectHprRuntime {
     pending_reciprocal_replies: VecDeque<Vec<u8>>,
     pending_reciprocal_reply_bytes: usize,
     switch: SessionSwitch,
-    session: Option<ActiveHprSession>,
+    sessions: BTreeMap<u64, ActiveHprSession>,
     pending_rtp: std::collections::VecDeque<RtpIngress>,
     pending_rtp_bytes: usize,
     next_handle: u64,
+    bound_user_scope: Option<router_core::hpr_session_address::RtpAssociationScope>,
     user_route_authorized: bool,
 }
 
@@ -140,10 +145,11 @@ impl DirectHprRuntime {
             pending_reciprocal_replies: VecDeque::new(),
             pending_reciprocal_reply_bytes: 0,
             switch,
-            session: None,
+            sessions: BTreeMap::new(),
             pending_rtp: std::collections::VecDeque::new(),
             pending_rtp_bytes: 0,
             next_handle: 1,
+            bound_user_scope: None,
             user_route_authorized: false,
         }
     }
@@ -186,7 +192,7 @@ impl DirectHprRuntime {
             self.try_cp_replies(link, now_us)?;
             self.try_reciprocal_replies(link, now_us)?;
         }
-        self.pump_session(link, hub, now_us)
+        self.pump_sessions(link, hub, now_us)
     }
 
     fn try_open_reciprocal_cp(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
@@ -474,11 +480,49 @@ impl DirectHprRuntime {
     }
 
     fn user_message(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
-        if self.session.is_none() {
+        let fid5 = Fid5WholeBiu::parse_complete(&message.bytes)
+            .map_err(|error| protocol(format!("invalid HPR user BIU: {error:?}")))?;
+        if fid5
+            .classify_bind()
+            .map_err(|error| protocol(format!("invalid HPR BIND: {error:?}")))?
+            .is_some()
+        {
+            let peer_sa = u64::from_be_bytes(fid5.session_address);
+            if let Some(session) = self
+                .sessions
+                .values()
+                .find(|session| session.peer_sa == peer_sa)
+            {
+                if session.bind_message == message.bytes {
+                    let scope = self
+                        .rtp
+                        .user_scope()
+                        .ok_or_else(|| protocol("user RTP scope missing"))?;
+                    if message.observation.generation != scope.generation
+                        || ![scope.initial_plu_tcid, scope.subsequent_plu_tcid]
+                            .contains(&message.observation.tcid)
+                    {
+                        return Err(protocol("duplicate HPR BIND on wrong RTP connection"));
+                    }
+                    tracing::debug!(
+                        peer_sa = format_args!("{peer_sa:016x}"),
+                        "duplicate HPR BIND ignored on existing session"
+                    );
+                    return Ok(());
+                }
+                return Err(protocol(format!(
+                    "conflicting HPR BIND peer session address={peer_sa:016x}"
+                )));
+            }
             self.start_user_session(hub, message)?;
             return Ok(());
         }
-        let session = self.session.as_mut().unwrap();
+        let handle = u64::from_be_bytes(fid5.session_address);
+        let session = self.sessions.get_mut(&handle).ok_or_else(|| {
+            protocol(format!(
+                "HPR user BIU has no verified session address={handle:016x}"
+            ))
+        })?;
         if let Some(credit) = session.pending_credit.take() {
             if let Err(error) = self
                 .switch
@@ -521,18 +565,72 @@ impl DirectHprRuntime {
         Ok(())
     }
 
+    fn publish_reachability(
+        &self,
+        hub: &mut AutoWsHub,
+        extra: Option<&SessionIdentity>,
+    ) -> io::Result<()> {
+        let identities = self
+            .sessions
+            .values()
+            .map(|session| &session.identity)
+            .chain(extra);
+        let mut cps = HashSet::new();
+        let mut lus = HashSet::new();
+        for identity in identities {
+            if let Some(cp) = identity.source_cp.as_ref() {
+                cps.insert(cp.clone());
+                lus.insert((identity.source_lu.clone(), cp.clone()));
+            }
+        }
+        let mut cps = cps.into_iter().collect::<Vec<_>>();
+        cps.sort_by(|a, b| (&a.netid, &a.name).cmp(&(&b.netid, &b.name)));
+        let mut lus = lus.into_iter().collect::<Vec<_>>();
+        lus.sort_by(|a, b| {
+            (&a.0.netid, &a.0.name, &a.1.netid, &a.1.name)
+                .cmp(&(&b.0.netid, &b.0.name, &b.1.netid, &b.1.name))
+        });
+        hub.publish_local(
+            &cps.iter().map(as_wire_name).collect::<Vec<_>>(),
+            &lus.iter()
+                .map(|(lu, cp)| wire::LuReachability {
+                    lu: Some(as_wire_name(lu)),
+                    hosting_cp: Some(as_wire_name(cp)),
+                    supported_types: vec![wire::LuType::LuType62 as i32],
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn start_user_session(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
+        if self.sessions.len() >= MAX_ACTIVE_HPR_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "HPR active session limit reached",
+            ));
+        }
+        let fid5 = Fid5WholeBiu::parse_complete(&message.bytes)
+            .map_err(|error| protocol(format!("invalid HPR BIND BIU: {error:?}")))?;
+        let peer_sa = u64::from_be_bytes(fid5.session_address);
         let scope = self
             .rtp
             .user_scope()
             .ok_or_else(|| protocol("user RTP scope missing"))?;
         let handle = self.next_handle;
+        if handle >= (1u64 << 62) {
+            return Err(protocol("HPR session address space exhausted"));
+        }
         self.next_handle = self
             .next_handle
             .checked_add(1)
             .ok_or_else(|| protocol("HPR session handles exhausted"))?;
         let local_sa = (1u64 << 63) | handle;
-        let adapter = HprSessionAdapter::new(
+        let constructor = if self.bound_user_scope == Some(scope) {
+            HprSessionAdapter::new_subsequent
+        } else {
+            HprSessionAdapter::new
+        };
+        let adapter = constructor(
             HprSessionRole::PeerPlu,
             scope,
             local_sa,
@@ -554,17 +652,9 @@ impl DirectHprRuntime {
                 "HPR BIND identity conflicts with authenticated route",
             ));
         }
-        let source_cp = identity.source_cp.as_ref().unwrap();
         let source_lu = as_wire_name(&identity.source_lu);
         let target_lu = as_wire_name(&identity.target_lu);
-        hub.publish_local(
-            &[as_wire_name(source_cp)],
-            &[wire::LuReachability {
-                lu: Some(source_lu.clone()),
-                hosting_cp: Some(as_wire_name(source_cp)),
-                supported_types: vec![wire::LuType::LuType62 as i32],
-            }],
-        )?;
+        self.publish_reachability(hub, Some(&identity))?;
         self.switch
             .replace_routes(
                 WS_ADAPTER,
@@ -594,27 +684,54 @@ impl DirectHprRuntime {
         tracing::info!(source_lu = %identity.source_lu, target_lu = %identity.target_lu,
             peer_cp = %self.bootstrap.peer.cp, proxy_cp = %self.bootstrap.local.cp,
             "HPR LU session routed to concentrator");
-        self.session = Some(ActiveHprSession {
+        self.sessions.insert(
             handle,
-            fabric_id,
-            identity,
-            bind_request,
-            adapter,
-            ws,
-            ws_closed: false,
-            pending_ws: None,
-            pending_credit: ingress.extra_credit,
-        });
+            ActiveHprSession {
+                handle,
+                peer_sa,
+                bind_message: message.bytes.clone(),
+                fabric_id,
+                identity,
+                bind_request,
+                adapter,
+                ws,
+                ws_closed: false,
+                pending_ws: None,
+                pending_credit: ingress.extra_credit,
+            },
+        );
+        self.bound_user_scope = Some(scope);
         Ok(())
     }
 
-    fn pump_session(
+    fn pump_sessions(
         &mut self,
         link: &EeLdlcEndpoint,
         hub: &mut AutoWsHub,
         now_us: u64,
     ) -> io::Result<()> {
-        let Some(session) = self.session.as_mut() else {
+        let handles = self.sessions.keys().copied().collect::<Vec<_>>();
+        for handle in handles {
+            self.pump_session(handle, link, hub, now_us)?;
+        }
+        let previous_count = self.sessions.len();
+        let switch = &self.switch;
+        self.sessions
+            .retain(|handle, _| switch.lookup(HPR_ADAPTER, *handle).is_ok());
+        if self.sessions.len() != previous_count {
+            self.publish_reachability(hub, None)?;
+        }
+        Ok(())
+    }
+
+    fn pump_session(
+        &mut self,
+        handle: u64,
+        link: &EeLdlcEndpoint,
+        hub: &mut AutoWsHub,
+        now_us: u64,
+    ) -> io::Result<()> {
+        let Some(session) = self.sessions.get_mut(&handle) else {
             return Ok(());
         };
         if let Some(credit) = session.pending_credit.take() {
@@ -734,10 +851,6 @@ impl DirectHprRuntime {
             }
         }
         let _ = ws.take_completed_send_count();
-        if self.switch.session_count() == 0 {
-            self.session = None;
-            hub.publish_local(&[], &[])?;
-        }
         Ok(())
     }
 }
@@ -1270,6 +1383,59 @@ mod tests {
             .unwrap();
         assert!(matches!(
             switch.next_delivery(egress, 0x55).unwrap(),
+            Some(SessionEvent::Information { .. })
+        ));
+    }
+
+    #[test]
+    fn overlapping_management_and_application_circuits_retire_independently() {
+        let mut switch = switch();
+        for handle in [1, 2] {
+            let (id, egress) = switch
+                .open(AdapterId(1), handle, identity(), unit(0x31))
+                .unwrap();
+            assert_eq!(egress, AdapterId(2));
+            switch.bind_egress(id, egress, handle).unwrap();
+            assert!(matches!(
+                switch.next_delivery(egress, handle).unwrap(),
+                Some(SessionEvent::BindRequest(_))
+            ));
+            switch.mark_sent(egress, handle).unwrap();
+            switch
+                .submit(
+                    egress,
+                    handle,
+                    SessionEvent::BindResult {
+                        accepted: true,
+                        unit: unit(0x31),
+                    },
+                )
+                .unwrap();
+            switch.next_delivery(AdapterId(1), handle).unwrap();
+            switch.mark_sent(AdapterId(1), handle).unwrap();
+        }
+        assert_eq!(switch.session_count(), 2);
+        switch.submit(AdapterId(2), 1, SessionEvent::Reset).unwrap();
+        assert_eq!(
+            switch.next_delivery(AdapterId(1), 1).unwrap(),
+            Some(SessionEvent::Reset)
+        );
+        switch.mark_sent(AdapterId(1), 1).unwrap();
+        assert_eq!(switch.session_count(), 1);
+        assert!(switch.lookup(AdapterId(1), 1).is_err());
+        assert!(switch.lookup(AdapterId(1), 2).is_ok());
+        switch
+            .submit(
+                AdapterId(1),
+                2,
+                SessionEvent::Information {
+                    flow: Flow::Normal,
+                    unit: unit(0x01),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            switch.next_delivery(AdapterId(2), 2).unwrap(),
             Some(SessionEvent::Information { .. })
         ));
     }
