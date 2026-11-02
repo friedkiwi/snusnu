@@ -203,3 +203,11 @@ cross-NETID route through the first remote display; authenticated sign-on
 and normal session teardown remain to be checked. The seventh router used
 a bounded 180-second lab timeout, so a follow-up with an established
 session held open is planned.
+
+The eighth combined run used a router build that keeps an established user
+session open. The same NETID-qualified pass-through reached Alice's remote
+`Sign On` again on Bob's console, with blank credentials. The two private
+captures, `combined8-sol9.pcap` and `combined8-sol8.pcap`, contain 13 and
+87 packets and had zero capture drops. Both captures were stopped while
+the guest screen and QA concentrator/router processes remained running for
+an uptime check beyond the earlier 180-second deadline.
