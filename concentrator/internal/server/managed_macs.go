@@ -19,10 +19,20 @@ func (a *App) routerLLCFacing(w http.ResponseWriter, r *http.Request, u store.Us
 	if !ok {
 		return
 	}
-	if err := a.DB.SetRouterLLCFacing(r.Context(), item.ID, r.FormValue("enabled") == "1"); err != nil {
+	enabled := r.FormValue("enabled") == "1"
+	update := func() error { return a.DB.SetRouterLLCFacing(r.Context(), item.ID, enabled) }
+	var err error
+	if !enabled && item.LLCFacing {
+		err = a.revokeRouter(item.ID, update)
+	} else {
+		err = update()
+	}
+	if err != nil {
 		dbError(w, err)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
+	if enabled || !item.LLCFacing {
+		a.routerPolicyChanged(r.Context())
+	}
 	http.Redirect(w, r, "/routers/"+item.ID, 303)
 }

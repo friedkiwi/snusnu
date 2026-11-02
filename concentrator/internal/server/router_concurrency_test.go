@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -104,6 +105,35 @@ func TestTemporaryBlockDeniesBeforePolicyReload(t *testing.T) {
 	a.hub.blockDenials.Delete(pair)
 	if !a.hub.allowed(source, target) {
 		t.Fatal("temporary block removal did not restore policy")
+	}
+}
+
+func TestRouterRevocationDeniesBeforeAndAfterFailedReload(t *testing.T) {
+	a := testApp(t)
+	source := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "source-token", store.RandomUUID())
+	target := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "target-token", store.RandomUUID())
+	installTestPolicy(a.hub, source, target)
+	if err := a.revokeRouter(source.router.ID, func() error {
+		if a.hub.allowed(source, target) || a.hub.current(source) {
+			t.Fatal("router was still authorized during revocation")
+		}
+		return errors.New("write failed")
+	}); err == nil {
+		t.Fatal("failed mutation was accepted")
+	}
+	if !a.hub.allowed(source, target) {
+		t.Fatal("failed mutation retained a denial")
+	}
+	if err := a.revokeRouter(source.router.ID, func() error {
+		return a.DB.DB.Close()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if a.hub.allowed(source, target) || a.hub.current(source) {
+		t.Fatal("failed reload restored a revoked router")
+	}
+	if _, denied := a.hub.revokedRouters.Load(source.router.ID); !denied {
+		t.Fatal("revocation denial did not survive failed reload")
 	}
 }
 

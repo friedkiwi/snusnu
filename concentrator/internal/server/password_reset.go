@@ -72,12 +72,20 @@ func (a *App) passwordResetComplete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or expired code", 400)
 		return
 	}
+	if err = a.DB.VerifyPasswordResetCode(r.Context(), u.ID, code); err != nil {
+		if errors.Is(err, store.ErrInvalidResetCode) {
+			http.Error(w, "invalid or expired code", 400)
+		} else {
+			dbError(w, err)
+		}
+		return
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		dbError(w, err)
 		return
 	}
-	if err = a.DB.CompletePasswordReset(r.Context(), u.ID, code, string(hash)); err != nil {
+	if err = a.DB.CompletePasswordResetVerified(r.Context(), u.ID, code, string(hash)); err != nil {
 		if errors.Is(err, store.ErrInvalidResetCode) {
 			http.Error(w, "invalid or expired code", 400)
 		} else {

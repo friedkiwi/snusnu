@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -282,7 +283,15 @@ func (a *App) setRole(w http.ResponseWriter, r *http.Request, u store.User, s st
 		http.Error(w, "cannot demote yourself", 400)
 		return
 	}
-	if _, err := a.DB.Exec(r.Context(), "UPDATE users SET role=? WHERE id=?", role, id); err != nil {
+	if err := a.DB.SetUserRole(r.Context(), u.ID, id, role); err != nil {
+		if errors.Is(err, store.ErrLastAdmin) {
+			http.Error(w, "cannot demote the last admin account", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, store.ErrNotAdmin) {
+			http.Error(w, "admin role required", http.StatusForbidden)
+			return
+		}
 		dbError(w, err)
 		return
 	}

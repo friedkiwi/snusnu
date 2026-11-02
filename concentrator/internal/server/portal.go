@@ -115,11 +115,19 @@ func (a *App) routerPause(w http.ResponseWriter, r *http.Request, u store.User, 
 		return
 	}
 	paused := r.FormValue("paused") == "1"
-	if err := a.DB.SetRouterPaused(r.Context(), item.ID, paused); err != nil {
+	var err error
+	if paused {
+		err = a.revokeRouter(item.ID, func() error { return a.DB.SetRouterPaused(r.Context(), item.ID, true) })
+	} else {
+		err = a.DB.SetRouterPaused(r.Context(), item.ID, false)
+	}
+	if err != nil {
 		dbError(w, err)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
+	if !paused {
+		a.routerPolicyChanged(r.Context())
+	}
 	http.Redirect(w, r, "/routers/"+item.ID, 303)
 }
 func (a *App) routerRotate(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -127,12 +135,15 @@ func (a *App) routerRotate(w http.ResponseWriter, r *http.Request, u store.User,
 	if !ok {
 		return
 	}
-	token, err := a.DB.RotateRouterToken(r.Context(), item.ID)
+	var token string
+	err := a.revokeRouter(item.ID, func() (err error) {
+		token, err = a.DB.RotateRouterToken(r.Context(), item.ID)
+		return err
+	})
 	if err != nil {
 		dbError(w, err)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
 	a.render(w, "router_token", map[string]any{"User": u, "CSRF": s.CSRF, "Router": item, "Token": token, "WebSocketURL": a.websocketURL(), "Rotated": true, "NetID": u.NetID})
 }
 func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -140,11 +151,10 @@ func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User,
 	if !ok {
 		return
 	}
-	if err := a.DB.DeleteRouter(r.Context(), item.ID); err != nil {
+	if err := a.revokeRouter(item.ID, func() error { return a.DB.DeleteRouter(r.Context(), item.ID) }); err != nil {
 		dbError(w, err)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/dashboard", 303)
 }
 func (a *App) globalDirectory(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -225,11 +235,20 @@ func (a *App) profileEdit(w http.ResponseWriter, r *http.Request, u store.User, 
 		}
 	}
 	public := r.FormValue("public_email") == "1"
-	if err := a.DB.UpdateProfile(r.Context(), u.ID, username, first, last, netid, public); err != nil {
+	update := func() error { return a.DB.UpdateProfile(r.Context(), u.ID, username, first, last, netid, public) }
+	var err error
+	if netid != u.NetID {
+		err = a.revokeOwnerRouters(u.ID, update)
+	} else {
+		err = update()
+	}
+	if err != nil {
 		http.Error(w, "username or NETID already taken, or profile is invalid", 409)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
+	if netid == u.NetID {
+		a.routerPolicyChanged(r.Context())
+	}
 	http.Redirect(w, r, "/profiles/"+u.ID, 303)
 }
 func (a *App) profilePictureUpload(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {

@@ -19,9 +19,8 @@ func (s *Store) IssuePasswordReset(ctx context.Context, userID, code string) err
 	return err
 }
 
-// CompletePasswordReset counts every submitted code, consumes a valid code
-// once, changes the password, and revokes all browser sessions atomically.
-func (s *Store) CompletePasswordReset(ctx context.Context, userID, code, passwordHash string) error {
+// VerifyPasswordResetCode counts an attempt before any password hashing work.
+func (s *Store) VerifyPasswordResetCode(ctx context.Context, userID, code string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -42,7 +41,19 @@ func (s *Store) CompletePasswordReset(ctx context.Context, userID, code, passwor
 		}
 		return ErrInvalidResetCode
 	}
-	res, err := tx.ExecContext(ctx, s.Q("DELETE FROM password_reset_tokens WHERE user_id=? AND code_hash=?"), userID, stored)
+	return tx.Commit()
+}
+
+// CompletePasswordResetVerified consumes a previously verified code once,
+// changes the password, and revokes browser sessions atomically.
+func (s *Store) CompletePasswordResetVerified(ctx context.Context, userID, code, passwordHash string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stored := resetCodeHash(userID, code)
+	res, err := tx.ExecContext(ctx, s.Q("DELETE FROM password_reset_tokens WHERE user_id=? AND code_hash=? AND expires_at>?"), userID, stored, Now())
 	if err != nil {
 		return err
 	}
@@ -54,6 +65,13 @@ func (s *Store) CompletePasswordReset(ctx context.Context, userID, code, passwor
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) CompletePasswordReset(ctx context.Context, userID, code, passwordHash string) error {
+	if err := s.VerifyPasswordResetCode(ctx, userID, code); err != nil {
+		return err
+	}
+	return s.CompletePasswordResetVerified(ctx, userID, code, passwordHash)
 }
 
 func (s *Store) AdminResetPassword(ctx context.Context, userID, passwordHash string) error {

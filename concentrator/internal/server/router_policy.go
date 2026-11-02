@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
@@ -183,6 +184,9 @@ func (h *routerHub) current(c *routerSession) bool {
 	if policy == nil || c.closed.Load() {
 		return false
 	}
+	if _, denied := h.revokedRouters.Load(c.router.ID); denied {
+		return false
+	}
 	c.mu.Lock()
 	routerID, ownerID, displayName, wasLLCFacing := c.router.ID, c.router.OwnerID, c.router.DisplayName, c.router.LLCFacing
 	c.mu.Unlock()
@@ -212,10 +216,81 @@ func (h *routerHub) allowed(source, target *routerSession) bool {
 	if source == nil || target == nil || !h.isCurrent(source) || !h.isCurrent(target) {
 		return false
 	}
+	if _, denied := h.revokedRouters.Load(source.router.ID); denied {
+		return false
+	}
+	if _, denied := h.revokedRouters.Load(target.router.ID); denied {
+		return false
+	}
 	if _, denied := h.blockDenials.Load(ownerPair(source.router.OwnerID, target.router.OwnerID)); denied {
 		return false
 	}
 	return h.policy.Load().allows(source.router.ID, target.router.ID)
+}
+
+func (h *routerHub) clearRevocations() {
+	h.revokedRouters.Range(func(key, _ any) bool {
+		h.revokedRouters.Delete(key)
+		return true
+	})
+}
+
+// Revoke a live router before the database change, then keep the denial until
+// a policy snapshot that includes the committed change has been loaded.
+func (a *App) revokeRouter(id string, mutate func() error) error {
+	return a.revokeRouters(func() []string { return []string{id} }, mutate)
+}
+
+func (a *App) revokeOwnerRouters(ownerID string, mutate func() error) error {
+	return a.revokeRouters(func() []string {
+		var ids []string
+		for _, session := range a.hub.sessions() {
+			if session.router.OwnerID == ownerID {
+				ids = append(ids, session.router.ID)
+			}
+		}
+		return ids
+	}, mutate)
+}
+
+func (a *App) revokeRouters(selectIDs func() []string, mutate func() error) error {
+	h := a.hub
+	h.revocationMu.Lock()
+	ids := selectIDs()
+	priorDenials := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		_, priorDenials[id] = h.revokedRouters.Load(id)
+		h.revokedRouters.Store(id, struct{}{})
+	}
+	if err := mutate(); err != nil {
+		for _, id := range ids {
+			if !priorDenials[id] {
+				h.revokedRouters.Delete(id)
+			}
+		}
+		h.revocationMu.Unlock()
+		return err
+	}
+	for _, id := range ids {
+		if session := h.session(id); session != nil && session.conn != nil {
+			_ = session.conn.Close()
+		}
+	}
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, err := h.loadPolicy(refreshCtx)
+	cancel()
+	if err == nil {
+		for _, id := range ids {
+			h.revokedRouters.Delete(id)
+		}
+	}
+	h.revocationMu.Unlock()
+	if err != nil {
+		log.Printf("refresh router policy after revocation: %v", err)
+		return nil
+	}
+	h.refresh()
+	return nil
 }
 
 // setBlock installs a fast denial before the database transaction. A failed

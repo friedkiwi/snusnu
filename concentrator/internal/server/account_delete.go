@@ -1,9 +1,7 @@
 package server
 
 import (
-	"context"
 	"errors"
-	"log"
 	"net/http"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -18,11 +16,10 @@ func (a *App) deleteOwnAccount(w http.ResponseWriter, r *http.Request, u store.U
 		http.Error(w, "confirmation or password is incorrect", 403)
 		return
 	}
-	if err := a.DB.DeleteUser(r.Context(), u.ID); err != nil {
+	if err := a.revokeOwnerRouters(u.ID, func() error { return a.DB.DeleteUser(r.Context(), u.ID) }); err != nil {
 		accountDeleteError(w, err)
 		return
 	}
-	a.closeDeletedUserRouters()
 	a.clearSession(w)
 	http.Redirect(w, r, "/login", 303)
 }
@@ -48,17 +45,11 @@ func (a *App) adminDeleteUser(w http.ResponseWriter, r *http.Request, u store.Us
 		http.Error(w, "confirmation or password is incorrect", 403)
 		return
 	}
-	if err := a.DB.DeleteUser(r.Context(), id); err != nil {
+	if err := a.revokeOwnerRouters(id, func() error { return a.DB.DeleteUser(r.Context(), id) }); err != nil {
 		accountDeleteError(w, err)
 		return
 	}
-	a.closeDeletedUserRouters()
 	http.Redirect(w, r, "/admin/users", 303)
-}
-func (a *App) closeDeletedUserRouters() {
-	if err := a.hub.refreshPolicyAndRoutes(context.Background()); err != nil {
-		log.Printf("refresh router policy after account deletion: %v", err)
-	}
 }
 func accountDeleteError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrLastAdmin) {

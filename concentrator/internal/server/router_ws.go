@@ -25,8 +25,8 @@ const wsPingInterval = 5 * time.Second
 const wsReadTimeout = 15 * time.Second
 const wsWriteTimeout = 10 * time.Second
 
-// Policy mutations call routerPolicyChanged immediately. This slower poll is
-// only a safety net for expiry and changes made outside the application.
+// Policy mutations refresh immediately. This slower poll covers expiry and
+// changes made outside the application.
 const policyFallbackInterval = 30 * time.Second
 
 type outboundMessage struct {
@@ -78,6 +78,8 @@ type routerHub struct {
 	policyMu        sync.Mutex
 	blockMu         sync.Mutex
 	blockDenials    sync.Map // owner pair -> temporary denial while policy catches up
+	revocationMu    sync.Mutex
+	revokedRouters  sync.Map // router ID -> temporary denial while policy catches up
 	reconcileMu     sync.Mutex
 	clients         sync.Map // router ID -> *routerSession
 	circuits        sync.Map // circuit UUID -> *wsCircuit
@@ -162,7 +164,23 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}, connectedAt: time.Now(), done: make(chan struct{})}
 	h := a.hub
-	if _, err := h.loadPolicy(r.Context()); err != nil {
+	h.revocationMu.Lock()
+	_, policyErr := h.loadPolicy(r.Context())
+	if policyErr == nil {
+		h.clearRevocations()
+	}
+	policy := h.policy.Load()
+	var value liveRouterPolicy
+	authorized := false
+	if policyErr == nil && policy != nil {
+		value, authorized = policy.routers[router.ID]
+	}
+	if authorized {
+		_, authorized = value.credentials[store.Hash(parts[1])]
+		authorized = authorized && !value.paused && value.epoch == epoch && value.ownerID == router.OwnerID && value.netID == owner.NetID
+	}
+	if policyErr != nil || !authorized {
+		h.revocationMu.Unlock()
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = a.DB.EndRouterEpoch(cleanupCtx, router.ID, epoch)
 		cancel()
@@ -172,6 +190,7 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.lifecycleMu.Lock()
 	if h.draining.Load() {
 		h.lifecycleMu.Unlock()
+		h.revocationMu.Unlock()
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = a.DB.EndRouterEpoch(cleanupCtx, router.ID, epoch)
 		cancel()
@@ -181,7 +200,9 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.sessionWG.Add(1)
 	h.lifecycleMu.Unlock()
 	defer h.sessionWG.Done()
-	if previous, loaded := h.clients.Swap(router.ID, c); loaded {
+	previous, loaded := h.clients.Swap(router.ID, c)
+	h.revocationMu.Unlock()
+	if loaded {
 		h.remove(previous.(*routerSession))
 	}
 	h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}}}, "", 0)
@@ -214,6 +235,7 @@ func (h *routerHub) tick() {
 			}
 			refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			h.blockMu.Lock()
+			h.revocationMu.Lock()
 			_, err := h.loadPolicy(refreshCtx)
 			cancel()
 			if err != nil {
@@ -225,7 +247,9 @@ func (h *routerHub) tick() {
 					h.blockDenials.Delete(key)
 					return true
 				})
+				h.clearRevocations()
 			}
+			h.revocationMu.Unlock()
 			h.blockMu.Unlock()
 			if err == nil {
 				h.refresh()
