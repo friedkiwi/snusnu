@@ -14,18 +14,30 @@ const serviceRouterID = "00000000-0000-4000-8000-000000000001"
 const serviceOwnerID = "concentrator"
 const serviceMACSuffix = 0xffffff
 
+// LocalPeer is stamped from the authenticated router session and its live LU
+// advertisement. Services can use OwnerID to keep per-user data isolated.
+type LocalPeer struct {
+	RouterID, OwnerID, NetID, LU string
+}
+
+type localDelivery struct {
+	Envelope *wire.WsEnvelope
+	Peer     LocalPeer
+}
+
 // registerLocalService installs a server-owned route origin after its handler
-// is ready. It must be called before accepting router WebSocket connections.
+// is ready. It must be called before accepting router WebSocket connections,
+// and ctx must remain live for the entire router-hub lifetime.
 // The callback receives the same server-stamped envelopes as a remote router.
-func (h *routerHub) registerLocalService(ctx context.Context, handle func(*wire.WsEnvelope)) error {
-	if h.local != nil || handle == nil {
+func (h *routerHub) registerLocalService(ctx context.Context, handle func(*wire.WsEnvelope, LocalPeer)) error {
+	if h.local != nil || handle == nil || ctx == nil {
 		return errors.New("local service already registered or handler absent")
 	}
 	epoch := uuid.NewString()
 	name := func(value string) *wire.SnaName { return &wire.SnaName{Netid: "SNUSNU", Name: value} }
 	local := &routerSession{
 		local:      true,
-		localInbox: make(chan *wire.WsEnvelope, 256),
+		localInbox: make(chan localDelivery, 256),
 		router:     store.Router{ID: serviceRouterID, OwnerID: serviceOwnerID, DisplayName: "SNUSNU services"},
 		epoch:      epoch, allowedNetID: "SNUSNU", subprotocol: "snusnu.v2",
 		queued: make(map[string]int), connectedAt: time.Now(),
@@ -38,8 +50,8 @@ func (h *routerHub) registerLocalService(ctx context.Context, handle func(*wire.
 	go func() {
 		for {
 			select {
-			case envelope := <-local.localInbox:
-				handle(envelope)
+			case delivery := <-local.localInbox:
+				handle(delivery.Envelope, delivery.Peer)
 			case <-ctx.Done():
 				return
 			}

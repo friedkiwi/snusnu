@@ -14,12 +14,16 @@ import (
 
 func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	a := testApp(t)
+	owner := store.RandomUUID()
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	t.Cleanup(cancelService)
 	incoming := make(chan *wire.IncomingOpen, 1)
 	events := make(chan *wire.CircuitEvent, 1)
-	if err := a.hub.registerLocalService(serviceCtx, func(envelope *wire.WsEnvelope) {
+	if err := a.hub.registerLocalService(serviceCtx, func(envelope *wire.WsEnvelope, peer LocalPeer) {
 		if open := envelope.GetIncomingOpen(); open != nil {
+			if peer.OwnerID != owner || peer.NetID != "PEERNET" || peer.LU != "LU" {
+				t.Errorf("wrong local peer: %+v", peer)
+			}
 			incoming <- open
 			_ = a.hub.decision(a.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500})
 		}
@@ -29,11 +33,10 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.hub.registerLocalService(serviceCtx, func(*wire.WsEnvelope) {}); err == nil {
+	if err := a.hub.registerLocalService(serviceCtx, func(*wire.WsEnvelope, LocalPeer) {}); err == nil {
 		t.Fatal("duplicate local origin")
 	}
 	ctx := context.Background()
-	owner := store.RandomUUID()
 	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "local-peer@example.com", "unused", store.Now(), "PEERNET"); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +58,13 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_PublishRoutes{PublishRoutes: sourceSnapshot})
 	source := &wire.RouteReference{RouterId: welcome.RouterId, Epoch: welcome.ConnectionEpoch, RouteId: 2, RouteGeneration: 1}
 	target := &wire.RouteReference{RouterId: uuidBytes(serviceRouterID), Epoch: routes.Snapshot.Epoch, RouteId: 2, RouteGeneration: 1}
+	forged := proto.Clone(source).(*wire.RouteReference)
+	forged.RouteId = 1 // The peer's CP is not a source LU.
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenRequest{OpenRequest: &wire.OpenRequest{RequestId: 9, Target: target, SourceRoute: forged, ReceiveAllowanceBytes: 1500}})
+	denied := expectTestBody(t, conn, "result").GetOpenResult()
+	if denied.Accepted || denied.Reason != wire.OpenFailure_OPEN_FAILURE_FORBIDDEN {
+		t.Fatalf("forged local source accepted: %+v", denied)
+	}
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenRequest{OpenRequest: &wire.OpenRequest{RequestId: 1, Target: target, SourceRoute: source, ReceiveAllowanceBytes: 1500}})
 	result := expectTestBody(t, conn, "result").GetOpenResult()
 	if !result.Accepted {

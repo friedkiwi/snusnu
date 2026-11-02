@@ -40,7 +40,7 @@ type outboundMessage struct {
 type routerSession struct {
 	mu                             sync.Mutex
 	local                          bool
-	localInbox                     chan *wire.WsEnvelope
+	localInbox                     chan localDelivery
 	router                         store.Router
 	token, epoch, ip, allowedNetID string
 	subprotocol                    string
@@ -367,8 +367,34 @@ func (h *routerHub) send(c *routerSession, e *wire.WsEnvelope, circuit string, c
 		return false
 	}
 	if c.local {
+		var idBytes []byte
+		switch body := e.Body.(type) {
+		case *wire.WsEnvelope_IncomingOpen:
+			idBytes = body.IncomingOpen.CircuitId
+		case *wire.WsEnvelope_OpenReady:
+			idBytes = body.OpenReady.CircuitId
+		case *wire.WsEnvelope_CircuitEvent:
+			idBytes = body.CircuitEvent.CircuitId
+		case *wire.WsEnvelope_CircuitCredit:
+			idBytes = body.CircuitCredit.CircuitId
+		case *wire.WsEnvelope_CircuitClose:
+			idBytes = body.CircuitClose.CircuitId
+		case *wire.WsEnvelope_CircuitReset:
+			idBytes = body.CircuitReset.CircuitId
+		default:
+			return false
+		}
+		id, ok := uuidString(idBytes)
+		if !ok {
+			return false
+		}
+		value, ok := h.circuits.Load(id)
+		if !ok {
+			return false
+		}
+		peer := value.(*wsCircuit).sourcePeer
 		select {
-		case c.localInbox <- proto.Clone(e).(*wire.WsEnvelope):
+		case c.localInbox <- localDelivery{Envelope: proto.Clone(e).(*wire.WsEnvelope), Peer: peer}:
 			return true
 		default:
 			return false

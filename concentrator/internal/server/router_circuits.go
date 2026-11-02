@@ -21,6 +21,7 @@ type wsCircuit struct {
 	requestID      uint64
 	targetRef      *wire.RouteReference
 	sourceRef      *wire.RouteReference
+	sourcePeer     LocalPeer
 	pending        bool
 	allowance      [2]uint64 // data bytes each side may send
 	sent           [2]uint64
@@ -189,7 +190,9 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	target := h.session(targetID)
 	reason := wire.OpenFailure_OPEN_FAILURE_ROUTE_GONE
 	if target != nil && target != source {
-		if !h.allowed(source, target) {
+		if target.local && req.SourceRoute == nil {
+			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
+		} else if !h.allowed(source, target) {
 			reason = wire.OpenFailure_OPEN_FAILURE_FORBIDDEN
 		} else if req.SourceRoute != nil && (target.subprotocol != "snusnu.v2" || !sourceLUValid(target, h.routeForRef(target, ref))) {
 			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
@@ -199,6 +202,9 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 			candidate := &wsCircuit{source: source, target: target, targetRef: proto.Clone(ref).(*wire.RouteReference), openedAt: time.Now(), lastActivityAt: time.Now()}
 			if req.SourceRoute != nil {
 				candidate.sourceRef = proto.Clone(req.SourceRoute).(*wire.RouteReference)
+				if sourceLU := h.routeForRef(source, req.SourceRoute).GetLogicalUnit(); sourceLU != nil {
+					candidate.sourcePeer = LocalPeer{RouterID: source.router.ID, OwnerID: source.router.OwnerID, NetID: sourceLU.Lu.Netid, LU: sourceLU.Lu.Name}
+				}
 			}
 			if h.routeValid(candidate) {
 				if !reserveCircuit(source, target) {
