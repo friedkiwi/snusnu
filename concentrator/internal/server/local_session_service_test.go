@@ -249,6 +249,9 @@ func TestLocalAPINGSessionAcceptsV5R4EESNASVCMGPingBind(t *testing.T) {
 	if !bytes.Equal(response.ReducedUnit[5+23:5+26], []byte{0x94, 0x43, 0x40}) {
 		t.Fatalf("SNASVCMG PING BIND profile changed: %x", response.ReducedUnit[5:32])
 	}
+	if response.ReducedUnit[5+8] != 3 || response.ReducedUnit[5+9] != 1 || response.ReducedUnit[5+13] != 3 {
+		t.Fatalf("SNASVCMG PING pacing window differs from user session: %x", response.ReducedUnit[5:32])
+	}
 	if credit := expectTestBody(t, conn, "credit").GetCircuitCredit(); credit.AllowanceBytes != 1500+uint64(len(reduced)) {
 		t.Fatalf("SNASVCMG PING BIND inbound credit: %+v", credit)
 	}

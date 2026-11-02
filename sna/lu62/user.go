@@ -69,6 +69,9 @@ func CandidateStandaloneUserResponse(request []byte, expectedPLU, expectedSLU st
 			// limited-resource settings. The response still selects a bounded
 			// receive window in CandidateManagementResponse.
 			copy(response[9+23:9+26], request[9+23:9+26])
+			// This circuit uses the standalone user's three-frame primary
+			// window, rather than the seven-frame management-session window.
+			response[9+8], response[9+13] = 3, 3
 			return response, nil
 		}
 	}

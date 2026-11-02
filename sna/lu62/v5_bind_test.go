@@ -84,7 +84,8 @@ func TestLiveV5R4EESNASVCMGPingBindIsStandaloneOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response[6] != 0xeb || response[9] != 0x31 || response[9+9] != 1 || response[9+12] != 0x81 ||
+	if response[6] != 0xeb || response[9] != 0x31 || response[9+8] != 3 || response[9+9] != 1 ||
+		response[9+12] != 0x81 || response[9+13] != 3 ||
 		!bytes.Equal(response[9+23:9+26], []byte{0x94, 0x43, 0x40}) || response[2] != 2 || response[3] != 1 {
 		t.Fatalf("invalid PING RSP(BIND) profile: %x", response)
 	}
