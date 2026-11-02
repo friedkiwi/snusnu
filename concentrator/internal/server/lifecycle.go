@@ -40,11 +40,7 @@ func (a *App) StartInstanceHeartbeat(ctx context.Context, instanceID string) {
 				a.leaseHealthy.Store(false)
 				log.Printf("instance heartbeat failed; retrying: %v", err)
 				if errors.Is(err, store.ErrInstanceActive) || time.Since(lastSuccess) >= 20*time.Second {
-					a.hub.draining.Store(true)
-					select {
-					case a.fatal <- fmt.Errorf("instance lease lost: %w", err):
-					default:
-					}
+					a.signalFatal(fmt.Errorf("instance lease lost: %w", err))
 					return
 				}
 			}
@@ -53,6 +49,17 @@ func (a *App) StartInstanceHeartbeat(ctx context.Context, instanceID string) {
 }
 
 func (a *App) Fatal() <-chan error { return a.fatal }
+
+func (a *App) signalFatal(err error) {
+	if err == nil {
+		return
+	}
+	a.hub.draining.Store(true)
+	select {
+	case a.fatal <- err:
+	default:
+	}
+}
 
 func (a *App) liveness(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

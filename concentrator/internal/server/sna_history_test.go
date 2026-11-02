@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
 )
@@ -13,6 +14,27 @@ func insertCircuitHistory(t *testing.T, a *App, record circuitHistoryRecord) {
 	_, err := a.DB.Exec(context.Background(), `INSERT INTO sna_circuit_history(id,source_router_id,source_router_name,source_owner_id,target_router_id,target_router_name,target_owner_id,profile,opened_at,activated_at,closed_at,state,close_reason,source_bytes,target_bytes,source_events,target_events,peak_queued_bytes,actor_type,actor_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, record.ID, record.SourceRouterID, record.SourceRouterName, record.SourceOwnerID, record.TargetRouterID, record.TargetRouterName, record.TargetOwnerID, record.Profile, record.OpenedAt, record.ActivatedAt, record.ClosedAt, record.State, record.CloseReason, record.SourceBytes, record.TargetBytes, record.SourceEvents, record.TargetEvents, record.PeakQueuedBytes, record.ActorType, record.ActorID)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCircuitHistoryWriteFailureTriggersFatalDrain(t *testing.T) {
+	a := testApp(t)
+	if err := a.DB.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := circuitHistoryRecord{ID: store.RandomUUID(), SourceRouterID: store.RandomUUID(), SourceOwnerID: store.RandomUUID(), TargetRouterID: store.RandomUUID(), TargetOwnerID: store.RandomUUID(), Profile: snaCircuitProfile, ClosedAt: store.Now(), State: "reset"}
+	a.historyPending[record.ID] = pendingCircuitHistory{Record: record, Status: "writing"}
+	a.persistCircuitHistory(record)
+	select {
+	case err := <-a.Fatal():
+		if err == nil || !a.hub.draining.Load() {
+			t.Fatalf("fatal state: %v draining=%v", err, a.hub.draining.Load())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("history persistence failure did not trigger fatal shutdown")
+	}
+	if pending := a.historyPending[record.ID]; pending.Status != "failed" {
+		t.Fatalf("pending status: %+v", pending)
 	}
 }
 

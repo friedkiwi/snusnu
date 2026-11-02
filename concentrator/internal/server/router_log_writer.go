@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -41,4 +42,5 @@ func (a *App) persistRouterLog(entry store.LogEntry) {
 	}
 	a.writeFailures.Add(1)
 	log.Printf("persist router log for %s after retries: %v", entry.RouterID, err)
+	a.signalFatal(fmt.Errorf("database unavailable while persisting router logs: %w", err))
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -73,6 +74,7 @@ func (h *routerHub) archiveCircuitLocked(id string, c *wsCircuit, reason, actorT
 		h.a.historyPending[id] = pendingCircuitHistory{Record: record, Status: "failed"}
 		h.a.historyMu.Unlock()
 		log.Printf("SNA circuit history queue full; summary for %s was not persisted", id)
+		h.a.signalFatal(errors.New("SNA circuit history queue exhausted"))
 	}
 }
 
@@ -125,6 +127,7 @@ func (a *App) persistCircuitHistory(record circuitHistoryRecord) {
 	a.historyPending[record.ID] = pendingCircuitHistory{Record: record, Status: "failed"}
 	a.historyMu.Unlock()
 	log.Printf("persist SNA circuit history %s after retries: %v", record.ID, err)
+	a.signalFatal(fmt.Errorf("database unavailable while persisting SNA circuit history: %w", err))
 }
 
 func (h *routerHub) liveCircuits(ownerID string, all bool) []circuitView {

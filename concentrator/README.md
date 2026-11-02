@@ -48,6 +48,8 @@ The default listener binds all network interfaces on port 8080. Use `-listen 127
 
 The concentrator is deliberately single-instance. At startup it acquires and continuously heartbeats an exclusive database lease; a second process using the same database refuses to start. Multi-instance operation is not supported. Startup clears stale live connection epochs and route advertisements only after acquiring that lease.
 
+The database is a required runtime dependency. Brief asynchronous write failures are retried, but exhausted router-log or SNA-circuit-history writes, sustained heartbeat failure, or loss of the singleton lease make the process unready and trigger its bounded graceful shutdown. The process exits nonzero so its service supervisor can restart it. Production supervisors should use restart-on-failure with backoff while PostgreSQL is unavailable. Unpersisted operational records may be discarded when the shutdown deadline expires; the concentrator does not maintain a separate local durability spool.
+
 ## Roles and current records
 
 New accounts have the `user` role and must verify email before login. The dashboard shows the user's named sna_router clients and their live CP/LU exports. Users can onboard a router, name it, pause or resume it, rotate its bearer credential, or remove it. Router credentials are separate from user API client credentials and are hashed at rest. The onboarding page shows the `wss://<host>/router/v1/ws` URL and the token once; router downloads are placeholders. Pausing and token rotation revoke the current connection epoch and withdraw its exports. The WebSocket service closes the affected socket on its next policy check.
