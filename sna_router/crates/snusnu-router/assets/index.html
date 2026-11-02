@@ -3,27 +3,61 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>snusnu router</title>
+  <title>sna_router</title>
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
   <header class="topbar">
-    <div><span class="mark">S</span><span class="brand">snusnu router</span></div>
+    <a class="brand-link" href="/"><span class="mark">S</span><span class="brand">sna_router</span></a>
     <form action="/logout" method="post" id="logout"><button type="submit" class="quiet">Sign out</button></form>
   </header>
-  <main>
-    <div class="heading">
-      <div><p class="eyebrow">Local router</p><h1>Network state</h1></div>
-      <div class="updated" id="updated">Connecting…</div>
-    </div>
-    <div class="summary" id="summary"></div>
-    <section class="panel"><div class="panel-head"><h2>Concentrator</h2></div><div id="concentrator" class="empty">Loading…</div></section>
-    <section class="panel"><div class="panel-head"><h2>Local peers</h2><span id="peer-count" class="count"></span></div><div class="table-scroll"><table id="peers"><thead><tr><th>State</th><th>Identity</th><th>Transport</th><th>Locator</th><th>Last seen</th><th>Details</th></tr></thead><tbody></tbody></table></div></section>
-    <section class="panel"><div class="panel-head"><h2>Local proxy MACs</h2><span id="local-mac-count" class="count"></span></div><div class="table-scroll"><table id="local-macs"><thead><tr><th>Target attachment</th><th>Configure this MAC on an LLC peer</th></tr></thead><tbody></tbody></table></div></section>
-    <section class="panel"><div class="panel-head"><h2>Upstream routes</h2><span id="route-count" class="count"></span></div><div class="table-scroll"><table id="routes"><thead><tr><th>Resource</th><th>Hosting CP</th><th>Origin router</th><th>Generation</th><th>Last seen</th></tr></thead><tbody></tbody></table></div></section>
-    <section class="panel"><div class="panel-head"><h2>Managed MACs</h2><span id="mac-count" class="count"></span></div><div class="table-scroll"><table id="macs"><thead><tr><th>Control point</th><th>MAC</th><th>Last seen</th></tr></thead><tbody></tbody></table></div></section>
-    <section class="panel"><div class="panel-head"><h2>Circuits</h2><span id="circuit-count" class="count"></span></div><div class="table-scroll"><table id="circuits"><thead><tr><th>State</th><th>Ingress</th><th>Egress</th><th>Traffic</th><th>Changed</th><th>ID</th></tr></thead><tbody></tbody></table></div></section>
-  </main>
+  <div class="layout">
+    <nav class="sidebar" aria-label="Router pages">
+      <a href="/" data-page="overview">Overview</a>
+      <a href="/concentrator" data-page="concentrator">Concentrator</a>
+      <a href="/routes" data-page="routes">Upstream routes</a>
+      <a href="/peers" data-page="peers">Local peers</a>
+      <a href="/addresses" data-page="addresses">Addresses</a>
+      <a href="/circuits" data-page="circuits">Circuits</a>
+    </nav>
+    <main>
+      <div class="heading">
+        <div><p class="eyebrow">Local router</p><h1 id="page-title">Overview</h1><p id="page-description" class="page-description"></p></div>
+        <div class="updated" id="updated" role="status">Connecting…</div>
+      </div>
+      <section id="overview-page" class="page" hidden>
+        <div class="summary" id="summary"></div>
+        <section class="panel"><div class="panel-head"><h2>Concentrator</h2><a href="/concentrator">View details</a></div><div id="concentrator-summary" class="empty">Loading…</div></section>
+      </section>
+      <section id="concentrator-page" class="page" hidden>
+        <section class="panel"><div class="panel-head"><h2>Connection</h2></div><div id="concentrator" class="empty">Loading…</div></section>
+        <section class="panel"><div class="panel-head"><h2>Received routes</h2><a href="/concentrator/routes">Browse and search</a></div><div class="detail-count" id="concentrator-route-count">Loading…</div></section>
+      </section>
+      <section id="routes-page" class="page" hidden>
+        <section class="panel">
+          <div class="panel-head"><h2>Upstream routes</h2><span id="route-count" class="count"></span></div>
+          <div class="toolbar">
+            <label for="route-search">Search routes</label>
+            <input id="route-search" type="search" placeholder="Resource, hosting CP, or router ID" autocomplete="off" maxlength="128">
+            <label for="route-page-size">Rows per page</label>
+            <select id="route-page-size"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select>
+          </div>
+          <div class="table-scroll"><table id="routes"><thead><tr><th>Resource</th><th>Hosting CP</th><th>Origin router</th><th>Generation</th><th>Last seen</th></tr></thead><tbody></tbody></table></div>
+          <div class="pagination"><span id="route-range" aria-live="polite"></span><div><button id="route-prev" type="button" class="quiet">Previous</button><button id="route-next" type="button" class="quiet">Next</button></div></div>
+        </section>
+      </section>
+      <section id="peers-page" class="page" hidden>
+        <section class="panel"><div class="panel-head"><h2>Local peers</h2><span id="peer-count" class="count"></span></div><div class="table-scroll"><table id="peers"><thead><tr><th>State</th><th>Identity</th><th>Transport</th><th>Locator</th><th>Last seen</th><th>Details</th></tr></thead><tbody></tbody></table></div></section>
+      </section>
+      <section id="addresses-page" class="page" hidden>
+        <section class="panel"><div class="panel-head"><h2>Local proxy MACs</h2><span id="local-mac-count" class="count"></span></div><div class="table-scroll"><table id="local-macs"><thead><tr><th>Target attachment</th><th>Configure this MAC on an LLC peer</th></tr></thead><tbody></tbody></table></div></section>
+        <section class="panel"><div class="panel-head"><h2>Managed MACs</h2><span id="mac-count" class="count"></span></div><div class="table-scroll"><table id="macs"><thead><tr><th>Control point</th><th>MAC</th><th>Last seen</th></tr></thead><tbody></tbody></table></div></section>
+      </section>
+      <section id="circuits-page" class="page" hidden>
+        <section class="panel"><div class="panel-head"><h2>Circuits</h2><span id="circuit-count" class="count"></span></div><div class="table-scroll"><table id="circuits"><thead><tr><th>State</th><th>Ingress</th><th>Egress</th><th>Traffic</th><th>Changed</th><th>ID</th></tr></thead><tbody></tbody></table></div></section>
+      </section>
+    </main>
+  </div>
 </body>
 </html>

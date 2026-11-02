@@ -30,6 +30,25 @@ pub(crate) struct StatusSnapshot {
     pub(crate) concentrator: Option<ConcentratorStatus>,
 }
 
+#[derive(Serialize)]
+pub(crate) struct StatusView {
+    started_at_ms: u64,
+    local_peers: Vec<LocalPeerStatus>,
+    local_proxy_macs: Vec<LocalProxyMacStatus>,
+    upstream_route_count: usize,
+    managed_macs: Vec<ManagedMacStatus>,
+    circuits: Vec<CircuitStatus>,
+    concentrator: Option<ConcentratorStatus>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RoutePage {
+    items: Vec<UpstreamRouteStatus>,
+    total: usize,
+    page: usize,
+    per_page: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct LocalPeerStatus {
     /// Stable local attachment key, such as an LLC interface/MAC pair.
@@ -154,6 +173,56 @@ impl LocalStatus {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(crate) fn view(&self) -> StatusView {
+        let snapshot = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        StatusView {
+            started_at_ms: snapshot.started_at_ms,
+            local_peers: snapshot.local_peers.clone(),
+            local_proxy_macs: snapshot.local_proxy_macs.clone(),
+            upstream_route_count: snapshot.upstream_routes.len(),
+            managed_macs: snapshot.managed_macs.clone(),
+            circuits: snapshot.circuits.clone(),
+            concentrator: snapshot.concentrator.clone(),
+        }
+    }
+
+    pub(crate) fn route_page(&self, query: &str, page: usize, per_page: usize) -> RoutePage {
+        let needle = query.to_ascii_lowercase();
+        let snapshot = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let offset = page.saturating_sub(1).saturating_mul(per_page);
+        let mut items = Vec::with_capacity(per_page);
+        let mut total = 0;
+        for route in &snapshot.upstream_routes {
+            if route.resource.to_ascii_lowercase().contains(&needle)
+                || route
+                    .origin_router_id
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+                || route
+                    .hosting_cp
+                    .as_ref()
+                    .is_some_and(|cp| cp.to_ascii_lowercase().contains(&needle))
+            {
+                if total >= offset && items.len() < per_page {
+                    items.push(route.clone());
+                }
+                total += 1;
+            }
+        }
+        RoutePage {
+            items,
+            total,
+            page,
+            per_page,
+        }
     }
 
     fn update(&self, update: impl FnOnce(&mut StatusSnapshot)) {
@@ -410,6 +479,31 @@ mod tests {
             .any(|route| route.resource == "NETB.CPB"));
         status.withdraw_origin("bob");
         assert_eq!(status.snapshot().upstream_routes.len(), 1);
+    }
+
+    #[test]
+    fn route_page_filters_and_limits_without_putting_routes_in_view() {
+        let status = LocalStatus::new();
+        let routes = (0..55)
+            .map(|index| UpstreamRouteStatus {
+                key: format!("origin/{index:03}"),
+                origin_router_id: "origin".into(),
+                resource: format!("NETA.LU{index:03}"),
+                hosting_cp: Some("NETA.CPA".into()),
+                generation: 1,
+                last_seen_ms: 1,
+            })
+            .collect();
+        status.replace_origin_routes("origin", routes);
+        let page = serde_json::to_value(status.route_page("lu0", 3, 20)).unwrap();
+        assert_eq!(page["total"], 55);
+        assert_eq!(page["items"].as_array().unwrap().len(), 15);
+        assert_eq!(page["items"][0]["resource"], "NETA.LU040");
+        assert_eq!(status.route_page("cpa", 1, 10).total, 55);
+        assert_eq!(status.route_page("missing", 1, 10).total, 0);
+        let view = serde_json::to_value(status.view()).unwrap();
+        assert_eq!(view["upstream_route_count"], 55);
+        assert!(view.get("upstream_routes").is_none());
     }
 
     #[test]

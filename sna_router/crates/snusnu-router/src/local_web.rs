@@ -233,15 +233,33 @@ fn handle_connection(
                 Some("snusnu_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".into()),
             )
         }
-        ("GET", "/") if !authorized => redirect(&mut stream, "/login", None),
-        ("GET", "/") => response(
+        (
+            "GET",
+            "/"
+            | "/peers"
+            | "/addresses"
+            | "/circuits"
+            | "/concentrator"
+            | "/routes"
+            | "/concentrator/routes",
+        ) if !authorized => redirect(&mut stream, "/login", None),
+        (
+            "GET",
+            "/"
+            | "/peers"
+            | "/addresses"
+            | "/circuits"
+            | "/concentrator"
+            | "/routes"
+            | "/concentrator/routes",
+        ) => response(
             &mut stream,
             "200 OK",
             "text/html; charset=utf-8",
             INDEX.as_bytes(),
             &[],
         ),
-        ("GET", "/api/status") if !authorized => response(
+        ("GET", "/api/status" | "/api/view" | "/api/routes") if !authorized => response(
             &mut stream,
             "401 Unauthorized",
             "application/json; charset=utf-8",
@@ -259,6 +277,36 @@ fn handle_connection(
                 &[],
             )
         }
+        ("GET", "/api/view") => {
+            let body = serde_json::to_vec(&status.view())?;
+            response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+                &[],
+            )
+        }
+        ("GET", "/api/routes") => {
+            if let Some((query, page, per_page)) = route_query(&request.path) {
+                let body = serde_json::to_vec(&status.route_page(&query, page, per_page))?;
+                response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &body,
+                    &[],
+                )
+            } else {
+                response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    b"{\"error\":\"invalid route query\"}",
+                    &[],
+                )
+            }
+        }
         ("GET", "/healthz") => response(&mut stream, "200 OK", "text/plain", b"ok", &[]),
         ("GET" | "POST", _) => response(
             &mut stream,
@@ -275,6 +323,57 @@ fn handle_connection(
             &[],
         ),
     }
+}
+
+fn route_query(path: &str) -> Option<(String, usize, usize)> {
+    let mut query = String::new();
+    let mut page = 1;
+    let mut per_page = 25;
+    if let Some((_, parameters)) = path.split_once('?') {
+        for parameter in parameters.split('&') {
+            let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            match key {
+                "q" => {
+                    query = url_decode(value)?;
+                    if query.len() > 128 {
+                        return None;
+                    }
+                }
+                "page" => {
+                    page = value.parse().ok()?;
+                    if page == 0 || page > 1_000_000 {
+                        return None;
+                    }
+                }
+                "per_page" => {
+                    per_page = value.parse().ok()?;
+                    if !(1..=100).contains(&per_page) {
+                        return None;
+                    }
+                }
+                "" => {}
+                _ => return None,
+            }
+        }
+    }
+    Some((query, page, per_page))
+}
+
+fn url_decode(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let high = (bytes.next()? as char).to_digit(16)? as u8;
+                let low = (bytes.next()? as char).to_digit(16)? as u8;
+                decoded.push(high << 4 | low);
+            }
+            other => decoded.push(other),
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
@@ -519,5 +618,17 @@ mod tests {
         );
         assert!(accepted.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(accepted.contains("\"local_peers\":[]"));
+    }
+
+    #[test]
+    fn route_query_accepts_search_and_rejects_unbounded_pages() {
+        assert_eq!(route_query("/api/routes"), Some((String::new(), 1, 25)));
+        assert_eq!(
+            route_query("/api/routes?q=NETA%2eCPA&page=2&per_page=50"),
+            Some(("NETA.CPA".into(), 2, 50))
+        );
+        assert!(route_query("/api/routes?page=0").is_none());
+        assert!(route_query("/api/routes?per_page=101").is_none());
+        assert!(route_query("/api/routes?q=%zz").is_none());
     }
 }
