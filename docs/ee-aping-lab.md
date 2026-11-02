@@ -81,10 +81,10 @@ location key, as verified in the guest prompt.
 Start an unfiltered TAP capture immediately before the trial:
 
 ```sh
-scripts/capture-ee-aping.sh sol7 /tmp/snusnu-ee-aping 180
+scripts/capture-ee-aping.sh sol7 /tmp/snusnu-ee-aping 600
 ```
 
-The script records one timestamped pcap and stops after three minutes. Run
+The script records one timestamped pcap and stops after ten minutes. Run
 the OS/400 command from the 5250 command line while the capture is active:
 
 ```text
@@ -95,7 +95,7 @@ After restarting the Rust router, force a fresh EE XID exchange by varying
 the guest controller off and on before running `VFYAPPCCNN` again:
 
 ```text
-VRYCFG CFGOBJ(EETOA) CFGTYPE(*CTL) STATUS(*OFF)
+VRYCFG CFGOBJ(EETOA) CFGTYPE(*CTL) STATUS(*OFF) FRCVRYOFF(*YES)
 VRYCFG CFGOBJ(EETOA) CFGTYPE(*CTL) STATUS(*ON)
 ```
 
@@ -104,14 +104,41 @@ console at `127.0.0.1:9561` and run `DSPMSG MSGQ(QSYSOPR)`. On the live V5R4
 guest, inquiry **CPA2611** said “Controller EETOA cannot be varied off at
 this time. (C G)” because network jobs still used it. Select option 5 for
 the message and reply `G` to vary it off with active jobs. The alternative
-reply `C` cancels the vary-off. Confirm “Vary off completed for controller
-EETOA” on the station before varying it on. The console also had an
+reply `C` cancels the vary-off. The forced vary-off form above was verified
+on V5R4 and completed without that inquiry. If `WRKCFGSTS` still displays
+`VARY OFF PENDING` after completion, press F5 to refresh it and confirm
+`VARIED OFF` before varying the controller on. A prior verification job can
+hold the controller; F3 cancels that job. The console also had an
 unrelated IBM service inquiry; leave that one alone.
 
-Do not interpret an EE `XID_DONE` or an RTP `STATUS+CIE` as APING success.
-The 2026-11-02 live trial reached both, then a positive CPSVCMG BIND
-response, the guest's STATUS echo, and its FMH5 Attach/CP Capabilities BIU.
-It had not yet completed CP service or APING when recorded.
+### Successful live result, 2026-11-02
+
+At 18:40:55 UTC, the V5R4 guest completed the command above over EE to the
+Rust router (`a239d92`) and isolated Go QA concentrator (`4c8b393`). The
+router served the adjacent CP as `SNUSNU.SVC`, established both CPSVCMG
+sessions, answered RouteSetup for `SNUSNU.PING`, and forwarded the guest's
+APINGD session to the embedded responder. The packet trace includes the
+APING version exchange, a 20-byte echo, and positive CONFIRM; the QA log
+shows no circuit reset. The guest's `DSP02` job log, viewed through
+`WRKACTJOB` → option 5 → option 10 → F10, reports:
+
+```text
+VFYAPPCCNN RMTLOCNAME(SNUSNU.PING) PKTLEN(16) NBRITER(1)
+Allocate took .109 seconds.
+Remote system type is OS/400.
+Initial exchange took .095 seconds.
+Iteration 1 took .030 seconds.
+Round-trip (in milliseconds) min/avg/max = 30/30/30
+```
+
+The station job returned to `MNU-MAIN`/`DSPW`, confirming the command
+finished. The full TAP capture is
+`/tmp/snusnu-ee-aping/sol7-20261102T183623Z.pcap`; the Rust debug log is
+`/tmp/snusnu-ee-aping/router-v12.log`, and the isolated QA log is
+`/tmp/snusnu-ee-aping/qa-8083-v14.log`. These files are lab artifacts and
+are not committed. The original QA service on `0.0.0.0:8081` was left
+untouched. The isolated QA service listens on `127.0.0.1:8083`; the Rust EE
+attachment uses `10.99.4.10` with guest `10.99.4.3`.
 
 Keep the pcap outside Git because it may contain guest credentials or
 application data. Record the guest's final command status and correlate the
