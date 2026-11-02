@@ -19,6 +19,14 @@ completion response. [Microsoft's APPC printing documentation](https://learn.mic
 describes SCS and optional Host Print Transform. The first implementation
 target is SCS text; an HPT or IPDS stream needs a separate renderer.
 
+The [IBM 5494 Functions Reference, chapter 8](https://bitsavers.trailing-edge.com/pdf/ibm/5494/SC30-3533-02_5494_Remote_Control_Unit_Functions_Reference_Rel_2.0_199311.pdf)
+settles the session direction: the 5494 first negotiates session limits with
+CNOS and initiates the controller BIND. It then reports a powered-on printer
+on that controller session; IBM i validates the device and initiates a second
+LU 6.2 BIND for that printer. LU 4 printer traffic is encapsulated inside the
+LU 6.2 device session. The service therefore needs both session directions
+and the controller notification before a writer can send spool data.
+
 The transport-independent Go `sna/services/printer` package now parses a
 bounded printer record stream and renders common SCS fixed-pitch text. It does
 not yet perform APPC session management, store jobs, or produce a PDF. The
@@ -64,9 +72,8 @@ constitute printer service support in the repository. This probe used EE to
 establish a known route baseline; it did **not** test the required AnyNet or
 LLC routes. The pending controller also shows that advertising a passive LU
 does not itself make a 5494-like printer available to the guest. The service
-must perform the controller and printer session startup expected by IBM i,
-and the router/concentrator path must support the required initiation
-direction and `QRMTWSC` application records.
+must initiate the controller session and accept the host-initiated printer
+session, including `QRMTWSC` application records.
 
 ## Remaining acceptance work
 
