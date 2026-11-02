@@ -34,6 +34,8 @@ use transport_ip_sna::{
 const MAX_INCOMING: usize = MAX_RECORD * 2;
 const MAX_WRITES: usize = 2;
 const MAX_ASSOCIATIONS: usize = 64;
+/// Rejections before admission do not belong to a live TCP association.
+pub(crate) const UNOWNED_ASSOCIATION_ID: u64 = u64::MAX;
 
 pub(crate) struct GatewayConfig {
     pub local: SocketAddr,
@@ -229,6 +231,15 @@ impl MptnGatewayPort {
         &mut self,
         can_accept_information: bool,
     ) -> io::Result<Option<(u64, GatewayEvent)>> {
+        self.poll_association_once_with_credit(|_| can_accept_information)
+    }
+
+    /// Credit is specific to the association selected for this poll. A busy
+    /// route cannot hold data from another TCP62 session on this listener.
+    pub(crate) fn poll_association_once_with_credit(
+        &mut self,
+        can_accept_information: impl Fn(u64) -> bool,
+    ) -> io::Result<Option<(u64, GatewayEvent)>> {
         match self.poll_udp_for_association() {
             Ok(Some(event)) => return Ok(Some(event)),
             Ok(None) => {}
@@ -260,7 +271,7 @@ impl MptnGatewayPort {
                 if self.association_ids().len() >= MAX_ASSOCIATIONS {
                     drop(stream);
                     return Ok(Some((
-                        0,
+                        UNOWNED_ASSOCIATION_ID,
                         GatewayEvent::Rejected("TCP62 association capacity reached".into()),
                     )));
                 }
@@ -285,6 +296,9 @@ impl MptnGatewayPort {
                     self.active = Some(association);
                 } else {
                     let id = self.next_association_id;
+                    if id == UNOWNED_ASSOCIATION_ID {
+                        return Err(invalid("TCP62 association ID exhausted"));
+                    }
                     self.next_association_id = self
                         .next_association_id
                         .checked_add(1)
@@ -295,7 +309,7 @@ impl MptnGatewayPort {
             Ok((stream, peer)) => {
                 drop(stream);
                 return Ok(Some((
-                    0,
+                    UNOWNED_ASSOCIATION_ID,
                     GatewayEvent::Rejected(format!("TCP62 peer IP {peer} is not configured")),
                 )));
             }
@@ -315,7 +329,7 @@ impl MptnGatewayPort {
         let completed_before = self.completed_user_records;
         let result = self.with_association(id, |port| {
             let mut association = port.active.take().unwrap();
-            let result = port.poll_association(&mut association, can_accept_information);
+            let result = port.poll_association(&mut association, can_accept_information(id));
             match result {
                 Ok((event, keep)) => {
                     if keep {
@@ -404,7 +418,13 @@ impl MptnGatewayPort {
         let mut bytes = [0u8; MAX_RECORD];
         match self.udp.recv_from(&mut bytes) {
             Ok((len, peer)) if bytes.get(4) == Some(&0x83) && peer.ip() == self.config.peer_ip => {
-                let datagram = OobDatagram::decode(&bytes[..len])?;
+                let datagram = match OobDatagram::decode(&bytes[..len]) {
+                    Ok(datagram) => datagram,
+                    Err(error) => {
+                        tracing::debug!(%peer, %error, "dropping malformed TCP62 OOB datagram");
+                        return Ok(None);
+                    }
+                };
                 let matching: Vec<_> = self
                     .association_ids()
                     .into_iter()
@@ -416,7 +436,10 @@ impl MptnGatewayPort {
                     })
                     .collect();
                 let [id] = matching.as_slice() else {
-                    return Err(invalid("TCP62 OOB has no unique matching user association"));
+                    tracing::debug!(%peer, sequence = datagram.sequence,
+                        matches = matching.len(),
+                        "dropping TCP62 OOB without unique active association");
+                    return Ok(None);
                 };
                 let id = *id;
                 self.with_association(id, |port| port.handle_udp_datagram(&bytes[..len], peer))
@@ -1294,6 +1317,12 @@ mod tests {
             port.associations.get(&1).unwrap().state,
             SessionState::Management(_)
         ));
+        let _wrong_peer = TcpStream::connect(address).unwrap();
+        assert!(matches!(
+            port.poll_association_once(true).unwrap(),
+            Some((UNOWNED_ASSOCIATION_ID, GatewayEvent::Rejected(_)))
+        ));
+        assert!(port.active.is_some());
         port.close_association_for(0).unwrap();
         assert_eq!(port.live_association_ids(), vec![1]);
     }
@@ -1317,8 +1346,8 @@ mod tests {
         })
         .unwrap();
         let address = port.listener.local_addr().unwrap();
-        let _first_client = peer_socket(address);
-        let _second_client = peer_socket(address);
+        let mut first_client = peer_socket(address);
+        let mut second_client = peer_socket(address);
         let make_association = |stream, correlator| {
             let mut ingress = IngressSession::new(IngressPolicy {
                 source_lu: "QABOB.SNAB".into(),
@@ -1386,6 +1415,43 @@ mod tests {
         assert!(port.associations.get(&1).unwrap().pending_oob.is_none());
         assert!(port.active.as_ref().unwrap().pending_oob.is_some());
         port.complete_udp_expedited_for(0, 0).unwrap();
+        let normal = [0, 0, 0, 8, 0, 0, 1, 2];
+        first_client.write_all(&normal).unwrap();
+        second_client.write_all(&normal).unwrap();
+        let mut second_delivered = false;
+        for _ in 0..8 {
+            if matches!(
+                port.poll_association_once_with_credit(|id| id == 1)
+                    .unwrap(),
+                Some((1, GatewayEvent::UserNormal(_)))
+            ) {
+                second_delivered = true;
+                break;
+            }
+        }
+        assert!(
+            second_delivered,
+            "ready route must advance while other route lacks credit"
+        );
+        assert!(port.active.as_ref().unwrap().incoming.front().is_some());
+        port.complete_user_record_for(1).unwrap();
+        let mut first_delivered = false;
+        for _ in 0..8 {
+            if matches!(
+                port.poll_association_once_with_credit(|_| true).unwrap(),
+                Some((0, GatewayEvent::UserNormal(_)))
+            ) {
+                first_delivered = true;
+                break;
+            }
+        }
+        assert!(first_delivered);
+        port.complete_user_record_for(0).unwrap();
+        port.close_association_for(1).unwrap();
+        peer.send_to(&second, port.udp.local_addr().unwrap())
+            .unwrap();
+        assert!(port.poll_association_once(true).unwrap().is_none());
+        assert!(port.user_active_for(0));
     }
 
     #[test]
