@@ -21,8 +21,11 @@ corresponding HPR-side session. Merely transporting an HPR NLP as a generic
 | [`EePort`](../sna_router/crates/snusnu-router/src/ip_ports.rs) | One configured peer IP and `RoutedUnit::EeDatagram` relay | Homogeneous HPR/IP route only; one peer per local IP |
 | [`hpr_lan`](../sna_router/crates/router-core/src/hpr_lan.rs) | LAN UI framing, HPR SAP and NLP classification | No activated LAN↔IP TG |
 | [`HprXidLeg`](../sna_router/crates/router-core/src/hpr_xid_leg.rs) and [`SetModeBridge`](../sna_router/crates/router-core/src/hpr_setmode.rs) | Evidence tracking and a proposed LAN↔IP SETMODE mapping | Neither is an HPR/IP endpoint; XID agreement alone cannot activate a TG |
-| [`RtpPacket`](../sna_router/crates/router-core/src/hpr_rtp.rs) | Strict NHDR/THDR framing and diagnostic sequence observation | No RTP ACK, retransmission, resequencing, qualifier, congestion control or endpoint |
-| [`AutomaticFabric`](../sna_router/crates/snusnu-router/src/routing.rs) | Directory selection and private circuit port pairs | Routed units still include media-specific variants; no HPR-origin LU adapter |
+| [`hpr_rtp`](../sna_router/crates/router-core/src/hpr_rtp.rs) | Strict NHDR/THDR framing, full 64-bit TCIDs, CIE parsing and bounded message assembly | No active RTP connection or wire reliability |
+| [`hpr_rtp_setup`](../sna_router/crates/router-core/src/hpr_rtp_setup.rs), [`hpr_rtp_reply`](../sna_router/crates/router-core/src/hpr_rtp_reply.rs) | Receive-side setup evidence and bounded STATUS+CIE packet encoding | Return path, status exchange, transmission and retries are not established |
+| [`hpr_rtp_receive`](../sna_router/crates/router-core/src/hpr_rtp_receive.rs), [`hpr_rtp_send`](../sna_router/crates/router-core/src/hpr_rtp_send.rs) | Bounded RSEQ/ABSP accounting and retransmission candidates | No timers, ARB pacing or live RTP transport loop |
+| [`hpr_fid5`](../sna_router/crates/router-core/src/hpr_fid5.rs), [`hpr_session_address`](../sna_router/crates/router-core/src/hpr_session_address.rs), [`hpr_route_setup`](../sna_router/crates/router-core/src/hpr_route_setup.rs) | Receive-side FID5, BIND/CV62 association and Route Setup parsing | No APPN route response, LU session admission or HPR egress |
+| [`SessionFabric`](../sna_router/crates/router-core/src/session_fabric.rs) | Bounded carrier-neutral LU/CP route selection and session event queues | Existing runtime adapters are not yet wired through it |
 
 [RFC 2353](https://www.rfc-editor.org/rfc/rfc2353.html) defines HPR/IP as a
 native IP DLC: LDLC controls the link, while HPR RTP carries session traffic.
