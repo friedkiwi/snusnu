@@ -221,7 +221,7 @@ fn classify_native_offer(
                 pdu,
             })
         }
-        0xaf if frame.information.first() == Some(&0x32) => {
+        0xaf if command && frame.information.first() == Some(&0x32) => {
             let peer_cp = Xid3::decode(frame.information)
                 .and_then(|xid| xid.cp_name())
                 .map_err(|error| {
@@ -560,6 +560,18 @@ mod tests {
                 proxy_mac: proxy,
                 peer_cp: "SOLNET.SNAB".into()
             }
+        );
+        let mut unsolicited_response = pdu.clone();
+        unsolicited_response[1] = 5;
+        assert_eq!(
+            classify_native_offer(
+                &frame(proxy, guest, &unsolicited_response),
+                guest,
+                &native,
+                &HashSet::new()
+            )
+            .unwrap(),
+            NativeOfferAction::Ignore
         );
         assert_eq!(
             classify_native_offer(
