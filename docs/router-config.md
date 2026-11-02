@@ -23,6 +23,18 @@ bidirectional = true
 
 Run `sudo sna_router/target/debug/snusnu-router --config router.toml` from the repository root. Each route selects a target association by its stable local ID. A source must have exactly one target while the current flow-control contract is per association. The loader rejects unknown IDs, ambiguous routes, duplicate associations, invalid MACs and ports without a route before opening any socket. `bidirectional` defaults to `true`.
 
+## Local status page
+
+Add an optional `[web]` table to serve the router's read-only status page:
+
+```toml
+[web]
+listen = "127.0.0.1:8082"
+password = "choose-a-password"
+```
+
+Open the configured address in a browser. The page shows locally observed LLC and MPTN peers, connection and circuit state, and routes and managed MACs received from the configured concentrator. It does not enable or deny peers; that policy belongs to whichever concentrator is in use. Omit `password`, or set it to an empty string, to allow access without signing in. Omit `[web]` to leave the page disabled. The HTML, CSS, and JavaScript are embedded in the router binary. The read-only status JSON is at `/api/status` and uses the same password session as the page. The local peer cache is stored beside the router config; for `router.toml` its name is `router.peers.toml`. Entries return as `stale` until the peer is observed again. Received upstream routes are never cached.
+
 `proxy_mac` on `[[route]]` overrides an inferred target address for one LLC-facing direction. A bidirectional LLC-to-LLC route has two different local addresses, so it cannot use one route-level override; use the opposite guests' MACs as shown above.
 
 An optional `[[concentrator]]` entry makes a WebSocket hop another named port. For example, use this as a separate configuration to route one LLC association to `upstream`:
