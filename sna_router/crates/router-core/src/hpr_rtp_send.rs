@@ -335,6 +335,12 @@ impl ReliableSendWindow {
         self.retained.len()
     }
 
+    /// The oldest unacknowledged NLP for a caller-owned retransmission
+    /// timer. This does not authorize transmission or advance sequence state.
+    pub fn oldest_retained_nlp(&self) -> Option<&[u8]> {
+        self.retained.front().map(|packet| packet.nlp.as_slice())
+    }
+
     fn check_generation(&self, generation: ConnectionGeneration) -> Result<(), SendError> {
         if generation == self.generation {
             Ok(())

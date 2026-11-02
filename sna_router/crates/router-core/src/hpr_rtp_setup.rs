@@ -20,7 +20,9 @@ const MAX_NETWORK_ID: usize = 8;
 pub struct RtpLocalTarget {
     /// Network ID in on-wire encoding, supplied by the local APPN identity.
     pub network_id: Vec<u8>,
-    pub node_id: [u8; 4],
+    /// Unqualified CP name in on-wire encoding, not the four-byte fixed XID
+    /// node identifier. The V5R4 capture's CV00 is EBCDIC `SNAA`.
+    pub node_id: Vec<u8>,
     pub nce_instance: [u8; 4],
 }
 
@@ -65,7 +67,11 @@ impl RtpInboundSetup {
         generation: ConnectionGeneration,
         target: RtpLocalTarget,
     ) -> Result<Self, SetupError> {
-        if target.network_id.is_empty() || target.network_id.len() > MAX_NETWORK_ID {
+        if target.network_id.is_empty()
+            || target.network_id.len() > MAX_NETWORK_ID
+            || target.node_id.is_empty()
+            || target.node_id.len() > 8
+        {
             return Err(SetupError::InvalidLocalTarget);
         }
         Ok(Self {
@@ -285,7 +291,7 @@ mod tests {
     fn target() -> RtpLocalTarget {
         RtpLocalTarget {
             network_id: b"NET001".to_vec(),
-            node_id: *b"NODE",
+            node_id: b"NODE".to_vec(),
             nce_instance: [0, 0, 0, 4],
         }
     }

@@ -284,7 +284,7 @@ mod tests {
         let generation = ConnectionGeneration::new(1).unwrap();
         let target = RtpLocalTarget {
             network_id: b"NET001".to_vec(),
-            node_id: *b"NODE",
+            node_id: b"NODE".to_vec(),
             nce_instance: [0, 0, 0, 4],
         };
         let mut observer = RtpInboundSetup::new(generation, target.clone()).unwrap();
