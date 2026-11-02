@@ -20,6 +20,7 @@ const INITIAL_ALLOWANCE: u64 = 1500;
 const MAX_PENDING_EVENTS: usize = INITIAL_ALLOWANCE as usize;
 const MAX_PENDING_TYPE1: usize = 16;
 const MAX_CLOSED_IDS: usize = 64;
+const MAX_PENDING_AUTO_OPENS: usize = 64;
 const FIRST_OPEN_RETRY: Duration = Duration::from_millis(500);
 const MAX_OPEN_RETRY: Duration = Duration::from_secs(30);
 
@@ -212,7 +213,17 @@ impl SharedWs {
                     && open.target.as_ref().is_some_and(|target|
                         self.auto_local_route_ids.contains(&target.route_id))
                 {
-                    self.auto_incoming.push_back(open.clone());
+                    if self.auto_incoming.len() < MAX_PENDING_AUTO_OPENS {
+                        self.auto_incoming.push_back(open.clone());
+                    } else {
+                        warn!(circuit_id = %format_uuid(&open.circuit_id),
+                            "automatic incoming circuit queue is full");
+                        self.client.send(envelope(Body::OpenDecision(wire::OpenDecision {
+                            circuit_id: open.circuit_id.clone(), accept: false,
+                            receive_allowance_bytes: 0,
+                            reason: wire::OpenFailure::Busy as i32,
+                        }))).map_err(io_error)?;
+                    }
                     return Ok(true);
                 }
                 let owner = if let Some(gateway) = &self.gateway_inbound {
@@ -1094,8 +1105,7 @@ impl WsRoutePort {
         });
         let v2 = self.shared.borrow().client.subprotocol() == transport_ws::SUBPROTOCOL_V2;
         let source_ok = if v2 {
-            self.target_lu.is_some()
-                && incoming.source_route.as_ref() == self.target.as_ref()
+            incoming.source_route.as_ref() == self.target.as_ref()
                 && incoming
                     .source_route
                     .as_ref()
@@ -2023,11 +2033,33 @@ impl AutoWsHub {
         source_route: Option<wire::RouteReference>,
         local_cp: wire::SnaName,
     ) -> io::Result<WsRoutePort> {
+        let target_valid = {
+            let directory = self.directory.borrow();
+            match directory.route_for_reference(&target).and_then(|route| route.resource.as_ref()) {
+                Some(wire::route_export::Resource::ControlPoint(cp)) =>
+                    target_lu.is_none() && cp == &target_cp,
+                Some(wire::route_export::Resource::LogicalUnit(lu)) =>
+                    target_lu.as_ref() == lu.lu.as_ref()
+                        && lu.hosting_cp.as_ref() == Some(&target_cp),
+                None => false,
+            }
+        };
+        if !target_valid { return Err(protocol("target route is not in the current directory")); }
         if let Some(source) = &source_route {
             if source.router_id != self.welcome.router_id
                 || source.epoch != self.welcome.connection_epoch
-                || !self.local_routes.contains_key(&source.route_id)
+                || self.local_route(source).is_none()
             { return Err(protocol("source route is not currently published")); }
+            let source_matches_profile = match self.local_route(source).and_then(|route| route.resource.as_ref()) {
+                Some(wire::route_export::Resource::LogicalUnit(_)) => target_lu.is_some(),
+                Some(wire::route_export::Resource::ControlPoint(_)) => target_lu.is_none(),
+                None => false,
+            };
+            if !source_matches_profile {
+                return Err(protocol("source and target route profiles differ"));
+            }
+        } else {
+            return Err(protocol("automatic v2 circuit requires a published source route"));
         }
         let mut port = self.new_port(local_cp, target_cp, target_lu, source_route, HashSet::new());
         port.target = Some(target);
@@ -2040,7 +2072,7 @@ impl AutoWsHub {
         let Some(local_ref) = open.target.as_ref() else { return Ok(None) };
         if local_ref.router_id != self.welcome.router_id
             || local_ref.epoch != self.welcome.connection_epoch
-            || !self.local_routes.contains_key(&local_ref.route_id)
+            || self.local_route(local_ref).is_none()
         { return Ok(None) }
         let local_cp = self.local_hosting_cp(local_ref)?;
         let Some(source_ref) = open.source_route.as_ref() else { return Ok(None) };
@@ -2050,12 +2082,17 @@ impl AutoWsHub {
             match route.resource.as_ref() {
                 Some(wire::route_export::Resource::LogicalUnit(lu)) =>
                     (lu.lu.clone(), lu.hosting_cp.clone()),
+                Some(wire::route_export::Resource::ControlPoint(cp)) =>
+                    (None, Some(cp.clone())),
                 _ => return Ok(None),
             }
         };
-        let (Some(target_lu), Some(target_cp)) = (target_lu, target_cp) else { return Ok(None) };
+        let Some(target_cp) = target_cp else { return Ok(None) };
+        let local_is_lu = matches!(self.local_route(local_ref).and_then(|route| route.resource.as_ref()),
+            Some(wire::route_export::Resource::LogicalUnit(_)));
+        if local_is_lu != target_lu.is_some() { return Ok(None) }
         let mut port = self.new_port(
-            local_cp, target_cp, Some(target_lu), Some(local_ref.clone()),
+            local_cp, target_cp, target_lu, Some(local_ref.clone()),
             HashSet::from([local_ref.route_id]),
         );
         port.target = Some(source_ref.clone());
