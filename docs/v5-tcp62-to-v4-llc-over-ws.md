@@ -1,6 +1,6 @@
 # V5R4 TCP62 to V4R4 LLC2 across WebSocket
 
-Target path: a V5R4 OS/400 guest initiates TCP62/AnyNet to Rust router A; A connects through the Go concentrator to Rust router B; B reaches a V4R4 OS/400 guest over LLC2. A and B belong to different users with different server-assigned NETIDs. This path is **not operational yet**. The current inbound TCP62 code admits a narrow Connect profile but does not complete the reverse MPTN/native gateway or attach it to WebSocket routing.
+Target path: a V5R4 OS/400 guest initiates TCP62/AnyNet to Rust router A; A connects through the Go concentrator to Rust router B; B reaches a V4R4 OS/400 guest over LLC2. A and B belong to different users with different server-assigned NETIDs. The opt-in QA gateway reached the V4R4 remote Sign On through this path twice. Ordinary `--config` gateway use remains gated by QA-specific native addressing and one-session runtime behavior; see [the live lab record](cross-netid-lab.md). The design discussion below records how the gateway was built and which protocol boundaries remain relevant.
 
 ## Use the existing native circuit event profile
 
@@ -16,11 +16,11 @@ The smallest data-plane design is for A to terminate TCP62 and present a **virtu
 
 The `sna_information` payload is an LLC2 information field, so it may contain only part of a PIU. Any converter that needs complete BIND, FM or UNBIND units must reassemble and segment as needed. Go forwards the existing binary events in circuit order and accounts `sna_information` bytes against current credit. It has no TCP62, XID or PIU parser. Putting raw TCP62 records directly in `sna_information` would violate the native circuit contract.
 
-The difficult part is A's virtual APPN CP/link and management-session behavior. The V4R4 guest must see a plausible peer CP in A's NETID, including XID3/link setup and whatever SNASVCMG/CNOS/BIS control exchange it initiates or expects. The existing isolated native and TCP62 lab state machines do not yet prove this composition. Native TH address assignment, BIND response correlation, pacing, positive FM response and UNBIND must be driven by actual V4R4/V5R4 traces before claiming success.
+The difficult part was A's virtual APPN CP/link and management-session behavior. The V4R4 guest saw a peer CP in A's NETID through XID3/link setup and SNASVCMG/CNOS/BIS exchange. Captured V4R4/V5R4 traces drove native TH address assignment, BIND response correlation and pacing through the first remote display. Full sign-on, normal teardown and a live UDP X'83' exchange remain unverified.
 
-## Proposed open-time source identity
+## Open-time source identity
 
-The current `OpenRequest` identifies only a target `RouteReference`; `IncomingOpen` has a server-stamped source router UUID but no source CP/LU route. Rust can now select a target LU route using `[[remote]] target_lu = "DSTNET.LUB"` with `target_cp = "DSTNET.CPB"`. To authorize a cross-user LU6.2 gateway open, add these **proposed, unimplemented** protobuf fields:
+The v2 `OpenRequest` includes both target and source `RouteReference` values. Go verifies that the source LU belongs to the authenticated router's current route snapshot and the target LU is live; `IncomingOpen` carries the validated source reference. For a local LLC route, Rust currently selects a destination with `[[concentrator]] target_lu = "DSTNET.LUB"` and `target_cp = "DSTNET.CPB"`. A TCP62 gateway derives that selection from its local `[[mptn_gateway]]` definition. The additive fields are:
 
 ```protobuf
 message OpenRequest {
@@ -33,16 +33,12 @@ message IncomingOpen {
 }
 ```
 
-A publishes its actual source LU and CP under its own NETID, then supplies the LU export's current route reference. A's TCP62 adapter checks that this LU matches the inbound Connect. Go derives A's router identity from its authenticated WebSocket and verifies `source_route` belongs to A's current epoch/snapshot and names an LU under A's NETID. It verifies the target reference is a live LU export on B, applies the existing owner block/pause policy, and forwards the checked source reference to B. B checks it against its configured source LU and the opened target LU before accepting. Source and target NETIDs are intentionally different; each export is restricted to its **own** user's assigned NETID. `source_router_id` alone is insufficient to identify the initiating LU.
+A publishes its source LU and CP under its own NETID, then supplies the LU export's current route reference. A's TCP62 adapter checks that this LU matches the inbound Connect. Go derives A's router identity from its authenticated WebSocket and verifies `source_route` belongs to A's current epoch/snapshot and names an LU under A's NETID. It verifies the target reference is a live LU export on B, applies owner policy, and forwards the checked source reference to B. B checks the opened target and expected source before accepting. Source and target NETIDs are intentionally different; each export is restricted to its own user's assigned NETID.
 
-These fields are protobuf-additive, but an older Go server would silently ignore `source_route`. The gateway must therefore require an explicitly negotiated `snusnu.v2` subprotocol (or equivalent acknowledged feature) before relying on source-LU authorization. Existing v1 CP-only native circuits keep their current open behavior. No new `CircuitEvent` variant is needed for this specific virtual-DLC design; a future semantic LU6.2 circuit profile would be a separate versioned contract.
+The gateway requires the negotiated `snusnu.v2` subprotocol for source-LU authorization. Existing v1 CP-only native circuits retain their open behavior. The virtual DLC uses the existing `CircuitEvent` payloads; a future semantic LU6.2 circuit profile would need a separate versioned contract.
 
-## Remaining implementation gates
+## Implementation record and remaining gates
 
-1. Implement A's reverse TCP62-to-native gateway and virtual DLC/CP endpoint. It must hold the TCP62 Connect response until the native BIND outcome and preserve backpressure through both directions.
-2. Allow an inbound AnyNet session to select a WebSocket route in Rust A. The current configured remote port requires a local LLC peer, and `WsRoutePort` rejects raw AnyNet records. The new route must emit native `Type1`, `LinkReady` and `sna_information` from the converter, not raw records.
-3. Add the source-route fields and v2 negotiation in Rust, Go and shared vectors. Go checks both live references and relays only the existing native circuit events. B validates the expected source identity at `IncomingOpen`.
-4. Configure B's LLC-facing proxy identity for A's CP. The present managed binding gate expects an enabled server-managed CP MAC and a live A CP export before B accepts an incoming circuit; retain that requirement or replace it with an explicitly specified virtual-CP address policy.
-5. Test the direction and lifecycle in order: V5 inbound Connect admission; cross-NETID LU route/open; virtual XID3; V4 management and user BIND; first FMH-5 and positive response; pacing/credit; UNBIND; failure/reconnect. Keep the direct two-V4R4 WebSocket path as a regression.
+The opt-in gateway now converts V5 inbound Connect to a native virtual DLC/CP endpoint, holds the TCP62 positive until native BIND acceptance, and preserves backpressure through the WebSocket circuit. The concentrator checks live source and target LU route references under v2. B's LLC-facing proxy uses the concentrator-managed CP MAC. The QA run covered Connect, cross-NETID open, XID3, V4 management and user BIND, FMH-5, pacing and the first remote display. Remaining live checks include full sign-on, normal teardown, failure/reconnect and UDP X'83' handling. The ordinary configured gateway still needs generic native session address assignment and a multi-session runtime.
 
-The gateway and source-route checks above are snusnu design proposals. IBM's [TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00) describes MPTN access-node framing but explicitly leaves MPTN gateway control-flow conversion beyond its scope. See [the current WebSocket contract](websocket-protocol.md) and [route advertisement schema](route-advertisements.md) for implemented v1 behavior.
+IBM's [TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00) describes MPTN access-node framing but leaves MPTN gateway control-flow conversion beyond its scope. See [the WebSocket contract](websocket-protocol.md) and [route advertisement schema](route-advertisements.md) for the circuit protocol.

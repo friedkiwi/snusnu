@@ -25,7 +25,7 @@ bidirectional = true
 
 Run `sudo sna_router/target/debug/snusnu-router --config router.toml` from the repository root. Each route selects a target association by its stable local ID. A source must have exactly one target while the current flow-control contract is per association. The loader rejects unknown IDs, ambiguous routes, duplicate associations, invalid MACs and ports without a route before opening any socket. `bidirectional` defaults to `true`.
 
-An optional `[[remote]]` entry makes a WebSocket hop another named port. For example, use this as a separate configuration to route one LLC association to `upstream`:
+An optional `[[concentrator]]` entry makes a WebSocket hop another named port. For example, use this as a separate configuration to route one LLC association to `upstream`:
 
 ```toml
 [[llc]]
@@ -35,24 +35,24 @@ guest_mac = "02:00:35:27:23:01"
 proxy_mac = "02:53:4e:00:00:02"
 local_cp = "SOLNET.SNAA"
 lus = ["SOLNET.SNAA"]
+lu_types = { "SOLNET.SNAA" = ["lu_6_2"] }
 
-[[remote]]
+[[concentrator]]
 id = "upstream"
 url = "ws://127.0.0.1:8081/router/v1/ws"
-local_cp = "SOLNET.SNAA"
 target_cp = "SOLNET.SNAB"
-lus = ["SOLNET.SNAA"]
+token = "replace-with-router-credential"
 
 [[route]]
 from = "snaa"
 to = "upstream"
 ```
 
-Set `SNUSNU_ROUTER_TOKEN` in the environment for a remote route. Do not put bearer tokens in the TOML file. The existing `--local-link`, `--remote-link` and `--lab-link` commands remain available.
+`token` is the concentrator's bearer credential for this router. Use `token = ""` when the endpoint does not require bearer authentication. Keep a file containing a real token readable only by the router operator; the token is never printed in logs. The older `--remote-link` command still reads `SNUSNU_ROUTER_TOKEN` from the environment.
 
-Configured `[[remote]]` entries share one authenticated connection and publish one snapshot containing all listed CPs and LUs. Each remote circuit must have one local LLC association. Declare the CP and LUs owned by that guest on its `[[llc]]` entry; `[[remote]] local_cp` must match, and its exported `lus` must be a subset of the peer's declared LUs. Standalone LLC routes can omit those identity fields. A configured remote route with no matching local identity is rejected before connecting or publishing. The configured proxy MAC must be in the `02:53:4e` managed namespace and is updated to the server-assigned virtual MAC while its LLC association is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
+Configured `[[concentrator]]` entries share one authenticated connection and publish one snapshot of CPs and LUs derived from their attached local peers. An LLC association declares its CP and LUs once on `[[llc]]`; the router uses those declarations for publication and verifies the CP against the guest's XID3 before LLC2 contact. The `target_cp` (and optional `target_lu`) on an LLC concentrator route currently selects one destination from the concentrator's advertised directory. These target fields are temporary per-circuit selection until the router can select a destination from each incoming session. Standalone LLC routes can omit identity declarations. The configured proxy MAC must be in the `02:53:4e` managed namespace and is updated to the server-assigned virtual MAC while its LLC association is disconnected. Configure the OS/400 remote adapter address to the assigned value shown by the concentrator.
 
-An exported LU can optionally declare its supported type for the global directory and remote route metadata. Omitted declarations remain `Unknown`; they are not inferred from the LU name. Keys must also appear in `lus`, and duplicate or empty type lists are rejected:
+An exported LU can optionally declare its supported type on its local peer for the global directory and remote route metadata. Omitted declarations remain `Unknown`; they are not inferred from the LU name. Keys must also appear in the same peer's `lus`, and duplicate or empty type lists are rejected:
 
 ```toml
 lus = ["SOLNET.PAYROLL"]
@@ -61,7 +61,40 @@ lu_types = { "SOLNET.PAYROLL" = ["lu_6_2"] }
 
 Supported values are `lu_0`, `lu_1`, `lu_2`, `lu_3`, and `lu_6_2`. These values are publisher declarations, not proof of a successful BIND negotiation.
 
-When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the remote route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
+The opt-in V5R4 TCP62 gateway uses its `[[mptn_gateway]]` definition as the
+source of local CP/LU exports and the remote destination names. It therefore
+needs no CP/LU fields on `[[concentrator]]`:
+
+```toml
+[[mptn_gateway]]
+id = "bob-v5"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+destination_lu = "QAALICE.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+
+[[concentrator]]
+id = "upstream"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = "replace-with-bob-router-credential"
+
+[[route]]
+from = "bob-v5"
+to = "upstream"
+converter = "mptn_lu62"
+```
+
+This gateway still requires `--mptn-ws-gateway-lab FILE
+--acknowledge-experimental-x83`; the ordinary `--config` runtime rejects it
+because its native address selection and session lifecycle are specific to
+the QA fixture. See [the cross-NETID lab](cross-netid-lab.md).
+
+When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the concentrator route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
 
 An EE link can also be attached without any LLC peers. Each `[[ee]]` entry binds UDP ports 12000–12004 on its `local_ip`, accepts datagrams only from `peer_ip`, and preserves the EE priority port. To relay two EE links, configure two distinct local addresses and route the two IDs together:
 

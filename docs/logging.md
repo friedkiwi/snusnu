@@ -44,9 +44,13 @@ sudo --preserve-env=RUST_LOG,SNUSNU_LOG_FORMAT \
   02:00:35:27:23:01 02:00:35:27:23:02 >>router.jsonl 2>&1
 ```
 
-For `--remote-link`, export `SNUSNU_ROUTER_TOKEN` separately and include it in
-the `sudo --preserve-env` list. The router logs the upstream host and port, not
-the credential. Use `RUST_LOG=info` for normal operation.
+For configured `[[concentrator]]` routes, the bearer credential is the
+`token` value in the TOML file; an empty value means no bearer credential.
+Keep a config containing a real token readable only by the router operator.
+The older `--remote-link` command uses `SNUSNU_ROUTER_TOKEN` from the
+environment; include it in `sudo --preserve-env` when needed. The router
+logs the upstream host and port, never the credential. Use `RUST_LOG=info`
+for normal operation.
 
 Debug hex dumps can contain SNA sign-on data, screen contents, and other
 application data. Restrict access to captured files, rotate and delete them

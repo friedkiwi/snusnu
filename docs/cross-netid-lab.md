@@ -57,6 +57,12 @@ the QA fixture's address and the gateway handles one user session per run.
 The X'83' UDP completion and teardown handlers are implemented and covered
 by focused tests, but have not been exercised against a live OS/400 UDP
 exchange. The `SOLNET` regression guests remain separate from this lab.
+The preserved QA router TOML files record the exact successful run but need
+conversion before reuse: their `[[remote]]` entries repeat local export
+fields that the current loader rejects. Use `[[concentrator]]` with `url`,
+`token`, and any needed destination selector; declare the local CP and LUs
+on `[[llc]]` or `[[mptn_gateway]]` once. See
+[router configuration](router-config.md).
 
 ## Prepared clone state
 
