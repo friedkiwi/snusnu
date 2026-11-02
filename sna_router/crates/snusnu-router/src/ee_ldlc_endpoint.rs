@@ -140,7 +140,7 @@ impl LocalEeXids {
     /// Accept only a consistent, locally secondary EE profile. Constructing
     /// this does not authorize starting it: the caller must implement every
     /// capability advertised in CV61 before binding the endpoint.
-    pub(crate) fn new(prenegotiation: Vec<u8>, negotiation: Vec<u8>) -> io::Result<Self> {
+    fn new(prenegotiation: Vec<u8>, negotiation: Vec<u8>) -> io::Result<Self> {
         let pre = Xid3::decode(&prenegotiation)
             .map_err(|_| invalid("invalid local EE prenegotiation XID"))?;
         let np =
@@ -183,7 +183,8 @@ pub(crate) struct EeLdlcEndpoint {
 type XidResolver = Box<dyn Fn(&Xid3) -> io::Result<LocalEeXids> + Send + Sync>;
 
 impl EeLdlcEndpoint {
-    pub(crate) fn bind(local_ip: IpAddr, peer_ip: IpAddr, xids: LocalEeXids) -> io::Result<Self> {
+    #[cfg(test)]
+    fn bind(local_ip: IpAddr, peer_ip: IpAddr, xids: LocalEeXids) -> io::Result<Self> {
         let mut endpoint = Self::bind_dynamic(local_ip, peer_ip, |_| {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -241,6 +242,13 @@ impl EeLdlcEndpoint {
             .then(|| self.activation.agreement())
             .flatten()
             .map(|agreement| agreement.remote.cp_name)
+    }
+
+    pub(crate) fn tg_number(&self) -> Option<u8> {
+        (self.phase() == Phase::Active)
+            .then(|| self.activation.agreement())
+            .flatten()
+            .map(|agreement| agreement.local.tg_number)
     }
 
     /// Return validated CP and Route Setup bootstrap labels only after the
@@ -897,6 +905,7 @@ mod tests {
         );
         assert_eq!(endpoint.phase(), Phase::Active);
         assert_eq!(endpoint.peer_cp().as_deref(), Some("SOLNET.SNAB"));
+        assert_eq!(endpoint.tg_number(), Some(1));
         let bootstrap = endpoint.control_bootstrap().unwrap().unwrap();
         assert_eq!(bootstrap.peer.cp.to_string(), "SOLNET.SNAB");
         assert_eq!(bootstrap.outbound_cp_label(), [0xa4, 0]);
