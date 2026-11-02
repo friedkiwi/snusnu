@@ -3,9 +3,10 @@
 use crate::{
     anynet_port::AnyNetPort,
     config::{self, BidirectionalGatewayConfig, RouterConfig},
-    endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
+    endpoint::{Endpoint, EndpointRegistry, Event, format_mac},
     hpr_lan_port::HprLanPort,
     ip_ports::EePort,
+    local_status::{LocalPeerStatus, now_ms},
     mptn_bidirectional_gateway,
     mptn_llc_reverse::{self, ReverseLlcConfig},
     mptn_ws_reverse::{self, ReverseWsConfig},
@@ -91,6 +92,33 @@ impl CpGate {
 }
 
 impl LlcPort {
+    fn observe_peer(&self, cp: Option<String>, state: &str) {
+        let Some(status) = crate::status() else {
+            return;
+        };
+        let key = format!("llc:{}:{}", self.interface, format_mac(self.guest_mac));
+        let existing = status
+            .snapshot()
+            .local_peers
+            .into_iter()
+            .find(|peer| peer.key == key);
+        if cp.is_none() && existing.is_none() {
+            return;
+        }
+        let now = now_ms();
+        status.upsert_peer(LocalPeerStatus {
+            key,
+            transport: "llc2".into(),
+            locator: format!("{} {}", self.interface, format_mac(self.guest_mac)),
+            cp: cp.or_else(|| existing.as_ref().and_then(|peer| peer.cp.clone())),
+            lus: Vec::new(),
+            state: state.into(),
+            first_seen_ms: now,
+            last_seen_ms: now,
+            last_error: None,
+        });
+    }
+
     pub(crate) fn open(peer: LlcPeer<'_>) -> io::Result<Self> {
         Ok(Self {
             endpoint: Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?,
@@ -133,6 +161,7 @@ impl LlcPort {
         for event in events {
             match &event {
                 Event::Type1(pdu) => {
+                    let mut observed_cp = None;
                     if let Some(gate) = &mut self.cp_gate {
                         let newly_verified = match gate.observe(pdu) {
                             Ok(verified) => verified,
@@ -148,14 +177,28 @@ impl LlcPort {
                                 self.endpoint.begin_connect_after(CONNECT_BARRIER);
                             }
                         }
+                        if gate.verified {
+                            observed_cp = Some(gate.expected.clone());
+                        }
+                    } else if pdu.get(2).is_some_and(|control| control & !0x10 == 0xaf)
+                        && pdu.get(3) == Some(&0x32)
+                    {
+                        observed_cp = Xid3::decode(&pdu[3..])
+                            .ok()
+                            .and_then(|xid| xid.cp_name().ok());
+                    }
+                    if let Some(cp) = observed_cp {
+                        self.observe_peer(Some(cp), "observed");
                     }
                 }
+                Event::Connected => self.observe_peer(None, "connected"),
                 Event::Disconnected | Event::TimedOut => {
                     if let Some(gate) = &mut self.cp_gate {
                         gate.verified = false;
                         self.endpoint.set_connect_allowed(false)?;
                     }
                     self.peer_ready = false;
+                    self.observe_peer(None, "disconnected");
                 }
                 _ => {}
             }
@@ -253,6 +296,7 @@ impl RoutePort for LlcPort {
 
     fn disconnect(&mut self) -> io::Result<()> {
         self.endpoint.disconnect()?;
+        self.observe_peer(None, "disconnected");
         self.peer_ready = false;
         if let Some(gate) = &mut self.cp_gate {
             gate.verified = false;
@@ -808,9 +852,11 @@ to = "upstream"
         };
         let error = wrong_netid.observe(&pdu).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error
-            .to_string()
-            .contains("NETID SOLNET differs from configured OTHNET"));
+        assert!(
+            error
+                .to_string()
+                .contains("NETID SOLNET differs from configured OTHNET")
+        );
         assert!(!wrong_netid.verified);
         let mut malformed = pdu;
         malformed[4] = 0x2e; // Declared XID length no longer matches.

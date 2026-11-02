@@ -11,18 +11,19 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
 };
 
+use crate::local_status::{LocalPeerStatus, now_ms};
 use std::time::Instant;
 use transport_ip_sna::{
-    anynet::{bind_udp, listen_tcp, TcpKind, TcpRecord, TcpSession, MAX_RECORD},
+    anynet::{MAX_RECORD, TcpKind, TcpRecord, TcpSession, bind_udp, listen_tcp},
     mptn_bind_negotiation::validate_positive_response,
     mptn_compensations::CompensationSet,
     mptn_connect::{Connect, Direction},
-    mptn_ingress::{inspect_connect, IngressKind, IngressOffer, IngressPolicy, IngressSession},
+    mptn_ingress::{IngressKind, IngressOffer, IngressPolicy, IngressSession, inspect_connect},
     mptn_keepalive::{Keepalive, Kind as KeepaliveKind},
     mptn_management_responder::{ManagementResponder, Phase as ManagementPhase, V5Options},
     mptn_oob::{
-        build_request as build_oob_request, Compensation as OobCompensation,
-        Datagram as OobDatagram, Kind as OobKind,
+        Compensation as OobCompensation, Datagram as OobDatagram, Kind as OobKind,
+        build_request as build_oob_request,
     },
     mptn_oob_fallback::{
         Action as FallbackAction, Completion as FallbackCompletion, Fallback, Purpose,
@@ -141,6 +142,72 @@ fn remember_completed(recent: &mut VecDeque<u16>, sequence: u16) {
 }
 
 impl MptnGatewayPort {
+    fn observe_association(&self, id: u64, event: Option<&GatewayEvent>) {
+        let Some(status) = crate::status() else {
+            return;
+        };
+        if id == UNOWNED_ASSOCIATION_ID {
+            return;
+        }
+        let key = format!("mptn:{}:{}", self.config.local, self.config.peer_ip);
+        let existing = status
+            .snapshot()
+            .local_peers
+            .into_iter()
+            .find(|peer| peer.key == key);
+        let mut lus = existing
+            .as_ref()
+            .map(|peer| peer.lus.clone())
+            .unwrap_or_default();
+        let state = match event {
+            Some(GatewayEvent::UserBind(offer)) => {
+                let Ok(source_lu) = offer.connect().source.qualified_lu() else {
+                    return;
+                };
+                if !lus.contains(&source_lu) {
+                    lus.push(source_lu);
+                    lus.sort();
+                }
+                "offered"
+            }
+            Some(GatewayEvent::ManagementReady) => "management-ready",
+            Some(GatewayEvent::Closed | GatewayEvent::Rejected(_))
+                if existing.is_some() && self.association_ids().is_empty() =>
+            {
+                "disconnected"
+            }
+            _ => {
+                let active = if id == 0 {
+                    self.active.as_ref()
+                } else {
+                    self.associations.get(&id)
+                };
+                if active.is_some_and(|association| {
+                    matches!(association.state, SessionState::UserActive(_))
+                }) && existing
+                    .as_ref()
+                    .is_some_and(|peer| peer.state != "connected")
+                {
+                    "connected"
+                } else {
+                    return;
+                }
+            }
+        };
+        let now = now_ms();
+        status.upsert_peer(LocalPeerStatus {
+            key,
+            transport: "mptn".into(),
+            locator: format!("{} <- {}", self.config.local, self.config.peer_ip),
+            cp: None,
+            lus,
+            state: state.into(),
+            first_seen_ms: now,
+            last_seen_ms: now,
+            last_error: None,
+        });
+    }
+
     pub(crate) fn bind(config: GatewayConfig) -> io::Result<Self> {
         // Check the configured LU policy before reserving TCP/UDP port 397.
         IngressSession::new(IngressPolicy {
@@ -366,7 +433,9 @@ impl MptnGatewayPort {
             *self.completed_by_association.entry(id).or_default() += completed;
             self.completed_user_records = completed_before;
         }
-        result.map(|event| event.map(|event| (id, event)))
+        let event = result?;
+        self.observe_association(id, event.as_ref());
+        Ok(event.map(|event| (id, event)))
     }
 
     fn association_ids(&self) -> Vec<u64> {
@@ -428,7 +497,7 @@ impl MptnGatewayPort {
             Some(_) => {
                 return Err(invalid(
                     "TCP62 fallback action differs from pending expedited",
-                ))
+                ));
             }
             None => {}
         }
@@ -2043,16 +2112,18 @@ mod tests {
         // TCP X'10'. Its positive response releases only the Abort event.
         let abort = TcpRecord::decode(hex("0000003b1000006b8000320f080100006014cec37477b5dc29a10be2d6d3d5c5e34be2d5c1c13513080100000c000be2d6d3d5c5e34be2d5c1c200")).unwrap();
         let mut sent = Vec::new();
-        assert!(MptnGatewayPort::queue_udp_abort_with(
-            port.active.as_mut().unwrap(),
-            port.config.peer_ip,
-            &abort,
-            |bytes, destination| {
-                sent.push((bytes.to_vec(), destination));
-                Ok(())
-            },
-        )
-        .unwrap());
+        assert!(
+            MptnGatewayPort::queue_udp_abort_with(
+                port.active.as_mut().unwrap(),
+                port.config.peer_ip,
+                &abort,
+                |bytes, destination| {
+                    sent.push((bytes.to_vec(), destination));
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1, "127.0.0.2:397".parse().unwrap());
         let datagram = OobDatagram::decode(&sent[0].0).unwrap();
