@@ -1,0 +1,1111 @@
+//! One verified HPR FID5 LU session at the carrier-neutral boundary.
+//!
+//! RTP setup, reliable delivery, and complete-message assembly belong to
+//! the caller. This adapter binds a generation and directional TCIDs to the
+//! FID5 BIND/CV62 address exchange, then removes or restores FID5 framing.
+//! It does not admit CP-CP or SNA management BINDs as user LU sessions.
+
+use std::str::FromStr;
+
+use crate::{
+    fid2_bind::BindClass,
+    fixed_pacing::{is_canonical_ipr, FixedPacing, PacingError, IPR_RH, PACING_INDICATOR},
+    hpr_fid5::{encode_whole_biu, Fid5Error, Fid5WholeBiu},
+    hpr_session_address::{
+        AssociationError, Direction, Fid5AddressAssociation, RtpAssociationScope, RtpObservation,
+    },
+    session::{Flow, QualifiedName, SessionError, SessionEvent, SessionIdentity, SessionUnit},
+};
+
+const ASSIGNOR: u64 = 1 << 63;
+const RESERVED: u64 = 1 << 62;
+const MAX_BIND_RESPONSE: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HprSessionRole {
+    /// The HPR peer sends BIND as PLU; this adapter responds as SLU.
+    PeerPlu,
+    /// The router sends BIND as PLU; the HPR peer responds as SLU.
+    RouterPlu,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HprSessionPhase {
+    AwaitBind,
+    AwaitBindResult,
+    Open,
+    AwaitUnbindResult,
+    Closed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HprIngress {
+    /// Present only on a peer-originated BIND, before route selection.
+    pub identity: Option<SessionIdentity>,
+    pub event: SessionEvent,
+    /// A normal response may carry both an information unit and a grant.
+    pub extra_credit: Option<SessionEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HprEgress {
+    pub observation: RtpObservation,
+    /// One complete FID5 BIU; RTP segmentation and transmission remain with
+    /// the validated connection that owns `observation`.
+    pub message: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HprAdapterError {
+    InvalidLocalAddress,
+    InvalidPhase,
+    WrongDirection,
+    ManagementBind,
+    UnqualifiedBind,
+    InvalidBindResult,
+    DuplicateAddressVector,
+    MissingPacingProfile,
+    InvalidCredit,
+    Pacing(PacingError),
+    InvalidMessage(Fid5Error),
+    InvalidAssociation(AssociationError),
+    InvalidSession(SessionError),
+}
+
+impl From<Fid5Error> for HprAdapterError {
+    fn from(value: Fid5Error) -> Self {
+        Self::InvalidMessage(value)
+    }
+}
+
+impl From<AssociationError> for HprAdapterError {
+    fn from(value: AssociationError) -> Self {
+        Self::InvalidAssociation(value)
+    }
+}
+
+impl From<SessionError> for HprAdapterError {
+    fn from(value: SessionError) -> Self {
+        Self::InvalidSession(value)
+    }
+}
+
+pub struct HprSessionAdapter {
+    role: HprSessionRole,
+    scope: RtpAssociationScope,
+    association: Fid5AddressAssociation,
+    local_assigned_sa: u64,
+    local_cp: Option<QualifiedName>,
+    peer_cp: Option<QualifiedName>,
+    identity: Option<SessionIdentity>,
+    phase: HprSessionPhase,
+    pacing: Option<FixedPacing>,
+    send_window: u8,
+    receive_window: u8,
+    pending_pacing_snf: Option<u16>,
+    pending_unbind_snf: Option<[u8; 2]>,
+}
+
+impl HprSessionAdapter {
+    /// `local_assigned_sa` has its assignor bit set and reserved bit clear.
+    /// The caller allocates it uniquely within the validated RTP generation.
+    pub fn new(
+        role: HprSessionRole,
+        scope: RtpAssociationScope,
+        local_assigned_sa: u64,
+        local_cp: Option<QualifiedName>,
+        peer_cp: Option<QualifiedName>,
+    ) -> Result<Self, HprAdapterError> {
+        if local_assigned_sa & (ASSIGNOR | RESERVED) != ASSIGNOR
+            || local_assigned_sa & !(ASSIGNOR | RESERVED) == 0
+        {
+            return Err(HprAdapterError::InvalidLocalAddress);
+        }
+        Ok(Self {
+            role,
+            scope,
+            association: Fid5AddressAssociation::new(scope),
+            local_assigned_sa,
+            local_cp,
+            peer_cp,
+            identity: None,
+            phase: HprSessionPhase::AwaitBind,
+            pacing: None,
+            send_window: 0,
+            receive_window: 0,
+            pending_pacing_snf: None,
+            pending_unbind_snf: None,
+        })
+    }
+
+    pub fn phase(&self) -> HprSessionPhase {
+        self.phase
+    }
+
+    pub fn identity(&self) -> Option<&SessionIdentity> {
+        self.identity.as_ref()
+    }
+
+    /// Install the negotiated session pacing windows after a positive BIND
+    /// and before any information is delivered. The caller derives these
+    /// values from the accepted BIND profile; RTP ARB is separate.
+    pub fn configure_fixed_pacing(
+        &mut self,
+        send_window: u8,
+        receive_window: u8,
+    ) -> Result<(), HprAdapterError> {
+        if self.phase != HprSessionPhase::Open || self.pacing.is_some() {
+            return Err(HprAdapterError::InvalidPhase);
+        }
+        self.pacing =
+            Some(FixedPacing::new(send_window, receive_window).map_err(HprAdapterError::Pacing)?);
+        self.send_window = send_window;
+        self.receive_window = receive_window;
+        Ok(())
+    }
+
+    /// Accept one complete, reassembled message from a validated RTP
+    /// connection. A wrong generation, TCID, SA, or BIND sequence cannot
+    /// advance this session.
+    pub fn ingest_verified(
+        &mut self,
+        observation: RtpObservation,
+        message: &[u8],
+    ) -> Result<HprIngress, HprAdapterError> {
+        let fid5 = Fid5WholeBiu::parse_complete(message)?;
+        match (self.role, self.phase) {
+            (HprSessionRole::PeerPlu, HprSessionPhase::AwaitBind) => {
+                let identity =
+                    user_bind_identity(fid5, self.peer_cp.clone(), self.local_cp.clone())?;
+                self.association.observe_bind_request(observation, fid5)?;
+                self.identity = Some(identity.clone());
+                self.phase = HprSessionPhase::AwaitBindResult;
+                Ok(HprIngress {
+                    identity: Some(identity),
+                    event: SessionEvent::BindRequest(fid5.session_unit()?),
+                    extra_credit: None,
+                })
+            }
+            (HprSessionRole::RouterPlu, HprSessionPhase::AwaitBindResult) => {
+                if is_negative_bind_response(fid5) {
+                    self.validate_negative_bind(observation, fid5)?;
+                    let unit = fid5.session_unit()?;
+                    self.disconnect();
+                    return Ok(HprIngress {
+                        identity: None,
+                        event: SessionEvent::BindResult {
+                            accepted: false,
+                            unit,
+                        },
+                        extra_credit: None,
+                    });
+                }
+                self.association.observe_bind_response(observation, fid5)?;
+                self.phase = HprSessionPhase::Open;
+                Ok(HprIngress {
+                    identity: None,
+                    event: SessionEvent::BindResult {
+                        accepted: true,
+                        // CV62 belongs to the HPR directional-address
+                        // exchange, not to a carrier-neutral BIND result.
+                        unit: remove_cv62(&fid5.session_unit()?)?,
+                    },
+                    extra_credit: None,
+                })
+            }
+            (_, HprSessionPhase::Open | HprSessionPhase::AwaitUnbindResult) => {
+                let direction = self.inbound_direction();
+                self.association
+                    .observe_data(direction, observation, fid5)?;
+                let unit = fid5.session_unit()?;
+                if is_unbind_request(&unit) {
+                    if self.phase != HprSessionPhase::Open {
+                        return Err(HprAdapterError::InvalidPhase);
+                    }
+                    self.pending_unbind_snf = Some(unit.snf().try_into().unwrap());
+                    self.phase = HprSessionPhase::AwaitUnbindResult;
+                    return Ok(HprIngress {
+                        identity: None,
+                        event: SessionEvent::Unbind(clear_pacing_indicator(&unit)?),
+                        extra_credit: None,
+                    });
+                }
+                if is_unbind_response(&unit) {
+                    if self.phase != HprSessionPhase::AwaitUnbindResult
+                        || self.pending_unbind_snf.as_ref().map(|snf| snf.as_slice())
+                            != Some(unit.snf())
+                    {
+                        return Err(HprAdapterError::InvalidPhase);
+                    }
+                    self.disconnect();
+                    return Ok(HprIngress {
+                        identity: None,
+                        event: SessionEvent::Unbind(clear_pacing_indicator(&unit)?),
+                        extra_credit: None,
+                    });
+                }
+                if self.phase != HprSessionPhase::Open {
+                    return Err(HprAdapterError::InvalidPhase);
+                }
+                let pacing = self
+                    .pacing
+                    .as_mut()
+                    .ok_or(HprAdapterError::MissingPacingProfile)?;
+                if is_canonical_ipr(unit.rh(), unit.ru()) {
+                    pacing
+                        .receive_pacing_response()
+                        .map_err(HprAdapterError::Pacing)?;
+                    return Ok(HprIngress {
+                        identity: None,
+                        event: SessionEvent::Credit {
+                            normal: u32::from(self.send_window),
+                            expedited: 0,
+                        },
+                        extra_credit: None,
+                    });
+                }
+                let mut extra_credit = None;
+                if !fid5.expedited {
+                    if unit.rh()[0] & 0x80 == 0 {
+                        let pi = unit.rh()[1] & PACING_INDICATOR != 0;
+                        pacing
+                            .receive_request(pi)
+                            .map_err(HprAdapterError::Pacing)?;
+                        if pi {
+                            self.pending_pacing_snf = Some(fid5.sequence_number);
+                        }
+                    } else if unit.rh()[1] & PACING_INDICATOR != 0 {
+                        pacing
+                            .receive_pacing_response()
+                            .map_err(HprAdapterError::Pacing)?;
+                        extra_credit = Some(SessionEvent::Credit {
+                            normal: u32::from(self.send_window),
+                            expedited: 0,
+                        });
+                    }
+                }
+                let event = SessionEvent::Information {
+                    flow: if fid5.expedited {
+                        Flow::Expedited
+                    } else {
+                        Flow::Normal
+                    },
+                    unit: clear_pacing_indicator(&unit)?,
+                };
+                Ok(HprIngress {
+                    identity: None,
+                    event,
+                    extra_credit,
+                })
+            }
+            _ => Err(HprAdapterError::InvalidPhase),
+        }
+    }
+
+    /// Prepare one event from the session fabric for the HPR RTP sender.
+    /// The caller must preserve ordering and hand `message` to the RTP
+    /// connection identified by `observation`.
+    pub fn encode_event(
+        &mut self,
+        event: SessionEvent,
+    ) -> Result<Option<HprEgress>, HprAdapterError> {
+        let (tcid, flow, address, unit) = match (self.role, self.phase, event) {
+            (
+                HprSessionRole::RouterPlu,
+                HprSessionPhase::AwaitBind,
+                SessionEvent::BindRequest(unit),
+            ) => {
+                let message =
+                    encode_whole_biu(self.local_assigned_sa.to_be_bytes(), Flow::Expedited, &unit)?;
+                let fid5 = Fid5WholeBiu::parse_complete(&message)?;
+                let identity =
+                    user_bind_identity(fid5, self.local_cp.clone(), self.peer_cp.clone())?;
+                self.association.observe_bind_request(
+                    RtpObservation {
+                        generation: self.scope.generation,
+                        tcid: self.scope.initial_plu_tcid,
+                    },
+                    fid5,
+                )?;
+                self.identity = Some(identity);
+                self.phase = HprSessionPhase::AwaitBindResult;
+                return Ok(Some(HprEgress {
+                    observation: RtpObservation {
+                        generation: self.scope.generation,
+                        tcid: self.scope.initial_plu_tcid,
+                    },
+                    message,
+                }));
+            }
+            (
+                HprSessionRole::PeerPlu,
+                HprSessionPhase::AwaitBindResult,
+                SessionEvent::BindResult {
+                    accepted: true,
+                    unit,
+                },
+            ) => {
+                let response = add_cv62(&unit, self.local_assigned_sa)?;
+                let address = self
+                    .association
+                    .bind_response_address()
+                    .ok_or(HprAdapterError::InvalidPhase)?;
+                let message = encode_whole_biu(address, Flow::Expedited, &response)?;
+                self.association.observe_bind_response(
+                    RtpObservation {
+                        generation: self.scope.generation,
+                        tcid: self.scope.slu_tcid,
+                    },
+                    Fid5WholeBiu::parse_complete(&message)?,
+                )?;
+                self.phase = HprSessionPhase::Open;
+                return Ok(Some(HprEgress {
+                    observation: RtpObservation {
+                        generation: self.scope.generation,
+                        tcid: self.scope.slu_tcid,
+                    },
+                    message,
+                }));
+            }
+            (
+                HprSessionRole::PeerPlu,
+                HprSessionPhase::AwaitBindResult,
+                SessionEvent::BindResult {
+                    accepted: false,
+                    unit,
+                },
+            ) => {
+                let address = self
+                    .association
+                    .bind_response_address()
+                    .ok_or(HprAdapterError::InvalidPhase)?;
+                let message = encode_whole_biu(address, Flow::Expedited, &unit)?;
+                self.validate_negative_bind(
+                    RtpObservation {
+                        generation: self.scope.generation,
+                        tcid: self.scope.slu_tcid,
+                    },
+                    Fid5WholeBiu::parse_complete(&message)?,
+                )?;
+                self.disconnect();
+                return Ok(Some(HprEgress {
+                    observation: RtpObservation {
+                        generation: self.scope.generation,
+                        tcid: self.scope.slu_tcid,
+                    },
+                    message,
+                }));
+            }
+            (_, HprSessionPhase::Open, SessionEvent::Information { flow, unit }) => {
+                let direction = self.outbound_direction();
+                let address = self
+                    .association
+                    .data_address(direction)
+                    .ok_or(HprAdapterError::InvalidPhase)?;
+                let mut unit = clear_pacing_indicator(&unit)?;
+                if flow == Flow::Normal && unit.rh()[0] & 0x80 == 0 {
+                    let pacing = self
+                        .pacing
+                        .as_mut()
+                        .ok_or(HprAdapterError::MissingPacingProfile)?;
+                    let mut candidate = pacing.clone();
+                    let pi = candidate.send_request().map_err(HprAdapterError::Pacing)?;
+                    let mut bytes = unit.as_reduced().to_vec();
+                    bytes[3] = (bytes[3] & !PACING_INDICATOR) | u8::from(pi);
+                    unit = SessionUnit::from_reduced(&bytes)?;
+                    *pacing = candidate;
+                }
+                (self.outbound_tcid(), flow, address, unit)
+            }
+            (_, HprSessionPhase::Open, SessionEvent::Credit { normal, expedited }) => {
+                if expedited != 0 || normal != u32::from(self.receive_window) {
+                    return Err(HprAdapterError::InvalidCredit);
+                }
+                let pacing = self
+                    .pacing
+                    .as_mut()
+                    .ok_or(HprAdapterError::MissingPacingProfile)?;
+                let snf = self
+                    .pending_pacing_snf
+                    .ok_or(HprAdapterError::InvalidCredit)?;
+                pacing
+                    .grant_receive_window()
+                    .map_err(HprAdapterError::Pacing)?;
+                self.pending_pacing_snf = None;
+                let mut reduced = snf.to_be_bytes().to_vec();
+                reduced.extend_from_slice(&IPR_RH);
+                let unit = SessionUnit::from_reduced(&reduced)?;
+                let address = self
+                    .association
+                    .data_address(self.outbound_direction())
+                    .ok_or(HprAdapterError::InvalidPhase)?;
+                (self.outbound_tcid(), Flow::Expedited, address, unit)
+            }
+            (
+                _,
+                HprSessionPhase::Open | HprSessionPhase::AwaitUnbindResult,
+                SessionEvent::Unbind(unit),
+            ) => {
+                if self.phase == HprSessionPhase::Open {
+                    if !is_unbind_request(&unit) {
+                        return Err(HprAdapterError::InvalidPhase);
+                    }
+                } else if !is_unbind_response(&unit)
+                    || self.pending_unbind_snf.as_ref().map(|snf| snf.as_slice())
+                        != Some(unit.snf())
+                {
+                    return Err(HprAdapterError::InvalidPhase);
+                }
+                let direction = self.outbound_direction();
+                let address = self
+                    .association
+                    .data_address(direction)
+                    .ok_or(HprAdapterError::InvalidPhase)?;
+                (
+                    self.outbound_tcid(),
+                    Flow::Expedited,
+                    address,
+                    clear_pacing_indicator(&unit)?,
+                )
+            }
+            (_, _, SessionEvent::Reset) => {
+                self.disconnect();
+                return Ok(None);
+            }
+            _ => return Err(HprAdapterError::InvalidPhase),
+        };
+        let is_unbind_request = is_unbind_request(&unit);
+        let is_unbind_response = is_unbind_response(&unit);
+        let message = encode_whole_biu(address, flow, &unit)?;
+        if is_unbind_request {
+            self.pending_unbind_snf = Some(unit.snf().try_into().unwrap());
+            self.phase = HprSessionPhase::AwaitUnbindResult;
+        } else if is_unbind_response {
+            self.disconnect();
+        }
+        Ok(Some(HprEgress {
+            observation: RtpObservation {
+                generation: self.scope.generation,
+                tcid,
+            },
+            message,
+        }))
+    }
+
+    pub fn disconnect(&mut self) {
+        self.phase = HprSessionPhase::Closed;
+        self.association.disconnect();
+        self.pacing = None;
+        self.pending_pacing_snf = None;
+        self.pending_unbind_snf = None;
+        self.identity = None;
+    }
+
+    fn inbound_direction(&self) -> Direction {
+        match self.role {
+            HprSessionRole::PeerPlu => Direction::PluToSlu,
+            HprSessionRole::RouterPlu => Direction::SluToPlu,
+        }
+    }
+
+    fn outbound_direction(&self) -> Direction {
+        match self.role {
+            HprSessionRole::PeerPlu => Direction::SluToPlu,
+            HprSessionRole::RouterPlu => Direction::PluToSlu,
+        }
+    }
+
+    fn outbound_tcid(&self) -> u64 {
+        match self.role {
+            HprSessionRole::PeerPlu => self.scope.slu_tcid,
+            HprSessionRole::RouterPlu => self.scope.subsequent_plu_tcid,
+        }
+    }
+
+    fn validate_negative_bind(
+        &self,
+        observation: RtpObservation,
+        fid5: Fid5WholeBiu<'_>,
+    ) -> Result<(), HprAdapterError> {
+        if observation.generation != self.scope.generation {
+            return Err(AssociationError::StaleGeneration.into());
+        }
+        if observation.tcid != self.scope.slu_tcid {
+            return Err(AssociationError::WrongRtpConnection.into());
+        }
+        if fid5.session_address
+            != self
+                .association
+                .bind_response_address()
+                .ok_or(HprAdapterError::InvalidPhase)?
+        {
+            return Err(AssociationError::WrongResponseAddress.into());
+        }
+        if fid5.sequence_number
+            != self
+                .association
+                .pending_bind_sequence()
+                .ok_or(HprAdapterError::InvalidPhase)?
+        {
+            return Err(AssociationError::WrongBindSequence.into());
+        }
+        if !is_negative_bind_response(fid5) {
+            return Err(HprAdapterError::InvalidBindResult);
+        }
+        Ok(())
+    }
+}
+
+fn user_bind_identity(
+    fid5: Fid5WholeBiu<'_>,
+    source_cp: Option<QualifiedName>,
+    target_cp: Option<QualifiedName>,
+) -> Result<SessionIdentity, HprAdapterError> {
+    let bind = fid5
+        .classify_bind()
+        .map_err(|_| HprAdapterError::UnqualifiedBind)?
+        .ok_or(HprAdapterError::UnqualifiedBind)?;
+    if matches!(bind.class, BindClass::Management { .. }) {
+        return Err(HprAdapterError::ManagementBind);
+    }
+    let source_lu =
+        QualifiedName::from_str(&bind.plu).map_err(|_| HprAdapterError::UnqualifiedBind)?;
+    let target_lu =
+        QualifiedName::from_str(&bind.slu).map_err(|_| HprAdapterError::UnqualifiedBind)?;
+    Ok(SessionIdentity::new(source_lu, target_lu).with_control_points(source_cp, target_cp)?)
+}
+
+fn is_unbind_request(unit: &SessionUnit) -> bool {
+    unit.rh()[0] & 0xe0 == 0x60 && unit.ru().first() == Some(&0x32)
+}
+
+fn is_unbind_response(unit: &SessionUnit) -> bool {
+    unit.rh()[0] & 0xe0 == 0xe0 && unit.ru().first() == Some(&0x32)
+}
+
+fn is_negative_bind_response(fid5: Fid5WholeBiu<'_>) -> bool {
+    fid5.expedited
+        && fid5.rh[0] & 0xeb == 0xeb
+        && fid5.rh[1] & 0x10 != 0
+        && fid5.rh[2] == 0
+        && fid5.ru.len() >= 4
+}
+
+fn clear_pacing_indicator(unit: &SessionUnit) -> Result<SessionUnit, HprAdapterError> {
+    if unit.rh()[1] & PACING_INDICATOR == 0 {
+        return Ok(unit.clone());
+    }
+    let mut reduced = unit.as_reduced().to_vec();
+    reduced[3] &= !PACING_INDICATOR;
+    SessionUnit::from_reduced(&reduced).map_err(Into::into)
+}
+
+fn add_cv62(unit: &SessionUnit, assigned_sa: u64) -> Result<SessionUnit, HprAdapterError> {
+    let ru = unit.ru();
+    if unit.rh()[0] & 0xeb != 0xeb
+        || unit.rh()[1] & 0x10 != 0
+        || unit.rh()[2] != 0
+        || ru.len() < 31
+        || ru.len() + 10 > MAX_BIND_RESPONSE
+        || ru[0] != 0x31
+        || ru[26] != 0
+        || ru[27] != 0
+    {
+        return Err(HprAdapterError::InvalidBindResult);
+    }
+    let user_end = 29usize
+        .checked_add(usize::from(ru[28]))
+        .filter(|&end| end < ru.len())
+        .ok_or(HprAdapterError::InvalidBindResult)?;
+    let retired = user_end
+        .checked_add(1 + usize::from(ru[user_end]))
+        .filter(|&end| end < ru.len())
+        .ok_or(HprAdapterError::InvalidBindResult)?;
+    if ru[retired] != 0 {
+        return Err(HprAdapterError::InvalidBindResult);
+    }
+    let mut cursor = retired + 1;
+    while cursor < ru.len() {
+        let header = ru
+            .get(cursor..cursor + 2)
+            .ok_or(HprAdapterError::InvalidBindResult)?;
+        if header[0] == 0x62 {
+            return Err(HprAdapterError::DuplicateAddressVector);
+        }
+        cursor = cursor
+            .checked_add(2 + usize::from(header[1]))
+            .filter(|&end| end <= ru.len())
+            .ok_or(HprAdapterError::InvalidBindResult)?;
+    }
+    let mut reduced = unit.as_reduced().to_vec();
+    reduced.extend_from_slice(&[0x62, 8]);
+    reduced.extend_from_slice(&assigned_sa.to_be_bytes());
+    SessionUnit::from_reduced(&reduced).map_err(Into::into)
+}
+
+fn remove_cv62(unit: &SessionUnit) -> Result<SessionUnit, HprAdapterError> {
+    let ru = unit.ru();
+    if ru.len() < 31 || ru.len() > MAX_BIND_RESPONSE || ru[0] != 0x31 || ru[26] != 0 || ru[27] != 0
+    {
+        return Err(HprAdapterError::InvalidBindResult);
+    }
+    let user_end = 29usize
+        .checked_add(usize::from(ru[28]))
+        .filter(|&end| end < ru.len())
+        .ok_or(HprAdapterError::InvalidBindResult)?;
+    let retired = user_end
+        .checked_add(1 + usize::from(ru[user_end]))
+        .filter(|&end| end < ru.len())
+        .ok_or(HprAdapterError::InvalidBindResult)?;
+    if ru[retired] != 0 {
+        return Err(HprAdapterError::InvalidBindResult);
+    }
+    let mut cursor = retired + 1;
+    let mut found = None;
+    while cursor < ru.len() {
+        let header = ru
+            .get(cursor..cursor + 2)
+            .ok_or(HprAdapterError::InvalidBindResult)?;
+        let end = cursor
+            .checked_add(2 + usize::from(header[1]))
+            .filter(|&end| end <= ru.len())
+            .ok_or(HprAdapterError::InvalidBindResult)?;
+        if header[0] == 0x62 && found.replace((cursor, end)).is_some() {
+            return Err(HprAdapterError::DuplicateAddressVector);
+        }
+        cursor = end;
+    }
+    let (start, end) = found.ok_or(HprAdapterError::InvalidBindResult)?;
+    let mut reduced = unit.as_reduced().to_vec();
+    reduced.drain(5 + start..5 + end);
+    SessionUnit::from_reduced(&reduced).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ConnectionGeneration;
+
+    const PLU_SA: u64 = 0x8000_0000_0000_1111;
+    const SLU_SA: u64 = 0x8000_0000_0000_2222;
+
+    fn scope() -> RtpAssociationScope {
+        RtpAssociationScope {
+            generation: ConnectionGeneration::new(9).unwrap(),
+            initial_plu_tcid: 0x8015_0000_0000_0040,
+            subsequent_plu_tcid: 0x0016_0000_0000_0040,
+            slu_tcid: 0x0015_0000_0000_0040,
+        }
+    }
+
+    fn cp(value: &str) -> QualifiedName {
+        value.parse().unwrap()
+    }
+
+    fn bind_unit() -> SessionUnit {
+        let mut ru = vec![0; 27];
+        ru[..4].copy_from_slice(&[0x31, 0, 0x13, 7]);
+        ru[14..16].copy_from_slice(&[6, 2]);
+        let plu = [0xd5, 0xc5, 0xe3, 0xc1, 0x4b, 0xd3, 0xe4, 0xc1];
+        let slu = [0xd5, 0xc5, 0xe3, 0xc2, 0x4b, 0xd3, 0xe4, 0xc2];
+        ru.push(plu.len() as u8);
+        ru.extend_from_slice(&plu);
+        ru.extend_from_slice(&[1, 0, 0]);
+        ru.push(slu.len() as u8);
+        ru.extend_from_slice(&slu);
+        let mut reduced = vec![0x80, 1, 0x6b, 0x80, 0];
+        reduced.extend_from_slice(&ru);
+        SessionUnit::from_reduced(&reduced).unwrap()
+    }
+
+    fn bind_response_unit() -> SessionUnit {
+        let mut ru = vec![0; 29];
+        ru[0] = 0x31;
+        ru[2..4].copy_from_slice(&[0x13, 7]);
+        ru[14..16].copy_from_slice(&[6, 2]);
+        ru.extend_from_slice(&[0, 0]);
+        let mut reduced = vec![0x80, 1, 0xeb, 0x80, 0];
+        reduced.extend_from_slice(&ru);
+        SessionUnit::from_reduced(&reduced).unwrap()
+    }
+
+    fn observation(tcid: u64) -> RtpObservation {
+        RtpObservation {
+            generation: scope().generation,
+            tcid,
+        }
+    }
+
+    fn data_unit() -> SessionUnit {
+        SessionUnit::from_reduced(&[0, 2, 0x03, 0x81, 0, 0x22]).unwrap()
+    }
+
+    #[test]
+    fn peer_plu_bind_and_data_use_both_receiver_assigned_addresses() {
+        let s = scope();
+        let mut adapter = HprSessionAdapter::new(
+            HprSessionRole::PeerPlu,
+            s,
+            SLU_SA,
+            Some(cp("NETB.CPB")),
+            Some(cp("NETA.CPA")),
+        )
+        .unwrap();
+        let bind = encode_whole_biu(PLU_SA.to_be_bytes(), Flow::Expedited, &bind_unit()).unwrap();
+        let ingress = adapter
+            .ingest_verified(observation(s.initial_plu_tcid), &bind)
+            .unwrap();
+        assert_eq!(ingress.identity.unwrap().source_lu, cp("NETA.LUA"));
+        assert!(matches!(ingress.event, SessionEvent::BindRequest(_)));
+        assert_eq!(adapter.phase(), HprSessionPhase::AwaitBindResult);
+
+        let response = adapter
+            .encode_event(SessionEvent::BindResult {
+                accepted: true,
+                unit: bind_response_unit(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.observation.tcid, s.slu_tcid);
+        let response_fid5 = Fid5WholeBiu::parse_complete(&response.message).unwrap();
+        assert_eq!(
+            response_fid5.session_address,
+            (PLU_SA & !ASSIGNOR).to_be_bytes()
+        );
+        assert!(response_fid5
+            .ru
+            .ends_with(&[0x62, 8, 0x80, 0, 0, 0, 0, 0, 0x22, 0x22]));
+        assert_eq!(adapter.phase(), HprSessionPhase::Open);
+        adapter.configure_fixed_pacing(7, 1).unwrap();
+
+        let inbound = encode_whole_biu(
+            (SLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Normal,
+            &data_unit(),
+        )
+        .unwrap();
+        let ingress = adapter
+            .ingest_verified(observation(s.subsequent_plu_tcid), &inbound)
+            .unwrap();
+        assert!(matches!(
+            ingress.event,
+            SessionEvent::Information {
+                flow: Flow::Normal,
+                ..
+            }
+        ));
+        let grant = adapter
+            .encode_event(SessionEvent::Credit {
+                normal: 1,
+                expedited: 0,
+            })
+            .unwrap()
+            .unwrap();
+        let grant_fid5 = Fid5WholeBiu::parse_complete(&grant.message).unwrap();
+        assert_eq!(grant_fid5.sequence_number, 2);
+        assert_eq!(grant_fid5.rh, IPR_RH);
+        assert!(grant_fid5.ru.is_empty());
+        let egress = adapter
+            .encode_event(SessionEvent::Information {
+                flow: Flow::Expedited,
+                unit: data_unit(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(egress.observation.tcid, s.slu_tcid);
+        let data = Fid5WholeBiu::parse_complete(&egress.message).unwrap();
+        assert_eq!(data.session_address, (PLU_SA & !ASSIGNOR).to_be_bytes());
+        assert_eq!(data.rh[1] & PACING_INDICATOR, 0); // expedited flow carries no normal pacing PI
+    }
+
+    #[test]
+    fn router_plu_bind_and_data_roundtrip() {
+        let s = scope();
+        let mut adapter = HprSessionAdapter::new(
+            HprSessionRole::RouterPlu,
+            s,
+            PLU_SA,
+            Some(cp("NETA.CPA")),
+            Some(cp("NETB.CPB")),
+        )
+        .unwrap();
+        let request = adapter
+            .encode_event(SessionEvent::BindRequest(bind_unit()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.observation.tcid, s.initial_plu_tcid);
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&request.message)
+                .unwrap()
+                .session_address,
+            PLU_SA.to_be_bytes()
+        );
+        let response = add_cv62(&bind_response_unit(), SLU_SA).unwrap();
+        let message = encode_whole_biu(
+            (PLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Expedited,
+            &response,
+        )
+        .unwrap();
+        let ingress = adapter
+            .ingest_verified(observation(s.slu_tcid), &message)
+            .unwrap();
+        assert_eq!(
+            ingress.event,
+            SessionEvent::BindResult {
+                accepted: true,
+                unit: bind_response_unit()
+            }
+        );
+        assert_eq!(adapter.phase(), HprSessionPhase::Open);
+        adapter.configure_fixed_pacing(7, 1).unwrap();
+        let outgoing = adapter
+            .encode_event(SessionEvent::Information {
+                flow: Flow::Normal,
+                unit: data_unit(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(outgoing.observation.tcid, s.subsequent_plu_tcid);
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&outgoing.message)
+                .unwrap()
+                .session_address,
+            (SLU_SA & !ASSIGNOR).to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn wrong_generation_and_address_do_not_advance_session() {
+        let s = scope();
+        let mut adapter =
+            HprSessionAdapter::new(HprSessionRole::PeerPlu, s, SLU_SA, None, None).unwrap();
+        let bind = encode_whole_biu(PLU_SA.to_be_bytes(), Flow::Expedited, &bind_unit()).unwrap();
+        let old = RtpObservation {
+            generation: ConnectionGeneration::new(8).unwrap(),
+            tcid: s.initial_plu_tcid,
+        };
+        assert!(matches!(
+            adapter.ingest_verified(old, &bind),
+            Err(HprAdapterError::InvalidAssociation(
+                AssociationError::StaleGeneration
+            ))
+        ));
+        assert_eq!(adapter.phase(), HprSessionPhase::AwaitBind);
+        adapter
+            .ingest_verified(observation(s.initial_plu_tcid), &bind)
+            .unwrap();
+        adapter
+            .encode_event(SessionEvent::BindResult {
+                accepted: true,
+                unit: bind_response_unit(),
+            })
+            .unwrap();
+        adapter.configure_fixed_pacing(7, 1).unwrap();
+        let wrong = encode_whole_biu(
+            (PLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Normal,
+            &data_unit(),
+        )
+        .unwrap();
+        assert!(matches!(
+            adapter.ingest_verified(observation(s.subsequent_plu_tcid), &wrong),
+            Err(HprAdapterError::InvalidAssociation(
+                AssociationError::WrongDataAddress
+            ))
+        ));
+        assert_eq!(adapter.phase(), HprSessionPhase::Open);
+    }
+
+    #[test]
+    fn pacing_indicator_and_ipr_stay_on_hpr_carrier() {
+        let s = scope();
+        let mut adapter =
+            HprSessionAdapter::new(HprSessionRole::PeerPlu, s, SLU_SA, None, None).unwrap();
+        let bind = encode_whole_biu(PLU_SA.to_be_bytes(), Flow::Expedited, &bind_unit()).unwrap();
+        adapter
+            .ingest_verified(observation(s.initial_plu_tcid), &bind)
+            .unwrap();
+        adapter
+            .encode_event(SessionEvent::BindResult {
+                accepted: true,
+                unit: bind_response_unit(),
+            })
+            .unwrap();
+        adapter.configure_fixed_pacing(1, 1).unwrap();
+        let first = adapter
+            .encode_event(SessionEvent::Information {
+                flow: Flow::Normal,
+                unit: data_unit(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&first.message).unwrap().rh[1] & PACING_INDICATOR,
+            1
+        );
+        assert_eq!(
+            adapter.encode_event(SessionEvent::Information {
+                flow: Flow::Normal,
+                unit: data_unit(),
+            }),
+            Err(HprAdapterError::Pacing(PacingError::SendWindowExhausted))
+        );
+        let ipr_unit = SessionUnit::from_reduced(&[0, 2, 0x83, 0x01, 0]).unwrap();
+        let ipr = encode_whole_biu(
+            (SLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Expedited,
+            &ipr_unit,
+        )
+        .unwrap();
+        let credit = adapter
+            .ingest_verified(observation(s.subsequent_plu_tcid), &ipr)
+            .unwrap();
+        assert_eq!(
+            credit.event,
+            SessionEvent::Credit {
+                normal: 1,
+                expedited: 0
+            }
+        );
+        assert_eq!(credit.extra_credit, None);
+        assert!(matches!(
+            adapter.ingest_verified(observation(s.subsequent_plu_tcid), &ipr),
+            Err(HprAdapterError::Pacing(
+                PacingError::DuplicatePacingResponse
+            ))
+        ));
+        assert!(adapter
+            .encode_event(SessionEvent::Information {
+                flow: Flow::Normal,
+                unit: data_unit(),
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn negative_bind_closes_without_assigning_a_second_address() {
+        let s = scope();
+        let denied =
+            SessionUnit::from_reduced(&[0x80, 1, 0xeb, 0x90, 0, 0x10, 0x16, 0, 0x27]).unwrap();
+        let mut peer_plu =
+            HprSessionAdapter::new(HprSessionRole::PeerPlu, s, SLU_SA, None, None).unwrap();
+        let bind = encode_whole_biu(PLU_SA.to_be_bytes(), Flow::Expedited, &bind_unit()).unwrap();
+        peer_plu
+            .ingest_verified(observation(s.initial_plu_tcid), &bind)
+            .unwrap();
+        let refusal = peer_plu
+            .encode_event(SessionEvent::BindResult {
+                accepted: false,
+                unit: denied.clone(),
+            })
+            .unwrap()
+            .unwrap();
+        let fid5 = Fid5WholeBiu::parse_complete(&refusal.message).unwrap();
+        assert_eq!(fid5.session_address, (PLU_SA & !ASSIGNOR).to_be_bytes());
+        assert_eq!(fid5.ru, denied.ru());
+        assert_eq!(peer_plu.phase(), HprSessionPhase::Closed);
+
+        let mut router_plu =
+            HprSessionAdapter::new(HprSessionRole::RouterPlu, s, PLU_SA, None, None).unwrap();
+        router_plu
+            .encode_event(SessionEvent::BindRequest(bind_unit()))
+            .unwrap();
+        let incoming =
+            encode_whole_biu((PLU_SA & !ASSIGNOR).to_be_bytes(), Flow::Expedited, &denied).unwrap();
+        assert_eq!(
+            router_plu
+                .ingest_verified(observation(s.slu_tcid), &incoming)
+                .unwrap()
+                .event,
+            SessionEvent::BindResult {
+                accepted: false,
+                unit: denied
+            }
+        );
+        assert_eq!(router_plu.phase(), HprSessionPhase::Closed);
+    }
+
+    #[test]
+    fn unbind_waits_for_correlated_response_in_both_directions() {
+        let s = scope();
+        let mut peer_plu =
+            HprSessionAdapter::new(HprSessionRole::PeerPlu, s, SLU_SA, None, None).unwrap();
+        let bind = encode_whole_biu(PLU_SA.to_be_bytes(), Flow::Expedited, &bind_unit()).unwrap();
+        peer_plu
+            .ingest_verified(observation(s.initial_plu_tcid), &bind)
+            .unwrap();
+        peer_plu
+            .encode_event(SessionEvent::BindResult {
+                accepted: true,
+                unit: bind_response_unit(),
+            })
+            .unwrap();
+        let request = SessionUnit::from_reduced(&[0x12, 0x34, 0x6b, 0x80, 0, 0x32]).unwrap();
+        let request_message = encode_whole_biu(
+            (SLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Expedited,
+            &request,
+        )
+        .unwrap();
+        assert_eq!(
+            peer_plu
+                .ingest_verified(observation(s.subsequent_plu_tcid), &request_message)
+                .unwrap()
+                .event,
+            SessionEvent::Unbind(request.clone())
+        );
+        assert_eq!(peer_plu.phase(), HprSessionPhase::AwaitUnbindResult);
+        let wrong = SessionUnit::from_reduced(&[0x12, 0x35, 0xeb, 0x80, 0, 0x32]).unwrap();
+        assert_eq!(
+            peer_plu.encode_event(SessionEvent::Unbind(wrong)),
+            Err(HprAdapterError::InvalidPhase)
+        );
+        let response = SessionUnit::from_reduced(&[0x12, 0x34, 0xeb, 0x80, 0, 0x32]).unwrap();
+        let egress = peer_plu
+            .encode_event(SessionEvent::Unbind(response.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&egress.message)
+                .unwrap()
+                .session_address,
+            (PLU_SA & !ASSIGNOR).to_be_bytes()
+        );
+        assert_eq!(peer_plu.phase(), HprSessionPhase::Closed);
+
+        let mut router_plu =
+            HprSessionAdapter::new(HprSessionRole::RouterPlu, s, PLU_SA, None, None).unwrap();
+        router_plu
+            .encode_event(SessionEvent::BindRequest(bind_unit()))
+            .unwrap();
+        let hpr_response = add_cv62(&bind_response_unit(), SLU_SA).unwrap();
+        let hpr_message = encode_whole_biu(
+            (PLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Expedited,
+            &hpr_response,
+        )
+        .unwrap();
+        router_plu
+            .ingest_verified(observation(s.slu_tcid), &hpr_message)
+            .unwrap();
+        router_plu
+            .encode_event(SessionEvent::Unbind(request))
+            .unwrap();
+        assert_eq!(router_plu.phase(), HprSessionPhase::AwaitUnbindResult);
+        let response_message = encode_whole_biu(
+            (PLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Expedited,
+            &response,
+        )
+        .unwrap();
+        assert_eq!(
+            router_plu
+                .ingest_verified(observation(s.slu_tcid), &response_message)
+                .unwrap()
+                .event,
+            SessionEvent::Unbind(response)
+        );
+        assert_eq!(router_plu.phase(), HprSessionPhase::Closed);
+    }
+}

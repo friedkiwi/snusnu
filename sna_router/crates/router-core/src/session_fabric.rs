@@ -117,6 +117,7 @@ struct Session {
     contract: SessionContract,
     ingress: AdapterId,
     egress: AdapterId,
+    pending_unbind_from: Option<AdapterId>,
     to_ingress: Pending,
     to_egress: Pending,
 }
@@ -206,6 +207,7 @@ impl SessionFabric {
                 contract: SessionContract::new(identity),
                 ingress,
                 egress,
+                pending_unbind_from: None,
                 to_ingress: Pending::new(),
                 to_egress: Pending::new(),
             },
@@ -268,9 +270,18 @@ impl SessionFabric {
         {
             return Err(FabricError::WrongDirection);
         }
+        let unbind_request = matches!(event, SessionEvent::Unbind(_))
+            && session.contract.phase() == SessionPhase::Open;
+        if matches!(event, SessionEvent::Unbind(_))
+            && session.contract.phase() == SessionPhase::AwaitUnbindResult
+            && session.pending_unbind_from == Some(from)
+        {
+            return Err(FabricError::WrongDirection);
+        }
         // A reset must reach the surviving side even when the queue is full.
         if matches!(event, SessionEvent::Reset) {
             session.contract.accept(&event)?;
+            session.pending_unbind_from = None;
             session.to_ingress.clear();
             session.to_egress.clear();
             if to_egress {
@@ -296,6 +307,11 @@ impl SessionFabric {
             return Err(FabricError::Capacity);
         }
         session.contract.accept(&event)?;
+        if unbind_request {
+            session.pending_unbind_from = Some(from);
+        } else if matches!(event, SessionEvent::Unbind(_)) {
+            session.pending_unbind_from = None;
+        }
         pending.push(event);
         Ok(())
     }
@@ -344,6 +360,18 @@ impl SessionFabric {
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Discard an admission whose destination carrier never opened a circuit.
+    /// The caller must first ensure no side has been told the session is open;
+    /// this method emits no Reset and is not for an active conversation.
+    pub fn discard_unopened(&mut self, id: FabricSessionId) -> Result<(), FabricError> {
+        let session = self.sessions.get(&id).ok_or(FabricError::UnknownSession)?;
+        if session.contract.phase() != SessionPhase::AwaitBindResult {
+            return Err(FabricError::Session(SessionError::InvalidTransition));
+        }
+        self.sessions.remove(&id);
+        Ok(())
     }
 
     /// Withdraw routes and reset only sessions on the removed attachment.
@@ -395,6 +423,9 @@ mod tests {
     }
     fn unit() -> SessionUnit {
         SessionUnit::from_reduced(&[0, 0, 0x31, 0, 0, 0x31]).unwrap()
+    }
+    fn unbind_response() -> SessionUnit {
+        SessionUnit::from_reduced(&[0, 0, 0xb1, 0, 0, 0x31]).unwrap()
     }
     fn identity() -> SessionIdentity {
         SessionIdentity::new(q("SRC.LUA"), q("DST.LUB"))
@@ -550,6 +581,18 @@ mod tests {
             fabric.poll(one, AdapterId(2)).unwrap(),
             Some(SessionEvent::Unbind(_))
         ));
+        assert_eq!(fabric.phase(one), Some(SessionPhase::AwaitUnbindResult));
+        assert_eq!(
+            fabric.submit(one, AdapterId(1), SessionEvent::Unbind(unbind_response())),
+            Err(FabricError::WrongDirection)
+        );
+        fabric
+            .submit(one, AdapterId(2), SessionEvent::Unbind(unbind_response()))
+            .unwrap();
+        assert_eq!(
+            fabric.poll(one, AdapterId(1)).unwrap(),
+            Some(SessionEvent::Unbind(unbind_response()))
+        );
         assert_eq!(fabric.phase(one), None);
         assert_eq!(fabric.phase(two), Some(SessionPhase::AwaitBind));
     }
@@ -616,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_survives_source_disconnect() {
+    fn pending_unbind_resets_on_source_disconnect() {
         let mut fabric = fabric(FabricLimits::default());
         let (id, _) = fabric.open(AdapterId(1), identity()).unwrap();
         fabric
@@ -638,10 +681,10 @@ mod tests {
             .submit(id, AdapterId(1), SessionEvent::Unbind(unit()))
             .unwrap();
         fabric.unregister_adapter(AdapterId(1));
-        assert!(matches!(
+        assert_eq!(
             fabric.poll(id, AdapterId(2)).unwrap(),
-            Some(SessionEvent::Unbind(_))
-        ));
+            Some(SessionEvent::Reset)
+        );
         assert_eq!(fabric.phase(id), None);
     }
 }

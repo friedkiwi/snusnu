@@ -205,6 +205,34 @@ impl Fid5AddressAssociation {
         (qualified(&identity.plu) && qualified(&identity.slu)).then_some(identity)
     }
 
+    /// The receiver-assigned SA to use in a positive response to the
+    /// outstanding BIND. Its assignor bit must be clear on the wire.
+    pub fn bind_response_address(&self) -> Option<[u8; 8]> {
+        let Phase::AwaitResponse { plu_sa, .. } = &self.phase else {
+            return None;
+        };
+        Some(plu_sa.to_be_bytes())
+    }
+
+    pub fn pending_bind_sequence(&self) -> Option<u16> {
+        let Phase::AwaitResponse { snf, .. } = &self.phase else {
+            return None;
+        };
+        Some(*snf)
+    }
+
+    /// The receiver-assigned SA for one established directional data flow.
+    /// The caller still needs an active RTP connection and matching TCID.
+    pub fn data_address(&self, direction: Direction) -> Option<[u8; 8]> {
+        let Phase::Associated { plu_sa, slu_sa, .. } = &self.phase else {
+            return None;
+        };
+        Some(match direction {
+            Direction::PluToSlu => slu_sa.to_be_bytes(),
+            Direction::SluToPlu => plu_sa.to_be_bytes(),
+        })
+    }
+
     pub fn disconnect(&mut self) {
         self.phase = Phase::Disconnected;
     }

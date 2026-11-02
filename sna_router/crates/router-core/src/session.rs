@@ -174,6 +174,7 @@ pub enum SessionPhase {
     AwaitBind,
     AwaitBindResult,
     Open,
+    AwaitUnbindResult,
     Closed,
 }
 
@@ -181,6 +182,7 @@ pub enum SessionPhase {
 pub struct SessionContract {
     pub identity: SessionIdentity,
     phase: SessionPhase,
+    pending_unbind_snf: Option<[u8; 2]>,
 }
 
 impl SessionContract {
@@ -188,6 +190,7 @@ impl SessionContract {
         Self {
             identity,
             phase: SessionPhase::AwaitBind,
+            pending_unbind_snf: None,
         }
     }
 
@@ -198,6 +201,7 @@ impl SessionContract {
     /// Validate an event before forwarding it. A failed transition leaves the
     /// session unchanged, so a malformed carrier record cannot advance it.
     pub fn accept(&mut self, event: &SessionEvent) -> Result<(), SessionError> {
+        let mut pending_unbind_snf = self.pending_unbind_snf;
         let next = match (self.phase, event) {
             (SessionPhase::AwaitBind, SessionEvent::BindRequest(unit)) => {
                 if unit.ru().is_empty() {
@@ -220,18 +224,35 @@ impl SessionContract {
                 SessionPhase::Open
             }
             (SessionPhase::Open, SessionEvent::Unbind(unit)) => {
-                if unit.ru().is_empty() {
+                if unit.ru().is_empty() || unit.rh()[0] & 0x80 != 0 {
                     return Err(SessionError::InvalidUnit);
                 }
+                pending_unbind_snf = Some(unit.snf().try_into().unwrap());
+                SessionPhase::AwaitUnbindResult
+            }
+            (SessionPhase::AwaitUnbindResult, SessionEvent::Unbind(unit)) => {
+                if unit.rh()[0] & 0x80 == 0
+                    || Some(unit.snf()) != pending_unbind_snf.as_ref().map(|snf| snf.as_slice())
+                {
+                    return Err(SessionError::InvalidUnit);
+                }
+                pending_unbind_snf = None;
                 SessionPhase::Closed
             }
             (
-                SessionPhase::AwaitBind | SessionPhase::AwaitBindResult | SessionPhase::Open,
+                SessionPhase::AwaitBind
+                | SessionPhase::AwaitBindResult
+                | SessionPhase::Open
+                | SessionPhase::AwaitUnbindResult,
                 SessionEvent::Reset,
-            ) => SessionPhase::Closed,
+            ) => {
+                pending_unbind_snf = None;
+                SessionPhase::Closed
+            }
             _ => return Err(SessionError::InvalidTransition),
         };
         self.phase = next;
+        self.pending_unbind_snf = pending_unbind_snf;
         Ok(())
     }
 }
@@ -348,6 +369,11 @@ mod tests {
         session
             .accept(&SessionEvent::Unbind(unit(&[0, 0, 0, 1])))
             .unwrap();
+        assert_eq!(session.phase(), SessionPhase::AwaitUnbindResult);
+        assert_eq!(
+            session.accept(&SessionEvent::Unbind(unit(&[0x80, 0, 0, 1]))),
+            Ok(())
+        );
         assert_eq!(session.phase(), SessionPhase::Closed);
         assert_eq!(
             session.accept(&SessionEvent::Reset),
@@ -371,5 +397,31 @@ mod tests {
         let mut reset = SessionContract::new(identity());
         reset.accept(&SessionEvent::Reset).unwrap();
         assert_eq!(reset.phase(), SessionPhase::Closed);
+    }
+
+    #[test]
+    fn unbind_waits_for_correlated_response() {
+        let mut session = SessionContract::new(identity());
+        session
+            .accept(&SessionEvent::BindRequest(unit(&[0x31, 0, 0, 1])))
+            .unwrap();
+        session
+            .accept(&SessionEvent::BindResult {
+                accepted: true,
+                unit: unit(&[0, 0, 0]),
+            })
+            .unwrap();
+        let request = SessionUnit::from_reduced(&[0x12, 0x34, 0x6b, 0x80, 0, 0x32]).unwrap();
+        session.accept(&SessionEvent::Unbind(request)).unwrap();
+        assert_eq!(session.phase(), SessionPhase::AwaitUnbindResult);
+        let wrong = SessionUnit::from_reduced(&[0x12, 0x35, 0xeb, 0x80, 0, 0x32]).unwrap();
+        assert_eq!(
+            session.accept(&SessionEvent::Unbind(wrong)),
+            Err(SessionError::InvalidUnit)
+        );
+        assert_eq!(session.phase(), SessionPhase::AwaitUnbindResult);
+        let response = SessionUnit::from_reduced(&[0x12, 0x34, 0xeb, 0x80, 0, 0x32]).unwrap();
+        session.accept(&SessionEvent::Unbind(response)).unwrap();
+        assert_eq!(session.phase(), SessionPhase::Closed);
     }
 }
