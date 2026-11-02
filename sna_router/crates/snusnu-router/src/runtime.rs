@@ -7,6 +7,7 @@ use crate::{
     hpr_lan_port::HprLanPort,
     ip_ports::EePort,
     mptn_llc_reverse::{self, ReverseLlcConfig},
+    mptn_ws_reverse::{self, ReverseWsConfig},
     remote::{Config as RemoteConfig, WsRoutePort},
     routing::{PortId, RouteAddress, RoutePort, RoutedUnit, Router, RouterEvent},
 };
@@ -280,6 +281,9 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     if let Some(reverse) = config.reverse_llc_config()? {
         return run_reverse_llc(reverse);
     }
+    if let Some(reverse) = config.reverse_ws_config()? {
+        return run_reverse_ws(reverse);
+    }
     if !config.mptn_gateway.is_empty() {
         return crate::mptn_ws_gateway_lab::run_config(config, false);
     }
@@ -483,6 +487,46 @@ fn run_reverse_llc(config: ReverseLlcConfig) -> io::Result<()> {
                     error = %error,
                     retry_ms = delay.as_millis(),
                     "native LLC to MPTN circuit failed"
+                );
+                wait_or_stop(delay);
+                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// One hosted MPTN LU accepts concentrator-initiated native circuits. Each
+/// completed or transiently failed circuit gets fresh management state and
+/// a new TCP62 correlator on the next attempt.
+fn run_reverse_ws(config: ReverseWsConfig) -> io::Result<()> {
+    config.validate()?;
+    let mut delay = Duration::from_millis(500);
+    tracing::info!(
+        hosted_cp = %config.hosted_cp,
+        hosted_lu = %config.hosted_lu,
+        source_cp = %config.source_cp,
+        source_lu = %config.source_lu,
+        local_ip = %config.endpoint.local_ip,
+        peer_ip = %config.endpoint.peer_ip,
+        "concentrator to MPTN route starting"
+    );
+    while !crate::STOP.load(Ordering::Relaxed) {
+        match mptn_ws_reverse::run_once(&config) {
+            Ok(()) => {
+                delay = Duration::from_millis(500);
+                tracing::info!(source_lu = %config.source_lu, hosted_lu = %config.hosted_lu, "concentrator to MPTN circuit closed");
+                wait_or_stop(Duration::from_millis(200));
+            }
+            Err(error) if retryable_reverse_error(&error) || retryable_remote_error(&error) => {
+                tracing::warn!(
+                    source_lu = %config.source_lu,
+                    hosted_lu = %config.hosted_lu,
+                    peer_ip = %config.endpoint.peer_ip,
+                    error = %error,
+                    retry_ms = delay.as_millis(),
+                    "concentrator to MPTN circuit failed"
                 );
                 wait_or_stop(delay);
                 delay = delay.saturating_mul(2).min(Duration::from_secs(30));
