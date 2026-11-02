@@ -37,6 +37,8 @@ pub enum BootstrapError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlAdvertisement {
     pub cp: QualifiedName,
+    /// Four-byte XID3 fixed-area node ID. RTP Network Address CV X'05'
+    /// carries the EBCDIC CP name as its Node ID CV X'00' instead.
     pub node_id: [u8; 4],
     pub hpr_sap: u8,
     pub link_label: Vec<u8>,
