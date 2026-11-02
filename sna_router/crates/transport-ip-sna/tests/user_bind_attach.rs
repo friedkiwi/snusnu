@@ -90,6 +90,50 @@ fn user_bind() -> Vec<u8> {
     piu
 }
 
+fn renamed_user_bind() -> Vec<u8> {
+    let mut bind = user_bind();
+    for (from, to) in [
+        ("SOLNET.SNAA", "SOLNET.PAYA"),
+        ("SOLNET.SNAB", "SOLNET.PAYB"),
+    ] {
+        let old = ebcdic_lu(from).node;
+        let new = ebcdic_lu(to).node;
+        assert_eq!(old.len(), new.len());
+        let mut replacements = 0;
+        for start in 0..=bind.len() - old.len() {
+            if bind[start..start + old.len()] == old {
+                bind[start..start + old.len()].copy_from_slice(&new);
+                replacements += 1;
+            }
+        }
+        assert!(replacements > 0);
+    }
+    bind
+}
+
+#[test]
+fn bridge_accepts_user_lus_distinct_from_management_cps() {
+    let mut user_policy = policy();
+    user_policy.plu = "SOLNET.PAYA".into();
+    user_policy.slu = "SOLNET.PAYB".into();
+    let mut user_template = template();
+    user_template.source = ebcdic_lu("SOLNET.PAYA");
+    user_template.destination = ebcdic_lu("SOLNET.PAYB");
+    let mut bridge = Bridge::new_dynamic_tp(
+        user_policy,
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        1,
+    )
+    .unwrap();
+    let record = bridge
+        .begin_native_bind(&renamed_user_bind(), user_template)
+        .unwrap();
+    let connect = Connect::decode(&record.bytes).unwrap();
+    assert_eq!(connect.source.node, ebcdic_lu("SOLNET.PAYA").node);
+    assert_eq!(connect.destination.node, ebcdic_lu("SOLNET.PAYB").node);
+}
+
 fn positive_response(request: &Connect) -> TcpRecord {
     let mut response = request.clone();
     response.direction = Direction::PositiveResponse;

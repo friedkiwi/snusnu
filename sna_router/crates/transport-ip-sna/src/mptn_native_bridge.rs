@@ -32,6 +32,8 @@ pub enum Phase {
 pub struct Bridge {
     gateway: GatewaySession,
     management: ManagementBind,
+    user_plu: String,
+    user_slu: String,
     mode: String,
     tp: Option<[u8; 4]>,
     window: u8,
@@ -90,16 +92,17 @@ impl Bridge {
         tp: Option<[u8; 4]>,
         window: u8,
     ) -> io::Result<Self> {
-        if policy.plu != management.plu()
-            || policy.slu != management.slu()
-            || !(1..=3).contains(&window)
-        {
+        if !(1..=3).contains(&window) {
             return Err(invalid("native bridge LU pair or pacing policy is invalid"));
         }
         let mode = policy.mode.clone().unwrap_or_default();
+        let user_plu = policy.plu.clone();
+        let user_slu = policy.slu.clone();
         Ok(Self {
             gateway: GatewaySession::new(policy, available)?,
             management,
+            user_plu,
+            user_slu,
             mode,
             tp,
             window,
@@ -146,8 +149,8 @@ impl Bridge {
             return Err(wrong_phase());
         }
         let policy = router_core::user_bind::UserBindPolicy {
-            plu: self.management.plu(),
-            slu: self.management.slu(),
+            plu: &self.user_plu,
+            slu: &self.user_slu,
             mode: &self.mode,
         };
         let offer = if management_closed {
