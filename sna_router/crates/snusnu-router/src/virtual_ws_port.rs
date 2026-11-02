@@ -32,6 +32,7 @@ enum NativeUserOutputKind {
     Expedited,
     TeardownUnbind,
     NativeCloseResponse,
+    UdpExpedited(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +84,8 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     native_user_close: Option<NativeUserClose>,
     tcp_user_writes: VecDeque<TcpUserOutputKind>,
     user_closed: bool,
+    udp_user_input: Option<(u16, Vec<u8>)>,
+    udp_user_completion: Option<u16>,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -125,6 +128,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
             native_user_close: None,
             tcp_user_writes: VecDeque::new(),
             user_closed: false,
+            udp_user_input: None,
+            udp_user_completion: None,
         })
     }
 
@@ -217,6 +222,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.native_user_output.is_some()
             || self.deferred_user_normal
             || self.expedited_ack.is_some()
+            || self.udp_user_input.is_some()
         {
             return Ok(false);
         }
@@ -244,6 +250,34 @@ impl<P: RoutePort> VirtualWsPort<P> {
 
     pub(crate) fn user_closed(&self) -> bool {
         self.user_closed
+    }
+
+    /// The gateway has already validated X'83' source, association and
+    /// sequence. This retains one reduced SNA image until native completion.
+    pub(crate) fn submit_udp_expedited(
+        &mut self,
+        sequence: u16,
+        reduced: &[u8],
+    ) -> io::Result<bool> {
+        if self.user_flow.is_none()
+            || self.user_closed
+            || self.udp_user_input.is_some()
+            || self.udp_user_completion.is_some()
+            || self.tcp_user_input.is_some()
+            || self.native_user_output.is_some()
+            || self.deferred_user_normal
+        {
+            return Ok(false);
+        }
+        if reduced.len() < 5 || reduced.len() > 1491 {
+            return Err(protocol("UDP X83 SNA image length invalid"));
+        }
+        self.udp_user_input = Some((sequence, reduced.to_vec()));
+        Ok(true)
+    }
+
+    pub(crate) fn take_completed_udp_expedited(&mut self) -> Option<u16> {
+        self.udp_user_completion.take()
     }
 
     /// The gateway calls this only after the final byte of each queued user
@@ -333,6 +367,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.native_user_close = None;
         self.tcp_user_writes.clear();
         self.user_closed = false;
+        self.udp_user_input = None;
+        self.udp_user_completion = None;
         if self.management.take().is_some() {
             // FQPCID and BIND token must be freshly minted on the next
             // circuit. A caller must construct a new virtual session.
@@ -482,6 +518,12 @@ impl<P: RoutePort> VirtualWsPort<P> {
                         .mark_native_response_enqueued(&piu)?;
                     self.user_closed = true;
                     flow.close();
+                }
+                NativeUserOutputKind::UdpExpedited(sequence) => {
+                    flow.mark_udp_native_enqueued(&piu)?;
+                    if self.udp_user_completion.replace(sequence).is_some() {
+                        return Err(protocol("unclaimed UDP X83 native completion"));
+                    }
                 }
             }
             self.native_user_output_queued = false;
@@ -674,7 +716,11 @@ impl<P: RoutePort> VirtualWsPort<P> {
             }
         }
         if self.native_user_output.is_none() {
-            if self.deferred_user_normal {
+            if let Some((sequence, reduced)) = self.udp_user_input.take() {
+                let piu = flow.prepare_udp_expedited(&reduced)?.to_vec();
+                self.native_user_output = Some(piu);
+                self.native_user_output_kind = Some(NativeUserOutputKind::UdpExpedited(sequence));
+            } else if self.deferred_user_normal {
                 match flow.retry_deferred_normal() {
                     Ok(Some(piu)) => {
                         self.native_user_output = Some(piu.to_vec());
@@ -1327,6 +1373,20 @@ mod tests {
         assert_eq!(expedited_ack.bytes, hex("0000000503"));
         port.mark_tcp_user_record_enqueued(&expedited_ack).unwrap();
 
+        let udp_reduced = hex("80004b8000c900010001");
+        assert!(port.submit_udp_expedited(7, &udp_reduced).unwrap());
+        assert!(!port.submit_udp_expedited(7, &udp_reduced).unwrap());
+        port.poll(false).unwrap();
+        assert_eq!(
+            port.inner.information.last().unwrap(),
+            &hex("2d00020180004b8000c900010001")
+        );
+        assert_eq!(port.take_completed_udp_expedited(), None);
+        port.inner.completed = 1;
+        port.poll(false).unwrap();
+        assert_eq!(port.take_completed_udp_expedited(), Some(7));
+        assert_eq!(port.take_completed_udp_expedited(), None);
+
         let mut native_unbind = hex("2d00010200006b8000320100000000");
         native_unbind.extend_from_slice(user_offer().fqpcid());
         port.inner
@@ -1343,7 +1403,7 @@ mod tests {
         port.complete_tcp_user_records(1).unwrap(); // Expedited ACK.
         assert_eq!(
             port.inner.information.last().unwrap(),
-            &hex("2d0002010002030000cc")
+            &hex("2d00020180004b8000c900010001")
         );
         port.complete_tcp_user_records(1).unwrap(); // Abort is fully written.
         port.poll(false).unwrap();
