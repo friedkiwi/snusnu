@@ -210,7 +210,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	if target != nil && target != source {
 		if target.local && req.SourceRoute == nil {
 			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
-		} else if target.local && !sourceLUSupports62(h.routeForRef(source, req.SourceRoute)) {
+		} else if target.local && (h.localServices == nil || !h.localServices.accepts(req.Target, h.routeForRef(source, req.SourceRoute), req.Profile)) {
 			reason = wire.OpenFailure_OPEN_FAILURE_UNSUPPORTED
 		} else if !h.allowed(source, target) {
 			reason = wire.OpenFailure_OPEN_FAILURE_FORBIDDEN

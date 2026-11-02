@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
+	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 )
 
 var usernamePattern = regexp.MustCompile(`^[a-z0-9_][a-z0-9_-]{2,31}$`)
@@ -175,15 +176,27 @@ func (a *App) liveDirectoryExports(ctx context.Context) ([]store.Export, error) 
 	if a.hub.local != nil {
 		service := store.Export{RouterID: serviceRouterID, RouterName: "SNUSNU services", OwnerID: serviceOwnerID,
 			OwnerUsername: "snusnu", NetID: "SNUSNU", Revision: 1, Generation: 1}
-		cp := service
-		cp.Kind, cp.Name, cp.RouteID = "CP", "SVC", 1
-		cp.ManagedMAC = (store.ManagedCP{Suffix: serviceMACSuffix}).MACColon()
-		cp.ADPTADR = (store.ManagedCP{Suffix: serviceMACSuffix}).ADPTADR()
-		lu := service
-		lu.Kind, lu.Name, lu.RouteID = "LU", "PING", 2
-		lu.HostingCPNetID, lu.HostingCPName = "SNUSNU", "SVC"
-		lu.LUTypes = []string{"LU 6.2"}
-		exports = append(exports, cp, lu)
+		for _, route := range a.hub.local.snapshot.Routes {
+			entry := service
+			entry.RouteID = int64(route.Id)
+			switch resource := route.Resource.(type) {
+			case *wire.RouteExport_ControlPoint:
+				entry.Kind, entry.Name = "CP", resource.ControlPoint.Name
+				if entry.Name == "SVC" {
+					entry.ManagedMAC = (store.ManagedCP{Suffix: serviceMACSuffix}).MACColon()
+					entry.ADPTADR = (store.ManagedCP{Suffix: serviceMACSuffix}).ADPTADR()
+				}
+			case *wire.RouteExport_LogicalUnit:
+				entry.Kind, entry.Name = "LU", resource.LogicalUnit.Lu.Name
+				entry.HostingCPNetID, entry.HostingCPName = resource.LogicalUnit.HostingCp.Netid, resource.LogicalUnit.HostingCp.Name
+				for _, kind := range resource.LogicalUnit.SupportedTypes {
+					entry.LUTypes = append(entry.LUTypes, localLUTypeLabel(kind))
+				}
+			default:
+				continue
+			}
+			exports = append(exports, entry)
+		}
 	}
 	return exports, nil
 }

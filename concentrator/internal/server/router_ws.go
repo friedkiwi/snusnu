@@ -79,6 +79,7 @@ type routeVersion struct {
 type routerHub struct {
 	a               *App
 	local           *routerSession
+	localServices   *localServiceRegistry
 	policyMu        sync.Mutex
 	blockMu         sync.Mutex
 	blockDenials    sync.Map // owner pair -> temporary denial while policy catches up

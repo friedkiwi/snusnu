@@ -51,10 +51,15 @@ func newLocalSNAService(h *routerHub) *localSNAService {
 	return &localSNAService{hub: h, circuits: make(map[string]*localSNACircuit)}
 }
 
-// StartLocalSNA publishes the concentrator's CP and APING LU for the lifetime
-// of ctx. Call it before accepting router connections.
+// StartLocalSNA publishes the concentrator's registered services for the
+// lifetime of ctx. Call it before accepting router connections.
 func (a *App) StartLocalSNA(ctx context.Context) error {
-	return a.hub.registerLocalService(ctx, newLocalSNAService(a.hub).handle)
+	aping := newLocalSNAService(a.hub)
+	return a.hub.registerLocalServices(ctx, localService{
+		LU: "PING", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
+		AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
+		Handle:       aping.handle,
+	})
 }
 
 func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {
