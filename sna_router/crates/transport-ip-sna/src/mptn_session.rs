@@ -13,7 +13,7 @@ use crate::{
     anynet::{TcpKind, TcpRecord, MAX_RECORD},
     mptn_bind_negotiation::validate_positive_response,
     mptn_compensations::{required_from_connect, CompensationSet},
-    mptn_connect::{Address, Connect, Direction},
+    mptn_connect::{Address, Connect, Direction, OptionalField, TransportRequirements},
     mptn_expedited::{Flow as ExpeditedFlow, Inbound as ExpeditedInbound},
     mptn_gateway::{mptn_normal_to_native, native_normal_to_mptn, NativeSessionAddress},
     mptn_segments::Reassembler,
@@ -111,6 +111,75 @@ fn reserve(pending: &mut usize, limit: usize, bytes: usize) -> io::Result<()> {
     }
     *pending = next;
     Ok(())
+}
+
+/// Build the TCP62 Connect envelope for a native-initiated user BIND.
+///
+/// The caller owns correlator uniqueness across live TCP62 sessions. The
+/// BIND image itself is installed by `GatewaySession::begin_native_bind`,
+/// after its route policy and implemented compensations have been checked.
+/// This supplies only the observed V5 TCP62 option profile; converting a
+/// native V4 BIND's negotiated capabilities remains a separate concern.
+pub fn connect_template_for_native_bind(
+    source_lu: &str,
+    destination_lu: &str,
+    piu: &[u8],
+    correlator: [u8; 8],
+) -> io::Result<Connect> {
+    let info = classify_bind(piu)
+        .map_err(|_| invalid("unsupported native LU6.2 BIND"))?
+        .ok_or_else(|| invalid("native PIU is not a BIND"))?;
+    if matches!(info.class, BindClass::Management { .. }) {
+        return Err(invalid("management BIND cannot open a user TCP62 session"));
+    }
+    if info.plu != source_lu || info.slu != destination_lu {
+        return Err(invalid("native BIND LU pair differs from outbound route"));
+    }
+    if correlator == [0; 8] {
+        return Err(state_error("TCP62 correlator must be freshly allocated"));
+    }
+    let request = Connect {
+        direction: Direction::Request,
+        processing: 0x0a,
+        ttl: 42,
+        source: encode_lu_name(source_lu)?,
+        destination: encode_lu_name(destination_lu)?,
+        correlator: correlator.to_vec(),
+        requirements: TransportRequirements {
+            max_record: MAX_RECORD as u32,
+            max_expedited: 0x76,
+            max_termination: 0x76,
+        },
+        options: vec![
+            OptionalField {
+                kind: 0x05,
+                processing: 0x08,
+                value: vec![1, 1],
+            },
+            OptionalField {
+                kind: 0x0a,
+                processing: 0x02,
+                value: vec![0x31],
+            },
+            OptionalField {
+                kind: 0x18,
+                processing: 0,
+                value: vec![1],
+            },
+            OptionalField {
+                kind: 0x19,
+                processing: 0x0a,
+                value: vec![0x00, 0x20, 0x01, 0x03, 0x10, 0x83],
+            },
+            OptionalField {
+                kind: 0x1a,
+                processing: 0,
+                value: vec![0x84],
+            },
+        ],
+    };
+    request.encode()?;
+    Ok(request)
 }
 
 impl GatewaySession {
@@ -579,8 +648,64 @@ mod tests {
         let mut response = request.clone();
         response.direction = Direction::PositiveResponse;
         response.processing = 0x8a;
-        response.options[0].value = hex("0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1");
+        response
+            .options
+            .iter_mut()
+            .find(|field| field.kind == 0x0a)
+            .unwrap()
+            .value = hex("0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1");
         TcpRecord::decode(response.encode().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn native_bind_builds_correlated_tcp62_connect_and_accepts_response() {
+        let bind = captured_user_bind();
+        let template =
+            connect_template_for_native_bind("SOLNET.SNAA", "SOLNET.SNAB", &bind, [0x41; 8])
+                .unwrap();
+        assert_eq!(template.correlator, [0x41; 8]);
+        assert_eq!(template.source.qualified_lu().unwrap(), "SOLNET.SNAA");
+        assert_eq!(template.destination.qualified_lu().unwrap(), "SOLNET.SNAB");
+        assert_eq!(
+            template
+                .options
+                .iter()
+                .map(|field| field.kind)
+                .collect::<Vec<_>>(),
+            [0x05, 0x0a, 0x18, 0x19, 0x1a]
+        );
+
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let request = session.begin_native_bind(&bind, template).unwrap();
+        let decoded = Connect::decode(&request.bytes).unwrap();
+        assert_eq!(decoded.correlator, [0x41; 8]);
+        assert_eq!(&decoded.connection_data()[..5], &[0, 0, 0x6b, 0x84, 0]);
+        let response = response_for(&decoded);
+        let native_response = session.receive_connect_response(&response).unwrap();
+        assert_eq!(
+            &native_response[..10],
+            &[0x2d, 0, 2, 1, 0, 0, 0xeb, 0x80, 0, 0x31]
+        );
+        assert_eq!(session.phase(), Phase::Established);
+    }
+
+    #[test]
+    fn native_connect_template_rejects_wrong_route_management_and_empty_correlator() {
+        let bind = captured_user_bind();
+        assert!(
+            connect_template_for_native_bind("SOLNET.SNAB", "SOLNET.SNAA", &bind, [1; 8]).is_err()
+        );
+        assert!(
+            connect_template_for_native_bind("SOLNET.SNAA", "SOLNET.SNAB", &bind, [0; 8]).is_err()
+        );
+        let management = native_bind(&[9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]);
+        assert!(connect_template_for_native_bind(
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            &management,
+            [1; 8]
+        )
+        .is_err());
     }
 
     #[test]
