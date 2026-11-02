@@ -24,6 +24,12 @@ requester then sent its normal close sequence. The captured exchange also
 included management BIND, CNOS, user BIND, FMH-5 Attach, pacing, and UNBIND.
 The Go packages and concentrator adapter implement these stages and cover
 them with a complete synthetic WebSocket circuit test. That test also checks
-the V4R4 extended pacing response and the no-echo positive response. The
-record vectors and synthetic test do not establish live guest interoperability
-with the embedded `SNUSNU.PING` LU.
+the V4R4 extended pacing response and the no-echo positive response.
+
+On 2026-11-02, an isolated V4R4 guest connected through the Rust LLC router
+to the embedded `SNUSNU.PING` LU in the Go concentrator. A
+`VFYAPPCCNN RMTLOCNAME(SNUSNU.PING) PKTLEN(16) NBRITER(1)` run reached
+APINGD, displayed the remote system type `OS/400`, and exchanged the 16-byte
+echo record. The wire trace then reached CONFIRM, BIS, and UNBIND without a
+concentrator reset. The guest's final command result was not captured, so the
+trace establishes the protocol exchange rather than a guest-reported pass.

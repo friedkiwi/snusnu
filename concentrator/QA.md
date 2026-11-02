@@ -9,6 +9,8 @@ go build -o snusnu-concentrator-qa ./cmd/snusnu-concentrator-qa
 
 It serves the same Go application and WebSocket protocol as the normal binary on all interfaces at port 8081 (`:8081`). Set `SNUSNU_LISTEN` or use `-listen` to choose another address and port; the flag takes precedence. The public origin defaults to `http://localhost:8081`; use `-origin` when the browser-facing address changes. Development mode is enabled, so registration and password-reset codes appear in the log. No SMTP, reCAPTCHA or MFA key setup is required. Preloaded accounts have verified emails and a 30-day MFA enrollment reminder deferral; MFA remains optional and can be enrolled through Settings.
 
+For an isolated guest that already uses another NETID, `-alice-netid SOLNET` changes only the Alice QA account's NETID in the new temporary database. Its router token stays the same. Use a separate `-listen` and `-origin` to keep this lab separate from another QA run.
+
 Every launch creates a new private directory under the OS temporary directory and a new `qa.sqlite` database in it. The database path is printed at startup. The QA binary **ignores** `SNUSNU_DB_DRIVER` and `SNUSNU_DB_DSN`, does not accept a database path flag, and creates the file exclusively. It cannot open or overwrite the normal concentrator's configured database. Previous QA databases are retained until removed by the operator or the OS temporary-directory cleanup.
 
 ## Accounts

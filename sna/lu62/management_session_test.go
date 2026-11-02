@@ -42,7 +42,7 @@ func TestManagementSessionRequiresAcknowledgedEgress(t *testing.T) {
 	if err := s.MarkCNOSSent(ipr, reply); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReceiveIPR([]byte{0x2f, 0, 1, 2, 0, 0, 0x83, 1, 0}); err != nil {
+	if err := s.ReceiveIPR([]byte{0x2e, 0, 1, 2, 0, 0, 0x83, 1, 0}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AckCNOS(); err != nil || s.Phase() != ManagementAwaitCNOSAck {

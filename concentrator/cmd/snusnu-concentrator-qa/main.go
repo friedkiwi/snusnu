@@ -25,7 +25,12 @@ func main() {
 	}
 	addr := flag.String("listen", listenDefault, "QA HTTP listen address (host:port or :port for all interfaces)")
 	origin := flag.String("origin", "http://localhost:8081", "QA public origin")
+	aliceNetID := flag.String("alice-netid", "QAALICE", "NETID for the isolated Alice QA fixture")
 	flag.Parse()
+	if !store.ValidNetID(*aliceNetID) {
+		log.Fatal("invalid Alice QA NETID")
+	}
+	qa.Accounts[1].NetID = *aliceNetID
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	db, path, err := createQAStore(ctx)

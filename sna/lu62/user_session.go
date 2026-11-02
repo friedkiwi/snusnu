@@ -49,7 +49,9 @@ type UserSession struct {
 	turnPositive       bool
 	turnAcks           uint8
 	turnAckGoal        uint8
+	confirmGrant       []byte
 	confirmReply       []byte
+	confirmAcks        uint8
 	bisGrant, bisReply []byte
 	bisPI              bool
 	bisAcks            uint8
@@ -242,7 +244,7 @@ func (s *UserSession) ReceiveIPR(data []byte) error {
 	if s.phase != UserActive && s.phase != UserAwaitTurnAck {
 		return ErrUserState
 	}
-	if !IsPacingResponse(data) || data[0] != s.bindRequest[0] || data[1] != 0 ||
+	if !IsPacingResponse(data) || data[0]&^byte(1) != s.bindRequest[0]&^byte(1) || data[1] != 0 ||
 		data[2] != s.bindRequest[2] || data[3] != s.bindRequest[3] ||
 		data[4] != 0 || data[5] != 0 {
 		return ErrUserState
@@ -252,21 +254,38 @@ func (s *UserSession) ReceiveIPR(data []byte) error {
 
 // PrepareConfirm answers the observed APPC CONFIRM/deallocate request only
 // after every mapped-data response has drained from the transport.
-func (s *UserSession) PrepareConfirm(request []byte) ([]byte, error) {
-	if s.phase != UserActive || len(request) != 12 || request[0]&2 != s.bindRequest[0]&2 || request[1] != 0 ||
+func (s *UserSession) PrepareConfirm(request []byte) ([]byte, []byte, error) {
+	if s.phase != UserActive || (len(request) != 12 && len(request) != 14) || request[0]&2 != s.bindRequest[0]&2 || request[1] != 0 ||
 		request[2] != s.bindRequest[2] || request[3] != s.bindRequest[3] ||
 		uint16(request[4])<<8|uint16(request[5]) != s.remoteSequence+1 ||
-		!bytes.Equal(request[6:], []byte{0x4b, 0xa0, 1, 4, 0, 6}) {
-		return nil, ErrUserState
+		request[6] != 0x4b || request[7]&^byte(1) != 0xa0 || request[8] != 1 ||
+		!bytes.Equal(request[9:12], []byte{4, 0, 6}) ||
+		(len(request) == 14 && !bytes.Equal(request[12:], []byte{0, 0})) {
+		return nil, nil, ErrUserState
+	}
+	if request[7]&1 != 0 {
+		trial := *s.pacing
+		if err := trial.ReceiveRequest(true); err != nil {
+			return nil, nil, err
+		}
+		if trial.GrantPending() {
+			s.confirmGrant = []byte{s.bindRequest[0], 0, s.bindRequest[3], s.bindRequest[2], 0, 0, 0x83, 1, 0}
+		}
+		s.pacing = &trial
 	}
 	s.confirmReply = []byte{request[0], 0, s.bindRequest[3], s.bindRequest[2], 0x80, 0, 0xcb, 0xa0, 0, 4}
 	s.phase = UserConfirmPrepared
-	return append([]byte(nil), s.confirmReply...), nil
+	return append([]byte(nil), s.confirmGrant...), append([]byte(nil), s.confirmReply...), nil
 }
 
-func (s *UserSession) MarkConfirmSent(reply []byte) error {
-	if s.phase != UserConfirmPrepared || !bytes.Equal(reply, s.confirmReply) {
+func (s *UserSession) MarkConfirmSent(grant, reply []byte) error {
+	if s.phase != UserConfirmPrepared || !bytes.Equal(grant, s.confirmGrant) || !bytes.Equal(reply, s.confirmReply) {
 		return ErrUserState
+	}
+	if len(grant) != 0 {
+		if err := s.pacing.GrantReceiveWindow(); err != nil {
+			return err
+		}
 	}
 	s.remoteSequence++
 	s.phase = UserAwaitConfirmAck
@@ -274,11 +293,15 @@ func (s *UserSession) MarkConfirmSent(reply []byte) error {
 }
 
 func (s *UserSession) AckConfirm() error {
-	if s.phase != UserAwaitConfirmAck {
+	if s.phase != UserAwaitConfirmAck || s.confirmAcks >= 1+uint8(len(s.confirmGrant)/9) {
 		return ErrUserState
 	}
-	s.confirmReply = nil
-	s.phase = UserConfirmed
+	s.confirmAcks++
+	if s.confirmAcks == 1+uint8(len(s.confirmGrant)/9) {
+		s.confirmGrant, s.confirmReply = nil, nil
+		s.confirmAcks = 0
+		s.phase = UserConfirmed
+	}
 	return nil
 }
 

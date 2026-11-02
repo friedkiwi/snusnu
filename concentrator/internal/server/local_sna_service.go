@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/friedkiwi/snusnu/sna"
@@ -106,6 +107,7 @@ func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {
 		err = s.credit(c, credit.AllowanceBytes)
 	}
 	if err != nil {
+		log.Printf("local SNA circuit %s reset: %v (XID ready=%t, link ready=%t, management phase=%d, user active=%t)", id, err, c.xid.Ready(), c.linkReady, c.management.Phase(), c.user != nil)
 		delete(s.circuits, id)
 		s.hub.resetCircuit(id, wire.ResetReason_RESET_REASON_PROTOCOL)
 	}
@@ -121,7 +123,7 @@ func (s *localSNAService) open(open *wire.IncomingOpen, source LocalPeer) {
 		reject()
 		return
 	}
-	localXID, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x45}, 1, xid3.Primary)
+	localXID, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x45}, 1, xid3.Secondary)
 	if err != nil {
 		reject()
 		return
@@ -291,6 +293,15 @@ func (s *localSNAService) dispatch(c *localSNACircuit, data []byte) error {
 	}
 	if bind != nil {
 		if bind.Management {
+			// V4R4 addresses SNASVCMG to the selected remote location LU
+			// when that LU differs from the adjacent CP.
+			if c.management.Phase() == lu62.ManagementAwaitBind && bind.SLU == "SNUSNU.PING" {
+				management, err := lu62.NewManagementSession(c.peer.NetID+"."+c.peer.CP, bind.SLU)
+				if err != nil {
+					return err
+				}
+				c.management = management
+			}
 			response, err := c.management.PrepareBind(data)
 			if err != nil {
 				return err
@@ -312,6 +323,7 @@ func (s *localSNAService) dispatch(c *localSNACircuit, data []byte) error {
 		}
 		response, err := user.PrepareBind(data)
 		if err != nil {
+			log.Printf("local SNA user BIND rejected: %v (peer=%s.%s, PLU=%s, SLU=%s, mode=%q)", err, c.peer.NetID, c.peer.LU, bind.PLU, bind.SLU, bind.Mode)
 			return err
 		}
 		c.user = user
@@ -391,15 +403,20 @@ func (s *localSNAService) dispatch(c *localSNACircuit, data []byte) error {
 		return c.user.MarkAttachGrantSent(grant)
 	}
 	if c.user.Phase() == lu62.UserActive {
-		if len(data) == 12 && bytes.Equal(data[6:9], []byte{0x4b, 0xa0, 1}) {
-			response, err := c.user.PrepareConfirm(data)
+		if len(data) >= 12 && data[6] == 0x4b && data[7]&^byte(1) == 0xa0 && data[8] == 1 {
+			grant, response, err := c.user.PrepareConfirm(data)
 			if err != nil {
 				return err
+			}
+			if len(grant) != 0 {
+				if err := s.sendInformation(c, grant, c.user.AckConfirm); err != nil {
+					return err
+				}
 			}
 			if err := s.sendInformation(c, response, c.user.AckConfirm); err != nil {
 				return err
 			}
-			return c.user.MarkConfirmSent(response)
+			return c.user.MarkConfirmSent(grant, response)
 		}
 		var responseRU []byte
 		if !c.appVersioned {

@@ -62,7 +62,7 @@ func TestUserSessionGatesFirstAttachOnBindAck(t *testing.T) {
 	if err := s.AckTurn(); err != nil || s.Phase() != UserActive {
 		t.Fatalf("turn ACK: %v", err)
 	}
-	if err := s.ReceiveIPR([]byte{0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0}); err != nil {
+	if err := s.ReceiveIPR([]byte{0x2e, 0, 2, 2, 0, 0, 0x83, 1, 0}); err != nil {
 		t.Fatal(err)
 	}
 	packet, _ := hex.DecodeString("001412ff00000000000000000000000000000000")
@@ -96,11 +96,11 @@ func TestUserSessionGatesFirstAttachOnBindAck(t *testing.T) {
 		t.Fatalf("no-echo ACK: %v", err)
 	}
 	confirm := []byte{0x2e, 0, 2, 2, 0, 5, 0x4b, 0xa0, 1, 4, 0, 6}
-	reply, err = s.PrepareConfirm(confirm)
-	if err != nil || !bytes.Equal(reply, []byte{0x2e, 0, 2, 2, 0x80, 0, 0xcb, 0xa0, 0, 4}) {
-		t.Fatalf("confirm: %x %v", reply, err)
+	grant, reply, err = s.PrepareConfirm(confirm)
+	if err != nil || len(grant) != 0 || !bytes.Equal(reply, []byte{0x2e, 0, 2, 2, 0x80, 0, 0xcb, 0xa0, 0, 4}) {
+		t.Fatalf("confirm: %x %x %v", grant, reply, err)
 	}
-	if err := s.MarkConfirmSent(reply); err != nil {
+	if err := s.MarkConfirmSent(grant, reply); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AckConfirm(); err != nil || s.Phase() != UserConfirmed {
@@ -130,5 +130,28 @@ func TestUserSessionGatesFirstAttachOnBindAck(t *testing.T) {
 	}
 	if err := s.AckUnbind(); err != nil || s.Phase() != UserClosed {
 		t.Fatalf("UNBIND ACK: %v", err)
+	}
+}
+
+func TestUserConfirmWithPacingAndExtendedClose(t *testing.T) {
+	pacing, err := NewFixedPacing(3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &UserSession{phase: UserActive, bindRequest: []byte{0x2d, 0, 2, 2}, pacing: pacing, remoteSequence: 3}
+	request := []byte{0x2c, 0, 2, 2, 0, 4, 0x4b, 0xa1, 1, 4, 0, 6, 0, 0}
+	grant, reply, err := s.PrepareConfirm(request)
+	if err != nil || !bytes.Equal(grant, []byte{0x2d, 0, 2, 2, 0, 0, 0x83, 1, 0}) ||
+		!bytes.Equal(reply, []byte{0x2c, 0, 2, 2, 0x80, 0, 0xcb, 0xa0, 0, 4}) {
+		t.Fatalf("extended confirm: %x %x %v", grant, reply, err)
+	}
+	if err := s.MarkConfirmSent(grant, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckConfirm(); err != nil || s.Phase() != UserAwaitConfirmAck {
+		t.Fatalf("grant acknowledgement: %v", err)
+	}
+	if err := s.AckConfirm(); err != nil || s.Phase() != UserConfirmed {
+		t.Fatalf("confirm acknowledgement: %v", err)
 	}
 }

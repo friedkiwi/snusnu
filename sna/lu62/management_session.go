@@ -169,7 +169,9 @@ func (s *ManagementSession) ReceiveIPR(data []byte) error {
 	if s.phase != ManagementAwaitCNOSAck && s.phase != ManagementCNOSComplete {
 		return ErrManagementState
 	}
-	if !IsPacingResponse(data) || data[0] != s.bindRequest[0] || data[1] != 0 || data[2] != s.bindRequest[2] || data[3] != s.bindRequest[3] || data[4] != 0 || data[5] != 0 {
+	// V4R4 may return the IPR on the normal-flow TH used by CNOS,
+	// rather than the expedited-flow TH used by the BIND.
+	if !IsPacingResponse(data) || data[0]&^byte(1) != s.bindRequest[0]&^byte(1) || data[1] != 0 || data[2] != s.bindRequest[2] || data[3] != s.bindRequest[3] || data[4] != 0 || data[5] != 0 {
 		return ErrManagementState
 	}
 	return s.pacing.ReceiveIPR()
