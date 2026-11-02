@@ -2121,7 +2121,7 @@ impl AutoWsHub {
         } else {
             return Err(protocol("automatic v2 circuit requires a published source route"));
         }
-        let mut port = self.new_port(local_cp, target_cp, target_lu, source_route, HashSet::new());
+        let mut port = self.new_port(local_cp, target_cp, target_lu, source_route, HashSet::new())?;
         port.target = Some(target);
         Ok(port)
     }
@@ -2151,10 +2151,17 @@ impl AutoWsHub {
         let local_is_lu = matches!(self.local_route(local_ref).and_then(|route| route.resource.as_ref()),
             Some(wire::route_export::Resource::LogicalUnit(_)));
         if local_is_lu != target_lu.is_some() { return Ok(None) }
-        let mut port = self.new_port(
+        let mut port = match self.new_port(
             local_cp, target_cp, target_lu, Some(local_ref.clone()),
             HashSet::from([local_ref.route_id]),
-        );
+        ) {
+            Ok(port) => port,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.reject_incoming(&open, wire::OpenFailure::Busy)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         port.target = Some(source_ref.clone());
         port.incoming_open(open)?;
         Ok(Some(port))
@@ -2164,14 +2171,20 @@ impl AutoWsHub {
         &mut self, local_cp: wire::SnaName, target_cp: wire::SnaName,
         target_lu: Option<wire::SnaName>, source_route: Option<wire::RouteReference>,
         local_route_ids: HashSet<u64>,
-    ) -> WsRoutePort {
+    ) -> io::Result<WsRoutePort> {
         let mut shared = self.shared.borrow_mut();
+        if shared.inbox.len().saturating_sub(shared.auto_free_indexes.len())
+            >= self.welcome.max_circuits as usize
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "concentrator circuit limit reached"));
+        }
         let index = if let Some(index) = shared.auto_free_indexes.pop() { index } else {
             shared.inbox.push(VecDeque::new());
             shared.inbox.len() - 1
         };
         drop(shared);
-        WsRoutePort {
+        Ok(WsRoutePort {
             shared: self.shared.clone(), index, welcome: self.welcome.clone(),
             local_cp, local_route_ids, target_cp, target_lu, target: None, source_route,
             require_managed_binding: false, managed_binding_seen: false, managed_mac: None,
@@ -2180,7 +2193,7 @@ impl AutoWsHub {
             pending_type1: VecDeque::new(), pending_information: VecDeque::new(),
             downstream_sizes: VecDeque::new(), outbound_completions: OutboundCompletions::default(),
             inbound_open: None, auto_owned: true,
-        }
+        })
     }
 }
 
@@ -2425,7 +2438,7 @@ mod tests {
             socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::Welcome(
                 wire::RouterWelcome {
                     router_id: vec![7; 16], connection_epoch: vec![8; 16],
-                    max_message_bytes: 65536, max_circuits: 4,
+                    max_message_bytes: 65536, max_circuits: 1,
                     display_name: "auto router".into(), allowed_netid: "OWNED".into(),
                 })).encode_to_vec().into())).unwrap();
             let mut local_cp_route = None;
@@ -2503,7 +2516,7 @@ mod tests {
         }
         assert_eq!(hub.resolve_lu(&target).unwrap().unwrap().1,
             Some(name("TARGET", "CPB")));
-        assert!(hub.open_lu(&target, &source).unwrap().is_some());
+        let lu_port = hub.open_lu(&target, &source).unwrap().unwrap();
         let mac = [0x02, 0x53, 0x4e, 0, 0, 1];
         for _ in 0..1000 {
             hub.poll_incoming().unwrap();
@@ -2519,6 +2532,10 @@ mod tests {
         let (target_ref, target_cp) = hub.resolve_mac(&mac).unwrap().unwrap();
         let local_cp = name("OWNED", "CPA");
         let source_ref = hub.local_reference_cp(&local_cp).unwrap();
+        assert_eq!(hub.open_ref(target_ref.clone(), target_cp.clone(), None,
+            Some(source_ref.clone()), local_cp.clone()).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock);
+        drop(lu_port);
         let mut cp_port = hub.open_ref(target_ref, target_cp, None,
             Some(source_ref), local_cp).unwrap();
         cp_port.send(RoutedUnit::DlcType1(vec![4, 4, 0xaf])).unwrap();
