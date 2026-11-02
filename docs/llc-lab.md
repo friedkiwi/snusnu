@@ -1,5 +1,11 @@
 # Local LLC2 and SNA lab
 
+This is a chronological record of the local LLC2 probes. The later router and
+concentrator now carry live APPC circuits, and the embedded Go APING service
+reached version, echo, and wire-level close with a V4R4 guest. See [runtime
+status](router-runtime.md) and [APING evidence](test-vectors/aping-v4r4.md)
+for current support; the probe limits below describe those individual runs.
+
 The Rust router's `--lab-link` mode joins two isolated Linux TAP interfaces. It relays LLC TEST and XID frames, terminates LLC2 separately on each interface, and forwards accepted SNA information fields in order. The OS/400 guests own XID3, APPC sessions, and APPN names. This mode is a fixed two-peer test path for local interoperability.
 
 ## V4R4 emulator setup
@@ -339,7 +345,7 @@ probe then deliberately sent DISC without answering the Attach. A returned
 to Main Menu with APPC failure `E022000BA2100000`; no remote Sign On or user
 conversation completed. The private capture
 `/tmp/snusnu-v4r4-regression/native-userbind2-sol5.pcap` has 50 frames and
-no capture drops. The next native milestone is a valid user FMH-5 reply and
+no capture drops. At that point, the next native milestone was a valid user FMH-5 reply and
 conversation handling, with the opaque tail treated as application data.
 
 The subsequent opt-in user pacing probe buffered that same 242-byte Attach
@@ -372,9 +378,9 @@ cargo run -p snusnu-router -- --native-converter-mock-lab /path/to/native-probe.
 ```
 
 For this fixture the configured user LU pair must match the management CP
-pair. The mock alone advertises the six TCP62 compensation codes needed by
-the converter test. Those codes are unavailable in the normal route loader
-until UDP X'83' and later APPC handlers exist. A successful harness exit
+pair. The mock alone advertised the six TCP62 compensation codes needed by
+the converter test; the normal route loader did not yet enable them in this
+probe revision. A successful harness exit
 means one Attach crossed the LLC-to-TCP62 boundary and its local pacing
 response was acknowledged; it does not mean the application conversation
 completed.

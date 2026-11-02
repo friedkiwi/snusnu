@@ -1,6 +1,6 @@
 # V5R4 TCP62 to V4R4 LLC2 across WebSocket
 
-Target path: a V5R4 OS/400 guest initiates TCP62/AnyNet to Rust router A; A connects through the Go concentrator to Rust router B; B reaches a V4R4 OS/400 guest over LLC2. A and B belong to different users with different server-assigned NETIDs. The opt-in QA gateway reached the V4R4 remote Sign On through this path twice. Ordinary `--config` gateway use remains gated by QA-specific native addressing and one-session runtime behavior; see [the live lab record](cross-netid-lab.md). The design discussion below records how the gateway was built and which protocol boundaries remain relevant.
+Target path: a V5R4 OS/400 guest initiates TCP62/AnyNet to Rust router A; A connects through the Go concentrator to Rust router B; B reaches a V4R4 OS/400 guest over LLC2. A and B belong to different users with different server-assigned NETIDs. The configured gateway reached remote Sign On in both initiation directions, including a repeated session without restarting the router. It remains a one-circuit runtime with teardown gaps; see [the live lab record](cross-netid-lab.md). The design discussion below records the protocol boundaries.
 
 ## Use the existing native circuit event profile
 
@@ -16,7 +16,7 @@ The smallest data-plane design is for A to terminate TCP62 and present a **virtu
 
 The `sna_information` payload is an LLC2 information field, so it may contain only part of a PIU. Any converter that needs complete BIND, FM or UNBIND units must reassemble and segment as needed. Go forwards the existing binary events in circuit order and accounts `sna_information` bytes against current credit. It has no TCP62, XID or PIU parser. Putting raw TCP62 records directly in `sna_information` would violate the native circuit contract.
 
-The difficult part was A's virtual APPN CP/link and management-session behavior. The V4R4 guest saw a peer CP in A's NETID through XID3/link setup and SNASVCMG/CNOS/BIS exchange. Captured V4R4/V5R4 traces drove native TH address assignment, BIND response correlation and pacing through the first remote display. Full sign-on, normal teardown and a live UDP X'83' exchange remain unverified.
+The difficult part was A's virtual APPN CP/link and management-session behavior. The V4R4 guest saw a peer CP in A's NETID through XID3/link setup and SNASVCMG/CNOS/BIS exchange. Captured V4R4/V5R4 traces drove native TH address assignment, BIND response correlation and pacing through remote Sign On. Clean teardown and a live UDP X'83' exchange remain unverified.
 
 ## Open-time source identity
 
@@ -39,6 +39,6 @@ The gateway requires the negotiated `snusnu.v2` subprotocol for source-LU author
 
 ## Implementation record and remaining gates
 
-The opt-in gateway now converts V5 inbound Connect to a native virtual DLC/CP endpoint, holds the TCP62 positive until native BIND acceptance, and preserves backpressure through the WebSocket circuit. The concentrator checks live source and target LU route references under v2. B's LLC-facing proxy uses the concentrator-managed CP MAC. The QA run covered Connect, cross-NETID open, XID3, V4 management and user BIND, FMH-5, pacing and the first remote display. Remaining live checks include full sign-on, normal teardown, failure/reconnect and UDP X'83' handling. The ordinary configured gateway still needs generic native session address assignment and a multi-session runtime.
+The configured gateway converts V5 inbound Connect to a native virtual DLC/CP endpoint, holds the TCP62 positive until native BIND acceptance, and preserves backpressure through the WebSocket circuit. The concentrator checks live source and target LU route references under v2. B's LLC-facing proxy uses the concentrator-managed CP MAC. QA runs covered Connect, cross-NETID open, XID3, V4 management and user BIND, FMH-5, pacing, remote Sign On, and sequential initiation in both directions. Remaining live checks include clean teardown, concurrent sessions, failure/reconnect, and UDP X'83' handling. General native address selection and a multi-session runtime remain open.
 
 IBM's [TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00) describes MPTN access-node framing but leaves MPTN gateway control-flow conversion beyond its scope. See [the WebSocket contract](websocket-protocol.md) and [route advertisement schema](route-advertisements.md) for the circuit protocol.

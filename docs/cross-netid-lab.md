@@ -251,7 +251,7 @@ working. Bob has no remote-location definition for `QAALICE.SNAC`, so the
 second selector was not exercised by a live OS/400 Connect. Repeated
 sessions on one target and native-initiated LLC-to-MPTN routing remain
 unverified here. Both Rust routers and the QA concentrator were stopped
-after the run; the isolated Solstice guests remain booted.
+after the run; the isolated lab guests remain booted.
 
 ## Concentrator to local MPTN peer on 2026-11-02
 
@@ -289,7 +289,7 @@ response, and Alice reported a communications failure for `SNAB00`.
 At that point normal teardown in this direction remained unverified. After the test,
 Alice's controller was restored to `INLCNN(*ANS)` and varied on; both Rust
 routers and QA concentrator were stopped. Ports 397 and 8081 had no
-listeners. The isolated Solstice guests remain booted.
+listeners. The isolated lab guests remain booted.
 
 ### Final return-home retest
 
@@ -318,7 +318,7 @@ Private evidence is in `/tmp/snusnu-cross-netid/ws-reverse-bob-final.log`,
 `ws-reverse-sysreq-sol8.pcap` (24 packets); both captures had zero drops.
 Alice's `SNAB` was restored to `INLCNN(*ANS)` and `ADPTADR(02534E000002)`,
 verified by `DSPCTLD`. Both Rust routers and the QA concentrator were
-stopped, with no listeners on ports 397 or 8081. The isolated Solstice
+stopped, with no listeners on ports 397 or 8081. The isolated lab
 guests remain booted. No remote sign-on credentials were entered.
 
 ## One configured Bob gateway, both initiation directions
@@ -341,7 +341,7 @@ router recovery are recorded in
 `/tmp/snusnu-cross-netid/bob-duplex-reverse.log`.
 
 The reverse session's native teardown sends a normal-flow DFC BIS request
-(`RH 4b9100`, RU `70`). The converter currently expects an FM request and
+(`RH 4b9100`, RU `70`). In this run the converter expected an FM request and
 raises `later native PIU is not an FM request`; Bob's router logs the session
 error, recreates its circuit, and remains available. Alice's dial controller
 briefly reopened an idle native link before it was varied off. The earlier

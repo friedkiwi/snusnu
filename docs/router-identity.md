@@ -4,13 +4,7 @@ The concentrator owns each Rust router's identity. During user registration, eac
 
 Authentication resolves `token hash → credential record → router_id`. A router may have more than one credential during rotation; revoking one credential does not rename the router. Each credential has its own creation, expiry/revocation and purpose. Revocation of an active credential closes or revalidates its WebSocket and withdraws its live routes. The concentrator stamps `router_id` on every relayed snapshot and checks it on circuit opens. The bearer token must travel over TLS and must not appear in logs; any holder can use it while valid ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html)).
 
-The current Go `api_clients` table is **user-scoped** and its bearer authentication resolves to a user for read-only APIs. It does not identify a router. Router onboarding therefore needs separate records or an explicitly router-scoped credential type. An illustrative server data model is:
-
-```text
-routers(id UUID PRIMARY KEY, owner_id, site_id NULL, display_name, status)
-router_credentials(id, router_id REFERENCES routers(id), secret_hash UNIQUE,
-                   created_at, expires_at, revoked_at)
-```
+Go keeps read-only `api_clients` **user-scoped** and `router_credentials` **router-scoped**. The former resolve to a user; the latter authenticate a WebSocket and resolve to a stable row in `routers`. Credential rows hold a secret hash, purpose, creation and optional expiry/revocation times. See the versioned schema in [`concentrator/internal/store/store.go`](../concentrator/internal/store/store.go).
 
 The Go web service uses versioned migrations for router records, router-scoped credentials, profiles, blocks and diagnostics. The WebSocket endpoint authenticates router bearer tokens before upgrade and sends `RouterWelcome` with the server-owned router UUID, display name, owner NETID and fresh connection epoch. A snapshot is rejected if a CP, LU, or hosting CP uses any other NETID. Changing the profile NETID fences all of the user's router epochs and withdraws their advertisements.
 

@@ -157,7 +157,7 @@ pub fn connect_template_for_route(
         destination: encode_lu_name(destination_lu)?,
         correlator: correlator.to_vec(),
         requirements: TransportRequirements {
-            // Match the V5R4 user Connect profile observed on Solstice.
+            // Match the V5R4 user Connect profile observed in the lab.
             max_record: 0x8005,
             max_expedited: 0x76,
             max_termination: 0x76,

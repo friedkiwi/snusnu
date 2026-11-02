@@ -461,7 +461,7 @@ fn format_mac(mac: [u8; 6]) -> String {
     )
 }
 
-/// The staged Solstice diagnostic uses the same session runner as a future
+/// The staged lab diagnostic uses the same session runner as a future
 /// ordinary route. The fixture supplies the native XID and LU6.2 TP policy;
 /// the command line chooses the two MPTN addresses.
 pub(crate) fn run_probe(path: &Path, local_ip: IpAddr, peer_ip: IpAddr) -> io::Result<()> {

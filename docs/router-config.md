@@ -1,6 +1,6 @@
 # Rust router configuration
 
-`snusnu-router --config FILE` starts multiple independent LLC2 associations and explicit routes. Each `[[llc]]` entry names the guest MAC on one Linux Ethernet interface; `guest_mac` is always required. For an LLC-to-LLC route, each endpoint uses the opposite peer's `guest_mac` as its local proxy address by default. For an LLC route to a non-LLC target, `[[route]] proxy_mac` can specify the local address the guest contacts; a concentrator route normally obtains it from the server's managed CP binding instead. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
+`snusnu-router --config FILE` starts multiple independent LLC2 associations and routes. Explicit `[[route]]` entries bind configured peers; with no `[[route]]` entries, the [automatic runtime](automatic-routing.md) selects supported destinations from local observations and the concentrator directory. Each `[[llc]]` entry names the guest MAC on one Linux Ethernet interface; `guest_mac` is always required. For an LLC-to-LLC route, each endpoint uses the opposite peer's `guest_mac` as its local proxy address by default. For an LLC route to a non-LLC target, `[[route]] proxy_mac` can specify the local address the guest contacts; a concentrator route normally obtains it from the server's managed CP binding instead. Several entries may use the same TAP. The process needs permission to open AF_PACKET sockets (for example, `CAP_NET_RAW`).
 
 For the two V4R4 guests used in [the LLC lab](llc-lab.md), save this as `router.toml`:
 
@@ -273,7 +273,7 @@ The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the con
 ## Standalone LLC to MPTN gateway
 
 An ordinary `--config` route can convert a native LLC2 LU6.2 session into
-TCP62 for one local MPTN peer. This staged Solstice example uses V4R4 on
+TCP62 for one local MPTN peer. This staged lab example uses V4R4 on
 `sol5` as the initiator and V5R4 at `10.99.4.3` as the MPTN destination:
 
 ```toml
@@ -313,7 +313,7 @@ session remains open until a peer closes it or the router stops. The loader requ
 one bidirectional route, one exported LLC LU, and matching CP/LU NETIDs.
 The converter runs one isolated circuit at a time and rearms after it closes.
 It handles TCP62 normal records and correlated UDP X'83' expedited delivery
-and normal-end abort; unsupported termination RUs fail closed. The [Solstice lab](anynet-lab.md)
+and normal-end abort; unsupported termination RUs fail closed. The [AnyNet lab](anynet-lab.md)
 records a V4R4-to-V5R4 Sign On through this ordinary config path.
 
 ### Concentrator to a local MPTN peer

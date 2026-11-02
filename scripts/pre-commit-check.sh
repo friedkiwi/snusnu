@@ -75,8 +75,8 @@ if $check_protocol; then
   test -f "$check_dir/tree/docs/protocol.md"
   test -d "$check_dir/tree/docs/test-vectors"
   test -f "$check_dir/tree/docs/test-vectors/README.md"
-  grep -q '## Goals and proposed invariants' "$check_dir/tree/docs/protocol.md"
-  grep -q 'No vectors are invented before the layout is defined' "$check_dir/tree/docs/test-vectors/README.md"
+  grep -q '## Implemented invariants' "$check_dir/tree/docs/protocol.md"
+  grep -q '## Captured vectors' "$check_dir/tree/docs/test-vectors/README.md"
 fi
 
 echo "pre-commit: all CI checks passed"

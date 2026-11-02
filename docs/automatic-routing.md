@@ -9,6 +9,10 @@ logged; frames are never broadcast to every attachment. Each accepted
 session owns a private circuit and flow-control state. Explicit `[[route]]`
 configs retain their current behavior.
 
+Automatic mode currently supports the configured LLC, MPTN gateway, and one
+concentrator connection. HPR/IP, HPR LAN, and MPTN relay attachments are
+rejected in automatic mode; use their explicit routes instead.
+
 The concentrator's Welcome assigns one NETID to an authenticated router.
 Automatic publication includes only **locally observed** CP/LU identities in
 that NETID. Other local identities remain available for local routing. A

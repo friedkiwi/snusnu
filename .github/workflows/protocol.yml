@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Check draft contract
+      - name: Check protocol documentation
         run: |
           test -f docs/protocol.md
           test -d docs/test-vectors
           test -f docs/test-vectors/README.md
-          grep -q '## Goals and proposed invariants' docs/protocol.md
-          grep -q 'No vectors are invented before the layout is defined' docs/test-vectors/README.md
+          grep -q '## Implemented invariants' docs/protocol.md
+          grep -q '## Captured vectors' docs/test-vectors/README.md

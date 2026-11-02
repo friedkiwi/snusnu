@@ -85,7 +85,7 @@ layer. They are not LU session attributes.
    lengths/queues, timer behavior, duplicate and out-of-order XID/TEST,
    wrong UDP IP/priority port, RTP gaps/duplicates/wraparound, stale ACKs,
    qualifier mismatch, and cleanup after a peer or upstream failure.
-3. Run a live Solstice V5R4 `LINKTYPE(*HPRIP)` peer against the new Rust
+3. Run a live V5R4 `LINKTYPE(*HPRIP)` peer against the new Rust
    endpoint and show active TG, control-flow RTP, user session BIND, data and
    clean UNBIND. A Sign On reached via an opaque EE relay is insufficient.
 4. Route that session through the shared contract to another V5R4 HPR/IP

@@ -1,3 +1,7 @@
-# Shared protocol vectors
+# Shared protocol evidence
 
-Once the `snusnu.v1` byte layout is specified, this directory will contain language-neutral successful decode, canonical encode, malformed-input rejection, and appropriate state-transition fixtures. Go and Rust implementations must consume identical fixtures. No vectors are invented before the layout is defined.
+## Captured vectors
+
+- [V4R4 APING application records](aping-v4r4.md) contain decoded version, echo, and no-echo records from the guest lab. The Go APING package and concentrator circuit tests use those shapes.
+
+The versioned WebSocket schema is in [`proto/`](../../proto/). Go and Rust protocol tests live beside their implementations; this directory records safe, trace-backed cross-language evidence. Private raw captures and application data stay outside the repository.

@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn admits_captured_bob_management_token_24_with_matching_repeated_token() {
-        // Sanitized 2026-11-02 Solstice management Connect shape: the live
+        // Sanitized 2026-11-02 V5R4 management Connect shape: the live
         // PLU generated X'24', its dynamic flag was 00, and X'13' repeated
         // the seven-byte token exactly. All other fixed fields are generated
         // by the same validated V5R4 management request constructor.

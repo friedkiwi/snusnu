@@ -2,7 +2,7 @@
 
 The Rust router publishes **exported reachability** over its optional WebSocket connection. It does not publish its private route table, TAP names or local converter internals. An export says that this router currently offers a network-qualified SNA control point or LU/location to remote routers. Local-only routes still work with no WebSocket or concentrator. See [OS/400 SNA names](os400-sna-names.md) for the distinction between CP, LU, system name and site ID.
 
-The v1 wire schema is [`proto/snusnu_routes_v1.proto`](../proto/snusnu_routes_v1.proto). These protobuf messages ride inside the versioned [WebSocket envelope](websocket-protocol.md); Go and Rust generate bindings from the same schema. The `snusnu.v1` WebSocket subprotocol and server Welcome establish the version and connection epoch before route messages. A protobuf encoding is binary but need not have a byte-for-byte canonical serialization: receivers validate the decoded fields and tests check the same semantic values.
+The route schema is [`proto/snusnu_routes_v1.proto`](../proto/snusnu_routes_v1.proto). Its messages ride inside the versioned [WebSocket envelope](websocket-protocol.md); Go and Rust generate bindings from the same schema. Both `snusnu.v1` and `snusnu.v2` use `RouterWelcome` to establish the connection epoch before route messages. Protobuf encoding need not be byte-for-byte canonical: receivers validate decoded fields.
 
 ## Snapshot and identity
 
@@ -12,7 +12,7 @@ The concentrator creates a stable UUID when a Rust router is onboarded. After We
 
 Each export has a nonzero opaque `id`, stable while it denotes the same configured target, and a nonzero `generation` that increments when that ID is retargeted. A remote circuit `OPEN` references `(router ID, epoch, id, generation)` through `RouteReference`. The owning router rechecks current readiness and permission when it receives `OPEN`; a published route is not an unconditional promise of capacity. The remote routing table is keyed by router ID and route ID. Duplicate matching resources of the same kind, whether within one router or across routers, require an explicit preference or cause an ambiguous-route error.
 
-Only **locally originated** exports may be published in version 1. A route learned from WebSocket is never re-exported. The concentrator does not reflect a router's routes to itself. This gives the hub topology a clear loop rule; transitive advertisement would need a separate path-vector design.
+Only **locally originated** exports may be published. A route learned from WebSocket is never re-exported. The concentrator does not reflect a router's routes to itself. It also publishes its own `SNUSNU.SVC` CP and `SNUSNU.PING` LU 6.2 as a server-owned local route origin. That service appears in the browser and API global directory, with CP MAC `02:53:4E:FF:FF:FF`. Transitive advertisement would need a separate path-vector design.
 
 ## SNA resource identity and local mappings
 
@@ -24,8 +24,8 @@ Route discovery is independent of encapsulation, but the data plane still needs 
 
 ## Validation and limits
 
-The first implementation should enforce a 64 KiB maximum encoded snapshot size, at most 256 entries and 512 encoded bytes per entry, unique nonzero IDs, 16-byte epochs, and nonzero monotonic revisions and generations. Each SNA network ID, CP name and LU name must be a valid 1–8 character SNA name in canonical uppercase; a LU entry must contain its LU name, and a hosting CP, if present, must have both name components. It must reject malformed, duplicate or oversized entries before installing any part of a snapshot. Limit protobuf parse allocation as well as post-decode values. Frame-level limits and unknown-field policy belong to the common control envelope.
+The implemented limits include a 64 KiB encoded WebSocket message, at most 256 route exports per snapshot, unique nonzero route IDs, a 16-byte epoch, and nonzero increasing revisions and generations. SNA NETIDs, CP names, and LU names use canonical 1–8 character uppercase SNA names; hosting CP fields must be complete. The server rejects invalid or duplicate exports before replacing the previous set. The route-ID history is bounded per connection. See [WebSocket protocol](websocket-protocol.md) for frame and circuit limits.
 
-The Go directory table currently represents planning data. Live advertisements have separate connection-scoped state and must be intersected with authorization before relay. Go needs only authenticated router ID and typed SNA resource identity for validation/filtering; it does not parse SNA PIUs or perform protocol conversion. Circuit forwarding uses `RouteReference` and checks the referenced router and generation again at the destination.
+The old planning directory remains separate from the live global CP/LU directory. Live advertisements are connection-scoped and filtered by authorization. The concentrator's relay treats SNA PIUs as opaque; its own APING endpoint is a separate local route that parses SNA through the Go `sna` module. Circuit forwarding uses `RouteReference` and checks the referenced router and generation again at the destination. `snusnu.v2` additionally requires a validated source LU route on `OPEN`.
 
-Shared Go/Rust fixtures should cover distinct CP and LU exports with the same spelling, multiple LUs under one CP, empty replacement, revision regression, stale epoch withdrawal, duplicate ID, malformed SNA name, duplicate resource ambiguity and an `OPEN` after retargeting. No WebSocket implementation is needed to test snapshot validation and route selection locally.
+Go and Rust tests cover snapshots, identities, stale epochs, route references, and circuit opens. The [APING vectors](test-vectors/aping-v4r4.md) document captured application records; the relevant WebSocket and routing tests live alongside each implementation.

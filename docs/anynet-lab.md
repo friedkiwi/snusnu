@@ -1,5 +1,10 @@
 # AnyNet V5R4 baseline
 
+This is a chronological lab record. Later sections document a constrained
+ordinary `--config` LLC2-to-MPTN gateway reaching V5R4 Sign On; the early
+direct and relay captures below predate that gateway. See [runtime status](router-runtime.md)
+for the current support boundary.
+
 Two V5R4 OS/400 guests completed a direct AnyNet pass-through and a second pass-through through the Rust MPTN relay on 2026-11-01. A's `STRPASTHR RMTLOCNAME(SNAB)` reached B's remote Sign On and Main Menu; `ENDPASTHR` returned to A in both runs. These are TCP62 peer baselines and do not demonstrate LLC2↔AnyNet conversion. The current Rust config calls this `[[mptn]] profile = "relay"`; IBM's AnyNet is the guest implementation.
 
 The guests were writable clones of a private V5R4 network template. They had distinct Ethernet MACs and IP addresses: A `SOLNET.SNAA` / `10.99.4.2` on `sol6`, B `SOLNET.SNAB` / `10.99.4.3` on `sol7`. Only these two TAPs were connected by an isolated `br-ip-sna` bridge. See the [EE lab](ee-lab.md) for the clone identity and IP setup; HPRIP controllers were varied off for this AnyNet run.
@@ -20,7 +25,7 @@ CRTCTLAPPC CTLD(ANYTOA) LINKTYPE(*ANYNW) RMTNETID(SOLNET) RMTCPNAME(SNAA)  [B]
 
 The unfiltered `sol6` capture showed a TCP connection from A to B port 397, a 230-byte `MPTN_Connect` request, a 189-byte positive response, normal records, expedited records, and expedited acknowledgements. The Connect request carried BIND and the response carried RSP(BIND). A separate idle session emitted a UDP/397 node-pair keepalive after about four minutes: a `0x84` request and `0x84` response, each with both peer IPv4 addresses embedded in its payload. A proxy that changes outer source IPs must translate this address pair or terminate and reoriginate the keepalive. The lab emulator emits IP in 802.3 SNAP frames, so a conventional `tcpdump udp` or `tcpdump tcp` capture filter on the TAP missed traffic; capture without a filter and inspect offline. Raw captures and application payloads stay outside this repository.
 
-The Rust [TCP62 codec](../sna_router/crates/transport-ip-sna/src/mptn_connect.rs) now accepts both observed Connect headers. Its BIND-to-FID2 converter is limited to complete normal PIUs after session establishment. The full LLC2↔AnyNet gateway still needs APPN control handling, BIND/session correlation, pacing, expedited traffic, segmentation, UDP keepalive, and teardown behavior.
+At this baseline stage, the Rust [TCP62 codec](../sna_router/crates/transport-ip-sna/src/mptn_connect.rs) accepted both observed Connect headers. The later constrained gateway added APPN management, BIND/session correlation, pacing, and expedited conversion. General multi-session operation, clean teardown, and live OS/400 UDP `0x83` interoperability remain open.
 
 ## Rust MPTN relay for AnyNet peers
 
@@ -50,7 +55,7 @@ to = "mptn_b"
 
 With the TCP-only router at commit `bb4acf2`, the OS/400 pass-through completed remote sign-on, login, and `ENDPASTHR`. The router recorded 13 TCP62 records in each direction (one Connect, ten normal, one expedited, one expedited acknowledgement), with no warnings or errors. Each TAP contained only its guest-to-router IP pair.
 
-The UDP-capable router at commit `77233ef` was then run with an authenticated B Main Menu held idle. After about four minutes, B sent one UDP/397 `0x84` keepalive to its router-facing IP. The sol7 capture showed provider addresses `.3,.11`; the sol6 egress showed rewritten `.10,.2`. A replied with `.10,.2`, and the sol7 egress returned `.3,.11` to B. Each TAP recorded one request and one response, the router logged no warnings or errors, and a subsequent remote `DSPNETA` command still displayed B's network attributes. This proves the supported IPv4 node-pair keepalive path for this V5R4 pair. UDP `0x83` out-of-band traffic remains unsupported and closes the route.
+The UDP-capable router at commit `77233ef` was then run with an authenticated B Main Menu held idle. After about four minutes, B sent one UDP/397 `0x84` keepalive to its router-facing IP. The sol7 capture showed provider addresses `.3,.11`; the sol6 egress showed rewritten `.10,.2`. A replied with `.10,.2`, and the sol7 egress returned `.3,.11` to B. Each TAP recorded one request and one response, the router logged no warnings or errors, and a subsequent remote `DSPNETA` command still displayed B's network attributes. This proves the supported IPv4 node-pair keepalive path for this V5R4 pair. The MPTN **relay** profile still closes on UDP `0x83`; the separate gateway has a bounded `0x83` implementation without a live OS/400 `0x83` capture.
 
 A fresh pass-through on the later `cd967f6` tree, including Connect response-direction validation and route fault isolation, again reached B's Main Menu and ended normally. Both router-facing TAPs contained only their configured guest/IP pair, and the router logged no warnings or errors. The test router and captures were stopped afterward.
 
@@ -60,7 +65,7 @@ An isolated direct V5R4 run captured both TAPs during `STRPASTHR`, B sign-on, an
 
 Neither case emitted UDP/397 `0x83` out-of-band data. The active-session failure produced one 59-byte TCP `0x10` compensation record from B and then a TCP reset from A. Both session starts had TCP `0x01` expedited records of 15 and 11 bytes and a five-byte `0x03` acknowledgement. This trace supports strict TCP expedited acknowledgement framing; it does not establish the V5R4 UDP `0x83` wire shape or justify enabling that path in the router.
 
-A later isolated test delayed B-to-A frames for 15 seconds during both startup and `ENDPASTHR`; a separate test dropped one exact five-byte TCP `0x03` acknowledgement. Both completed without any UDP/397 `0x83` datagram. IBM's [TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00), section 3.2.2.1, says an OOB datagram does not need a four-byte length field for its data portion, while section 5.3.3 explicitly includes a four-byte Record Length in the `0x83` command format. The bounded parser follows the detailed section 5.3.3 command format. With no captured `0x83` packet, that choice remains unverified against V5R4 and must not enable the X19 compensation gate.
+A later isolated test delayed B-to-A frames for 15 seconds during both startup and `ENDPASTHR`; a separate test dropped one exact five-byte TCP `0x03` acknowledgement. Both completed without any UDP/397 `0x83` datagram. IBM's [TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00), section 3.2.2.1, says an OOB datagram does not need a four-byte length field for its data portion, while section 5.3.3 explicitly includes a four-byte Record Length in the `0x83` command format. The bounded parser follows the detailed section 5.3.3 command format. With no captured `0x83` packet, that choice remains unverified against V5R4. At this stage the X19 compensation gate stayed disabled; later gateway code added bounded synthetic handling.
 
 ## Focused expedited and out-of-band capture
 
@@ -75,7 +80,7 @@ sequence before capture stopped; later normal TCP records continued. This
 helps explain the lack of a UDP fallback in this particular exchange, but
 does not establish when other expedited senders choose to retry.
 
-The UDP wire format has an unresolved contradiction in the [IBM-authored TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00): section 3.2.2.1 says an out-of-band UDP datagram omits the four-byte record length because UDP preserves message boundaries, while section 5.3.3 lists that length as the first field of `MPTN_DG_OOB_Data`. No captured `0x83` packet settles which form V5R4 sends. Rust has a bounded section-5.3.3 structural parser and separate TCP/UDP expedited sequence-deduplication state, but `GatewaySession` does not accept or emit `0x83`, send its UDP acknowledgement, or retry it. The `0x83` required compensation must stay unavailable. To complete it, capture an actual V5R4 `0x83` request and response, establish the record-length and alias forms, then verify duplicate suppression when the same expedited message arrives over both TCP and UDP, response correlation, retry limits, and abort handling.
+The UDP wire format has an unresolved contradiction in the [IBM-authored TCP62 draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00): section 3.2.2.1 says an out-of-band UDP datagram omits the four-byte record length because UDP preserves message boundaries, while section 5.3.3 lists that length as the first field of `MPTN_DG_OOB_Data`. No captured `0x83` packet settles which form V5R4 sends. Rust now has a bounded structural parser, TCP/UDP expedited sequence handling, and gateway code for `0x83` delivery and acknowledgement, covered by synthetic tests. A live V5R4 request and response are still needed to establish the actual record-length and alias forms and validate duplicate suppression, response correlation, retry limits, and abort handling with that guest.
 
 ## V4R4 LLC2 to V5R4 AnyNet mixed lab
 
