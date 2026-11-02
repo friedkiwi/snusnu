@@ -709,6 +709,10 @@ mod tests {
         assert_eq!(xids.negotiation[9] & 0x40, 0x40);
         assert_eq!(xids.negotiation[10] & 0xc0, 0); // No FID2 adaptive BIND pacing.
         assert_eq!(xids.negotiation[15] & 0x80, 0); // No parallel TGs.
+        let bootstrap_advertisement = ControlAdvertisement::from_xid3(&xids.negotiation).unwrap();
+        assert_eq!(bootstrap_advertisement.cp, local);
+        assert_eq!(bootstrap_advertisement.link_label, [0x80, 2]);
+        assert_eq!(bootstrap_advertisement.tower.arb_mode, ArbMode::Base);
         assert_eq!(
             HprXidEvidence::parse(&xids.negotiation, HprMedium::EnterpriseExtender)
                 .unwrap()
