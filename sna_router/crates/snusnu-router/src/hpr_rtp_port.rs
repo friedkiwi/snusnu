@@ -82,7 +82,7 @@ impl HprRtpPort {
             || route.generation != self.bootstrap.generation
             || route.target_lu.netid != self.bootstrap.local.cp.netid
             || route.tg_number == 0
-            || route.return_link_label != self.bootstrap.peer.link_label
+            || route.return_link_label != self.bootstrap.local.link_label
             || route.maximum_packet_size > self.bootstrap.max_packet_size
         {
             return Err(invalid("invalid or duplicate HPR user route authorization"));
@@ -492,6 +492,20 @@ mod tests {
     fn user_connection_requires_route_authorization() {
         let mut port = HprRtpPort::new(bootstrap());
         assert!(port.config_for(RtpIngressKind::User, &path()).is_err());
+        // A distinct peer CV61 link label must not authorize the return
+        // path that the guest addressed to this local link generation.
+        assert!(port
+            .authorize_user_route(AuthorizedUserRoute {
+                generation: ConnectionGeneration::new(1).unwrap(),
+                target_lu: "SNUSNU.PING".parse().unwrap(),
+                local_nce_label: vec![0xb0, 1],
+                local_nce_instance: [0, 0, 0, 9],
+                cos_tpf: vec![4, 0x2c, 1, 0],
+                tg_number: 1,
+                return_link_label: vec![0x80, 2],
+                maximum_packet_size: 1461,
+            })
+            .is_err());
         port.authorize_user_route(AuthorizedUserRoute {
             generation: ConnectionGeneration::new(1).unwrap(),
             target_lu: "SNUSNU.PING".parse().unwrap(),
@@ -499,7 +513,7 @@ mod tests {
             local_nce_instance: [0, 0, 0, 9],
             cos_tpf: vec![4, 0x2c, 1, 0],
             tg_number: 1,
-            return_link_label: vec![0x80, 2],
+            return_link_label: vec![0x80, 1],
             maximum_packet_size: 1461,
         })
         .unwrap();
@@ -514,7 +528,7 @@ mod tests {
                 local_nce_instance: [0, 0, 0, 10],
                 cos_tpf: vec![4, 0x2c, 1, 0],
                 tg_number: 1,
-                return_link_label: vec![0x80, 2],
+                return_link_label: vec![0x80, 1],
                 maximum_packet_size: 1461,
             })
             .is_err());
