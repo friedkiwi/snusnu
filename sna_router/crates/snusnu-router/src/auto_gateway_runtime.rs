@@ -150,6 +150,7 @@ pub(crate) struct AutoMptnGateway<'a> {
     config: &'a MptnGatewayConfig,
     listener: MptnGatewayPort,
     sessions: HashMap<u64, MptnToWsSession>,
+    udp_leased: bool,
 }
 
 impl<'a> AutoMptnGateway<'a> {
@@ -167,7 +168,7 @@ impl<'a> AutoMptnGateway<'a> {
             cnos_limit: 8,
             allow_resumed_user: true,
         })?;
-        Ok(Self { config, listener, sessions: HashMap::new() })
+        Ok(Self { config, listener, sessions: HashMap::new(), udp_leased: false })
     }
 
     pub(crate) fn id(&self) -> &str { &self.config.id }
@@ -195,9 +196,12 @@ impl<'a> AutoMptnGateway<'a> {
             }
         }
         let sessions = &self.sessions;
-        let event = self.listener.poll_association_once_with_credit(|id| {
-            sessions.get(&id).is_none_or(MptnToWsSession::can_accept)
-        })?;
+        let can_accept = |id| sessions.get(&id).is_none_or(MptnToWsSession::can_accept);
+        let event = if self.udp_leased {
+            self.listener.poll_tcp_only_with_credit(can_accept)?
+        } else {
+            self.listener.poll_association_once_with_credit(can_accept)?
+        };
         let Some((id, event)) = event else { return Ok(None) };
         if let Some(session) = self.sessions.get_mut(&id) {
             match session.on_event(event, &mut self.listener) {
@@ -213,7 +217,13 @@ impl<'a> AutoMptnGateway<'a> {
             return Ok(None);
         }
         match event {
-            GatewayEvent::UserBind(offer) => Ok(Some((id, offer))),
+            GatewayEvent::UserBind(offer) if !self.udp_leased => Ok(Some((id, offer))),
+            GatewayEvent::UserBind(_) => {
+                self.listener.close_association_for(id)?;
+                tracing::warn!(gateway = %self.config.id, association = id,
+                    "TCP62 offer rejected while UDP/397 belongs to another circuit");
+                Ok(None)
+            }
             GatewayEvent::ManagementReady | GatewayEvent::Closed => Ok(None),
             GatewayEvent::Rejected(reason) => {
                 tracing::warn!(gateway = %self.config.id, association = id, reason,
@@ -243,7 +253,7 @@ impl<'a> AutoMptnGateway<'a> {
         seed: &[u8],
         timeout: Duration,
     ) -> io::Result<()> {
-        if self.sessions.contains_key(&association) || timeout.is_zero() {
+        if self.udp_leased || self.sessions.contains_key(&association) || timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 "TCP62 association already active or timeout invalid"));
         }
@@ -285,8 +295,20 @@ impl<'a> AutoMptnGateway<'a> {
         self.listener.close_association_for(association)
     }
 
-    pub(crate) fn clone_udp_socket(&self) -> io::Result<std::net::UdpSocket> {
-        self.listener.clone_udp_socket()
+    /// One UDP socket reader owns expedited and keepalive traffic at a time.
+    /// The lease must be returned when an outbound session closes.
+    pub(crate) fn lease_udp(&mut self) -> io::Result<std::net::UdpSocket> {
+        if self.udp_leased || !self.sessions.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "gateway UDP/397 is already owned by an active circuit"));
+        }
+        let socket = self.listener.clone_udp_socket()?;
+        self.udp_leased = true;
+        Ok(socket)
+    }
+
+    pub(crate) fn release_udp(&mut self) {
+        self.udp_leased = false;
     }
 }
 
