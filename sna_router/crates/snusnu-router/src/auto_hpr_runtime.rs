@@ -6,16 +6,615 @@
 //! Each outbound event has an explicit delivery lease so a carrier that
 //! temporarily cannot send cannot lose an event popped from the fabric.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io,
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, Instant},
+};
 
+use crate::{
+    auto_hpr_identity::AuthorizedEeIdentity,
+    config::RouterConfig,
+    ee_ldlc_endpoint::EeLdlcEndpoint,
+    hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
+    remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
+    STOP,
+};
 use router_core::{
+    hpr_control_bootstrap::HprControlBootstrap,
+    hpr_ip_activation::Phase,
+    hpr_route_setup::{RouteSetupGds, RouteSetupKind},
+    hpr_route_setup_reply::ReverseLinkMetrics,
+    hpr_route_setup_service::{DirectRouteSetupService, PreparedRouteSetupReply},
+    hpr_session_adapter::{negotiated_fixed_windows, HprSessionAdapter, HprSessionRole},
     session::{Flow, SessionEvent, SessionIdentity, SessionUnit},
     session_fabric::{
         AdapterId, FabricError, FabricLimits, FabricSessionId, Reachability, SessionFabric,
     },
 };
-use std::io;
 use transport_ws::wire;
+
+const HPR_ADAPTER: AdapterId = AdapterId(1);
+const WS_ADAPTER: AdapterId = AdapterId(2);
+const IDLE_POLL: Duration = Duration::from_micros(200);
+const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_PENDING_RTP_MESSAGES: usize = 64;
+const MAX_PENDING_RTP_BYTES: usize = 128 * 1024;
+
+fn protocol(reason: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason.into())
+}
+
+fn as_wire_name(value: &router_core::session::QualifiedName) -> wire::SnaName {
+    wire::SnaName {
+        netid: value.netid.clone(),
+        name: value.name.clone(),
+    }
+}
+
+fn user_nce_label(control: &[u8]) -> io::Result<Vec<u8>> {
+    let mut label = control.to_vec();
+    let last = label
+        .last_mut()
+        .ok_or_else(|| protocol("empty HPR NCE label"))?;
+    // 0xff is reserved. Rotate through the other 255 suffixes, including
+    // when the control label already ends in 0xfe or 0xff.
+    *last = if *last >= 0xfe { 0 } else { *last + 1 };
+    if label == control {
+        return Err(protocol("HPR LU NCE label space exhausted"));
+    }
+    Ok(label)
+}
+
+struct ActiveHprSession {
+    handle: u64,
+    fabric_id: FabricSessionId,
+    identity: SessionIdentity,
+    bind_request: SessionUnit,
+    adapter: HprSessionAdapter,
+    ws: Option<SessionWsPort>,
+    ws_closed: bool,
+    pending_ws: Option<(SessionEvent, bool)>,
+    pending_credit: Option<SessionEvent>,
+}
+
+struct DirectHprRuntime {
+    bootstrap: HprControlBootstrap,
+    rtp: HprRtpPort,
+    route_setup: Option<DirectRouteSetupService>,
+    route_reply: Option<PreparedRouteSetupReply>,
+    switch: SessionSwitch,
+    session: Option<ActiveHprSession>,
+    pending_rtp: std::collections::VecDeque<RtpIngress>,
+    pending_rtp_bytes: usize,
+    next_handle: u64,
+    user_route_authorized: bool,
+}
+
+impl DirectHprRuntime {
+    fn new(bootstrap: HprControlBootstrap) -> Self {
+        let mut switch = SessionSwitch::new();
+        switch.register(HPR_ADAPTER);
+        switch.register(WS_ADAPTER);
+        Self {
+            rtp: HprRtpPort::new(bootstrap.clone()),
+            bootstrap,
+            route_setup: None,
+            route_reply: None,
+            switch,
+            session: None,
+            pending_rtp: std::collections::VecDeque::new(),
+            pending_rtp_bytes: 0,
+            next_handle: 1,
+            user_route_authorized: false,
+        }
+    }
+
+    fn queue_rtp(&mut self, messages: Vec<RtpIngress>) -> io::Result<()> {
+        for message in messages {
+            if self.pending_rtp.len() >= MAX_PENDING_RTP_MESSAGES
+                || message.bytes.len() > MAX_PENDING_RTP_BYTES - self.pending_rtp_bytes
+            {
+                return Err(protocol("HPR session ingress backlog full"));
+            }
+            self.pending_rtp_bytes += message.bytes.len();
+            self.pending_rtp.push_back(message);
+        }
+        Ok(())
+    }
+
+    fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
+        self.try_route_reply(link, now_us)?;
+        while let Some(message) = self.pending_rtp.front().cloned() {
+            let result = match message.kind {
+                RtpIngressKind::RouteSetup => self.route_message(link, hub, &message, now_us),
+                RtpIngressKind::User => self.user_message(hub, &message),
+                RtpIngressKind::CpSvcMg => {
+                    Err(protocol("HPR CP management topic is not established"))
+                }
+            };
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            {
+                break;
+            }
+            result?;
+            self.pending_rtp.pop_front();
+            self.pending_rtp_bytes -= message.bytes.len();
+            self.try_route_reply(link, now_us)?;
+        }
+        self.pump_session(link, hub, now_us)
+    }
+
+    fn route_message(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        hub: &AutoWsHub,
+        message: &RtpIngress,
+        _now_us: u64,
+    ) -> io::Result<()> {
+        if self.route_reply.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "route reply pending",
+            ));
+        }
+        let request = RouteSetupGds::parse(&message.bytes)
+            .map_err(|error| protocol(format!("invalid HPR RouteSetup: {error:?}")))?;
+        if request.kind != RouteSetupKind::Request {
+            return Err(protocol("unexpected HPR RouteSetup reply"));
+        }
+        let target: router_core::session::QualifiedName = request
+            .destination_lu_name
+            .as_deref()
+            .ok_or_else(|| protocol("HPR RouteSetup lacks target LU"))?
+            .parse()
+            .map_err(|_| protocol("invalid HPR RouteSetup target LU"))?;
+        let Some((_, Some(hosting_cp))) = hub.resolve_lu(&as_wire_name(&target))? else {
+            return Err(protocol(format!(
+                "HPR RouteSetup target {target} unavailable"
+            )));
+        };
+        if hosting_cp != as_wire_name(&self.bootstrap.local.cp) {
+            return Err(protocol(
+                "HPR RouteSetup target is not hosted by EE proxy CP",
+            ));
+        }
+        if self.route_setup.is_none() {
+            let tg = link
+                .tg_number()
+                .ok_or_else(|| protocol("HPR route has no active TG"))?;
+            let user_label = user_nce_label(&self.bootstrap.local.tower.route_setup_nce_label)?;
+            let service = DirectRouteSetupService::new(
+                self.bootstrap.clone(),
+                target.clone(),
+                user_label,
+                self.bootstrap.local.tower.route_setup_nce_instance,
+                tg,
+                ReverseLinkMetrics {
+                    transmission_time_us: 1000,
+                    capacity_kbps: 100_000,
+                    liveness_seconds: 10,
+                },
+                16,
+            )
+            .map_err(|error| protocol(format!("HPR RouteSetup service: {error:?}")))?;
+            self.route_setup = Some(service);
+        }
+        if self.route_setup.as_ref().unwrap().local_lu() != &target {
+            return Err(protocol("second HPR RouteSetup target on one direct TG"));
+        }
+        self.route_reply = Some(
+            self.route_setup
+                .as_mut()
+                .unwrap()
+                .prepare_reply(self.bootstrap.generation, &message.bytes)
+                .map_err(|error| protocol(format!("HPR RouteSetup rejected: {error:?}")))?,
+        );
+        Ok(())
+    }
+
+    fn try_route_reply(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        let Some(reply) = self.route_reply.as_ref() else {
+            return Ok(());
+        };
+        if !self
+            .rtp
+            .send(link, RtpIngressKind::RouteSetup, &reply.gds, now_us)?
+        {
+            return Ok(());
+        }
+        let reply = self.route_reply.take().unwrap();
+        let authorized = self
+            .route_setup
+            .as_mut()
+            .unwrap()
+            .confirm_reply_sent(self.bootstrap.generation, reply.pcid, &reply.gds)
+            .map_err(|error| protocol(format!("HPR RouteSetup confirmation: {error:?}")))?;
+        if !self.user_route_authorized {
+            self.rtp.authorize_user_route(authorized)?;
+            self.user_route_authorized = true;
+        }
+        tracing::info!(target_lu = %self.route_setup.as_ref().unwrap().local_lu(),
+            generation = self.bootstrap.generation.get(),
+            "HPR direct RouteSetup reply transmitted and user route authorized");
+        Ok(())
+    }
+
+    fn user_message(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
+        if self.session.is_none() {
+            self.start_user_session(hub, message)?;
+            return Ok(());
+        }
+        let session = self.session.as_mut().unwrap();
+        if let Some(credit) = session.pending_credit.take() {
+            if let Err(error) = self
+                .switch
+                .submit(HPR_ADAPTER, session.handle, credit.clone())
+            {
+                session.pending_credit = Some(credit);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("HPR credit backpressure: {error:?}"),
+                ));
+            }
+        }
+        let (candidate, ingress) = session
+            .adapter
+            .preview_ingress(message.observation, &message.bytes)
+            .map_err(|error| protocol(format!("invalid HPR session BIU: {error:?}")))?;
+        match self
+            .switch
+            .submit(HPR_ADAPTER, session.handle, ingress.event)
+        {
+            Ok(()) => {}
+            Err(SwitchError::Fabric(FabricError::Capacity)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "HPR fabric backpressure",
+                ));
+            }
+            Err(error) => return Err(protocol(format!("HPR session event rejected: {error:?}"))),
+        }
+        session.adapter = candidate;
+        if let Some(credit) = ingress.extra_credit {
+            if self
+                .switch
+                .submit(HPR_ADAPTER, session.handle, credit.clone())
+                .is_err()
+            {
+                session.pending_credit = Some(credit);
+            }
+        }
+        Ok(())
+    }
+
+    fn start_user_session(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
+        let scope = self
+            .rtp
+            .user_scope()
+            .ok_or_else(|| protocol("user RTP scope missing"))?;
+        let handle = self.next_handle;
+        self.next_handle = self
+            .next_handle
+            .checked_add(1)
+            .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+        let local_sa = (1u64 << 63) | handle;
+        let adapter = HprSessionAdapter::new(
+            HprSessionRole::PeerPlu,
+            scope,
+            local_sa,
+            Some(self.bootstrap.local.cp.clone()),
+            Some(self.bootstrap.peer.cp.clone()),
+        )
+        .map_err(|error| protocol(format!("HPR session address: {error:?}")))?;
+        let (adapter, ingress) = adapter
+            .preview_ingress(message.observation, &message.bytes)
+            .map_err(|error| protocol(format!("HPR BIND rejected: {error:?}")))?;
+        let identity = ingress
+            .identity
+            .ok_or_else(|| protocol("HPR user RTP lacks BIND identity"))?;
+        if identity.source_lu.netid != hub.allowed_netid()
+            || identity.source_cp.as_ref() != Some(&self.bootstrap.peer.cp)
+            || self.route_setup.as_ref().map(|route| route.local_lu()) != Some(&identity.target_lu)
+        {
+            return Err(protocol(
+                "HPR BIND identity conflicts with authenticated route",
+            ));
+        }
+        let source_cp = identity.source_cp.as_ref().unwrap();
+        let source_lu = as_wire_name(&identity.source_lu);
+        let target_lu = as_wire_name(&identity.target_lu);
+        hub.publish_local(
+            &[as_wire_name(source_cp)],
+            &[wire::LuReachability {
+                lu: Some(source_lu.clone()),
+                hosting_cp: Some(as_wire_name(source_cp)),
+                supported_types: vec![wire::LuType::LuType62 as i32],
+            }],
+        )?;
+        self.switch
+            .replace_routes(
+                WS_ADAPTER,
+                vec![Reachability {
+                    lu: Some(identity.target_lu.clone()),
+                    cp: identity.target_cp.clone(),
+                }],
+            )
+            .map_err(|error| protocol(format!("HPR route admission: {error:?}")))?;
+        let bind_request = match ingress.event {
+            SessionEvent::BindRequest(ref unit) => unit.clone(),
+            _ => return Err(protocol("HPR first session unit is not BIND")),
+        };
+        let (fabric_id, egress) = self
+            .switch
+            .open(HPR_ADAPTER, handle, identity.clone(), bind_request.clone())
+            .map_err(|error| protocol(format!("HPR BIND route unavailable: {error:?}")))?;
+        if egress != WS_ADAPTER {
+            return Err(protocol("HPR session selected unexpected egress"));
+        }
+        let ws = hub.open_session_lu(&target_lu, &source_lu)?;
+        if ws.is_some() {
+            self.switch
+                .bind_egress(fabric_id, WS_ADAPTER, handle)
+                .map_err(|error| protocol(format!("HPR WS bind failed: {error:?}")))?;
+        }
+        tracing::info!(source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+            peer_cp = %self.bootstrap.peer.cp, proxy_cp = %self.bootstrap.local.cp,
+            "HPR LU session routed to concentrator");
+        self.session = Some(ActiveHprSession {
+            handle,
+            fabric_id,
+            identity,
+            bind_request,
+            adapter,
+            ws,
+            ws_closed: false,
+            pending_ws: None,
+            pending_credit: ingress.extra_credit,
+        });
+        Ok(())
+    }
+
+    fn pump_session(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        hub: &mut AutoWsHub,
+        now_us: u64,
+    ) -> io::Result<()> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        if let Some(credit) = session.pending_credit.take() {
+            match self
+                .switch
+                .submit(HPR_ADAPTER, session.handle, credit.clone())
+            {
+                Ok(()) => {}
+                Err(SwitchError::Fabric(FabricError::Capacity)) => {
+                    session.pending_credit = Some(credit);
+                }
+                Err(error) => {
+                    return Err(protocol(format!("HPR pacing credit rejected: {error:?}")))
+                }
+            }
+        }
+        if session.ws.is_none() {
+            let target = as_wire_name(&session.identity.target_lu);
+            let source = as_wire_name(&session.identity.source_lu);
+            if let Some(port) = hub.open_session_lu(&target, &source)? {
+                self.switch
+                    .bind_egress(session.fabric_id, WS_ADAPTER, session.handle)
+                    .map_err(|error| protocol(format!("HPR WS open: {error:?}")))?;
+                session.ws = Some(port);
+            } else {
+                return Ok(());
+            }
+        }
+        let ws = session.ws.as_mut().unwrap();
+        if session.pending_ws.is_none() && !session.ws_closed {
+            match ws.poll()? {
+                Some(SessionWsUpdate::Event(event)) => {
+                    let event = from_session_wire(event)?;
+                    let charge = !matches!(event, SessionEvent::Credit { .. });
+                    session.pending_ws = Some((event, charge));
+                }
+                Some(SessionWsUpdate::Closed) => {
+                    self.switch
+                        .submit(WS_ADAPTER, session.handle, SessionEvent::Reset)
+                        .map_err(|error| protocol(format!("HPR WS close: {error:?}")))?;
+                    session.ws_closed = true;
+                }
+                Some(SessionWsUpdate::Opened) | None => {}
+            }
+        }
+        if let Some((event, charge)) = session.pending_ws.clone() {
+            match self.switch.submit(WS_ADAPTER, session.handle, event) {
+                Ok(()) => {
+                    if charge {
+                        ws.complete_received(1)?;
+                    }
+                    session.pending_ws = None;
+                }
+                Err(SwitchError::Fabric(FabricError::Capacity)) => {}
+                Err(error) => {
+                    return Err(protocol(format!(
+                        "HPR WS session event rejected: {error:?}"
+                    )))
+                }
+            }
+        }
+        if let Some(event) = self
+            .switch
+            .next_delivery(WS_ADAPTER, session.handle)
+            .map_err(|error| protocol(format!("HPR WS delivery: {error:?}")))?
+        {
+            if session.ws_closed {
+                self.switch
+                    .mark_sent(WS_ADAPTER, session.handle)
+                    .map_err(|error| protocol(format!("HPR WS closed completion: {error:?}")))?;
+            } else if let Some(wire_event) = to_session_wire(&event) {
+                if ws.send(wire_event)? {
+                    self.switch
+                        .mark_sent(WS_ADAPTER, session.handle)
+                        .map_err(|error| protocol(format!("HPR WS completion: {error:?}")))?;
+                }
+            } else {
+                ws.close()?;
+                self.switch
+                    .mark_sent(WS_ADAPTER, session.handle)
+                    .map_err(|error| protocol(format!("HPR WS reset: {error:?}")))?;
+            }
+        }
+        if let Some(event) = self
+            .switch
+            .next_delivery(HPR_ADAPTER, session.handle)
+            .map_err(|error| protocol(format!("HPR egress delivery: {error:?}")))?
+        {
+            let (mut candidate, egress) = session
+                .adapter
+                .preview_egress(event.clone())
+                .map_err(|error| protocol(format!("HPR egress conversion: {error:?}")))?;
+            if let SessionEvent::BindResult {
+                accepted: true,
+                ref unit,
+            } = event
+            {
+                let (send, receive) =
+                    negotiated_fixed_windows(HprSessionRole::PeerPlu, &session.bind_request, unit)
+                        .map_err(|error| protocol(format!("HPR BIND pacing: {error:?}")))?;
+                candidate
+                    .configure_fixed_pacing(send, receive)
+                    .map_err(|error| protocol(format!("HPR pacing setup: {error:?}")))?;
+            }
+            let sent = match egress {
+                Some(egress) => {
+                    self.rtp
+                        .send(link, RtpIngressKind::User, &egress.message, now_us)?
+                }
+                None => true,
+            };
+            if sent {
+                session.adapter = candidate;
+                self.switch
+                    .mark_sent(HPR_ADAPTER, session.handle)
+                    .map_err(|error| protocol(format!("HPR egress completion: {error:?}")))?;
+            }
+        }
+        let _ = ws.take_completed_send_count();
+        if self.switch.session_count() == 0 {
+            self.session = None;
+            hub.publish_local(&[], &[])?;
+        }
+        Ok(())
+    }
+}
+
+/// The initial direct EE rollout serves one attachment while the remaining
+/// automatic LLC/MPTN runtime keeps its existing route loop. The destination
+/// is taken from a validated RouteSetup/BIND and the live upstream directory.
+/// A disconnected upstream drops EE/RTP state and reconnects with fresh
+/// generations; an XID CP alone never publishes a user LU.
+pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
+    let attachment = config
+        .ee
+        .first()
+        .ok_or_else(|| protocol("HPR runtime requires one EE attachment"))?;
+    let remote = config
+        .remote
+        .first()
+        .ok_or_else(|| protocol("HPR runtime requires one concentrator"))?;
+    while !STOP.load(Ordering::Relaxed) {
+        match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
+            Ok(mut hub) => {
+                if let Err(error) = run_connected(attachment, &mut hub) {
+                    tracing::warn!(attachment = %attachment.id, error = %error,
+                        "HPR upstream or EE adjacency reset");
+                }
+            }
+            Err(error) => tracing::warn!(attachment = %attachment.id, error = %error,
+                "HPR concentrator connection failed"),
+        }
+        if !STOP.load(Ordering::Relaxed) {
+            thread::sleep(CONNECT_BACKOFF);
+        }
+    }
+    Ok(())
+}
+
+fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> io::Result<()> {
+    let identity = loop {
+        if STOP.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        poll_unsolicited(hub)?;
+        if let Some(identity) = AuthorizedEeIdentity::resolve(hub, attachment)? {
+            break identity;
+        }
+        thread::sleep(IDLE_POLL);
+    };
+    let peer_identity = identity.clone();
+    let mut link =
+        EeLdlcEndpoint::bind_dynamic(attachment.local_ip, attachment.peer_ip, move |xid| {
+            peer_identity.build_xids(xid, true)
+        })?;
+    let clock = Instant::now();
+    let mut active: Option<DirectHprRuntime> = None;
+    tracing::info!(attachment = %attachment.id, local_ip = %attachment.local_ip,
+        peer_ip = %attachment.peer_ip, proxy_cp = %identity.local_cp,
+        "HPR EE attachment listening");
+    while !STOP.load(Ordering::Relaxed) {
+        poll_unsolicited(hub)?;
+        if !identity.still_authorized(hub)? {
+            return Err(protocol("EE proxy CP route withdrawn"));
+        }
+        let now = Instant::now();
+        link.tick(now)?;
+        if link.phase() == Phase::Active {
+            if active
+                .as_ref()
+                .is_none_or(|runtime| runtime.bootstrap.generation != link.generation())
+            {
+                let bootstrap = link
+                    .control_bootstrap()?
+                    .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
+                active = Some(DirectHprRuntime::new(bootstrap));
+                tracing::info!(attachment = %attachment.id, generation = link.generation().get(),
+                    peer_cp = ?link.peer_cp(), "HPR EE link activated");
+            }
+        } else if active.take().is_some() {
+            hub.publish_local(&[], &[])?;
+            tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
+        }
+        if let Some(datagram) = link.poll(now)? {
+            if let Some(runtime) = active.as_mut() {
+                let messages =
+                    runtime
+                        .rtp
+                        .on_ee_ui(&link, &datagram, clock.elapsed().as_micros() as u64)?;
+                runtime.queue_rtp(messages)?;
+            }
+        }
+        if let Some(runtime) = active.as_mut() {
+            runtime
+                .rtp
+                .tick(&link, clock.elapsed().as_micros() as u64)?;
+            runtime.pump(&link, hub, clock.elapsed().as_micros() as u64)?;
+        }
+        thread::sleep(IDLE_POLL);
+    }
+    Ok(())
+}
+
+fn poll_unsolicited(hub: &mut AutoWsHub) -> io::Result<()> {
+    if let Some(open) = hub.poll_incoming()? {
+        hub.reject_incoming(&open, wire::OpenFailure::Unsupported)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SwitchError {
@@ -87,8 +686,13 @@ impl SessionSwitch {
         let (id, egress) = self.fabric.open(ingress, identity)?;
         // Default fabric limits always admit one validated SessionUnit. The
         // BIND is the first event on a new session, so no queue can be full.
-        self.fabric
-            .submit(id, ingress, SessionEvent::BindRequest(bind))?;
+        if let Err(error) = self
+            .fabric
+            .submit(id, ingress, SessionEvent::BindRequest(bind))
+        {
+            let _ = self.fabric.discard_unopened(id);
+            return Err(error.into());
+        }
         self.handles.insert((ingress, handle), id);
         Ok((id, egress))
     }
@@ -284,6 +888,16 @@ mod tests {
 
     fn unit(opcode: u8) -> SessionUnit {
         SessionUnit::from_reduced(&[0x80, 1, 0x6b, 0x80, 0, opcode]).unwrap()
+    }
+
+    #[test]
+    fn user_nce_avoids_control_label_and_reserved_suffix_at_boundary() {
+        for control in [[0xa4, 0xfd], [0xa4, 0xfe], [0xa4, 0xff]] {
+            let user = user_nce_label(&control).unwrap();
+            assert_ne!(user, control);
+            assert_ne!(user[1], 0xff);
+        }
+        assert!(user_nce_label(&[]).is_err());
     }
 
     fn switch() -> SessionSwitch {

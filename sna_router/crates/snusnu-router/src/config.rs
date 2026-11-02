@@ -119,6 +119,10 @@ pub(crate) struct EeConfig {
     pub(crate) id: String,
     pub(crate) local_ip: IpAddr,
     pub(crate) peer_ip: IpAddr,
+    /// CP presented to this EE neighbor. A concentrator-owned proxy CP must
+    /// be verified against the received directory before XID3 is sent.
+    #[serde(default)]
+    pub(crate) local_cp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -666,6 +670,9 @@ impl RouterConfig {
                 return Err(invalid(format!("duplicate port ID {}", peer.id)));
             }
             kinds.insert(&peer.id, "hpr_ip");
+            if let Some(local_cp) = &peer.local_cp {
+                parse_cp(local_cp)?;
+            }
             if peer.local_ip == peer.peer_ip
                 || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
                 || peer.local_ip.is_unspecified()
@@ -1228,10 +1235,22 @@ impl RouterConfig {
             ));
         }
         if !self.ee.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "HPR/IP attachments cannot join automatic routing yet",
-            ));
+            if self.ee.len() != 1
+                || self.remote.len() != 1
+                || !self.llc.is_empty()
+                || !self.mptn_gateway.is_empty()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "automatic HPR/IP currently requires one [[hpr_ip]] and one [[concentrator]] with no other attachments",
+                ));
+            }
+            if self.ee[0].local_cp.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "automatic HPR/IP requires local_cp until stable router-owned CP identity is available",
+                ));
+            }
         }
         if !self.anynet.is_empty() {
             return Err(io::Error::new(
@@ -2181,11 +2200,32 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
     }
 
     #[test]
-    fn automatic_mode_rejects_media_without_session_adapters() {
+    fn automatic_mode_admits_single_hpr_attachment_with_concentrator() {
         let ee = parse("[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n");
         let error = ee.validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("HPR/IP attachments"));
+        assert!(error.to_string().contains("one [[concentrator]]"));
+
+        let with_upstream = parse(
+            "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SNUSNU.SVC'\n[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",
+        );
+        with_upstream.validate().unwrap();
+        assert!(with_upstream.automatic());
+        assert!(parse(
+            "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",
+        )
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("requires local_cp"));
+
+        let duplicate = parse(
+            "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n[[hpr_ip]]\nid='other'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\n[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",
+        );
+        assert_eq!(
+            duplicate.validate().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
 
         let relay = parse(
             "[[mptn]]\nprofile='relay'\nid='relay'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\n",

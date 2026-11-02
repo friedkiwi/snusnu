@@ -16,6 +16,9 @@ mod auto_address;
 #[cfg(target_os = "linux")]
 mod auto_gateway_runtime;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // The EE runtime uses this once its live session loop is wired.
+mod auto_hpr_identity;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // Prepared for HPR gateway integration; automatic config remains gated.
 mod auto_hpr_ip;
 #[cfg(target_os = "linux")]
