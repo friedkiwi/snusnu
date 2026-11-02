@@ -44,6 +44,7 @@ pub struct ReverseUserFlow {
     grant: Option<(Vec<u8>, FixedPacing)>,
     expedited: ExpeditedFlow,
     pending_expedited_native: Option<(Vec<u8>, usize)>,
+    pending_udp_native: Option<Vec<u8>>,
     pending_expedited_tcp: Option<TcpRecord>,
     closed: bool,
 }
@@ -79,6 +80,7 @@ impl ReverseUserFlow {
             grant: None,
             expedited: ExpeditedFlow::new(MAX_RECORD * 2)?,
             pending_expedited_native: None,
+            pending_udp_native: None,
             pending_expedited_tcp: None,
             closed: false,
         })
@@ -92,6 +94,7 @@ impl ReverseUserFlow {
             || self.pending_native.is_some()
             || self.grant.is_some()
             || self.deferred_normal.is_some()
+            || self.pending_udp_native.is_some()
             || !self.expedited.inbound_normal_may_pass()
         {
             return Err(blocked());
@@ -109,7 +112,10 @@ impl ReverseUserFlow {
     /// exhausted. Keep that complete record and retry after a native IPR;
     /// never ask the caller to replay the final fragment without its header.
     pub fn retry_deferred_normal(&mut self) -> io::Result<Option<&[u8]>> {
-        if self.closed || self.pending_native.is_some() || !self.expedited.inbound_normal_may_pass()
+        if self.closed
+            || self.pending_native.is_some()
+            || self.pending_udp_native.is_some()
+            || !self.expedited.inbound_normal_may_pass()
         {
             return Err(blocked());
         }
@@ -165,7 +171,10 @@ impl ReverseUserFlow {
     /// native PIU must still enter its own bounded queue before later normal
     /// data can pass. The ACK belongs on the same TCP stream.
     pub fn prepare_tcp_expedited(&mut self, record: &TcpRecord) -> io::Result<(&[u8], TcpRecord)> {
-        if self.closed || self.pending_expedited_native.is_some() {
+        if self.closed
+            || self.pending_expedited_native.is_some()
+            || self.pending_udp_native.is_some()
+        {
             return Err(blocked());
         }
         let ExpeditedInbound::Expedited { ack } = self.expedited.receive(record)? else {
@@ -202,6 +211,49 @@ impl ReverseUserFlow {
             return Err(invalid("native expedited egress differs from prepared PIU"));
         }
         self.expedited.complete_native_delivery(bytes)
+    }
+
+    /// The gateway validates UDP X'83' source, Connect correlator, sequence
+    /// and duplicate suppression before calling this method. `reduced` is
+    /// only its SNF/RH/RU image. UDP delivery has no TCP X'03' ACK; the
+    /// gateway owns the X'83' UDP acknowledgement and retry window.
+    pub fn prepare_udp_expedited(&mut self, reduced: &[u8]) -> io::Result<&[u8]> {
+        if self.closed
+            || self.pending_udp_native.is_some()
+            || self.pending_expedited_native.is_some()
+        {
+            return Err(blocked());
+        }
+        let len = 5 + reduced.len();
+        if reduced.len() < 5 || len > MAX_RECORD {
+            return Err(invalid("UDP expedited SNA image length is invalid"));
+        }
+        let mut bytes = Vec::with_capacity(len);
+        bytes.extend_from_slice(&(len as u32).to_be_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(reduced);
+        let record = TcpRecord::decode(bytes)?;
+        let mut piu = mptn_normal_to_native(
+            &record,
+            NativeSessionAddress {
+                daf: self.address.daf,
+                oaf: self.address.oaf,
+                odai: self.address.odai,
+            },
+        )?;
+        piu[0] |= 1;
+        self.pending_udp_native = Some(piu);
+        Ok(self.pending_udp_native.as_deref().unwrap())
+    }
+
+    pub fn mark_udp_native_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {
+        if self.pending_udp_native.as_deref() != Some(piu) {
+            return Err(invalid(
+                "UDP expedited native egress differs from prepared PIU",
+            ));
+        }
+        self.pending_udp_native = None;
+        Ok(())
     }
 
     /// Queue one native expedited PIU on TCP and wait for its exact X'03'
@@ -356,6 +408,7 @@ impl ReverseUserFlow {
         self.grant = None;
         self.grant_pending = false;
         self.pending_expedited_native = None;
+        self.pending_udp_native = None;
         self.pending_expedited_tcp = None;
     }
 }
@@ -505,5 +558,32 @@ mod tests {
         assert_eq!(piu, [0x2c, 0, 2, 1, 0, 2, 3, 1, 0, 0xbb, 0xcc]);
         flow.mark_native_enqueued(&piu).unwrap();
         assert!(flow.retry_deferred_normal().unwrap().is_none());
+    }
+
+    #[test]
+    fn validated_udp_expedited_reaches_native_without_tcp_ack() {
+        let mut flow = ReverseUserFlow::new(address(), 1, 1).unwrap();
+        let reduced = [0x80, 0, 0x4b, 0x80, 0, 0xc9, 0, 1, 0, 1];
+        let piu = flow.prepare_udp_expedited(&reduced).unwrap().to_vec();
+        assert_eq!(
+            piu,
+            [0x2d, 0, 2, 1, 0x80, 0, 0x4b, 0x80, 0, 0xc9, 0, 1, 0, 1]
+        );
+        assert_eq!(
+            flow.prepare_udp_expedited(&reduced).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            flow.prepare_tcp_normal(&normal(1, [3, 0, 0], &[0xaa]))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(flow.mark_udp_native_enqueued(&[0]).is_err());
+        flow.mark_udp_native_enqueued(&piu).unwrap();
+        assert!(flow
+            .prepare_tcp_normal(&normal(1, [3, 0, 0], &[0xaa]))
+            .unwrap()
+            .is_some());
     }
 }
