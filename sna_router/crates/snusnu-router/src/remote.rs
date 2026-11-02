@@ -92,6 +92,10 @@ struct SharedWs {
     next_request_id: u64,
     last_managed_revision: u64,
     gateway_inbound: Option<GatewayInbound>,
+    auto_directory: Option<Rc<RefCell<AutoDirectory>>>,
+    auto_incoming: VecDeque<wire::IncomingOpen>,
+    auto_local_route_ids: HashSet<u64>,
+    auto_free_indexes: Vec<usize>,
 }
 
 impl Drop for SharedWs {
@@ -172,6 +176,9 @@ impl SharedWs {
                 if let Some(status) = crate::status() {
                     status.observe_origin_snapshot(origin);
                 }
+                if let Some(directory) = &self.auto_directory {
+                    directory.borrow_mut().replace_origin(origin)?;
+                }
                 for inbox in &mut self.inbox {
                     inbox.push_back(body.clone());
                 }
@@ -179,6 +186,9 @@ impl SharedWs {
             Body::OriginWithdraw(withdraw) => {
                 if let Some(status) = crate::status() {
                     status.withdraw_origin_bytes(&withdraw.router_id);
+                }
+                if let Some(directory) = &self.auto_directory {
+                    directory.borrow_mut().withdraw(withdraw)?;
                 }
                 for inbox in &mut self.inbox {
                     inbox.push_back(body.clone());
@@ -190,11 +200,21 @@ impl SharedWs {
                 if let Some(status) = crate::status() {
                     status.observe_managed_snapshot(bindings);
                 }
+                if let Some(directory) = &self.auto_directory {
+                    directory.borrow_mut().replace_managed(bindings)?;
+                }
                 for inbox in &mut self.inbox {
                     inbox.push_back(body.clone());
                 }
             }
             Body::IncomingOpen(open) => {
+                if self.auto_directory.is_some()
+                    && open.target.as_ref().is_some_and(|target|
+                        self.auto_local_route_ids.contains(&target.route_id))
+                {
+                    self.auto_incoming.push_back(open.clone());
+                    return Ok(true);
+                }
                 let owner = if let Some(gateway) = &self.gateway_inbound {
                     gateway.owner(open)
                 } else {
@@ -311,6 +331,20 @@ pub(crate) struct WsRoutePort {
     // information delivery. Account by exact PIU lengths, not socket writes.
     outbound_completions: OutboundCompletions,
     inbound_open: Option<InboundOpen>,
+    auto_owned: bool,
+}
+
+impl Drop for WsRoutePort {
+    fn drop(&mut self) {
+        if !self.auto_owned {
+            return;
+        }
+        let _ = self.disconnect();
+        if let Ok(mut shared) = self.shared.try_borrow_mut() {
+            shared.inbox[self.index].clear();
+            shared.auto_free_indexes.push(self.index);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -670,6 +704,10 @@ impl WsRoutePort {
             next_request_id: 0,
             last_managed_revision: 0,
             gateway_inbound,
+            auto_directory: None,
+            auto_incoming: VecDeque::new(),
+            auto_local_route_ids: HashSet::new(),
+            auto_free_indexes: Vec::new(),
         }));
         if let Some(status) = crate::status() {
             status.set_concentrator(Some(ConcentratorStatus {
@@ -712,6 +750,7 @@ impl WsRoutePort {
                 downstream_sizes: VecDeque::new(),
                 outbound_completions: OutboundCompletions::default(),
                 inbound_open: None,
+                auto_owned: false,
             })
             .collect())
     }
@@ -1695,6 +1734,12 @@ pub(crate) struct AutoDirectory {
 }
 
 impl AutoDirectory {
+    fn route_for_reference(&self, reference: &wire::RouteReference) -> Option<&wire::RouteExport> {
+        let (epoch, routes) = self.origins.get(&reference.router_id)?;
+        if epoch != &reference.epoch { return None; }
+        routes.iter().find(|route|
+            route.id == reference.route_id && route.generation == reference.route_generation)
+    }
     pub(crate) fn replace_origin(&mut self, origin: &wire::OriginRouteSnapshot) -> io::Result<()> {
         if origin.router_id.len() != 16 {
             return Err(protocol("invalid origin ID"));
@@ -1795,6 +1840,250 @@ impl AutoDirectory {
             }
         }
         Ok(found)
+    }
+}
+
+/// A single authenticated connection for automatic routing.  Its socket and
+/// directory outlive individual circuit ports; each circuit gets an isolated
+/// inbox and credit counter in `WsRoutePort`.
+pub(crate) struct AutoWsHub {
+    shared: Rc<RefCell<SharedWs>>,
+    directory: Rc<RefCell<AutoDirectory>>,
+    welcome: wire::RouterWelcome,
+    local_routes: HashMap<u64, wire::RouteExport>,
+    revision: u64,
+}
+
+impl AutoWsHub {
+    pub(crate) fn connect(
+        url: &str,
+        bearer: &str,
+        control_points: &[wire::SnaName],
+        logical_units: &[wire::LuReachability],
+    ) -> io::Result<Self> {
+        let (client, welcome) = WsClient::connect_v2(url, bearer).map_err(io_error)?;
+        let directory = Rc::new(RefCell::new(AutoDirectory::default()));
+        let shared = Rc::new(RefCell::new(SharedWs {
+            client,
+            inbox: Vec::new(),
+            route_owners: HashMap::new(),
+            request_owners: HashMap::new(),
+            circuit_owners: HashMap::new(),
+            closed_circuits: VecDeque::new(),
+            closed_requests: VecDeque::new(),
+            next_request_id: 0,
+            last_managed_revision: 0,
+            gateway_inbound: None,
+            auto_directory: Some(directory.clone()),
+            auto_incoming: VecDeque::new(),
+            auto_local_route_ids: HashSet::new(),
+            auto_free_indexes: Vec::new(),
+        }));
+        info!(server = %server_authority(url), router_id = %format_uuid(&welcome.router_id),
+            assigned_netid = %welcome.allowed_netid, "automatic router connected to concentrator");
+        if let Some(status) = crate::status() {
+            status.set_concentrator(Some(ConcentratorStatus {
+                state: "connected".into(),
+                authority: server_authority(url).into(),
+                router_id: Some(format_uuid(&welcome.router_id)),
+                allowed_netid: Some(welcome.allowed_netid.clone()),
+                connection_epoch: Some(format_uuid(&welcome.connection_epoch)),
+                last_change_ms: local_status::now_ms(),
+                last_error: None,
+            }));
+        }
+        let mut hub = Self { shared, directory, welcome, local_routes: HashMap::new(), revision: 0 };
+        hub.publish_local(control_points, logical_units)?;
+        Ok(hub)
+    }
+
+    pub(crate) fn router_id(&self) -> &[u8] { &self.welcome.router_id }
+    pub(crate) fn allowed_netid(&self) -> &str { &self.welcome.allowed_netid }
+
+    pub(crate) fn local_route(&self, reference: &wire::RouteReference) -> Option<&wire::RouteExport> {
+        if reference.router_id != self.welcome.router_id
+            || reference.epoch != self.welcome.connection_epoch
+        { return None; }
+        self.local_routes.get(&reference.route_id)
+            .filter(|route| route.generation == reference.route_generation)
+    }
+
+    pub(crate) fn remote_route(&self, reference: &wire::RouteReference)
+        -> Option<wire::RouteExport>
+    {
+        self.directory.borrow().route_for_reference(reference).cloned()
+    }
+
+    pub(crate) fn reject_incoming(&mut self, open: &wire::IncomingOpen,
+        reason: wire::OpenFailure) -> io::Result<()> {
+        self.shared.borrow_mut().client.send(envelope(
+            wire::ws_envelope::Body::OpenDecision(wire::OpenDecision {
+                circuit_id: open.circuit_id.clone(), accept: false,
+                receive_allowance_bytes: 0, reason: reason as i32,
+            }))).map_err(io_error)
+    }
+
+    pub(crate) fn publish_local(
+        &mut self,
+        control_points: &[wire::SnaName],
+        logical_units: &[wire::LuReachability],
+    ) -> io::Result<()> {
+        let revision = self.revision.checked_add(1)
+            .ok_or_else(|| protocol("route revision exhausted"))?;
+        let snapshot = automatic_route_snapshot(
+            &self.welcome.connection_epoch, revision, &self.welcome.allowed_netid,
+            control_points, logical_units,
+        )?;
+        let ids = snapshot.routes.iter().map(|route| route.id).collect();
+        self.shared.borrow_mut().client.send(envelope(
+            wire::ws_envelope::Body::PublishRoutes(snapshot.clone()))).map_err(io_error)?;
+        self.shared.borrow_mut().auto_local_route_ids = ids;
+        self.local_routes = snapshot.routes.into_iter().map(|route| (route.id, route)).collect();
+        self.revision = revision;
+        info!(revision, export_count = self.local_routes.len(), assigned_netid = %self.welcome.allowed_netid,
+            "published automatic local reachability");
+        Ok(())
+    }
+
+    pub(crate) fn local_reference_lu(&self, lu: &wire::SnaName) -> Option<wire::RouteReference> {
+        self.local_reference(|resource| matches!(resource,
+            wire::route_export::Resource::LogicalUnit(reachability)
+                if reachability.lu.as_ref() == Some(lu)))
+    }
+
+    pub(crate) fn local_reference_cp(&self, cp: &wire::SnaName) -> Option<wire::RouteReference> {
+        self.local_reference(|resource| matches!(resource,
+            wire::route_export::Resource::ControlPoint(name) if name == cp))
+    }
+
+    fn local_reference(&self, matches: impl Fn(&wire::route_export::Resource) -> bool)
+        -> Option<wire::RouteReference>
+    {
+        let route = self.local_routes.values().find(|route|
+            route.resource.as_ref().is_some_and(&matches))?;
+        Some(wire::RouteReference {
+            router_id: self.welcome.router_id.clone(), epoch: self.welcome.connection_epoch.clone(),
+            route_id: route.id, route_generation: route.generation,
+        })
+    }
+
+    pub(crate) fn poll_incoming(&mut self) -> io::Result<Option<wire::IncomingOpen>> {
+        let mut shared = self.shared.borrow_mut();
+        if shared.auto_incoming.is_empty() { shared.receive_once()?; }
+        Ok(shared.auto_incoming.pop_front())
+    }
+
+    pub(crate) fn resolve_lu(&self, lu: &wire::SnaName)
+        -> io::Result<Option<(wire::RouteReference, Option<wire::SnaName>)>>
+    {
+        let directory = self.directory.borrow();
+        let Some(reference) = directory.resolve_lu(lu)? else { return Ok(None) };
+        let host = match directory.route_for_reference(&reference).and_then(|route| route.resource.as_ref()) {
+            Some(wire::route_export::Resource::LogicalUnit(reachability)) => reachability.hosting_cp.clone(),
+            _ => None,
+        };
+        Ok(Some((reference, host)))
+    }
+
+    pub(crate) fn resolve_mac(&self, mac: &[u8; 6])
+        -> io::Result<Option<(wire::RouteReference, wire::SnaName)>>
+    {
+        let directory = self.directory.borrow();
+        let Some(reference) = directory.resolve_mac(mac)? else { return Ok(None) };
+        let cp = match directory.route_for_reference(&reference).and_then(|route| route.resource.as_ref()) {
+            Some(wire::route_export::Resource::ControlPoint(cp)) => cp.clone(),
+            _ => return Err(protocol("managed MAC points to missing CP route")),
+        };
+        Ok(Some((reference, cp)))
+    }
+
+    pub(crate) fn open_lu(&mut self, target_lu: &wire::SnaName, source_lu: &wire::SnaName)
+        -> io::Result<Option<WsRoutePort>>
+    {
+        let Some((target, Some(target_cp))) = self.resolve_lu(target_lu)? else { return Ok(None) };
+        let Some(source) = self.local_reference_lu(source_lu) else { return Ok(None) };
+        let local_cp = self.local_hosting_cp(&source)?;
+        self.open_ref(target, target_cp, Some(target_lu.clone()), Some(source), local_cp).map(Some)
+    }
+
+    fn local_hosting_cp(&self, reference: &wire::RouteReference) -> io::Result<wire::SnaName> {
+        match self.local_routes.get(&reference.route_id).and_then(|route| route.resource.as_ref()) {
+            Some(wire::route_export::Resource::ControlPoint(cp)) => Ok(cp.clone()),
+            Some(wire::route_export::Resource::LogicalUnit(lu)) => lu.hosting_cp.clone()
+                .ok_or_else(|| protocol("local LU has no hosting CP")),
+            None => Err(protocol("local source route unavailable")),
+        }
+    }
+
+    pub(crate) fn open_ref(
+        &mut self,
+        target: wire::RouteReference,
+        target_cp: wire::SnaName,
+        target_lu: Option<wire::SnaName>,
+        source_route: Option<wire::RouteReference>,
+        local_cp: wire::SnaName,
+    ) -> io::Result<WsRoutePort> {
+        if let Some(source) = &source_route {
+            if source.router_id != self.welcome.router_id
+                || source.epoch != self.welcome.connection_epoch
+                || !self.local_routes.contains_key(&source.route_id)
+            { return Err(protocol("source route is not currently published")); }
+        }
+        let mut port = self.new_port(local_cp, target_cp, target_lu, source_route, HashSet::new());
+        port.target = Some(target);
+        Ok(port)
+    }
+
+    pub(crate) fn accept_incoming(&mut self, open: wire::IncomingOpen)
+        -> io::Result<Option<WsRoutePort>>
+    {
+        let Some(local_ref) = open.target.as_ref() else { return Ok(None) };
+        if local_ref.router_id != self.welcome.router_id
+            || local_ref.epoch != self.welcome.connection_epoch
+            || !self.local_routes.contains_key(&local_ref.route_id)
+        { return Ok(None) }
+        let local_cp = self.local_hosting_cp(local_ref)?;
+        let Some(source_ref) = open.source_route.as_ref() else { return Ok(None) };
+        let (target_lu, target_cp) = {
+            let directory = self.directory.borrow();
+            let Some(route) = directory.route_for_reference(source_ref) else { return Ok(None) };
+            match route.resource.as_ref() {
+                Some(wire::route_export::Resource::LogicalUnit(lu)) =>
+                    (lu.lu.clone(), lu.hosting_cp.clone()),
+                _ => return Ok(None),
+            }
+        };
+        let (Some(target_lu), Some(target_cp)) = (target_lu, target_cp) else { return Ok(None) };
+        let mut port = self.new_port(
+            local_cp, target_cp, Some(target_lu), Some(local_ref.clone()),
+            HashSet::from([local_ref.route_id]),
+        );
+        port.target = Some(source_ref.clone());
+        port.incoming_open(open)?;
+        Ok(Some(port))
+    }
+
+    fn new_port(
+        &mut self, local_cp: wire::SnaName, target_cp: wire::SnaName,
+        target_lu: Option<wire::SnaName>, source_route: Option<wire::RouteReference>,
+        local_route_ids: HashSet<u64>,
+    ) -> WsRoutePort {
+        let mut shared = self.shared.borrow_mut();
+        let index = if let Some(index) = shared.auto_free_indexes.pop() { index } else {
+            shared.inbox.push(VecDeque::new());
+            shared.inbox.len() - 1
+        };
+        drop(shared);
+        WsRoutePort {
+            shared: self.shared.clone(), index, welcome: self.welcome.clone(),
+            local_cp, local_route_ids, target_cp, target_lu, target: None, source_route,
+            require_managed_binding: false, managed_binding_seen: false, managed_mac: None,
+            circuit: None, opening: false, local_ready: false, request_id: 0,
+            retry_at: None, retry_delay: FIRST_OPEN_RETRY,
+            pending_type1: VecDeque::new(), pending_information: VecDeque::new(),
+            downstream_sizes: VecDeque::new(), outbound_completions: OutboundCompletions::default(),
+            inbound_open: None, auto_owned: true,
+        }
     }
 }
 
