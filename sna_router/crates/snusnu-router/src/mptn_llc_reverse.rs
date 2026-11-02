@@ -1,0 +1,334 @@
+//! A session-local native LLC to MPTN gateway runner.
+//!
+//! The caller selects a qualified LU route and owns retry policy. This module
+//! keeps one LLC association, one TCP62 association and one UDP correlator
+//! together, so credit and teardown cannot cross sessions.
+
+use crate::{
+    config::parse_cp,
+    mptn_outbound_port::{OutboundEndpoint, OutboundUdp, OutboundUdpAction},
+    native_llc_port::NativeLlcPort,
+    native_peer_port::NativeLlcEvent,
+    runtime::LlcPeer,
+    STOP,
+};
+use router_core::{xid3::Role, xid3_local::LocalLlcProfile};
+use std::{
+    fs::File,
+    io::{self, Read},
+    net::{SocketAddr, UdpSocket},
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, Instant},
+};
+use transport_ip_sna::{
+    anynet::MAX_RECORD,
+    mptn_compensations::{CompensationSet, TCP62_REQUIRED},
+    mptn_gateway_edge::GatewayEdge,
+    mptn_native_bridge::Bridge,
+    mptn_oob::Compensation,
+    mptn_session::{connect_template_for_route, BindPolicy},
+};
+
+const IDLE_POLL: Duration = Duration::from_micros(200);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReverseLlcConfig {
+    pub(crate) interface: String,
+    pub(crate) guest_mac: [u8; 6],
+    pub(crate) proxy_mac: [u8; 6],
+    /// Router CP identity presented over LLC2 to the native guest.
+    pub(crate) local_cp: String,
+    /// Native guest CP, checked against XID3.
+    pub(crate) guest_cp: String,
+    pub(crate) local_station: String,
+    pub(crate) local_node_id: [u8; 4],
+    pub(crate) tg_number: u8,
+    pub(crate) role: Role,
+    /// The native initiating LU, then the MPTN-hosted destination LU.
+    pub(crate) source_lu: String,
+    pub(crate) destination_lu: String,
+    pub(crate) user_tp: [u8; 4],
+    pub(crate) endpoint: OutboundEndpoint,
+    pub(crate) timeout: Duration,
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+impl ReverseLlcConfig {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        if self.interface.is_empty()
+            || self.timeout.is_zero()
+            || self.timeout > Duration::from_secs(600)
+            || self.source_lu == self.destination_lu
+            || self.tg_number == 0
+            || self.user_tp == [0; 4]
+        {
+            return Err(invalid("invalid native LLC to MPTN route identity"));
+        }
+        let source = parse_cp(&self.source_lu)?;
+        let destination = parse_cp(&self.destination_lu)?;
+        if source.netid != parse_cp(&self.guest_cp)?.netid
+            || destination.netid != parse_cp(&self.local_cp)?.netid
+        {
+            return Err(invalid("native LU and CP NETIDs differ"));
+        }
+        if self.endpoint.local_ip.is_unspecified()
+            || self.endpoint.peer_ip.is_unspecified()
+            || self.endpoint.local_ip == self.endpoint.peer_ip
+            || self.endpoint.local_ip.is_ipv4() != self.endpoint.peer_ip.is_ipv4()
+        {
+            return Err(invalid("invalid native LLC to MPTN IP pair"));
+        }
+        let _ = connect_template_for_route(&self.source_lu, &self.destination_lu, [1; 8])?;
+        Ok(())
+    }
+
+    fn profile(&self) -> LocalLlcProfile {
+        LocalLlcProfile {
+            cp_name: self.local_cp.clone(),
+            station_name: self.local_station.clone(),
+            node_id: self.local_node_id,
+            tg_number: self.tg_number,
+            max_receive_btu: 1496,
+            max_iframes_before_ack: 1,
+            role: self.role,
+        }
+    }
+}
+
+fn new_correlator() -> io::Result<[u8; 8]> {
+    let mut value = [0; 8];
+    File::open("/dev/urandom")?.read_exact(&mut value)?;
+    if value == [0; 8] {
+        value[0] = 1;
+    }
+    Ok(value)
+}
+
+fn poll_udp(
+    socket: &UdpSocket,
+    oob: &mut OutboundUdp,
+    edge: &mut GatewayEdge<NativeLlcPort>,
+) -> io::Result<()> {
+    let mut packet = [0u8; MAX_RECORD];
+    match socket.recv_from(&mut packet) {
+        Ok((length, source)) => match oob.receive(&packet[..length], source) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::InvalidData
+                        | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                tracing::debug!(peer = %source, error = %error, "unmatched MPTN UDP packet dropped");
+            }
+            Err(error) => return Err(error),
+            Ok(OutboundUdpAction::Reply(response)) => {
+                if socket.send_to(&response, source)? != response.len() {
+                    return Err(invalid("partial MPTN UDP response"));
+                }
+            }
+            Ok(OutboundUdpAction::PendingDuplicate) => {}
+            Ok(OutboundUdpAction::Deliver {
+                compensation: Compensation::Expedited,
+                sequence,
+                reduced,
+            }) => match edge.submit_udp_expedited(&reduced) {
+                Ok(()) => oob.mark_native_submitted(sequence)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            },
+            Ok(OutboundUdpAction::Deliver {
+                compensation: Compensation::Abort,
+                ..
+            }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "MPTN abort compensation is unavailable",
+                ));
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(OutboundUdpAction::Deliver {
+        compensation: Compensation::Expedited,
+        sequence,
+        reduced,
+    }) = oob.unsubmitted_delivery()
+    {
+        match edge.submit_udp_expedited(&reduced) {
+            Ok(()) => oob.mark_native_submitted(sequence)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if edge.take_completed_udp_expedited() {
+        let sequence = oob
+            .pending_sequence()
+            .ok_or_else(|| invalid("missing UDP sequence"))?;
+        let (reply, peer) = oob.complete_native_delivery(sequence)?;
+        if socket.send_to(&reply, peer)? != reply.len() {
+            return Err(invalid("partial MPTN UDP acknowledgement"));
+        }
+    }
+    Ok(())
+}
+
+/// Run one native-initiated LU6.2 circuit. `Ok` means the circuit closed
+/// after its first Attach; callers may start a new circuit with fresh IDs.
+pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
+    config.validate()?;
+    let deadline = Instant::now() + config.timeout;
+    let socket = UdpSocket::bind(SocketAddr::new(config.endpoint.local_ip, 397))?;
+    socket.set_nonblocking(true)?;
+    config.endpoint.establish_v5_management(
+        config.timeout.min(Duration::from_secs(5)),
+        &config.source_lu,
+        &config.destination_lu,
+    )?;
+    let xid = config
+        .profile()
+        .build()
+        .map_err(|error| invalid(format!("local XID3: {error}")))?;
+    let mut native = NativeLlcPort::open(
+        LlcPeer {
+            interface: &config.interface,
+            guest_mac: config.guest_mac,
+            proxy_mac: config.proxy_mac,
+        },
+        xid,
+        config.guest_cp.clone(),
+        config.local_cp.clone(),
+        config.source_lu.clone(),
+        config.destination_lu.clone(),
+    )?;
+    while native.management_bind().is_none()
+        && !STOP.load(Ordering::Relaxed)
+        && Instant::now() < deadline
+    {
+        match native.receive_once()? {
+            None => thread::sleep(IDLE_POLL),
+            Some(NativeLlcEvent::Closed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "native contact closed before management BIND",
+                ))
+            }
+            Some(_) => return Err(invalid("native user event before management BIND")),
+        }
+    }
+    let management = native
+        .management_bind()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "native management BIND timed out"))?
+        .clone();
+    let bridge = Bridge::new(
+        BindPolicy {
+            plu: config.source_lu.clone(),
+            slu: config.destination_lu.clone(),
+            mode: None,
+            allow_blank_mode: true,
+            max_pending_bytes: MAX_RECORD,
+        },
+        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?,
+        management,
+        config.user_tp,
+        1,
+    )?;
+    let connect =
+        connect_template_for_route(&config.source_lu, &config.destination_lu, new_correlator()?)?;
+    let mut oob = OutboundUdp::new(config.endpoint, connect.clone())?;
+    let mut edge = config
+        .endpoint
+        .open_edge(Duration::from_secs(5), native, bridge, connect)?;
+    let mut first_attach_seen = false;
+    let result = (|| -> io::Result<()> {
+        loop {
+            if STOP.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native to MPTN session timed out",
+                ));
+            }
+            poll_udp(&socket, &mut oob, &mut edge)?;
+            edge.poll_native_once()?;
+            if edge.is_closed() {
+                return Ok(());
+            }
+            edge.flush_tcp()?;
+            first_attach_seen |= edge.first_attach_delivery_complete();
+            if first_attach_seen || !edge.ipr_ack_outstanding() {
+                match edge.poll_tcp_once() {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.kind() == io::ErrorKind::UnexpectedEof && first_attach_seen =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            poll_udp(&socket, &mut oob, &mut edge)?;
+            thread::sleep(IDLE_POLL);
+        }
+    })();
+    let close = edge.close();
+    result?;
+    close?;
+    if !first_attach_seen && !STOP.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "MPTN session ended before first Attach",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> ReverseLlcConfig {
+        ReverseLlcConfig {
+            interface: "sol5".into(),
+            guest_mac: [2, 0, 0, 0, 0, 1],
+            proxy_mac: [2, 0x53, 0x4e, 0, 0, 2],
+            local_cp: "SOLNET.SNAB".into(),
+            guest_cp: "SOLNET.SNAA".into(),
+            local_station: "SNAB".into(),
+            local_node_id: [0xff, 0xf1, 0x23, 0x45],
+            tg_number: 1,
+            role: Role::Secondary,
+            source_lu: "SOLNET.SNAA".into(),
+            destination_lu: "SOLNET.SNAB".into(),
+            user_tp: [1, 2, 3, 4],
+            endpoint: OutboundEndpoint {
+                local_ip: "10.99.4.10".parse().unwrap(),
+                peer_ip: "10.99.4.3".parse().unwrap(),
+            },
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn route_identity_is_checked_before_opening_raw_sockets() {
+        config().validate().unwrap();
+        let mut distinct_lus = config();
+        distinct_lus.source_lu = "SOLNET.PAYROLL".into();
+        distinct_lus.destination_lu = "SOLNET.LEDGER".into();
+        distinct_lus.validate().unwrap();
+        let mut wrong = config();
+        wrong.source_lu = "OTHERNET.OTHER".into();
+        assert!(wrong.validate().is_err());
+        let mut wrong = config();
+        wrong.endpoint.peer_ip = wrong.endpoint.local_ip;
+        assert!(wrong.validate().is_err());
+    }
+}
