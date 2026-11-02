@@ -506,6 +506,10 @@ impl MptnGatewayPort {
             return Ok((None, true));
         }
         if association.user_inflight
+            || association
+                .pending_oob
+                .as_ref()
+                .is_some_and(|pending| pending.compensation == OobCompensation::Abort)
             || (front.kind == TcpKind::Expedited
                 && (association.pending_oob.is_some()
                     || association.pending_tcp_expedited.is_some()))
@@ -1019,6 +1023,8 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         assert!(port.complete_udp_expedited(2).is_err());
+        client.write_all(&[0, 0, 0, 8, 0, 0, 1, 2]).unwrap();
+        assert!(port.poll_once(true).unwrap().is_none());
         port.complete_udp_abort(2).unwrap();
         let received = peer.recv(&mut output).unwrap();
         assert_eq!(
