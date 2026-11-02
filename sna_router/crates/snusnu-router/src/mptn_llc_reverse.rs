@@ -5,10 +5,11 @@
 //! together, so credit and teardown cannot cross sessions.
 
 use crate::{
-    config::parse_cp,
+    config::{parse_cp, parse_mac},
     mptn_outbound_port::{OutboundEndpoint, OutboundUdp, OutboundUdpAction},
     native_llc_port::NativeLlcPort,
     native_peer_port::NativeLlcEvent,
+    native_probe::{parse_tp, ProbeConfig},
     runtime::LlcPeer,
     STOP,
 };
@@ -16,7 +17,8 @@ use router_core::{xid3::Role, xid3_local::LocalLlcProfile};
 use std::{
     fs::File,
     io::{self, Read},
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
+    path::Path,
     sync::atomic::Ordering,
     thread,
     time::{Duration, Instant},
@@ -289,6 +291,49 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The staged Solstice diagnostic uses the same session runner as a future
+/// ordinary route. The fixture supplies the native XID and LU6.2 TP policy;
+/// the command line chooses the two MPTN addresses.
+pub(crate) fn run_probe(path: &Path, local_ip: IpAddr, peer_ip: IpAddr) -> io::Result<()> {
+    let fixture = ProbeConfig::load(path)?;
+    if fixture.active_xid {
+        return Err(invalid("active_xid is unavailable for native converter"));
+    }
+    let source_lu = fixture
+        .user_plu
+        .clone()
+        .ok_or_else(|| invalid("user_plu required"))?;
+    let destination_lu = fixture
+        .user_slu
+        .clone()
+        .ok_or_else(|| invalid("user_slu required"))?;
+    let node_id = fixture.profile()?.node_id;
+    let config = ReverseLlcConfig {
+        interface: fixture.interface,
+        guest_mac: parse_mac(&fixture.guest_mac)?,
+        proxy_mac: parse_mac(&fixture.proxy_mac)?,
+        local_cp: fixture.local_cp,
+        guest_cp: fixture
+            .remote_cp
+            .ok_or_else(|| invalid("remote_cp required"))?,
+        local_station: fixture.local_station,
+        local_node_id: node_id,
+        tg_number: fixture.tg_number,
+        role: fixture.role.into(),
+        source_lu,
+        destination_lu,
+        user_tp: parse_tp(
+            fixture
+                .user_tp_hex
+                .as_deref()
+                .ok_or_else(|| invalid("user_tp_hex required"))?,
+        )?,
+        endpoint: OutboundEndpoint { local_ip, peer_ip },
+        timeout: Duration::from_secs(fixture.timeout_seconds),
+    };
+    run_once(&config)
 }
 
 #[cfg(test)]
