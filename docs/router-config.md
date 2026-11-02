@@ -156,8 +156,8 @@ profile; each additional route supplies its own exact target LU and CP.
 
 ### One gateway with initiation from either side
 
-The following route completes the preceding single-target example and runs
-with `snusnu-router --config bob.toml`:
+Replace the route in the preceding single-target example with this one, then
+run `snusnu-router --config bob.toml`:
 
 ```toml
 [[route]]
