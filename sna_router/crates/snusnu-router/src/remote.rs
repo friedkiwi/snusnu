@@ -3,7 +3,7 @@
 
 use crate::{
     local_status::{self, CircuitStatus, ConcentratorStatus},
-    routing::{FailureScope, RoutePort, RoutedUnit, RouterEvent},
+    routing::{FailureScope, RouteAddress, RoutePort, RoutedUnit, RouterEvent},
 };
 use router_core::packet_log::{decode_llc_pdu, decode_sna_information, hex_dump};
 use std::{
@@ -2031,6 +2031,40 @@ impl AutoWsHub {
         -> io::Result<Option<[u8; 6]>>
     {
         self.directory.borrow().managed_mac_for_cp(cp)
+    }
+
+    /// A current, medium-neutral view for the local automatic directory.
+    /// OPEN still rechecks the selected live RouteReference before use.
+    pub(crate) fn advertised_addresses(&self) -> Vec<RouteAddress> {
+        let directory = self.directory.borrow();
+        let mut addresses = Vec::new();
+        for (router_id, (_, _, routes)) in &directory.origins {
+            if router_id == &self.welcome.router_id { continue; }
+            for route in routes {
+                match route.resource.as_ref() {
+                    Some(wire::route_export::Resource::ControlPoint(cp)) =>
+                        addresses.push(RouteAddress::ControlPoint {
+                            netid: cp.netid.clone(), name: cp.name.clone(),
+                        }),
+                    Some(wire::route_export::Resource::LogicalUnit(lu)) => {
+                        if let Some(name) = &lu.lu {
+                            addresses.push(RouteAddress::LogicalUnit {
+                                netid: name.netid.clone(),
+                                cp: lu.hosting_cp.as_ref().map(|cp| cp.name.clone()),
+                                name: name.name.clone(),
+                            });
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        for mac in directory.managed.keys() {
+            if directory.resolve_mac(mac).ok().flatten().is_some() {
+                addresses.push(RouteAddress::Mac(*mac));
+            }
+        }
+        addresses
     }
 
     pub(crate) fn open_lu(&mut self, target_lu: &wire::SnaName, source_lu: &wire::SnaName)
