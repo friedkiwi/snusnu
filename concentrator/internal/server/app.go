@@ -96,10 +96,10 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /routers/{id}/rotate", a.full(a.routerRotate))
 	m.HandleFunc("POST /routers/{id}/delete", a.full(a.routerDelete))
 	m.HandleFunc("POST /routers/{id}/llc-facing", a.full(a.routerLLCFacing))
-	m.HandleFunc("GET /llc-macs", a.full(a.managedCPPage))
-	m.HandleFunc("POST /llc-macs", a.full(a.managedCPCreate))
-	m.HandleFunc("POST /llc-macs/{id}/enabled", a.full(a.managedCPEnabled))
-	m.HandleFunc("POST /llc-macs/{id}/retire", a.full(a.managedCPRetire))
+	m.HandleFunc("GET /llc-macs", http.NotFound)
+	m.HandleFunc("POST /llc-macs", http.NotFound)
+	m.HandleFunc("POST /llc-macs/{id}/enabled", http.NotFound)
+	m.HandleFunc("POST /llc-macs/{id}/retire", http.NotFound)
 	m.HandleFunc("GET /admin/llc-macs", a.admin(a.adminManagedCPPage))
 	m.HandleFunc("GET /flows", a.full(a.flows))
 	m.HandleFunc("GET /blocks", a.full(a.blocks))
@@ -617,12 +617,14 @@ func dbError(w http.ResponseWriter, err error) {
 	}
 }
 func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
+	pageLayout := strings.Replace(layout, `<a class="nav-link" href="/llc-macs">LLC MACs</a>`, "", 1)
+	pageLayout = strings.Replace(pageLayout, `>All MACs</a>`, `>LLC allocations</a>`, 1)
 	t, err := template.New("page").Funcs(template.FuncMap{"date": func(unix int64) string {
 		if unix == 0 {
 			return "Never"
 		}
 		return time.Unix(unix, 0).UTC().Format(time.RFC3339)
-	}, "prettyJSON": prettyJSON}).Parse(layout + nodeAddressTemplate + pages[name])
+	}, "prettyJSON": prettyJSON}).Parse(pageLayout + nodeAddressTemplate + pages[name])
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "template error", 500)

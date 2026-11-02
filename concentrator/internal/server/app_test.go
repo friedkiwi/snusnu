@@ -426,51 +426,13 @@ func TestRouterOnboardingProfileAndDirectory(t *testing.T) {
 	}
 }
 
-func TestManagedCPWebViewsAndOwnership(t *testing.T) {
+func TestManagedCPAllocationAndDirectoryAreServerOwned(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()
-	owner := store.RandomUUID()
-	other := store.RandomUUID()
-	for _, x := range []struct{ id, email, netid string }{{owner, "mac-owner@example.com", "SOLNET"}, {other, "mac-other@example.com", "OTHERNET"}} {
-		if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", x.id, x.email, "unused", store.Now(), x.netid); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ownerToken, ownerSession, err := a.DB.NewSession(ctx, owner, "full")
-	if err != nil {
+	owner, ownerCookie, _ := uiUser(t, a, "mac-owner@example.com", "user", "owner-password-123")
+	admin, adminCookie, _ := uiUser(t, a, "mac-admin@example.com", "admin", "admin-password-123")
+	if err := a.DB.UpdateProfile(ctx, owner, "mac-owner", "", "", "SOLNET", false); err != nil {
 		t.Fatal(err)
-	}
-	otherToken, otherSession, err := a.DB.NewSession(ctx, other, "full")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownerCookie := &http.Cookie{Name: "snusnu_session", Value: ownerToken}
-	otherCookie := &http.Cookie{Name: "snusnu_session", Value: otherToken}
-	w := postForm(a, "/llc-macs", url.Values{"csrf": {ownerSession.CSRF}, "netid": {"SOLNET"}, "cp_name": {"SNAB"}}, ownerCookie)
-	if w.Code != 303 {
-		t.Fatalf("allocate CP: %d %s", w.Code, w.Body.String())
-	}
-	items, err := a.DB.ListManagedCP(ctx, owner)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("address book: %+v %v", items, err)
-	}
-	cp := items[0]
-	for _, tc := range []struct {
-		cookie *http.Cookie
-		want   bool
-	}{{ownerCookie, true}, {otherCookie, false}} {
-		r := httptest.NewRequest("GET", "/llc-macs", nil)
-		r.AddCookie(tc.cookie)
-		w = httptest.NewRecorder()
-		a.Handler().ServeHTTP(w, r)
-		visible := strings.Contains(w.Body.String(), cp.MACColon()) && strings.Contains(w.Body.String(), cp.ADPTADR())
-		if w.Code != 200 || visible != tc.want {
-			t.Fatalf("MAC visibility: %d visible=%t", w.Code, visible)
-		}
-	}
-	w = postForm(a, "/llc-macs/"+cp.ID+"/retire", url.Values{"csrf": {otherSession.CSRF}}, otherCookie)
-	if w.Code != 403 {
-		t.Fatalf("foreign retirement: %d", w.Code)
 	}
 	origin, _, err := a.DB.CreateRouter(ctx, owner, "CP source")
 	if err != nil {
@@ -483,19 +445,31 @@ func TestManagedCPWebViewsAndOwnership(t *testing.T) {
 	if err = a.DB.ReplaceRouterSnapshot(ctx, origin.ID, epoch, 1, []store.RouteExport{{ID: 1, Generation: 1, Kind: "CP", NetID: "SOLNET", Name: "SNAB"}, {ID: 2, Generation: 1, Kind: "LU", NetID: "SOLNET", Name: "PAYROLL", HostingCPNetID: "SOLNET", HostingCPName: "SNAB", LUTypes: []string{"LU 6.2"}}}); err != nil {
 		t.Fatal(err)
 	}
-	r := httptest.NewRequest("GET", "/directory", nil)
-	r.AddCookie(ownerCookie)
-	w = httptest.NewRecorder()
-	a.Handler().ServeHTTP(w, r)
+	items, err := a.DB.ListManagedCP(ctx, owner)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("automatic address: %+v %v", items, err)
+	}
+	cp := items[0]
+	if w := uiGet(t, a, "/llc-macs", ownerCookie); w.Code != http.StatusNotFound {
+		t.Fatalf("user MAC manager still exposed: %d", w.Code)
+	}
+	if w := postForm(a, "/llc-macs/"+cp.ID+"/retire", url.Values{}, ownerCookie); w.Code != http.StatusNotFound {
+		t.Fatalf("user retirement still exposed: %d", w.Code)
+	}
+	ownerPage := uiGet(t, a, "/dashboard", ownerCookie).Body.String()
+	if strings.Contains(ownerPage, `href="/llc-macs"`) {
+		t.Fatal("user navigation still links MAC manager")
+	}
+	adminPage := uiGet(t, a, "/admin/llc-macs", adminCookie)
+	if adminPage.Code != http.StatusOK || !strings.Contains(adminPage.Body.String(), "Read-only operational view") || !strings.Contains(adminPage.Body.String(), cp.MACColon()) || strings.Contains(adminPage.Body.String(), "Retire") {
+		t.Fatalf("admin allocation view: %d %s", adminPage.Code, adminPage.Body.String())
+	}
+	w := uiGet(t, a, "/directory", ownerCookie)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), cp.MACColon()) || !strings.Contains(w.Body.String(), cp.ADPTADR()) || !strings.Contains(w.Body.String(), "Hosted by") || !strings.Contains(w.Body.String(), "LU 6.2") {
 		t.Fatalf("directory MAC/host CP: %d %s", w.Code, w.Body.String())
 	}
-	w = postForm(a, "/llc-macs/"+cp.ID+"/retire", url.Values{"csrf": {ownerSession.CSRF}}, ownerCookie)
-	if w.Code != 303 {
-		t.Fatalf("owner retirement: %d", w.Code)
+	if got := strings.Count(w.Body.String(), cp.MACColon()); got != 2 {
+		t.Fatalf("CP and hosted LU should both show assigned MAC, got %d", got)
 	}
-	retired, err := a.DB.ManagedCPByID(ctx, cp.ID)
-	if err != nil || retired.RetiredAt == 0 || retired.Suffix != cp.Suffix {
-		t.Fatalf("retired address: %+v %v", retired, err)
-	}
+	_ = admin
 }

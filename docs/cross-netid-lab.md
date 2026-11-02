@@ -12,19 +12,18 @@ This topology is separate from the `SOLNET` regression guests in the
 | V5R4 initiator | `/tmp/snusnu-cross-netid/v5-bob` | `sol9` | 9571, 9572 | `QABOB.SNAB` | Bob |
 
 The directories were cold sparse copies of powered-off writable guests on
-2026-11-02, not copies of the original Solstice templates. Their chassis
-files use independent TAPs and console ports. The source `SOLNET` guests
+2026-11-02, not copies of the original private templates. Their chassis
+files use independent TAPs and console ports. The source guests
 retain `sol5`/`sol7` and their original ports. The host filesystem does not
 support reflink copies, so the two copies occupy about 9 GiB of allocated
 disk space. Do not bridge `sol8` and `sol9`: each guest must see only its own
 router endpoint. Guest MACs may match the source clones because the TAPs
 remain isolated.
 
-The QA seed gives Alice managed CP `QAALICE.SNAA` and Bob managed CP
-`QABOB.SNAB`, with one bearer token for each router. The seed allocates
-Alice before Bob, so a fresh database normally gives Bob's CP managed MAC
-`02:53:4e:00:00:02`; read the assigned address from the concentrator before
-entering it in V4's controller. The Go forwarding policy allows different
+The QA seed gives Alice and Bob one bearer token for each router. The
+concentrator automatically allocates a stable managed MAC when each router
+first advertises `QAALICE.SNAA` or `QABOB.SNAB`; read the resulting address
+from the global directory before entering it in V4's controller. The Go forwarding policy allows different
 owners by default unless a router is paused or either user blocks the other.
 
 Configure only the copied OS/400 guests after they reach Main Menu:

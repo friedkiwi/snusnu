@@ -144,19 +144,12 @@ func TestManagedBindingAuthorizationAndPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SchemaVersion != 1 || len(result.Bindings) != 0 {
-		t.Fatalf("binding without opt-in CP: %+v", result)
-	}
-	cp, err := s.AllocateManagedCP(ctx, owner, "SOLNET", "SNAB")
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err = s.BuildManagedBindingSnapshot(ctx, recipient.ID, recipientEpoch, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if result.SchemaVersion != 1 || result.RecipientEpoch != recipientEpoch || len(result.Bindings) != 1 {
 		t.Fatalf("downstream snapshot: %+v", result)
+	}
+	cp, err := s.managedCPByName(ctx, owner, "SOLNET", "SNAB")
+	if err != nil {
+		t.Fatal(err)
 	}
 	b := result.Bindings[0]
 	if b.AddressID != cp.ID || b.MAC != cp.MACBytes() || b.CPName != "SNAB" || len(b.Candidates) != 1 || b.Candidates[0].RouterID != origin.ID {

@@ -52,13 +52,6 @@ func Seed(ctx context.Context, db *store.Store) error {
 		if err != nil {
 			return err
 		}
-		var netid string
-		if err = db.Row(ctx, "SELECT netid FROM users WHERE id=?", owner).Scan(&netid); err != nil {
-			return err
-		}
-		if _, err = db.AllocateManagedCP(ctx, owner, netid, router.CP); err != nil {
-			return err
-		}
 	}
 	_, err := db.Exec(ctx, "INSERT INTO api_clients(id,user_id,name,secret_hash,created_at) VALUES(?,?,?,?,?)", store.RandomUUID(), owners[Accounts[0].Email], "QA admin API", store.Hash(AdminAPIToken), store.Now())
 	return err

@@ -37,7 +37,7 @@ func TestQAStoreIsFreshAndIgnoresProductionDSN(t *testing.T) {
 	}
 	for _, router := range qa.Routers {
 		client, err := first.RouterByToken(ctx, router.Token)
-		if err != nil || !client.LLCFacing || client.DisplayName != router.Name {
+		if err != nil || client.LLCFacing != router.LLCFacing || client.DisplayName != router.Name {
 			t.Fatalf("QA router: %+v %v", client, err)
 		}
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,6 +100,10 @@ func (s *Store) ReplaceRouterSnapshot(ctx context.Context, routerID, epoch strin
 		return err
 	}
 	defer tx.Rollback()
+	var ownerID string
+	if err = tx.QueryRowContext(ctx, s.Q("SELECT owner_id FROM routers WHERE id=?"), routerID).Scan(&ownerID); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, s.Q("UPDATE router_epochs SET revision=? WHERE router_id=? AND epoch=? AND revision<?"), int64(revision), routerID, epoch, int64(revision))
 	if err != nil {
 		return err
@@ -116,8 +121,37 @@ func (s *Store) ReplaceRouterSnapshot(ctx context.Context, routerID, epoch strin
 		if err != nil {
 			return fmt.Errorf("insert route export: %w", err)
 		}
+		if x.Kind == "CP" {
+			if err = s.ensureManagedCP(ctx, tx, ownerID, x.NetID, x.Name); err != nil {
+				return fmt.Errorf("allocate managed CP address: %w", err)
+			}
+		}
 	}
 	return tx.Commit()
+}
+
+// ensureManagedCP makes the concentrator, rather than the user or router,
+// responsible for the stable LLC address associated with an advertised CP.
+func (s *Store) ensureManagedCP(ctx context.Context, tx *sql.Tx, ownerID, netid, name string) error {
+	var id string
+	err := tx.QueryRowContext(ctx, s.Q("SELECT id FROM managed_cp_addresses WHERE owner_id=? AND netid=? AND cp_name=?"), ownerID, netid, name).Scan(&id)
+	if err == nil {
+		_, err = tx.ExecContext(ctx, s.Q("UPDATE managed_cp_addresses SET enabled=1,retired_at=0 WHERE id=?"), id)
+		return err
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	var suffix int64
+	err = tx.QueryRowContext(ctx, "UPDATE mac_pool_state SET next_suffix=next_suffix+1 WHERE id=1 AND next_suffix<=16777215 RETURNING next_suffix-1").Scan(&suffix)
+	if err == sql.ErrNoRows {
+		return ErrMACPoolExhausted
+	}
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, s.Q("INSERT INTO managed_cp_addresses(id,owner_id,netid,cp_name,mac_suffix,enabled,created_at) VALUES(?,?,?,?,?,1,?) ON CONFLICT(owner_id,netid,cp_name) DO UPDATE SET enabled=1,retired_at=0"), uuid.NewString(), ownerID, netid, name, suffix, Now())
+	return err
 }
 
 // EndRouterEpoch withdraws only the named connection's routes.

@@ -46,7 +46,7 @@ func (s *Store) ListExports(ctx context.Context, ownerID string) ([]Export, erro
 	return s.listExports(ctx, ownerID, "")
 }
 func (s *Store) listExports(ctx context.Context, ownerID, routerID string) ([]Export, error) {
-	q := "SELECT e.router_id,r.display_name,r.owner_id,u.username,e.kind,e.netid,e.name,e.hosting_cp_netid,e.hosting_cp_name,e.route_id,e.generation,e.revision,COALESCE(m.mac_suffix,0),e.lu_types FROM router_advertisements e JOIN routers r ON r.id=e.router_id JOIN users u ON u.id=r.owner_id LEFT JOIN managed_cp_addresses m ON m.owner_id=r.owner_id AND m.netid=e.netid AND m.cp_name=e.name AND e.kind='CP' AND m.enabled=1 AND m.retired_at=0 WHERE r.paused=0"
+	q := "SELECT e.router_id,r.display_name,r.owner_id,u.username,e.kind,e.netid,e.name,e.hosting_cp_netid,e.hosting_cp_name,e.route_id,e.generation,e.revision,COALESCE(m.mac_suffix,0),e.lu_types FROM router_advertisements e JOIN routers r ON r.id=e.router_id JOIN users u ON u.id=r.owner_id LEFT JOIN managed_cp_addresses m ON m.owner_id=r.owner_id AND ((e.kind='CP' AND m.netid=e.netid AND m.cp_name=e.name) OR (e.kind='LU' AND m.netid=e.hosting_cp_netid AND m.cp_name=e.hosting_cp_name)) AND m.enabled=1 AND m.retired_at=0 WHERE r.paused=0"
 	args := []any{}
 	if ownerID != "" {
 		q += " AND r.owner_id=?"

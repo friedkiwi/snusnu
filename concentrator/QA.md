@@ -26,7 +26,7 @@ Every launch creates a new private directory under the OS temporary directory an
 | Alice | `Alice V4R4` | `qa-alice-router-token-1234567890` | `QAALICE.SNAA` |
 | Bob | `Bob V5R4` | `qa-bob-router-token-1234567890` | `QABOB.SNAB` |
 
-Alice's router is LLC-facing; Bob's TCP62 gateway is not. Both CPs have managed virtual MAC address-book entries, but they have no live advertisements until they connect and publish a route snapshot. Each router uses `ws://localhost:8081/router/v1/ws` with its token in the `Authorization: Bearer` header. Native LLC relay tests can use `snusnu.v1`; the cross-NETID LU gateway requires `snusnu.v2` source-route validation. The managed MACs can be viewed in the UI.
+Alice's router is LLC-facing; Bob's TCP62 gateway is not. A stable virtual MAC is allocated automatically when either router connects and first advertises its CP; there are no pre-created or user-managed address entries. Each router uses `ws://localhost:8081/router/v1/ws` with its token in the `Authorization: Bearer` header. Native LLC relay tests can use `snusnu.v1`; the cross-NETID LU gateway requires `snusnu.v2` source-route validation. Assigned MACs appear alongside live CPs and hosted LUs in the global directory; administrators also have a read-only allocation view.
 
 The admin account also has a read-only API client named `QA admin API` with token `qa-admin-api-token-1234567890`. Use it for `/api/v1/directory` and `/api/v1/connections`.
 
