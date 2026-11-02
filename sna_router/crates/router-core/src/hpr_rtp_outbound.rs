@@ -331,6 +331,7 @@ impl RtpOutboundEndpoint {
         }
         let packet = RtpPacket::parse(nlp).ok()?;
         (packet.tcid == self.origin_tcid & !ASSIGNOR
+            && packet.data.is_empty()
             && packet.connection_identifier_exchange().ok().flatten()
                 == self.peer_tcid.map(|id| id | ASSIGNOR))
         .then_some(self.sent_initial_status.as_deref())
@@ -351,7 +352,14 @@ impl RtpOutboundEndpoint {
         let segments = packet
             .optional_segments()
             .map_err(EndpointError::InvalidRtp)?;
-        if segments.iter().any(|s| !matches!(s.key, 0x0e | 0x22)) {
+        if segments
+            .iter()
+            .any(|s| !matches!(s.key, 0x0e | 0x10 | 0x22))
+            || packet
+                .connection_identifier_exchange()
+                .map_err(EndpointError::InvalidRtp)?
+                .is_some_and(|tcid| Some(tcid & !ASSIGNOR) != self.peer_tcid)
+        {
             return Err(EndpointError::UnsupportedSegment);
         }
         let mut arb = self.arb.unwrap();
@@ -609,6 +617,18 @@ mod tests {
         nlp
     }
 
+    fn peer_data_with_cie(data: &[u8]) -> Vec<u8> {
+        let mut nlp = vec![0xc6, 8, 0xa4, 0x80, 0xff, 0];
+        nlp.extend_from_slice(&(ORIGIN & !ASSIGNOR).to_be_bytes());
+        nlp.extend_from_slice(&[0x3c, 4, 0, 8]);
+        nlp.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        nlp.extend_from_slice(&0u32.to_be_bytes());
+        nlp.extend_from_slice(&[3, 0x10, 0, 0]);
+        nlp.extend_from_slice(&PEER_ASSIGNED.to_be_bytes());
+        nlp.extend_from_slice(data);
+        nlp
+    }
+
     #[test]
     fn setup_reply_status_and_early_bind_response_are_ordered() {
         let (mut endpoint, bind) = fixture();
@@ -696,5 +716,35 @@ mod tests {
         let received = endpoint.receive(&ack).unwrap();
         assert!(received.messages.is_empty());
         assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 0);
+    }
+
+    #[test]
+    fn live_bind_response_with_repeated_cie_delivers_data_once() {
+        let (mut endpoint, bind) = fixture();
+        let setup = endpoint.prepare_setup(&bind).unwrap();
+        endpoint.confirm_setup_sent(&setup, 10_000).unwrap();
+        let reply = peer_reply(endpoint.setup_next_bsn);
+        let status = endpoint.prepare_reply_status(&reply).unwrap();
+        endpoint.confirm_status_sent(&status).unwrap();
+        // V5R4's first +RSP(BIND) at 17:20:22 has both CIE X'10' and
+        // FID5 data. It is a new BIU, not an empty duplicate setup reply.
+        let first = peer_data_with_cie(b"BIND-RSP");
+        assert_eq!(endpoint.reply_to_duplicate_cie(&first), None);
+        assert_eq!(
+            endpoint.receive(&first).unwrap().messages,
+            [b"BIND-RSP".to_vec()]
+        );
+        assert!(endpoint.receive(&first).unwrap().messages.is_empty());
+        assert_eq!(
+            endpoint.reply_to_duplicate_cie(&reply),
+            Some(status.as_slice())
+        );
+        let mut wrong = first.clone();
+        let cie_tcid_start = wrong.len() - b"BIND-RSP".len() - 8;
+        wrong[cie_tcid_start + 7] ^= 1;
+        assert_eq!(
+            endpoint.receive(&wrong),
+            Err(EndpointError::UnsupportedSegment)
+        );
     }
 }
