@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
 base_commit=$(git rev-parse HEAD)
-staged_paths=$(git diff --cached --name-only --diff-filter=ACMR)
+staged_paths=$(git diff --cached --name-only --diff-filter=ACDMR)
 if [[ -z "$staged_paths" ]]; then
   exit 0
 fi

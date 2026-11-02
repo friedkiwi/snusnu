@@ -7,10 +7,15 @@ snusnu is an early-stage, stateful DLC circuit service for connecting hobbyist S
 
 **Early development:** the LLC2 lab mode passed a V4R4 guest-to-guest APPC pass-through test. WSS circuit transport, authentication, and production routing are not implemented yet. Directory and connection records are planning data, not live reachability or transport status.
 
+Install the repository pre-commit checks once per clone:
+
 ```sh
-cd concentrator && go build ./... && test -z "$(gofmt -l .)" && go vet ./... && go test ./...
-cd ../sna_router && cargo build --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+git config core.hooksPath .githooks
 ```
+
+The hook checks the staged tree with the CI formatting, vet or clippy, test,
+and build commands for the Go and Rust paths affected by each commit. Run
+`scripts/pre-commit-check.sh` to check the current staged changes manually.
 
 See [architecture](docs/architecture.md) and [draft protocol](docs/protocol.md).
 
