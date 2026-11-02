@@ -39,7 +39,10 @@ check_go_module() {
   echo "pre-commit: $module formatting, vet, tests, build"
   (
     cd "$check_dir/tree/$module"
-    unformatted=$(gofmt -l .)
+    go_version=$(awk '$1 == "go" { print $2; exit }' "$check_dir/tree/concentrator/go.mod")
+    export GOTOOLCHAIN="go${go_version}+auto"
+    go_toolchain_root=$(go env GOROOT)
+    unformatted=$("$go_toolchain_root/bin/gofmt" -l .)
     if [[ -n "$unformatted" ]]; then
       printf 'Go files need gofmt:\n%s\n' "$unformatted" >&2
       exit 1

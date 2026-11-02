@@ -10,4 +10,20 @@ type Peer struct {
 	LU        string
 }
 
-func (p Peer) Valid() bool { return p.Principal != "" && p.NetID != "" && p.CP != "" && p.LU != "" }
+func (p Peer) Valid() bool {
+	return p.Principal != "" && validName(p.NetID) && validName(p.CP) && validName(p.LU)
+}
+
+func validName(value string) bool {
+	if len(value) == 0 || len(value) > 8 {
+		return false
+	}
+	for i := range value {
+		c := value[i]
+		if c >= 'A' && c <= 'Z' || c == '@' || c == '#' || c == '$' || i > 0 && c >= '0' && c <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
