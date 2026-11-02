@@ -6,7 +6,7 @@
 use crate::{
     config::parse_cp,
     mptn_outbound_port::{OutboundEndpoint, OutboundUdp, OutboundUdpAction},
-    remote::{Config as RemoteConfig, WsRoutePort},
+    remote::{Config as RemoteConfig, InboundOpen, WsRoutePort},
     ws_native_responder::WsNativeResponder,
     STOP,
 };
@@ -223,6 +223,18 @@ pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
         }
         thread::sleep(IDLE_POLL);
     };
+    run_from_open(config, native, socket, open, setup_deadline)
+}
+
+/// Continue an inbound native circuit selected by a duplex gateway. Its UDP
+/// socket is a clone of that gateway's sole bound UDP/397 socket.
+pub(crate) fn run_from_open(
+    config: &ReverseWsConfig,
+    mut native: WsNativeResponder<WsRoutePort>,
+    socket: UdpSocket,
+    open: InboundOpen,
+    setup_deadline: Instant,
+) -> io::Result<()> {
     tracing::info!(
         circuit_id = ?open.circuit_id,
         source_router_id = ?open.source_router_id,
