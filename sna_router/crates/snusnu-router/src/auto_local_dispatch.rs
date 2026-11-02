@@ -73,11 +73,11 @@ impl AutoLocalDispatch {
         let proxy_mac = offer.proxy_mac;
         let gateway_id = gateway.id().to_owned();
         let target = gateway.outbound_endpoint();
-        let udp = gateway.lease_udp()?;
         let id = self
             .next_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("automatic local session ID exhausted"))?;
+        let udp = gateway.lease_udp()?;
         let sender = self.sender.clone();
         let handle = match thread::Builder::new()
             .name("snusnu-local-mptn".into())
