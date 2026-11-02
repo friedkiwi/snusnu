@@ -50,7 +50,7 @@ fn one_gateway(
         || config.route.len() != 1
     {
         return Err(invalid(
-            "virtual management lab needs exactly one gateway, concentrator and route",
+            "virtual management lab needs one MPTN gateway-profile peer, concentrator and route",
         ));
     }
     let gateway = &config.mptn_gateway[0];
@@ -169,7 +169,8 @@ mod tests {
     #[test]
     fn lab_derives_qualified_source_lu62_and_fixed_secondary_profile() {
         let input = r#"
-[[mptn_gateway]]
+[[mptn]]
+profile = "gateway"
 id = "bob"
 local_ip = "10.99.4.11"
 peer_ip = "10.99.4.3"

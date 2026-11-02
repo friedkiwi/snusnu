@@ -55,7 +55,7 @@ fn check_shape(config: &config::RouterConfig) -> io::Result<()> {
         || !config.hpr_lan.is_empty()
     {
         return Err(invalid(
-            "experimental gateway requires one MPTN gateway, concentrator and route",
+            "experimental gateway requires one MPTN gateway-profile peer, concentrator and route",
         ));
     }
     Ok(())
@@ -94,13 +94,13 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     run_config(&config, true)
 }
 
-/// Shared gateway runtime entry. Production remains gated until all X'83'
-/// directions, including native-initiated Abort, have socket completion.
+/// Shared gateway runtime entry. Production remains gated while native user
+/// addressing is specific to the QA fixture and only one session is handled.
 pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> io::Result<()> {
     if !experimental {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "production TCP62 gateway waits for outbound UDP Abort completion",
+            "production TCP62 gateway requires generalized native user addressing and session lifecycle",
         ));
     }
     check_shape(&config)?;
