@@ -287,6 +287,129 @@ impl RtpPosition {
     }
 }
 
+/// A diagnostic upper bound for one assembled RTP message. An endpoint would
+/// negotiate and enforce its own limits independently of this receive helper.
+pub const MAX_ASSEMBLED_MESSAGE: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssemblyError {
+    InvalidLimit,
+    QualifiedConnectionUnsupported,
+    WrongConnection,
+    MissingStart,
+    UnexpectedStart,
+    MessageTooLarge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssemblyObservation {
+    /// No data or EOM in this packet; status and other optional segments are
+    /// not interpreted or acted upon.
+    ControlOnly,
+    Incomplete,
+    Complete(Vec<u8>),
+    Gap {
+        expected: u32,
+        observed: u32,
+    },
+    OldOrDuplicate {
+        expected: u32,
+        observed: u32,
+    },
+}
+
+/// Reassembles one already-identified, unqualified, directional RTP data
+/// stream. The caller must establish the connection and keep each priority
+/// separate, and validate optional segments before passing a packet; numeric
+/// TCID alone does not prove peer identity. This helper
+/// never ACKs, requests retransmission, interprets ARB, or accepts a qualified
+/// setup packet. Gaps and duplicates leave the buffered message untouched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RtpMessageAssembler {
+    tcid: u32,
+    max_message_bytes: usize,
+    next: Option<u32>,
+    partial: Option<Vec<u8>>,
+}
+
+impl RtpMessageAssembler {
+    pub fn new(tcid: u32, max_message_bytes: usize) -> Result<Self, AssemblyError> {
+        if tcid & 0x8000_0000 != 0 {
+            return Err(AssemblyError::QualifiedConnectionUnsupported);
+        }
+        if max_message_bytes == 0 || max_message_bytes > MAX_ASSEMBLED_MESSAGE {
+            return Err(AssemblyError::InvalidLimit);
+        }
+        Ok(Self {
+            tcid,
+            max_message_bytes,
+            next: None,
+            partial: None,
+        })
+    }
+
+    pub fn observe(&mut self, packet: RtpPacket<'_>) -> Result<AssemblyObservation, AssemblyError> {
+        if packet.tcid & 0x8000_0000 != 0 {
+            return Err(AssemblyError::QualifiedConnectionUnsupported);
+        }
+        if packet.tcid != self.tcid {
+            return Err(AssemblyError::WrongConnection);
+        }
+        if let Some(expected) = self.next {
+            if packet.byte_sequence_number != expected {
+                let distance = packet.byte_sequence_number.wrapping_sub(expected);
+                return Ok(if distance < 0x8000_0000 {
+                    AssemblyObservation::Gap {
+                        expected,
+                        observed: packet.byte_sequence_number,
+                    }
+                } else {
+                    AssemblyObservation::OldOrDuplicate {
+                        expected,
+                        observed: packet.byte_sequence_number,
+                    }
+                });
+            }
+        }
+        if packet.start_of_message && self.partial.is_some() {
+            return Err(AssemblyError::UnexpectedStart);
+        }
+        if !packet.start_of_message
+            && self.partial.is_none()
+            && (!packet.data.is_empty() || packet.end_of_message)
+        {
+            return Err(AssemblyError::MissingStart);
+        }
+        let current_len = self.partial.as_ref().map_or(0, Vec::len);
+        if packet.data.len() > self.max_message_bytes - current_len {
+            return Err(AssemblyError::MessageTooLarge);
+        }
+        if packet.start_of_message {
+            self.partial = Some(Vec::new());
+        }
+        self.next = Some(packet.next_byte_sequence_number());
+        if let Some(partial) = self.partial.as_mut() {
+            partial.extend_from_slice(packet.data);
+            if packet.end_of_message {
+                return Ok(AssemblyObservation::Complete(self.partial.take().unwrap()));
+            }
+            return Ok(AssemblyObservation::Incomplete);
+        }
+        Ok(AssemblyObservation::ControlOnly)
+    }
+
+    pub fn next_expected(&self) -> Option<u32> {
+        self.next
+    }
+
+    /// Discard position and incomplete data after an external connection
+    /// reset or explicit diagnostic restart. This emits no wire signal.
+    pub fn reset(&mut self) {
+        self.next = None;
+        self.partial = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +447,23 @@ mod tests {
         }
         assert_eq!(nlp.len(), 6 + 172);
         nlp
+    }
+
+    fn synthetic_fragment(tcid: u32, bsn: u32, som: bool, eom: bool, data: &[u8]) -> Vec<u8> {
+        let mut nlp = vec![0xc2, 0x08, 0xa4, 0, 0xff, 0];
+        let mut thdr = [0u8; 20];
+        thdr[..4].copy_from_slice(&tcid.to_be_bytes());
+        thdr[8] = (u8::from(som) << 5) | (u8::from(eom) << 4);
+        thdr[10..12].copy_from_slice(&5u16.to_be_bytes());
+        thdr[12..16].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        thdr[16..20].copy_from_slice(&bsn.to_be_bytes());
+        nlp.extend_from_slice(&thdr);
+        nlp.extend_from_slice(data);
+        nlp
+    }
+
+    fn fragment<'a>(bytes: &'a [u8]) -> RtpPacket<'a> {
+        RtpPacket::parse(bytes).unwrap()
     }
 
     #[test]
@@ -498,6 +638,160 @@ mod tests {
         assert_eq!(
             RtpPacket::parse(&nlp).unwrap().optional_segments(),
             Err(RtpError::UnsupportedConnectionQualifier)
+        );
+    }
+
+    #[test]
+    fn assembles_in_order_synthetic_fragments_and_ignores_control_only() {
+        let tcid = 0x0016_a4a1;
+        let mut assembler = RtpMessageAssembler::new(tcid, 8).unwrap();
+        let control = synthetic_fragment(tcid, 100, false, false, &[]);
+        assert_eq!(
+            assembler.observe(fragment(&control)),
+            Ok(AssemblyObservation::ControlOnly)
+        );
+        assert_eq!(assembler.next_expected(), Some(100));
+        let start = synthetic_fragment(tcid, 100, true, false, b"AB");
+        assert_eq!(
+            assembler.observe(fragment(&start)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        let middle = synthetic_fragment(tcid, 102, false, false, b"CD");
+        assert_eq!(
+            assembler.observe(fragment(&middle)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        let end = synthetic_fragment(tcid, 104, false, true, b"E");
+        assert_eq!(
+            assembler.observe(fragment(&end)),
+            Ok(AssemblyObservation::Complete(b"ABCDE".to_vec()))
+        );
+        assert_eq!(assembler.next_expected(), Some(106)); // EOM consumes one BSN.
+    }
+
+    #[test]
+    fn gaps_and_duplicates_preserve_partial_message() {
+        let tcid = 0x0016_a4a1;
+        let mut assembler = RtpMessageAssembler::new(tcid, 8).unwrap();
+        let start = synthetic_fragment(tcid, 10, true, false, b"AB");
+        let missing = synthetic_fragment(tcid, 12, false, false, b"CD");
+        let future = synthetic_fragment(tcid, 14, false, true, b"E");
+        assert_eq!(
+            assembler.observe(fragment(&start)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        assert_eq!(
+            assembler.observe(fragment(&future)),
+            Ok(AssemblyObservation::Gap {
+                expected: 12,
+                observed: 14
+            })
+        );
+        assert_eq!(assembler.next_expected(), Some(12));
+        assert_eq!(
+            assembler.observe(fragment(&start)),
+            Ok(AssemblyObservation::OldOrDuplicate {
+                expected: 12,
+                observed: 10
+            })
+        );
+        assert_eq!(
+            assembler.observe(fragment(&missing)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        assert_eq!(
+            assembler.observe(fragment(&future)),
+            Ok(AssemblyObservation::Complete(b"ABCDE".to_vec()))
+        );
+    }
+
+    #[test]
+    fn assembly_counts_eom_across_bsn_wraparound() {
+        let tcid = 0x0016_a4a1;
+        let mut assembler = RtpMessageAssembler::new(tcid, 8).unwrap();
+        let start = synthetic_fragment(tcid, u32::MAX - 1, true, false, b"AB");
+        let end = synthetic_fragment(tcid, 0, false, true, b"C");
+        assert_eq!(
+            assembler.observe(fragment(&start)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        assert_eq!(
+            assembler.observe(fragment(&end)),
+            Ok(AssemblyObservation::Complete(b"ABC".to_vec()))
+        );
+        assert_eq!(assembler.next_expected(), Some(2));
+    }
+
+    #[test]
+    fn assembly_enforces_limit_and_reset_without_advancing_on_error() {
+        let tcid = 0x0016_a4a1;
+        assert_eq!(
+            RtpMessageAssembler::new(tcid, 0),
+            Err(AssemblyError::InvalidLimit)
+        );
+        assert_eq!(
+            RtpMessageAssembler::new(tcid, MAX_ASSEMBLED_MESSAGE + 1),
+            Err(AssemblyError::InvalidLimit)
+        );
+        assert_eq!(
+            RtpMessageAssembler::new(tcid | 0x8000_0000, 8),
+            Err(AssemblyError::QualifiedConnectionUnsupported)
+        );
+        let mut assembler = RtpMessageAssembler::new(tcid, 3).unwrap();
+        let start = synthetic_fragment(tcid, 7, true, false, b"AB");
+        let over = synthetic_fragment(tcid, 9, false, true, b"CD");
+        assert_eq!(
+            assembler.observe(fragment(&start)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        assert_eq!(
+            assembler.observe(fragment(&over)),
+            Err(AssemblyError::MessageTooLarge)
+        );
+        assert_eq!(assembler.next_expected(), Some(9));
+        let wrong = synthetic_fragment(tcid + 1, 9, false, true, b"C");
+        assert_eq!(
+            assembler.observe(fragment(&wrong)),
+            Err(AssemblyError::WrongConnection)
+        );
+        let end = synthetic_fragment(tcid, 9, false, true, b"C");
+        assert_eq!(
+            assembler.observe(fragment(&end)),
+            Ok(AssemblyObservation::Complete(b"ABC".to_vec()))
+        );
+        let next_start = synthetic_fragment(tcid, 11, true, false, b"X");
+        assert_eq!(
+            assembler.observe(fragment(&next_start)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        assembler.reset();
+        assert_eq!(assembler.next_expected(), None);
+        assert_eq!(
+            assembler.observe(fragment(&end)),
+            Err(AssemblyError::MissingStart)
+        );
+        assert_eq!(assembler.next_expected(), None);
+    }
+
+    #[test]
+    fn assembly_rejects_unexpected_start_and_qualified_packet() {
+        let tcid = 0x0016_a4a1;
+        let mut assembler = RtpMessageAssembler::new(tcid, 8).unwrap();
+        let start = synthetic_fragment(tcid, 0, true, false, b"A");
+        let another = synthetic_fragment(tcid, 1, true, true, b"B");
+        assert_eq!(
+            assembler.observe(fragment(&start)),
+            Ok(AssemblyObservation::Incomplete)
+        );
+        assert_eq!(
+            assembler.observe(fragment(&another)),
+            Err(AssemblyError::UnexpectedStart)
+        );
+        assert_eq!(assembler.next_expected(), Some(1));
+        let qualified = synthetic_fragment(tcid | 0x8000_0000, 1, false, true, b"B");
+        assert_eq!(
+            assembler.observe(fragment(&qualified)),
+            Err(AssemblyError::QualifiedConnectionUnsupported)
         );
     }
 }
