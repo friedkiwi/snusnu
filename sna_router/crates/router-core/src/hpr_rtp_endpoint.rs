@@ -806,10 +806,10 @@ fn encode_data_nlp(
     nlp.extend_from_slice(&path.peer_anr_label);
     nlp.extend_from_slice(&[0xff, 0]);
     nlp.extend_from_slice(&tcid.to_be_bytes());
-    // The first outbound data packet can precede the peer's STATUS echo.
-    // Request a prompt STATUS so the CIE-assigned TCID and receive window
-    // are confirmed before subsequent traffic (V5R4 direct EE packet 16).
-    nlp.extend_from_slice(&[if cie_tcid.is_some() { 0x3c } else { 0x30 }, 4]);
+    // Request prompt STATUS for every complete data message. The V5R4 peer
+    // otherwise returns only an ARB Rate Reply, which does not acknowledge
+    // our send window; a second CP response then retransmits indefinitely.
+    nlp.extend_from_slice(&[0x3c, 4]);
     nlp.extend_from_slice(&(8u16 + if cie_tcid.is_some() { 3 } else { 0 }).to_be_bytes());
     nlp.extend_from_slice(&(message.len() as u32).to_be_bytes());
     nlp.extend_from_slice(&bsn.to_be_bytes());
@@ -1051,7 +1051,9 @@ mod tests {
         assert_eq!((parsed.sync, parsed.echo, parsed.rseq), (2, 1, 111));
         endpoint.confirm_status_sent(&status).unwrap();
         let output = endpoint.prepare_message(b"REPLY", 10_000).unwrap();
-        assert_eq!(RtpPacket::parse(&output).unwrap().thdr[8], 0x30);
+        // A second, post-CIE CP reply still needs STATUS Requested and
+        // Respond ASAP; ARB Rate Reply alone is not RTP acknowledgment.
+        assert_eq!(RtpPacket::parse(&output).unwrap().thdr[8], 0x3c);
         endpoint.confirm_message_sent(&output, 10_000).unwrap();
         assert_eq!(RtpPacket::parse(&output).unwrap().byte_sequence_number, 200);
         assert_eq!(endpoint.retransmit_due(259_999), Ok(None));
