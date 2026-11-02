@@ -113,7 +113,7 @@ impl EndpointRegistry {
     }
 }
 
-fn validate_mac_pair(guest_mac: [u8; 6], proxy_mac: [u8; 6]) -> io::Result<()> {
+pub(crate) fn validate_mac_pair(guest_mac: [u8; 6], proxy_mac: [u8; 6]) -> io::Result<()> {
     if guest_mac == proxy_mac
         || validate_unicast_mac(guest_mac).is_err()
         || validate_unicast_mac(proxy_mac).is_err()
@@ -282,7 +282,7 @@ impl Endpoint {
         let mut buffer = [0u8; MAX_FRAME_LEN];
         match self.port.receive_frame(&mut buffer) {
             Ok(length) => Ok(Some(
-                self.receive_frame(&buffer[..length], can_accept_information)?,
+                self.inject_frame(&buffer[..length], can_accept_information)?,
             )),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => {
@@ -290,6 +290,18 @@ impl Endpoint {
                 Err(error)
             }
         }
+    }
+
+    /// Feed the first frame captured by a session listener into a newly
+    /// created private association. Subsequent frames arrive on this port's
+    /// own packet socket; opening that socket after capture avoids replaying
+    /// the same frame twice.
+    pub(crate) fn inject_frame(
+        &mut self,
+        frame: &[u8],
+        can_accept_information: bool,
+    ) -> io::Result<Vec<Event>> {
+        self.receive_frame(frame, can_accept_information)
     }
 
     fn receive_frame(
