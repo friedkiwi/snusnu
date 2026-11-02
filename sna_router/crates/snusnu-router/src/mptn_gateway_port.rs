@@ -11,6 +11,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
 };
 
+use std::time::Instant;
 use transport_ip_sna::{
     anynet::{bind_udp, listen_tcp, TcpKind, TcpRecord, TcpSession, MAX_RECORD},
     mptn_bind_negotiation::validate_positive_response,
@@ -19,7 +20,13 @@ use transport_ip_sna::{
     mptn_ingress::{IngressKind, IngressOffer, IngressPolicy, IngressSession},
     mptn_keepalive::{Keepalive, Kind as KeepaliveKind},
     mptn_management_responder::{ManagementResponder, Phase as ManagementPhase, V5Options},
-    mptn_oob::{Compensation as OobCompensation, Datagram as OobDatagram, Kind as OobKind},
+    mptn_oob::{
+        build_request as build_oob_request, Compensation as OobCompensation,
+        Datagram as OobDatagram, Kind as OobKind,
+    },
+    mptn_oob_fallback::{
+        Action as FallbackAction, Completion as FallbackCompletion, Fallback, Purpose,
+    },
     mptn_oob_sequence::{Delivery, SequenceWindow},
     mptn_reverse_management::classify_reverse_management_connect,
 };
@@ -47,6 +54,7 @@ pub(crate) enum GatewayEvent {
     UserNormal(TcpRecord),
     UserExpedited(TcpRecord),
     UserUdpExpedited { sequence: u16, reduced: Vec<u8> },
+    UserUdpAbort { sequence: u16, reduced: Vec<u8> },
     UserAbort(TcpRecord),
     Closed,
     Rejected(String),
@@ -70,11 +78,18 @@ enum Completion {
 }
 
 struct PendingOob {
+    compensation: OobCompensation,
     sequence: u16,
     peer: SocketAddr,
     request: Vec<u8>,
     response: Vec<u8>,
     trial: Option<SequenceWindow>,
+}
+
+struct PendingOutboundOob {
+    sequence: u16,
+    request: Vec<u8>,
+    fallback: Fallback,
 }
 
 struct Association {
@@ -87,6 +102,11 @@ struct Association {
     oob: SequenceWindow,
     pending_oob: Option<PendingOob>,
     pending_tcp_expedited: Option<SequenceWindow>,
+    outbound_sequence: u16,
+    outbound_oob: Option<PendingOutboundOob>,
+    recent_outbound_completed: VecDeque<u16>,
+    late_tcp_acks_owed: u16,
+    deferred_logical_ack: Option<TcpRecord>,
 }
 
 pub(crate) struct MptnGatewayPort {
@@ -100,6 +120,13 @@ pub(crate) struct MptnGatewayPort {
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+fn remember_completed(recent: &mut VecDeque<u16>, sequence: u16) {
+    if recent.len() == 64 {
+        recent.pop_front();
+    }
+    recent.push_back(sequence);
 }
 
 impl MptnGatewayPort {
@@ -144,6 +171,12 @@ impl MptnGatewayPort {
         &mut self,
         can_accept_information: bool,
     ) -> io::Result<Option<GatewayEvent>> {
+        Self::poll_outbound_fallback_at(
+            &mut self.active,
+            self.config.peer_ip,
+            Instant::now(),
+            |bytes, peer| Self::send_oob_response(&self.udp, bytes, peer),
+        )?;
         match self.poll_udp_once() {
             Ok(Some(event)) => return Ok(Some(event)),
             Ok(None) => {}
@@ -165,6 +198,11 @@ impl MptnGatewayPort {
                         oob: SequenceWindow::default(),
                         pending_oob: None,
                         pending_tcp_expedited: None,
+                        outbound_sequence: 0,
+                        outbound_oob: None,
+                        recent_outbound_completed: VecDeque::new(),
+                        late_tcp_acks_owed: 0,
+                        deferred_logical_ack: None,
                     });
                 }
                 Ok((stream, peer)) => {
@@ -188,6 +226,43 @@ impl MptnGatewayPort {
             }
             Err(error) => Ok(Some(GatewayEvent::Rejected(error.to_string()))),
         }
+    }
+
+    fn poll_outbound_fallback_at(
+        active: &mut Option<Association>,
+        peer_ip: IpAddr,
+        now: Instant,
+        mut send: impl FnMut(&[u8], SocketAddr) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let Some(association) = active.as_mut() else {
+            return Ok(());
+        };
+        let Some(pending) = association.outbound_oob.as_mut() else {
+            return Ok(());
+        };
+        match pending.fallback.poll(now) {
+            Some(FallbackAction::SendOob {
+                purpose: Purpose::Expedited,
+                sequence,
+            }) if sequence == pending.sequence => {
+                let peer = SocketAddr::new(peer_ip, 397);
+                send(&pending.request, peer)?;
+            }
+            Some(FallbackAction::CloseUnresponsive) => {
+                *active = None;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TCP62 expedited peer did not acknowledge TCP or UDP",
+                ));
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "TCP62 fallback action differs from pending expedited",
+                ))
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn poll_udp_once(&mut self) -> io::Result<Option<GatewayEvent>> {
@@ -220,8 +295,61 @@ impl MptnGatewayPort {
                 let SessionState::UserActive(offer) = &association.state else {
                     return Err(invalid("TCP62 OOB before active user BIND"));
                 };
+                if datagram.kind != OobKind::Request {
+                    if !datagram.options.is_empty() || !datagram.matches_connect(offer.connect()) {
+                        return Err(invalid(
+                            "TCP62 OOB response identity or options unsupported",
+                        ));
+                    }
+                    if association
+                        .outbound_oob
+                        .as_ref()
+                        .is_none_or(|pending| pending.sequence != datagram.sequence)
+                    {
+                        if datagram.kind == OobKind::PositiveResponse
+                            && association
+                                .recent_outbound_completed
+                                .contains(&datagram.sequence)
+                        {
+                            return Ok(None);
+                        }
+                        return Err(invalid(
+                            "TCP62 OOB response options or sequence unsupported",
+                        ));
+                    }
+                    let pending = association.outbound_oob.as_mut().unwrap();
+                    let completion = pending
+                        .fallback
+                        .received_oob_response(&datagram, offer.connect())?;
+                    match completion {
+                        FallbackCompletion::ExpeditedAcknowledged => {
+                            association.outbound_oob = None;
+                            remember_completed(
+                                &mut association.recent_outbound_completed,
+                                datagram.sequence,
+                            );
+                            association.late_tcp_acks_owed = association
+                                .late_tcp_acks_owed
+                                .checked_add(1)
+                                .filter(|count| *count <= 64)
+                                .ok_or_else(|| invalid("TCP62 late ACK window full"))?;
+                            if association.deferred_logical_ack.is_some() {
+                                return Err(invalid("TCP62 logical expedited ACK queue full"));
+                            }
+                            association.deferred_logical_ack =
+                                Some(TcpRecord::decode(vec![0, 0, 0, 5, 3])?);
+                            return Ok(None);
+                        }
+                        FallbackCompletion::Rejected | FallbackCompletion::AbortAcknowledged => {
+                            return Err(invalid("TCP62 OOB expedited request was rejected"));
+                        }
+                    }
+                }
                 if datagram.kind != OobKind::Request
-                    || datagram.compensation != Some(OobCompensation::Expedited)
+                    || !matches!(
+                        datagram.compensation,
+                        Some(OobCompensation::Expedited | OobCompensation::Abort)
+                    )
                     || !datagram.options.is_empty()
                     || !datagram.matches_connect(offer.connect())
                 {
@@ -239,12 +367,18 @@ impl MptnGatewayPort {
                     return Ok(None);
                 }
                 if association.pending_tcp_expedited.is_some() {
+                    if datagram.compensation == Some(OobCompensation::Abort) {
+                        return Err(invalid(
+                            "TCP62 OOB Abort overlaps unconfirmed expedited delivery",
+                        ));
+                    }
                     if sequence != association.oob.next_tcp_sequence() {
                         return Err(invalid(
                             "TCP62 OOB overlaps unconfirmed TCP expedited sequence",
                         ));
                     }
                     association.pending_oob = Some(PendingOob {
+                        compensation: OobCompensation::Expedited,
                         sequence,
                         peer,
                         request,
@@ -261,14 +395,23 @@ impl MptnGatewayPort {
                     }
                     Delivery::New => {
                         let reduced = datagram.user_data.to_vec();
+                        let compensation = datagram.compensation.unwrap();
                         association.pending_oob = Some(PendingOob {
+                            compensation,
                             sequence,
                             peer,
                             request,
                             response,
                             trial: Some(trial),
                         });
-                        Ok(Some(GatewayEvent::UserUdpExpedited { sequence, reduced }))
+                        Ok(Some(match compensation {
+                            OobCompensation::Expedited => {
+                                GatewayEvent::UserUdpExpedited { sequence, reduced }
+                            }
+                            OobCompensation::Abort => {
+                                GatewayEvent::UserUdpAbort { sequence, reduced }
+                            }
+                        }))
                     }
                 }
             }
@@ -325,6 +468,12 @@ impl MptnGatewayPort {
                 _ => return Err(invalid("TCP62 write completed in wrong gateway phase")),
             }
         }
+        if !association.user_inflight {
+            if let Some(ack) = association.deferred_logical_ack.take() {
+                association.user_inflight = true;
+                return Ok((Some(GatewayEvent::UserExpedited(ack)), true));
+            }
+        }
         // Do not consume normal user data while the WebSocket/native leg has
         // no credit. A later Abort can still be buffered up to MAX_INCOMING.
         if let Some(records) = match association.tcp.receive_once() {
@@ -360,7 +509,7 @@ impl MptnGatewayPort {
                     || association.pending_tcp_expedited.is_some()))
             || (!can_accept_information
                 && matches!(association.state, SessionState::UserActive(_))
-                && front.kind != TcpKind::Abort)
+                && !matches!(front.kind, TcpKind::Abort | TcpKind::ExpeditedAck))
         {
             return Ok((None, true));
         }
@@ -444,6 +593,20 @@ impl MptnGatewayPort {
                 }
             }
             SessionState::UserActive(_) => {
+                if record.kind == TcpKind::ExpeditedAck {
+                    if association.late_tcp_acks_owed != 0 {
+                        association.late_tcp_acks_owed -= 1;
+                        return Ok((None, true));
+                    }
+                    let pending = association
+                        .outbound_oob
+                        .as_mut()
+                        .ok_or_else(|| invalid("unsolicited TCP62 expedited ACK"))?;
+                    pending.fallback.received_tcp_ack()?;
+                    let sequence = pending.sequence;
+                    association.outbound_oob = None;
+                    remember_completed(&mut association.recent_outbound_completed, sequence);
+                }
                 if record.kind == TcpKind::Expedited {
                     let mut trial = association.oob.clone();
                     match trial.receive_tcp() {
@@ -539,6 +702,17 @@ impl MptnGatewayPort {
     /// exact LLC enqueue completion. Retransmissions remain unacknowledged
     /// while that delivery is pending.
     pub(crate) fn complete_udp_expedited(&mut self, sequence: u16) -> io::Result<()> {
+        self.complete_udp(sequence, OobCompensation::Expedited)
+    }
+
+    /// An X'83' Abort is acknowledged only after native +RSP(UNBIND).
+    pub(crate) fn complete_udp_abort(&mut self, sequence: u16) -> io::Result<()> {
+        self.complete_udp(sequence, OobCompensation::Abort)?;
+        self.active = None;
+        Ok(())
+    }
+
+    fn complete_udp(&mut self, sequence: u16, compensation: OobCompensation) -> io::Result<()> {
         let association = self
             .active
             .as_mut()
@@ -547,7 +721,7 @@ impl MptnGatewayPort {
             .pending_oob
             .as_ref()
             .ok_or_else(|| invalid("no pending TCP62 OOB request"))?;
-        if pending.sequence != sequence {
+        if pending.sequence != sequence || pending.compensation != compensation {
             return Err(invalid("TCP62 OOB completion sequence mismatch"));
         }
         let trial = pending
@@ -599,8 +773,38 @@ impl MptnGatewayPort {
         if association.writes.len() >= MAX_WRITES || !association.tcp.has_capacity() {
             return Ok(false);
         }
+        let outbound = if record.kind == TcpKind::Expedited {
+            if association.outbound_oob.is_some() {
+                return Ok(false);
+            }
+            let SessionState::UserActive(offer) = &association.state else {
+                unreachable!()
+            };
+            let sequence = association.outbound_sequence;
+            let request = build_oob_request(
+                offer.connect(),
+                sequence,
+                OobCompensation::Expedited,
+                &record.bytes[5..],
+            )?;
+            let mut fallback = Fallback::default();
+            fallback.sent_tcp_expedited(sequence, Instant::now())?;
+            Some(PendingOutboundOob {
+                sequence,
+                request,
+                fallback,
+            })
+        } else {
+            None
+        };
         match Self::queue(association, record.bytes.clone(), Completion::UserRecord) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                if let Some(pending) = outbound {
+                    association.outbound_oob = Some(pending);
+                    association.outbound_sequence = association.outbound_sequence.wrapping_add(1);
+                }
+                Ok(true)
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
             Err(error) => Err(error),
         }
@@ -724,6 +928,9 @@ mod tests {
             .clone();
         let datagram = oob_request(offer.connect(), 0);
         let fallback = oob_request(offer.connect(), 1);
+        let mut abort = oob_request(offer.connect(), 2);
+        let abort_header = 4 + u32::from_be_bytes(abort[6..10].try_into().unwrap()) as usize;
+        abort[abort_header] = 0x10;
         port.active = Some(Association {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
@@ -734,6 +941,11 @@ mod tests {
             oob: SequenceWindow::default(),
             pending_oob: None,
             pending_tcp_expedited: None,
+            outbound_sequence: 0,
+            outbound_oob: None,
+            recent_outbound_completed: VecDeque::new(),
+            late_tcp_acks_owed: 0,
+            deferred_logical_ack: None,
         });
         let peer = UdpSocket::bind("127.0.0.2:0").unwrap();
         peer.set_nonblocking(true).unwrap();
@@ -794,6 +1006,24 @@ mod tests {
             OobDatagram::decode(&output[..received]).unwrap().sequence,
             1
         );
+        peer.send_to(&abort, port.udp.local_addr().unwrap())
+            .unwrap();
+        assert!(matches!(
+            port.poll_once(true).unwrap(),
+            Some(GatewayEvent::UserUdpAbort { sequence: 2, .. })
+        ));
+        assert_eq!(
+            peer.recv(&mut output).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(port.complete_udp_expedited(2).is_err());
+        port.complete_udp_abort(2).unwrap();
+        let received = peer.recv(&mut output).unwrap();
+        assert_eq!(
+            OobDatagram::decode(&output[..received]).unwrap().sequence,
+            2
+        );
+        assert!(port.active.is_none());
     }
 
     #[test]
@@ -983,6 +1213,11 @@ mod tests {
             oob: SequenceWindow::default(),
             pending_oob: None,
             pending_tcp_expedited: None,
+            outbound_sequence: 0,
+            outbound_oob: None,
+            recent_outbound_completed: VecDeque::new(),
+            late_tcp_acks_owed: 0,
+            deferred_logical_ack: None,
         });
         let record = TcpRecord::decode(vec![0, 0, 0, 8, 0, 0, 1, 2]).unwrap();
         assert!(port.queue_user_record(&record).unwrap());
@@ -994,5 +1229,151 @@ mod tests {
         use std::io::Read;
         client.read_exact(&mut received).unwrap();
         assert_eq!(received, record.bytes.as_slice());
+        let expedited = TcpRecord::decode(vec![0, 0, 0, 10, 1, 0, 0x83, 1, 0, 0]).unwrap();
+        let start = Instant::now();
+        assert!(port.queue_user_record(&expedited).unwrap());
+        let mut datagrams = Vec::new();
+        MptnGatewayPort::poll_outbound_fallback_at(
+            &mut port.active,
+            port.config.peer_ip,
+            start + Duration::from_secs(4),
+            |bytes, peer| {
+                datagrams.push((bytes.to_vec(), peer));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0].1, "127.0.0.2:397".parse().unwrap());
+        let first = OobDatagram::decode(&datagrams[0].0).unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.compensation, Some(OobCompensation::Expedited));
+        MptnGatewayPort::poll_outbound_fallback_at(
+            &mut port.active,
+            port.config.peer_ip,
+            start + Duration::from_secs(15),
+            |bytes, peer| {
+                datagrams.push((bytes.to_vec(), peer));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(datagrams.len(), 2);
+        assert_eq!(datagrams[0], datagrams[1]);
+        client.write_all(&[0, 0, 0, 5, 3]).unwrap();
+        assert!(matches!(
+            port.poll_once(true).unwrap(),
+            Some(GatewayEvent::UserExpedited(_))
+        ));
+        port.complete_user_record().unwrap();
+        let mut late = Vec::new();
+        MptnGatewayPort::poll_outbound_fallback_at(
+            &mut port.active,
+            port.config.peer_ip,
+            start + Duration::from_secs(40),
+            |bytes, _| {
+                late.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(late.is_empty());
+    }
+
+    #[test]
+    fn udp_positive_acknowledges_once_and_late_tcp_ack_precedes_next_sequence() {
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::default(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: false,
+        })
+        .unwrap();
+        let mut client = peer_socket(port.listener.local_addr().unwrap());
+        let (stream, _) = port.listener.accept().unwrap();
+        let mut ingress = IngressSession::new(IngressPolicy {
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            user_mode: None,
+            allow_blank_user_mode: false,
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            forbidden_fqpcid: None,
+        })
+        .unwrap();
+        let offer = ingress
+            .receive(request().connect_request())
+            .unwrap()
+            .clone();
+        port.active = Some(Association {
+            tcp: TcpSession::new(stream).unwrap(),
+            state: SessionState::UserActive(offer),
+            incoming: VecDeque::new(),
+            incoming_bytes: 0,
+            writes: VecDeque::new(),
+            user_inflight: false,
+            oob: SequenceWindow::default(),
+            pending_oob: None,
+            pending_tcp_expedited: None,
+            outbound_sequence: 0,
+            outbound_oob: None,
+            recent_outbound_completed: VecDeque::new(),
+            late_tcp_acks_owed: 0,
+            deferred_logical_ack: None,
+        });
+        let expedited = TcpRecord::decode(vec![0, 0, 0, 10, 1, 0, 0x83, 1, 0, 0]).unwrap();
+        assert!(port.queue_user_record(&expedited).unwrap());
+        MptnGatewayPort::poll_outbound_fallback_at(
+            &mut port.active,
+            port.config.peer_ip,
+            Instant::now() + Duration::from_secs(4),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let request = port
+            .active
+            .as_ref()
+            .unwrap()
+            .outbound_oob
+            .as_ref()
+            .unwrap()
+            .request
+            .clone();
+        let response = OobDatagram::decode(&request)
+            .unwrap()
+            .positive_response()
+            .unwrap();
+        let peer = UdpSocket::bind("127.0.0.2:0").unwrap();
+        peer.send_to(&response, port.udp.local_addr().unwrap())
+            .unwrap();
+        assert!(
+            matches!(port.poll_once(true).unwrap(), Some(GatewayEvent::UserExpedited(ref record)) if record.bytes == [0,0,0,5,3])
+        );
+        port.complete_user_record().unwrap();
+        assert_eq!(port.active.as_ref().unwrap().late_tcp_acks_owed, 1);
+        assert!(port.queue_user_record(&expedited).unwrap());
+        client.write_all(&[0, 0, 0, 5, 3]).unwrap();
+        assert!(port.poll_once(true).unwrap().is_none());
+        assert_eq!(port.active.as_ref().unwrap().late_tcp_acks_owed, 0);
+        assert!(port.active.as_ref().unwrap().outbound_oob.is_some());
+        client.write_all(&[0, 0, 0, 5, 3]).unwrap();
+        assert!(matches!(
+            port.poll_once(true).unwrap(),
+            Some(GatewayEvent::UserExpedited(_))
+        ));
+        port.complete_user_record().unwrap();
+        assert!(port.active.as_ref().unwrap().outbound_oob.is_none());
+        peer.send_to(&response, port.udp.local_addr().unwrap())
+            .unwrap();
+        assert!(port.poll_once(true).unwrap().is_none());
+        assert!(port.active.is_some());
     }
 }

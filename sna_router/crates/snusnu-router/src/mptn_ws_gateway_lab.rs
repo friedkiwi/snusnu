@@ -237,7 +237,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         tracing::info!("held TCP62 user BIND offered to virtual native link");
     }
     let mut pending_user_input: Option<TcpRecord> = None;
-    let mut pending_udp_input: Option<(u16, Vec<u8>)> = None;
+    let mut pending_udp_input: Option<(u16, Vec<u8>, bool)> = None;
     // The deadline bounds setup only. An established user conversation runs
     // until STOP or a correlated transport/session close.
     while !STOP.load(Ordering::Relaxed) && (tcp.user_active() || Instant::now() < deadline) {
@@ -248,8 +248,21 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         if let Some(sequence) = virtual_port.take_completed_udp_expedited() {
             tcp.complete_udp_expedited(sequence)?;
         }
-        if let Some((sequence, reduced)) = pending_udp_input.as_ref() {
-            if virtual_port.submit_udp_expedited(*sequence, reduced)? {
+        if let Some(sequence) = virtual_port.take_completed_udp_abort() {
+            tcp.complete_udp_abort(sequence)?;
+            tracing::info!(
+                sequence,
+                "TCP62 UDP Abort completed after native UNBIND response"
+            );
+            return Ok(());
+        }
+        if let Some((sequence, reduced, abort)) = pending_udp_input.as_ref() {
+            let accepted = if *abort {
+                virtual_port.submit_udp_abort(*sequence, reduced)?
+            } else {
+                virtual_port.submit_udp_expedited(*sequence, reduced)?
+            };
+            if accepted {
                 pending_udp_input = None;
             }
         }
@@ -292,7 +305,12 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
                 }
                 GatewayEvent::UserUdpExpedited { sequence, reduced } => {
                     if !virtual_port.submit_udp_expedited(sequence, &reduced)? {
-                        pending_udp_input = Some((sequence, reduced));
+                        pending_udp_input = Some((sequence, reduced, false));
+                    }
+                }
+                GatewayEvent::UserUdpAbort { sequence, reduced } => {
+                    if !virtual_port.submit_udp_abort(sequence, &reduced)? {
+                        pending_udp_input = Some((sequence, reduced, true));
                     }
                 }
                 GatewayEvent::Closed => {
