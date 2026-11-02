@@ -1,12 +1,12 @@
 //! Nonblocking TCP62 ingress boundary for a virtual SNA gateway.
 //!
-//! The port owns one bounded TCP association at a time and emits typed user
+//! The port owns bounded TCP associations and emits typed user
 //! offers. It never sends a positive user Connect until the owning virtual
 //! native leg returns a correlated positive BIND. Production capability sets
 //! must be backed by live handlers; without X'83', V5R4 admission fails closed.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
 };
@@ -17,7 +17,7 @@ use transport_ip_sna::{
     mptn_bind_negotiation::validate_positive_response,
     mptn_compensations::CompensationSet,
     mptn_connect::{Connect, Direction},
-    mptn_ingress::{IngressKind, IngressOffer, IngressPolicy, IngressSession},
+    mptn_ingress::{inspect_connect, IngressKind, IngressOffer, IngressPolicy, IngressSession},
     mptn_keepalive::{Keepalive, Kind as KeepaliveKind},
     mptn_management_responder::{ManagementResponder, Phase as ManagementPhase, V5Options},
     mptn_oob::{
@@ -33,6 +33,7 @@ use transport_ip_sna::{
 
 const MAX_INCOMING: usize = MAX_RECORD * 2;
 const MAX_WRITES: usize = 2;
+const MAX_ASSOCIATIONS: usize = 64;
 
 pub(crate) struct GatewayConfig {
     pub local: SocketAddr,
@@ -117,6 +118,11 @@ pub(crate) struct MptnGatewayPort {
     listener: TcpListener,
     udp: UdpSocket,
     active: Option<Association>,
+    associations: BTreeMap<u64, Association>,
+    next_association_id: u64,
+    poll_cursor: u64,
+    allowed_routes: Vec<(String, String)>,
+    completed_by_association: BTreeMap<u64, usize>,
     management_ready: bool,
     completed_user_records: usize,
 }
@@ -153,6 +159,11 @@ impl MptnGatewayPort {
             listener,
             udp,
             active: None,
+            associations: BTreeMap::new(),
+            next_association_id: 1,
+            poll_cursor: 0,
+            allowed_routes: Vec::new(),
+            completed_by_association: BTreeMap::new(),
             management_ready: false,
             completed_user_records: 0,
         })
@@ -166,6 +177,39 @@ impl MptnGatewayPort {
         self.active
             .as_ref()
             .is_some_and(|association| matches!(association.state, SessionState::UserActive(_)))
+            || self
+                .associations
+                .values()
+                .any(|association| matches!(association.state, SessionState::UserActive(_)))
+    }
+
+    /// Admit another exact LU pair on this listener. A peer may connect to
+    /// several SNA targets through the same TCP/397 endpoint.
+    pub(crate) fn allow_route(
+        &mut self,
+        source_lu: String,
+        destination_lu: String,
+    ) -> io::Result<()> {
+        IngressSession::new(IngressPolicy {
+            source_lu: source_lu.clone(),
+            destination_lu: destination_lu.clone(),
+            user_mode: None,
+            allow_blank_user_mode: true,
+            available_compensations: self.config.available_compensations,
+            forbidden_fqpcid: None,
+        })?;
+        if (source_lu.as_str(), destination_lu.as_str())
+            != (
+                self.config.source_lu.as_str(),
+                self.config.destination_lu.as_str(),
+            )
+            && !self
+                .allowed_routes
+                .contains(&(source_lu.clone(), destination_lu.clone()))
+        {
+            self.allowed_routes.push((source_lu, destination_lu));
+        }
+        Ok(())
     }
 
     /// One UDP receive, one TCP accept/read, one record and at most two queued
@@ -174,64 +218,150 @@ impl MptnGatewayPort {
         &mut self,
         can_accept_information: bool,
     ) -> io::Result<Option<GatewayEvent>> {
-        match self.poll_udp_once() {
+        Ok(self
+            .poll_association_once(can_accept_information)?
+            .map(|(_, event)| event))
+    }
+
+    /// Poll every live association fairly. The identifier stays stable until
+    /// close and must be passed to the matching completion or outbound call.
+    pub(crate) fn poll_association_once(
+        &mut self,
+        can_accept_information: bool,
+    ) -> io::Result<Option<(u64, GatewayEvent)>> {
+        match self.poll_udp_for_association() {
             Ok(Some(event)) => return Ok(Some(event)),
             Ok(None) => {}
             Err(error) => {
-                self.active = None;
                 return Err(error);
             }
         }
         // Give an already received UDP acknowledgement precedence over an
         // expiry observed in this same poll iteration.
-        Self::poll_outbound_fallback_at(
-            &mut self.active,
-            self.config.peer_ip,
-            Instant::now(),
-            |bytes, peer| Self::send_oob_response(&self.udp, bytes, peer),
-        )?;
-        if self.active.is_none() {
-            match self.listener.accept() {
-                Ok((stream, peer)) if peer.ip() == self.config.peer_ip => {
-                    self.active = Some(Association {
-                        tcp: TcpSession::new(stream)?,
-                        state: SessionState::AwaitConnect,
-                        incoming: VecDeque::new(),
-                        incoming_bytes: 0,
-                        writes: VecDeque::new(),
-                        user_inflight: false,
-                        oob: SequenceWindow::default(),
-                        pending_oob: None,
-                        pending_tcp_expedited: None,
-                        outbound_sequence: 0,
-                        outbound_oob: None,
-                        recent_outbound_completed: VecDeque::new(),
-                        late_tcp_acks_owed: 0,
-                        deferred_logical_ack: None,
-                        outbound_abort_pending: false,
-                    });
+        let ids = self.association_ids();
+        for id in ids {
+            let fallback = self.with_association(id, |port| {
+                Self::poll_outbound_fallback_at(
+                    &mut port.active,
+                    port.config.peer_ip,
+                    Instant::now(),
+                    |bytes, peer| Self::send_oob_response(&port.udp, bytes, peer),
+                )
+            });
+            if let Err(error) = fallback {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    return Ok(Some((id, GatewayEvent::Rejected(error.to_string()))));
                 }
-                Ok((stream, peer)) => {
+                return Err(error);
+            }
+        }
+        match self.listener.accept() {
+            Ok((stream, peer)) if peer.ip() == self.config.peer_ip => {
+                if self.association_ids().len() >= MAX_ASSOCIATIONS {
                     drop(stream);
-                    return Ok(Some(GatewayEvent::Rejected(format!(
-                        "TCP62 peer IP {peer} is not configured"
-                    ))));
+                    return Ok(Some((
+                        0,
+                        GatewayEvent::Rejected("TCP62 association capacity reached".into()),
+                    )));
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) => return Err(error),
-            }
-        }
-        let mut association = self.active.take().unwrap();
-        let result = self.poll_association(&mut association, can_accept_information);
-        match result {
-            Ok((event, keep)) => {
-                if keep {
+                let association = Association {
+                    tcp: TcpSession::new(stream)?,
+                    state: SessionState::AwaitConnect,
+                    incoming: VecDeque::new(),
+                    incoming_bytes: 0,
+                    writes: VecDeque::new(),
+                    user_inflight: false,
+                    oob: SequenceWindow::default(),
+                    pending_oob: None,
+                    pending_tcp_expedited: None,
+                    outbound_sequence: 0,
+                    outbound_oob: None,
+                    recent_outbound_completed: VecDeque::new(),
+                    late_tcp_acks_owed: 0,
+                    deferred_logical_ack: None,
+                    outbound_abort_pending: false,
+                };
+                if self.active.is_none() && self.associations.is_empty() {
                     self.active = Some(association);
+                } else {
+                    let id = self.next_association_id;
+                    self.next_association_id = self
+                        .next_association_id
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("TCP62 association ID exhausted"))?;
+                    self.associations.insert(id, association);
                 }
-                Ok(event)
             }
-            Err(error) => Ok(Some(GatewayEvent::Rejected(error.to_string()))),
+            Ok((stream, peer)) => {
+                drop(stream);
+                return Ok(Some((
+                    0,
+                    GatewayEvent::Rejected(format!("TCP62 peer IP {peer} is not configured")),
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
         }
+        let ids = self.association_ids();
+        let Some(id) = ids
+            .iter()
+            .copied()
+            .find(|id| *id >= self.poll_cursor)
+            .or_else(|| ids.first().copied())
+        else {
+            return Ok(None);
+        };
+        self.poll_cursor = id.saturating_add(1);
+        let completed_before = self.completed_user_records;
+        let result = self.with_association(id, |port| {
+            let mut association = port.active.take().unwrap();
+            let result = port.poll_association(&mut association, can_accept_information);
+            match result {
+                Ok((event, keep)) => {
+                    if keep {
+                        port.active = Some(association);
+                    }
+                    Ok(event)
+                }
+                Err(error) => Ok(Some(GatewayEvent::Rejected(error.to_string()))),
+            }
+        });
+        if id != 0 {
+            let completed = self.completed_user_records - completed_before;
+            *self.completed_by_association.entry(id).or_default() += completed;
+            self.completed_user_records = completed_before;
+        }
+        result.map(|event| event.map(|event| (id, event)))
+    }
+
+    fn association_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::with_capacity(self.associations.len() + 1);
+        if self.active.is_some() {
+            ids.push(0);
+        }
+        ids.extend(self.associations.keys().copied());
+        ids
+    }
+
+    fn with_association<T>(
+        &mut self,
+        id: u64,
+        operation: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        if id == 0 {
+            return operation(self);
+        }
+        let selected = self
+            .associations
+            .remove(&id)
+            .ok_or_else(|| invalid("unknown TCP62 association ID"))?;
+        let original = self.active.replace(selected);
+        let result = operation(self);
+        if let Some(selected) = self.active.take() {
+            self.associations.insert(id, selected);
+        }
+        self.active = original;
+        result
     }
 
     fn poll_outbound_fallback_at(
@@ -270,11 +400,55 @@ impl MptnGatewayPort {
         Ok(())
     }
 
-    fn poll_udp_once(&mut self) -> io::Result<Option<GatewayEvent>> {
+    fn poll_udp_for_association(&mut self) -> io::Result<Option<(u64, GatewayEvent)>> {
         let mut bytes = [0u8; MAX_RECORD];
         match self.udp.recv_from(&mut bytes) {
-            Ok((_, peer)) if peer.ip() != self.config.peer_ip => Ok(None),
-            Ok((len, peer)) if bytes.get(4) == Some(&0x84) => {
+            Ok((len, peer)) if bytes.get(4) == Some(&0x83) && peer.ip() == self.config.peer_ip => {
+                let datagram = OobDatagram::decode(&bytes[..len])?;
+                let matching: Vec<_> = self
+                    .association_ids()
+                    .into_iter()
+                    .filter(|id| {
+                        self.association(*id).is_some_and(|association| {
+                            matches!(&association.state, SessionState::UserActive(offer)
+                            if datagram.matches_connect(offer.connect()))
+                        })
+                    })
+                    .collect();
+                let [id] = matching.as_slice() else {
+                    return Err(invalid("TCP62 OOB has no unique matching user association"));
+                };
+                let id = *id;
+                self.with_association(id, |port| port.handle_udp_datagram(&bytes[..len], peer))
+                    .map(|event| event.map(|event| (id, event)))
+            }
+            Ok((len, peer)) => self
+                .handle_udp_datagram(&bytes[..len], peer)
+                .map(|event| event.map(|event| (0, event))),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn association(&self, id: u64) -> Option<&Association> {
+        if id == 0 {
+            self.active.as_ref()
+        } else {
+            self.associations.get(&id)
+        }
+    }
+
+    fn handle_udp_datagram(
+        &mut self,
+        packet: &[u8],
+        peer: SocketAddr,
+    ) -> io::Result<Option<GatewayEvent>> {
+        let mut bytes = [0u8; MAX_RECORD];
+        let len = packet.len();
+        bytes[..len].copy_from_slice(packet);
+        match (len, peer) {
+            (_, peer) if peer.ip() != self.config.peer_ip => Ok(None),
+            (len, peer) if bytes.get(4) == Some(&0x84) => {
                 let keepalive = Keepalive::decode(&bytes[..len])?;
                 keepalive.validate_ingress(peer.ip(), self.config.local.ip())?;
                 if keepalive.kind != KeepaliveKind::Request {
@@ -290,7 +464,7 @@ impl MptnGatewayPort {
                 }
                 Ok(None)
             }
-            Ok((len, peer)) if bytes.get(4) == Some(&0x83) => {
+            (len, peer) if bytes.get(4) == Some(&0x83) => {
                 let request = bytes[..len].to_vec();
                 let datagram = OobDatagram::decode(&request)?;
                 let association = self
@@ -430,12 +604,10 @@ impl MptnGatewayPort {
                     }
                 }
             }
-            Ok((_, _)) => Err(io::Error::new(
+            (_, _) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "TCP62 UDP/397 X'83' compensation handler unavailable",
             )),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
         }
     }
 
@@ -539,9 +711,19 @@ impl MptnGatewayPort {
         association.incoming_bytes -= record.bytes.len();
         match &mut association.state {
             SessionState::AwaitConnect => {
+                let route = inspect_connect(&record.bytes).ok();
+                let (source_lu, destination_lu) = route
+                    .as_ref()
+                    .and_then(|route| {
+                        self.allowed_routes.iter().find(|pair| {
+                            pair.0 == route.source_lu && pair.1 == route.destination_lu
+                        })
+                    })
+                    .map(|pair| (pair.0.as_str(), pair.1.as_str()))
+                    .unwrap_or((&self.config.source_lu, &self.config.destination_lu));
                 let mut ingress = IngressSession::new(IngressPolicy {
-                    source_lu: self.config.source_lu.clone(),
-                    destination_lu: self.config.destination_lu.clone(),
+                    source_lu: source_lu.to_string(),
+                    destination_lu: destination_lu.to_string(),
                     user_mode: None,
                     allow_blank_user_mode: true,
                     available_compensations: self.config.available_compensations,
@@ -552,8 +734,8 @@ impl MptnGatewayPort {
                     IngressKind::Management => {
                         let admitted = classify_reverse_management_connect(
                             offer.connect().clone(),
-                            &self.config.source_lu,
-                            &self.config.destination_lu,
+                            source_lu,
+                            destination_lu,
                             None,
                         )?;
                         let token = fresh_token()?;
@@ -907,6 +1089,75 @@ impl MptnGatewayPort {
     pub(crate) fn take_completed_user_records(&mut self) -> usize {
         std::mem::take(&mut self.completed_user_records)
     }
+
+    pub(crate) fn user_active_for(&self, id: u64) -> bool {
+        self.association(id)
+            .is_some_and(|association| matches!(association.state, SessionState::UserActive(_)))
+    }
+
+    pub(crate) fn live_association_ids(&self) -> Vec<u64> {
+        self.association_ids()
+    }
+
+    pub(crate) fn close_association_for(&mut self, id: u64) -> io::Result<()> {
+        if id == 0 {
+            self.active
+                .take()
+                .ok_or_else(|| invalid("unknown TCP62 association ID"))?;
+        } else {
+            self.associations
+                .remove(&id)
+                .ok_or_else(|| invalid("unknown TCP62 association ID"))?;
+            self.completed_by_association.remove(&id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queue_user_bind_response_for(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        self.with_association(id, |port| port.queue_user_bind_response(bytes))
+    }
+
+    pub(crate) fn complete_user_record_for(&mut self, id: u64) -> io::Result<()> {
+        self.with_association(id, Self::complete_user_record)
+    }
+
+    pub(crate) fn complete_udp_expedited_for(&mut self, id: u64, sequence: u16) -> io::Result<()> {
+        self.with_association(id, |port| port.complete_udp_expedited(sequence))
+    }
+
+    pub(crate) fn complete_udp_abort_for(&mut self, id: u64, sequence: u16) -> io::Result<()> {
+        self.with_association(id, |port| port.complete_udp_abort(sequence))
+    }
+
+    pub(crate) fn complete_tcp_expedited_for(&mut self, id: u64) -> io::Result<()> {
+        self.with_association(id, Self::complete_tcp_expedited)
+    }
+
+    pub(crate) fn queue_user_record_for(
+        &mut self,
+        id: u64,
+        record: &TcpRecord,
+    ) -> io::Result<bool> {
+        self.with_association(id, |port| port.queue_user_record(record))
+    }
+
+    pub(crate) fn queue_udp_abort_for(&mut self, id: u64, record: &TcpRecord) -> io::Result<bool> {
+        self.with_association(id, |port| port.queue_udp_abort(record))
+    }
+
+    pub(crate) fn take_completed_user_records_for(&mut self, id: u64) -> usize {
+        if id == 0 {
+            self.take_completed_user_records()
+        } else {
+            self.completed_by_association
+                .remove(&id)
+                .unwrap_or_default()
+        }
+    }
 }
 
 fn fresh_token() -> io::Result<[u8; 7]> {
@@ -932,6 +1183,10 @@ mod tests {
     use transport_ip_sna::mptn_management_initiator::ManagementInitiator;
 
     fn request() -> ManagementInitiator {
+        request_to("QAALICE.SNAA", [0x11; 8])
+    }
+
+    fn request_to(destination: &str, correlator: [u8; 8]) -> ManagementInitiator {
         let source = [0xd8, 0xc1, 0xc2, 0xd6, 0xc2, 0x4b, 0xe2, 0xd5, 0xc1, 0xc2];
         let mut fqpcid = vec![0x60, 19];
         fqpcid.extend_from_slice(&[0x22; 8]);
@@ -939,9 +1194,9 @@ mod tests {
         fqpcid.extend_from_slice(&source);
         ManagementInitiator::new(
             "QABOB.SNAB",
-            "QAALICE.SNAA",
+            destination,
             fqpcid,
-            [0x11; 8],
+            correlator,
             [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
             "",
             8,
@@ -981,6 +1236,156 @@ mod tests {
         let len = bytes.len() as u32;
         bytes[..4].copy_from_slice(&len.to_be_bytes());
         bytes
+    }
+
+    #[test]
+    fn concurrent_peers_select_distinct_lu_routes_on_one_listener() {
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        port.allow_route("QABOB.SNAB".into(), "QAALICE.SNAC".into())
+            .unwrap();
+        let address = port.listener.local_addr().unwrap();
+        let mut first = peer_socket(address);
+        let mut second = peer_socket(address);
+        first.write_all(request().connect_request()).unwrap();
+        second
+            .write_all(request_to("QAALICE.SNAC", [0x22; 8]).connect_request())
+            .unwrap();
+        for _ in 0..20 {
+            if let Some((_, GatewayEvent::Rejected(reason))) =
+                port.poll_association_once(true).unwrap()
+            {
+                panic!("unexpected rejection: {reason}");
+            }
+            if port.live_association_ids().len() == 2
+                && port
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.state, SessionState::Management(_)))
+                && port
+                    .associations
+                    .values()
+                    .all(|a| matches!(a.state, SessionState::Management(_)))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(port.live_association_ids(), vec![0, 1]);
+        assert!(matches!(
+            port.active.as_ref().unwrap().state,
+            SessionState::Management(_)
+        ));
+        assert!(matches!(
+            port.associations.get(&1).unwrap().state,
+            SessionState::Management(_)
+        ));
+        port.close_association_for(0).unwrap();
+        assert_eq!(port.live_association_ids(), vec![1]);
+    }
+
+    #[test]
+    fn udp_oob_demuxes_by_connect_correlator_across_associations() {
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        let address = port.listener.local_addr().unwrap();
+        let _first_client = peer_socket(address);
+        let _second_client = peer_socket(address);
+        let make_association = |stream, correlator| {
+            let mut ingress = IngressSession::new(IngressPolicy {
+                source_lu: "QABOB.SNAB".into(),
+                destination_lu: "QAALICE.SNAA".into(),
+                user_mode: None,
+                allow_blank_user_mode: false,
+                available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                    .unwrap(),
+                forbidden_fqpcid: None,
+            })
+            .unwrap();
+            let offer = ingress
+                .receive(request_to("QAALICE.SNAA", correlator).connect_request())
+                .unwrap()
+                .clone();
+            Association {
+                tcp: TcpSession::new(stream).unwrap(),
+                state: SessionState::UserActive(offer),
+                incoming: VecDeque::new(),
+                incoming_bytes: 0,
+                writes: VecDeque::new(),
+                user_inflight: false,
+                oob: SequenceWindow::default(),
+                pending_oob: None,
+                pending_tcp_expedited: None,
+                outbound_sequence: 0,
+                outbound_oob: None,
+                recent_outbound_completed: VecDeque::new(),
+                late_tcp_acks_owed: 0,
+                deferred_logical_ack: None,
+                outbound_abort_pending: false,
+            }
+        };
+        let (first_stream, _) = port.listener.accept().unwrap();
+        let (second_stream, _) = port.listener.accept().unwrap();
+        port.active = Some(make_association(first_stream, [0x11; 8]));
+        port.associations
+            .insert(1, make_association(second_stream, [0x22; 8]));
+        port.next_association_id = 2;
+        let first = match &port.active.as_ref().unwrap().state {
+            SessionState::UserActive(offer) => oob_request(offer.connect(), 0),
+            _ => unreachable!(),
+        };
+        let second = match &port.associations.get(&1).unwrap().state {
+            SessionState::UserActive(offer) => oob_request(offer.connect(), 0),
+            _ => unreachable!(),
+        };
+        let peer = UdpSocket::bind("127.0.0.2:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        peer.send_to(&second, port.udp.local_addr().unwrap())
+            .unwrap();
+        assert!(matches!(
+            port.poll_association_once(true).unwrap(),
+            Some((1, GatewayEvent::UserUdpExpedited { sequence: 0, .. }))
+        ));
+        assert!(port.active.as_ref().unwrap().pending_oob.is_none());
+        assert!(port.associations.get(&1).unwrap().pending_oob.is_some());
+        peer.send_to(&first, port.udp.local_addr().unwrap())
+            .unwrap();
+        assert!(matches!(
+            port.poll_association_once(true).unwrap(),
+            Some((0, GatewayEvent::UserUdpExpedited { sequence: 0, .. }))
+        ));
+        port.complete_udp_expedited_for(1, 0).unwrap();
+        assert!(port.associations.get(&1).unwrap().pending_oob.is_none());
+        assert!(port.active.as_ref().unwrap().pending_oob.is_some());
+        port.complete_udp_expedited_for(0, 0).unwrap();
     }
 
     #[test]
