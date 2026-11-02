@@ -167,6 +167,54 @@ impl<P: RoutePort> VirtualWsPort<P> {
         Ok(())
     }
 
+    /// Start another native management exchange on the same WebSocket route
+    /// port after the previous user session has closed. The caller must mint
+    /// a new FQPCID and BIND token for `initiator`.
+    pub(crate) fn rearm_management(
+        &mut self,
+        initiator: NativeManagementInitiator,
+    ) -> io::Result<()> {
+        if initiator.local_cp() != self.local_cp || initiator.remote_cp() != self.peer_cp {
+            return Err(protocol("virtual management identity mismatch"));
+        }
+        if self.user_closed {
+            if !self.management_egress.is_empty()
+                || !self.tcp_user_writes.is_empty()
+                || self.tcp_bind_response.is_some()
+                || self.tcp_user_input.is_some()
+                || self.tcp_user_output.is_some()
+                || self.tcp_user_output_queued
+                || self.native_user_input.is_some()
+                || self.native_user_output.is_some()
+                || self.native_user_output_queued
+                || self.udp_abort_output.is_some()
+                || self.udp_abort_output_queued
+                || self.deferred_user_normal
+                || self.udp_user_input.is_some()
+                || self.udp_user_completion.is_some()
+                || self.udp_abort_input.is_some()
+                || self.udp_abort_pending.is_some()
+                || self.udp_abort_completion.is_some()
+                || self.expedited_ack.is_some()
+            {
+                return Err(protocol("virtual user close still has pending delivery"));
+            }
+            self.inner.disconnect()?;
+            self.reset_cp()?;
+        }
+        if !self.management_invalidated
+            || self.initial_xid_sent
+            || self.management.is_some()
+            || self.user_bind.is_some()
+            || self.user_flow.is_some()
+        {
+            return Err(protocol("virtual management is still active"));
+        }
+        self.management = Some(initiator);
+        self.management_invalidated = false;
+        Ok(())
+    }
+
     pub(crate) fn management_complete(&self) -> bool {
         self.management
             .as_ref()
@@ -1200,6 +1248,56 @@ mod tests {
         })
         .unwrap();
         ingress.receive(&connect.encode().unwrap()).unwrap().clone()
+    }
+
+    fn fresh_management(marker: u8) -> NativeManagementInitiator {
+        NativeManagementInitiator::new(
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+            0x2f,
+            1,
+            2,
+            [marker; 8],
+            [0x23, marker, marker, marker, marker, 0, 0],
+            "",
+            8,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rearm_requires_closed_and_drained_session_and_keeps_inner_port() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::new(
+            inner,
+            xid("SOLNET.SNAA", Role::Secondary),
+            "SOLNET.SNAA",
+            "SOLNET.SNAB",
+        )
+        .unwrap();
+        port.attach_management(fresh_management(1)).unwrap();
+        assert!(port.rearm_management(fresh_management(2)).is_err());
+        port.user_closed = true;
+        port.tcp_user_writes.push_back(TcpUserOutputKind::Normal);
+        assert!(port.rearm_management(fresh_management(2)).is_err());
+        port.tcp_user_writes.clear();
+        port.rearm_management(fresh_management(2)).unwrap();
+        assert!(!port.management_invalidated);
+        assert!(!port.user_closed);
+        port.tick().unwrap();
+        assert_eq!(port.inner.sent.len(), 1);
+        port.handle(vec![RouterEvent::Closed]).unwrap();
+        assert!(port.management_invalidated);
+        port.rearm_management(fresh_management(3)).unwrap();
+        port.tick().unwrap();
+        assert_eq!(port.inner.sent.len(), 2);
     }
 
     #[test]
