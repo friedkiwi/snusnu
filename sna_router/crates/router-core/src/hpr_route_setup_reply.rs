@@ -17,6 +17,7 @@ use crate::{
 pub enum DirectReplyError {
     NotRequest,
     UnsupportedPathSwitch,
+    InvalidPathSwitch,
     WrongOrigin,
     WrongDestination,
     InvalidRoute,
@@ -64,7 +65,7 @@ impl DirectReplyTarget<'_> {
             return Err(DirectReplyError::WrongDestination);
         }
         let route = unique_vector(request, 0x2b).ok_or(DirectReplyError::InvalidRoute)?;
-        validate_direct_route(route, self)?;
+        validate_direct_route(route, self.bootstrap, self.tg_number)?;
         let fqpcid = unique_vector(request, 0x60).ok_or(DirectReplyError::InvalidRoute)?;
         let cos = unique_vector(request, 0x2c).ok_or(DirectReplyError::InvalidRoute)?;
         let forward = unique_vector(request, 0x80).ok_or(DirectReplyError::InvalidRoute)?;
@@ -130,12 +131,13 @@ fn unique_vector<'a>(request: &'a RouteSetupGds<'_>, key: u8) -> Option<&'a [u8]
 
 fn validate_direct_route(
     route: &[u8],
-    target: &DirectReplyTarget<'_>,
+    bootstrap: &HprControlBootstrap,
+    tg_number: u8,
 ) -> Result<(), DirectReplyError> {
     if route.len() < 11
         || route[2] != 1
         || route[3] != 1
-        || target.tg_number == 0
+        || tg_number == 0
         || route[4] as usize != route.len() - 4
         || route[5] != 0x46
     {
@@ -145,19 +147,68 @@ fn validate_direct_route(
     if tg.len() < 6
         || tg[0] as usize != tg.len()
         || tg[1] != 0x80
-        || tg[2] != target.tg_number
+        || tg[2] != tg_number
         || tg.len() != 5 + usize::from(tg[3])
         || tg[tg.len() - 1] != 0x21
     {
         return Err(DirectReplyError::InvalidRoute);
     }
     let name = &tg[4..tg.len() - 1];
-    let expected_qualified = encode_qualified_name(&target.bootstrap.local.cp);
-    let expected_short = encode_name(&target.bootstrap.local.cp.name);
+    let expected_qualified = encode_qualified_name(&bootstrap.local.cp);
+    let expected_short = encode_name(&bootstrap.local.cp.name);
     if name != expected_qualified && name != expected_short {
         return Err(DirectReplyError::InvalidRoute);
     }
     Ok(())
+}
+
+/// Reject a path switch for which this link generation has no active RTP
+/// association. A path-switch request names an NCE, not an LU; it must never
+/// be converted into a new route from a static directory entry. The returned
+/// GDS may be sent on the already validated Route Setup RTP connection, and
+/// grants no user-route authorization.
+pub fn encode_stale_path_switch_negative(
+    bootstrap: &HprControlBootstrap,
+    tg_number: u8,
+    message: &[u8],
+) -> Result<Vec<u8>, DirectReplyError> {
+    let request = RouteSetupGds::parse(message).map_err(|_| DirectReplyError::InvalidPathSwitch)?;
+    if request.kind != RouteSetupKind::Request {
+        return Err(DirectReplyError::NotRequest);
+    }
+    if !request.path_switch || request.destination_lu_name.is_some() {
+        return Err(DirectReplyError::InvalidPathSwitch);
+    }
+    if request.origin_cp_name != bootstrap.peer.cp.to_string() {
+        return Err(DirectReplyError::WrongOrigin);
+    }
+    let route = unique_vector(&request, 0x2b).ok_or(DirectReplyError::InvalidRoute)?;
+    validate_direct_route(route, bootstrap, tg_number)?;
+    let forward = unique_vector(&request, 0x80).ok_or(DirectReplyError::InvalidRoute)?;
+    validate_forward_route_information(forward, &bootstrap.peer.link_label)?;
+    let nce = unique_vector(&request, 0x26).ok_or(DirectReplyError::InvalidPathSwitch)?;
+    if !(3..=10).contains(&nce.len())
+        || nce[0] as usize != nce.len()
+        || nce[1] != 0x26
+        || nce[2] & 0x80 == 0
+        || nce[2..].contains(&0xff)
+    {
+        return Err(DirectReplyError::InvalidPathSwitch);
+    }
+    let fqpcid = unique_vector(&request, 0x60).ok_or(DirectReplyError::InvalidRoute)?;
+    let mut reply = vec![0, 0, 0x12, 0xce, 0x80, request.destination_hop_index];
+    reply.extend_from_slice(&[0; 10]);
+    // GA27-3136-20 pp. 10-37–10-38: 08550000 is Route Setup failure with
+    // no specific subcode. CV35's RU-information flag is zero; no unsupported
+    // claim about which LU (if any) owns the stale NCE is made.
+    reply.extend_from_slice(&[8, 0x35, 0x08, 0x55, 0, 0, 0, 0]);
+    reply.extend_from_slice(fqpcid);
+    let length: u16 = reply
+        .len()
+        .try_into()
+        .map_err(|_| DirectReplyError::TooLarge)?;
+    reply[..2].copy_from_slice(&length.to_be_bytes());
+    Ok(reply)
 }
 
 fn validate_forward_route_information(
@@ -401,6 +452,54 @@ mod tests {
         assert_eq!(
             setup(&bootstrap, &lu).encode_positive(&wrong),
             Err(DirectReplyError::InvalidLinkLabel)
+        );
+    }
+
+    #[test]
+    fn stale_live_path_switch_gets_correlated_negative_without_lu_inference() {
+        // V5R4 EE 2026-11-02 17:56:15Z after a former user RTP was reset:
+        // path-switch bit 0x40, prior LU NCE a4 81, no destination LU name.
+        let hex = "006512ce400100000000000000000000152b010111460f80010ae2d5e4e2d5e44be2e5c3211660cec370e7b283a2a50be2d6d3d5c5e34be2d5c1c20c2c01087bc3d6d5d5c5c3e30426a4811a800000000005b500000114000010cc00000000066704008002";
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let mut peer = advertisement("SOLNET.SNAB", &[0x80, 0x02]);
+        peer.node_id = [0, 0, 0, 3];
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            advertisement("SNUSNU.SVC", &[0x80, 0x80]),
+            peer,
+        )
+        .unwrap();
+        let request = RouteSetupGds::parse(&bytes).unwrap();
+        assert!(request.path_switch);
+        assert_eq!(request.destination_lu_name, None);
+        let negative = encode_stale_path_switch_negative(&bootstrap, 1, &bytes).unwrap();
+        let parsed = RouteSetupGds::parse(&negative).unwrap();
+        assert_eq!(parsed.kind, RouteSetupKind::NegativeReply);
+        assert_eq!(parsed.pcid, request.pcid);
+        assert_eq!(parsed.origin_cp_name, request.origin_cp_name);
+        assert_eq!(parsed.vectors.len(), 2);
+        assert_eq!(parsed.vectors[0].wire, [8, 0x35, 0x08, 0x55, 0, 0, 0, 0]);
+        assert_eq!(parsed.vectors[1].wire, request.vectors[1].wire);
+
+        let mut wrong_label = bytes.clone();
+        *wrong_label.last_mut().unwrap() = 0x80;
+        assert_eq!(
+            encode_stale_path_switch_negative(&bootstrap, 1, &wrong_label),
+            Err(DirectReplyError::InvalidLinkLabel)
+        );
+        let mut wrong_nce = bytes.clone();
+        let nce_offset = wrong_nce
+            .windows(4)
+            .position(|part| part == [4, 0x26, 0xa4, 0x81])
+            .unwrap();
+        wrong_nce[nce_offset + 2] = 0x24;
+        assert_eq!(
+            encode_stale_path_switch_negative(&bootstrap, 1, &wrong_nce),
+            Err(DirectReplyError::InvalidPathSwitch)
         );
     }
 }

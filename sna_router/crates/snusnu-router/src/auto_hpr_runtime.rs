@@ -31,7 +31,7 @@ use router_core::{
     hpr_cp_management::CpManagementResponder,
     hpr_ip_activation::Phase,
     hpr_route_setup::{RouteSetupGds, RouteSetupKind},
-    hpr_route_setup_reply::ReverseLinkMetrics,
+    hpr_route_setup_reply::{encode_stale_path_switch_negative, ReverseLinkMetrics},
     hpr_route_setup_service::{DirectRouteSetupService, PreparedRouteSetupReply},
     hpr_session_adapter::{negotiated_fixed_windows, HprSessionAdapter, HprSessionRole},
     session::{Flow, SessionEvent, SessionIdentity, SessionUnit},
@@ -107,6 +107,7 @@ struct DirectHprRuntime {
     rtp: HprRtpPort,
     route_setup: Option<DirectRouteSetupService>,
     route_reply: Option<PreparedRouteSetupReply>,
+    negative_route_reply: Option<Vec<u8>>,
     cp_management: Option<CpManagementResponder>,
     pending_cp_replies: VecDeque<Vec<u8>>,
     pending_cp_reply_bytes: usize,
@@ -132,6 +133,7 @@ impl DirectHprRuntime {
             bootstrap,
             route_setup: None,
             route_reply: None,
+            negative_route_reply: None,
             pending_cp_replies: VecDeque::new(),
             pending_cp_reply_bytes: 0,
             reciprocal_cp: None,
@@ -360,7 +362,7 @@ impl DirectHprRuntime {
         message: &RtpIngress,
         _now_us: u64,
     ) -> io::Result<()> {
-        if self.route_reply.is_some() {
+        if self.route_reply.is_some() || self.negative_route_reply.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "route reply pending",
@@ -371,10 +373,20 @@ impl DirectHprRuntime {
         if request.kind != RouteSetupKind::Request {
             return Err(protocol("unexpected HPR RouteSetup reply"));
         }
-        let target: router_core::session::QualifiedName = request
-            .destination_lu_name
-            .as_deref()
-            .ok_or_else(|| protocol("HPR RouteSetup lacks target LU"))?
+        let Some(target_name) = request.destination_lu_name.as_deref() else {
+            let tg = link
+                .tg_number()
+                .ok_or_else(|| protocol("HPR route has no active TG"))?;
+            let reply = encode_stale_path_switch_negative(&self.bootstrap, tg, &message.bytes)
+                .map_err(|error| {
+                    protocol(format!("invalid HPR path-switch RouteSetup: {error:?}"))
+                })?;
+            self.negative_route_reply = Some(reply);
+            tracing::warn!(pcid = ?request.pcid, generation = self.bootstrap.generation.get(),
+                "rejecting stale HPR path-switch RouteSetup without LU");
+            return Ok(());
+        };
+        let target: router_core::session::QualifiedName = target_name
             .parse()
             .map_err(|_| protocol("invalid HPR RouteSetup target LU"))?;
         let Some((_, Some(hosting_cp))) = hub.resolve_lu(&as_wire_name(&target))? else {
@@ -422,6 +434,19 @@ impl DirectHprRuntime {
     }
 
     fn try_route_reply(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        if let Some(reply) = self.negative_route_reply.as_ref() {
+            if self
+                .rtp
+                .send(link, RtpIngressKind::RouteSetup, reply, now_us)?
+            {
+                self.negative_route_reply = None;
+                tracing::info!(
+                    generation = self.bootstrap.generation.get(),
+                    "HPR stale path-switch negative RouteSetup reply transmitted"
+                );
+            }
+            return Ok(());
+        }
         let Some(reply) = self.route_reply.as_ref() else {
             return Ok(());
         };
