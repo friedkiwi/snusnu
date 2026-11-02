@@ -592,8 +592,21 @@ fn user_bind_identity(
         .classify_bind()
         .map_err(|_| HprAdapterError::UnqualifiedBind)?
         .ok_or(HprAdapterError::UnqualifiedBind)?;
-    if matches!(bind.class, BindClass::Management { .. }) {
-        return Err(HprAdapterError::ManagementBind);
+    if let BindClass::Management { ref mode } = bind.class {
+        // V5R4 APING can send its LU 6.2 BIND with SNASVCMG as the mode even
+        // though the target is the concentrator's application LU. Admit only
+        // this exact server-owned service and a caller-verified CP pair; all
+        // CP management modes and untrusted/unqualified targets stay out of
+        // the user-session fabric.
+        if mode != "SNASVCMG"
+            || bind.slu != "SNUSNU.PING"
+            || !target_cp
+                .as_ref()
+                .is_some_and(|cp| cp.netid == "SNUSNU" && cp.name == "SVC")
+            || source_cp.is_none()
+        {
+            return Err(HprAdapterError::ManagementBind);
+        }
     }
     let source_lu =
         QualifiedName::from_str(&bind.plu).map_err(|_| HprAdapterError::UnqualifiedBind)?;
@@ -1274,5 +1287,86 @@ mod tests {
                 PacingError::DuplicatePacingResponse
             ))
         ));
+    }
+
+    #[test]
+    fn captured_v5r4_aping_snasvcmg_bind_requires_exact_service_cp() {
+        // Complete FID5 BIU observed in the V5R4 EE APING attempt.
+        let hex = concat!(
+            "5d00000080020600f0f100016b800031001307b0b051330787868687070602",
+            "00000000000000944340000be2d6d3d5c5e34be2d5c1c22d000902e2d5",
+            "c1e2e5c3d4c709030124e67713cf80000c04e2d6d3d5c5e34be2d5c1",
+            "c20a1300b024e67713cf8000000be2d5e4e2d5e44bd7c9d5c76014ce",
+            "c370e7b283a29c0be2d6d3d5c5e34be2d5c1c22c0a04087bc3d6d5",
+            "d5c5c3e3",
+        );
+        let message: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(message.len(), 147);
+        let fid5 = Fid5WholeBiu::parse_complete(&message).unwrap();
+        let bind = fid5.classify_bind().unwrap().unwrap();
+        assert_eq!(bind.plu, "SOLNET.SNAB");
+        assert_eq!(bind.slu, "SNUSNU.PING");
+        assert_eq!(
+            bind.class,
+            BindClass::Management {
+                mode: "SNASVCMG".into()
+            }
+        );
+        let s = scope();
+        let mut permitted = HprSessionAdapter::new(
+            HprSessionRole::PeerPlu,
+            s,
+            SLU_SA,
+            Some(cp("SNUSNU.SVC")),
+            Some(cp("SOLNET.SNAB")),
+        )
+        .unwrap();
+        let admitted = permitted
+            .ingest_verified(observation(s.initial_plu_tcid), &message)
+            .unwrap();
+        assert_eq!(admitted.identity.unwrap().target_lu, cp("SNUSNU.PING"));
+        assert!(matches!(admitted.event, SessionEvent::BindRequest(_)));
+
+        let mut no_service_cp = HprSessionAdapter::new(
+            HprSessionRole::PeerPlu,
+            s,
+            SLU_SA,
+            None,
+            Some(cp("SOLNET.SNAB")),
+        )
+        .unwrap();
+        assert_eq!(
+            no_service_cp.ingest_verified(observation(s.initial_plu_tcid), &message),
+            Err(HprAdapterError::ManagementBind)
+        );
+
+        let mut cp_management = message.clone();
+        let mode = [0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
+        let at = cp_management
+            .windows(mode.len())
+            .position(|part| part == mode)
+            .unwrap();
+        cp_management.splice(
+            at..at + mode.len(),
+            [0xc3, 0xd7, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7],
+        );
+        cp_management[at - 2] = 8;
+        cp_management[at - 4] -= 1;
+        let mut reject_cp = HprSessionAdapter::new(
+            HprSessionRole::PeerPlu,
+            s,
+            SLU_SA,
+            Some(cp("SNUSNU.SVC")),
+            Some(cp("SOLNET.SNAB")),
+        )
+        .unwrap();
+        assert_eq!(
+            reject_cp.ingest_verified(observation(s.initial_plu_tcid), &cp_management),
+            Err(HprAdapterError::ManagementBind)
+        );
     }
 }
