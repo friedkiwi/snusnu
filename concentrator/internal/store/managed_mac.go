@@ -106,7 +106,8 @@ func (s *Store) AllocateManagedCP(ctx context.Context, owner, netid, name string
 	}
 	defer tx.Rollback()
 	var suffix int64
-	err = tx.QueryRowContext(ctx, "UPDATE mac_pool_state SET next_suffix=next_suffix+1 WHERE id=1 AND next_suffix<=16777215 RETURNING next_suffix-1").Scan(&suffix)
+	// The top suffix belongs to the concentrator-owned SNUSNU.SVC CP.
+	err = tx.QueryRowContext(ctx, "UPDATE mac_pool_state SET next_suffix=next_suffix+1 WHERE id=1 AND next_suffix<16777215 RETURNING next_suffix-1").Scan(&suffix)
 	if err == sql.ErrNoRows {
 		return ManagedCP{}, ErrMACPoolExhausted
 	}

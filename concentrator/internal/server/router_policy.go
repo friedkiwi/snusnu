@@ -180,6 +180,9 @@ func policySnapshotsEqual(a, b *routerPolicySnapshot) bool {
 }
 
 func (h *routerHub) current(c *routerSession) bool {
+	if c != nil && c.local {
+		return h.isCurrent(c)
+	}
 	policy := h.policy.Load()
 	if policy == nil || c.closed.Load() {
 		return false
@@ -215,6 +218,13 @@ func (h *routerHub) current(c *routerSession) bool {
 func (h *routerHub) allowed(source, target *routerSession) bool {
 	if source == nil || target == nil || !h.isCurrent(source) || !h.isCurrent(target) {
 		return false
+	}
+	if source.local || target.local {
+		peer := source
+		if source.local {
+			peer = target
+		}
+		return !h.draining.Load() && h.current(peer)
 	}
 	if _, denied := h.revokedRouters.Load(source.router.ID); denied {
 		return false

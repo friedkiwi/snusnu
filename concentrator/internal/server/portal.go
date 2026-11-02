@@ -163,6 +163,19 @@ func (a *App) globalDirectory(w http.ResponseWriter, r *http.Request, u store.Us
 		dbError(w, err)
 		return
 	}
+	if a.hub.local != nil {
+		service := store.Export{RouterID: serviceRouterID, RouterName: "SNUSNU services", OwnerID: serviceOwnerID,
+			OwnerUsername: "snusnu", NetID: "SNUSNU", Revision: 1, Generation: 1}
+		cp := service
+		cp.Kind, cp.Name, cp.RouteID = "CP", "SVC", 1
+		cp.ManagedMAC = (store.ManagedCP{Suffix: serviceMACSuffix}).MACColon()
+		cp.ADPTADR = (store.ManagedCP{Suffix: serviceMACSuffix}).ADPTADR()
+		lu := service
+		lu.Kind, lu.Name, lu.RouteID = "LU", "PING", 2
+		lu.HostingCPNetID, lu.HostingCPName = "SNUSNU", "SVC"
+		lu.LUTypes = []string{"LU 6.2"}
+		exports = append(exports, cp, lu)
+	}
 	a.render(w, "global_directory", map[string]any{"User": u, "CSRF": s.CSRF, "Exports": exports})
 }
 func (a *App) adminRouters(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {

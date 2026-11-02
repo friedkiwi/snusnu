@@ -72,6 +72,14 @@ func Open(ctx context.Context, driver, dsn string) (*Store, error) {
 		db.Close()
 		return nil, errors.New("NETID SNUSNU is reserved for concentrator services; reassign the existing user before starting")
 	}
+	if err = s.Row(ctx, "SELECT COUNT(*) FROM managed_cp_addresses WHERE mac_suffix=16777215").Scan(&reservedCount); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if reservedCount != 0 {
+		db.Close()
+		return nil, errors.New("managed MAC 02:53:4e:ff:ff:ff is reserved for SNUSNU.SVC; retire the existing allocation before starting")
+	}
 	return s, nil
 }
 

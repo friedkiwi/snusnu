@@ -39,6 +39,8 @@ type outboundMessage struct {
 }
 type routerSession struct {
 	mu                             sync.Mutex
+	local                          bool
+	localInbox                     chan *wire.WsEnvelope
 	router                         store.Router
 	token, epoch, ip, allowedNetID string
 	subprotocol                    string
@@ -75,6 +77,7 @@ type routeVersion struct {
 }
 type routerHub struct {
 	a               *App
+	local           *routerSession
 	policyMu        sync.Mutex
 	blockMu         sync.Mutex
 	blockDenials    sync.Map // owner pair -> temporary denial while policy catches up
@@ -363,6 +366,14 @@ func (h *routerHub) send(c *routerSession, e *wire.WsEnvelope, circuit string, c
 	if c == nil || !h.isCurrent(c) || c.closed.Load() {
 		return false
 	}
+	if c.local {
+		select {
+		case c.localInbox <- proto.Clone(e).(*wire.WsEnvelope):
+			return true
+		default:
+			return false
+		}
+	}
 	data, err := proto.Marshal(e)
 	if err != nil || len(data) > maxWSMessage {
 		return false
@@ -421,6 +432,9 @@ func (h *routerHub) outboundAllowed(recipient *routerSession, msg outboundMessag
 	return true
 }
 func (h *routerHub) session(id string) *routerSession {
+	if h.local != nil && h.local.router.ID == id {
+		return h.local
+	}
 	value, ok := h.clients.Load(id)
 	if !ok {
 		return nil
@@ -429,6 +443,9 @@ func (h *routerHub) session(id string) *routerSession {
 }
 
 func (h *routerHub) isCurrent(c *routerSession) bool {
+	if c != nil && c.local {
+		return h.local == c && !c.closed.Load()
+	}
 	return c != nil && !c.closed.Load() && h.session(c.router.ID) == c
 }
 
@@ -455,6 +472,9 @@ type publishedRoutes struct {
 
 func (h *routerHub) publishedLocked() map[string]publishedRoutes {
 	origins := make(map[string]publishedRoutes)
+	if h.local != nil {
+		origins[h.local.router.ID] = publishedRoutes{session: h.local, epoch: h.local.epoch, snapshot: h.local.snapshot}
+	}
 	for _, c := range h.sessions() {
 		if !h.current(c) || !h.isCurrent(c) {
 			continue
@@ -634,6 +654,9 @@ func (h *routerHub) refreshLocked() {
 	}
 	sessions = h.sessions()
 	origins := make(map[string]publishedRoutes, len(sessions))
+	if h.local != nil {
+		origins[h.local.router.ID] = publishedRoutes{session: h.local, epoch: h.local.epoch, snapshot: h.local.snapshot}
+	}
 	for _, origin := range sessions {
 		origin.mu.Lock()
 		if origin.snapshot != nil {
@@ -692,6 +715,10 @@ func (h *routerHub) refreshBindings(c *routerSession, origins map[string]publish
 	candidates := make(map[string][]*wire.RouteReference)
 	for originID, origin := range origins {
 		originPolicy, ok := policy.routers[originID]
+		if origin.session != nil && origin.session.local {
+			originPolicy = liveRouterPolicy{ownerID: serviceOwnerID}
+			ok = true
+		}
 		if !ok || !h.allowed(c, origin.session) {
 			continue
 		}
@@ -702,8 +729,14 @@ func (h *routerHub) refreshBindings(c *routerSession, origins map[string]publish
 			}
 		}
 	}
-	bindings := make([]*wire.ManagedCpBinding, 0, len(policy.managed))
-	for _, address := range policy.managed {
+	addresses := policy.managed
+	if h.local != nil {
+		addresses = append(append([]liveManagedAddress(nil), addresses...), liveManagedAddress{
+			id: serviceRouterID, ownerID: serviceOwnerID, netID: "SNUSNU", cpName: "SVC", suffix: serviceMACSuffix,
+		})
+	}
+	bindings := make([]*wire.ManagedCpBinding, 0, len(addresses))
+	for _, address := range addresses {
 		refs := candidates[address.ownerID+"\x00"+address.netID+"\x00"+address.cpName]
 		if len(refs) == 0 {
 			continue

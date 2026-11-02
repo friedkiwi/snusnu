@@ -475,6 +475,9 @@ func (h *routerHub) resetCircuitValue(id string, c *wsCircuit, reason wire.Reset
 	h.retireCircuit(id, c)
 }
 func (h *routerHub) logEvent(sender, peer *routerSession, event *wire.CircuitEvent) {
+	if sender.local || peer.local {
+		return // local services have no user-owned router log row
+	}
 	// Keep previews bounded. The LLC endpoints own full SNA packet decoding.
 	kind := "SNA information"
 	size := 0
