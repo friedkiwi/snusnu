@@ -1739,13 +1739,13 @@ pub(crate) fn automatic_route_snapshot(
 /// guessed route could deliver an SNA session to the wrong endpoint.
 #[derive(Default)]
 pub(crate) struct AutoDirectory {
-    origins: HashMap<Vec<u8>, (Vec<u8>, Vec<wire::RouteExport>)>,
+    origins: HashMap<Vec<u8>, (Vec<u8>, u64, Vec<wire::RouteExport>)>,
     managed: HashMap<[u8; 6], (wire::SnaName, Vec<wire::RouteReference>)>,
 }
 
 impl AutoDirectory {
     fn route_for_reference(&self, reference: &wire::RouteReference) -> Option<&wire::RouteExport> {
-        let (epoch, routes) = self.origins.get(&reference.router_id)?;
+        let (epoch, _, routes) = self.origins.get(&reference.router_id)?;
         if epoch != &reference.epoch { return None; }
         routes.iter().find(|route|
             route.id == reference.route_id && route.generation == reference.route_generation)
@@ -1772,8 +1772,13 @@ impl AutoDirectory {
                 None => return Err(protocol("origin route missing resource")),
             }
         }
+        if self.origins.get(&origin.router_id).is_some_and(|(epoch, revision, _)|
+            epoch == &snapshot.epoch && snapshot.revision <= *revision)
+        {
+            return Err(protocol("origin route revision is not increasing"));
+        }
         self.origins.insert(origin.router_id.clone(),
-            (snapshot.epoch.clone(), snapshot.routes.clone()));
+            (snapshot.epoch.clone(), snapshot.revision, snapshot.routes.clone()));
         Ok(())
     }
 
@@ -1782,7 +1787,7 @@ impl AutoDirectory {
             return Err(protocol("invalid origin withdrawal"));
         }
         if self.origins.get(&withdraw.router_id)
-            .is_some_and(|(epoch, _)| epoch == &withdraw.epoch)
+            .is_some_and(|(epoch, _, _)| epoch == &withdraw.epoch)
         {
             self.origins.remove(&withdraw.router_id);
         }
@@ -1816,7 +1821,7 @@ impl AutoDirectory {
         let Some((name, candidates)) = self.managed.get(mac) else { return Ok(None) };
         let mut found = Vec::new();
         for candidate in candidates {
-            if self.origins.get(&candidate.router_id).is_some_and(|(epoch, routes)| {
+            if self.origins.get(&candidate.router_id).is_some_and(|(epoch, _, routes)| {
                 epoch == &candidate.epoch && routes.iter().any(|route| {
                     route.id == candidate.route_id
                         && route.generation == candidate.route_generation
@@ -1851,7 +1856,7 @@ impl AutoDirectory {
 
     fn resolve(&self, matches: impl Fn(&wire::route_export::Resource) -> bool) -> io::Result<Option<wire::RouteReference>> {
         let mut found = None;
-        for (router_id, (epoch, routes)) in &self.origins {
+        for (router_id, (epoch, _, routes)) in &self.origins {
             for route in routes {
                 if route.resource.as_ref().is_some_and(&matches) {
                     if found.is_some() {
@@ -2319,6 +2324,10 @@ mod tests {
             }),
         };
         directory.replace_origin(&origin).unwrap();
+        assert!(directory.replace_origin(&origin).is_err());
+        let mut advanced = origin.clone();
+        advanced.snapshot.as_mut().unwrap().revision = 2;
+        directory.replace_origin(&advanced).unwrap();
         assert_eq!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap()
             .unwrap().route_id, 41);
         directory.withdraw(&wire::OriginWithdraw {
