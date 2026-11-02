@@ -99,6 +99,18 @@ fn pump_virtual(port: &mut VirtualWsPort<WsRoutePort>) -> io::Result<()> {
 
 pub(crate) fn run(path: &Path) -> io::Result<()> {
     let config = config::load(path)?;
+    run_config(&config, true)
+}
+
+/// Shared gateway runtime entry. Production remains gated until all X'83'
+/// directions, including native-initiated Abort, have socket completion.
+pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> io::Result<()> {
+    if !experimental {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "production TCP62 gateway waits for outbound UDP Abort completion",
+        ));
+    }
     check_shape(&config)?;
     let gateway = &config.mptn_gateway[0];
     let remote = &config.remote[0];
