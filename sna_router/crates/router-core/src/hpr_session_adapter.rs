@@ -65,6 +65,7 @@ pub enum HprAdapterError {
     InvalidBindResult,
     DuplicateAddressVector,
     MissingPacingProfile,
+    UnsupportedPacing,
     InvalidCredit,
     Pacing(PacingError),
     InvalidMessage(Fid5Error),
@@ -90,6 +91,7 @@ impl From<SessionError> for HprAdapterError {
     }
 }
 
+#[derive(Clone)]
 pub struct HprSessionAdapter {
     role: HprSessionRole,
     scope: RtpAssociationScope,
@@ -140,6 +142,31 @@ impl HprSessionAdapter {
 
     pub fn phase(&self) -> HprSessionPhase {
         self.phase
+    }
+
+    /// Parse on a candidate. The caller commits the returned adapter only
+    /// after the fabric has accepted its event; dropping it leaves all local
+    /// BIND, SA, and pacing state unchanged.
+    pub fn preview_ingress(
+        &self,
+        observation: RtpObservation,
+        message: &[u8],
+    ) -> Result<(Self, HprIngress), HprAdapterError> {
+        let mut candidate = self.clone();
+        let ingress = candidate.ingest_verified(observation, message)?;
+        Ok((candidate, ingress))
+    }
+
+    /// Encode on a candidate. The caller commits the returned adapter only
+    /// after RTP accepted the message for transmission. A rejected candidate
+    /// can be retried without spending a pacing window or closing a session.
+    pub fn preview_egress(
+        &self,
+        event: SessionEvent,
+    ) -> Result<(Self, Option<HprEgress>), HprAdapterError> {
+        let mut candidate = self.clone();
+        let egress = candidate.encode_event(event)?;
+        Ok((candidate, egress))
     }
 
     pub fn identity(&self) -> Option<&SessionIdentity> {
@@ -591,6 +618,47 @@ fn is_negative_bind_response(fid5: Fid5WholeBiu<'_>) -> bool {
         && fid5.ru.len() >= 4
 }
 
+/// The fixed one-stage windows negotiated by a positive user BIND response.
+/// IBM SNA Formats defines BIND RU bytes 8/9 and 12/13 as the secondary send
+/// and receive pacing fields. In the conservative APING profile, the response
+/// selects fixed pacing, and each side's send window equals its partner's
+/// receive window. Adaptive pacing and unsupported profiles fail closed.
+pub fn negotiated_fixed_windows(
+    role: HprSessionRole,
+    request: &SessionUnit,
+    response: &SessionUnit,
+) -> Result<(u8, u8), HprAdapterError> {
+    let offered = request.ru();
+    let accepted = response.ru();
+    if request.snf() != response.snf()
+        || offered.len() < 27
+        || accepted.len() < 31
+        || offered[0] != 0x31
+        || accepted[0] != 0x31
+        || offered[2..4] != [0x13, 0x07]
+        || accepted[2..4] != [0x13, 0x07]
+        || offered[14..16] != [0x06, 0x02]
+        || accepted[14..16] != [0x06, 0x02]
+        || response.rh()[0] & 0xeb != 0xeb
+        || response.rh()[1] & 0x10 != 0
+    {
+        return Err(HprAdapterError::UnsupportedPacing);
+    }
+    let secondary_send = accepted[8];
+    let secondary_receive = accepted[9];
+    if !(1..=63).contains(&secondary_send)
+        || !(1..=63).contains(&secondary_receive)
+        || accepted[12] != (0x80 | secondary_receive)
+        || accepted[13] != secondary_send
+    {
+        return Err(HprAdapterError::UnsupportedPacing);
+    }
+    Ok(match role {
+        HprSessionRole::PeerPlu => (secondary_send, secondary_receive),
+        HprSessionRole::RouterPlu => (secondary_receive, secondary_send),
+    })
+}
+
 fn clear_pacing_indicator(unit: &SessionUnit) -> Result<SessionUnit, HprAdapterError> {
     if unit.rh()[1] & PACING_INDICATOR == 0 {
         return Ok(unit.clone());
@@ -726,6 +794,15 @@ mod tests {
         ru.extend_from_slice(&[0, 0]);
         let mut reduced = vec![0x80, 1, 0xeb, 0x80, 0];
         reduced.extend_from_slice(&ru);
+        SessionUnit::from_reduced(&reduced).unwrap()
+    }
+
+    fn fixed_bind_response_unit() -> SessionUnit {
+        let mut reduced = bind_response_unit().as_reduced().to_vec();
+        reduced[5 + 8] = 3;
+        reduced[5 + 9] = 1;
+        reduced[5 + 12] = 0x81;
+        reduced[5 + 13] = 3;
         SessionUnit::from_reduced(&reduced).unwrap()
     }
 
@@ -1107,5 +1184,95 @@ mod tests {
             SessionEvent::Unbind(response)
         );
         assert_eq!(router_plu.phase(), HprSessionPhase::Closed);
+    }
+
+    #[test]
+    fn extracts_directional_fixed_windows_and_rejects_adaptive_claim() {
+        let request = bind_unit();
+        let response = fixed_bind_response_unit();
+        assert_eq!(
+            negotiated_fixed_windows(HprSessionRole::PeerPlu, &request, &response),
+            Ok((3, 1))
+        );
+        assert_eq!(
+            negotiated_fixed_windows(HprSessionRole::RouterPlu, &request, &response),
+            Ok((1, 3))
+        );
+        let mut invalid = response.as_reduced().to_vec();
+        invalid[5 + 12] = 1;
+        assert_eq!(
+            negotiated_fixed_windows(
+                HprSessionRole::PeerPlu,
+                &request,
+                &SessionUnit::from_reduced(&invalid).unwrap(),
+            ),
+            Err(HprAdapterError::UnsupportedPacing)
+        );
+    }
+
+    #[test]
+    fn preview_discards_state_until_delivery_is_committed() {
+        let s = scope();
+        let adapter =
+            HprSessionAdapter::new(HprSessionRole::PeerPlu, s, SLU_SA, None, None).unwrap();
+        let bind = encode_whole_biu(PLU_SA.to_be_bytes(), Flow::Expedited, &bind_unit()).unwrap();
+        let (mut candidate, ingress) = adapter
+            .preview_ingress(observation(s.initial_plu_tcid), &bind)
+            .unwrap();
+        assert_eq!(adapter.phase(), HprSessionPhase::AwaitBind);
+        assert_eq!(candidate.phase(), HprSessionPhase::AwaitBindResult);
+        assert!(matches!(ingress.event, SessionEvent::BindRequest(_)));
+        candidate
+            .encode_event(SessionEvent::BindResult {
+                accepted: true,
+                unit: fixed_bind_response_unit(),
+            })
+            .unwrap();
+        candidate.configure_fixed_pacing(1, 1).unwrap();
+        let event = SessionEvent::Information {
+            flow: Flow::Normal,
+            unit: data_unit(),
+        };
+        let (sent, first) = candidate.preview_egress(event.clone()).unwrap();
+        assert_eq!(
+            first.as_ref().unwrap().message,
+            candidate
+                .preview_egress(event.clone())
+                .unwrap()
+                .1
+                .unwrap()
+                .message
+        );
+        assert!(candidate.preview_egress(event.clone()).is_ok());
+        assert!(matches!(
+            sent.preview_egress(event),
+            Err(HprAdapterError::Pacing(PacingError::SendWindowExhausted))
+        ));
+        let ipr_unit = SessionUnit::from_reduced(&[0, 2, 0x83, 0x01, 0]).unwrap();
+        let ipr = encode_whole_biu(
+            (SLU_SA & !ASSIGNOR).to_be_bytes(),
+            Flow::Expedited,
+            &ipr_unit,
+        )
+        .unwrap();
+        let (received, credit) = sent
+            .preview_ingress(observation(s.subsequent_plu_tcid), &ipr)
+            .unwrap();
+        assert_eq!(
+            credit.event,
+            SessionEvent::Credit {
+                normal: 1,
+                expedited: 0
+            }
+        );
+        assert!(sent
+            .preview_ingress(observation(s.subsequent_plu_tcid), &ipr)
+            .is_ok());
+        assert!(matches!(
+            received.preview_ingress(observation(s.subsequent_plu_tcid), &ipr),
+            Err(HprAdapterError::Pacing(
+                PacingError::DuplicatePacingResponse
+            ))
+        ));
     }
 }
