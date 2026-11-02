@@ -10,10 +10,10 @@ fi
 check_go=false
 check_rust=false
 check_protocol=false
-if grep -Eq '^(concentrator/|sna/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/go\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
+if grep -Eq '^(concentrator/|sna/|proto/|sna_router/crates/snusnu-router/Cargo\.toml$|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/go\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
   check_go=true
 fi
-if grep -Eq '^(sna_router/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/rust\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
+if grep -Eq '^(sna_router/|proto/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/rust\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then
   check_rust=true
 fi
 if grep -Eq '^(docs/protocol\.md$|docs/test-vectors/|\.github/workflows/protocol\.yml$|\.githooks/|scripts/pre-commit-check\.sh$)' <<< "$staged_paths"; then

@@ -14,6 +14,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
+use tungstenite::http::HeaderName;
 use tungstenite::http::HeaderValue;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
@@ -26,12 +27,15 @@ pub mod wire {
 pub const SUBPROTOCOL: &str = "snusnu.v1";
 pub const SUBPROTOCOL_V2: &str = "snusnu.v2";
 pub const MAX_V1_MESSAGE_BYTES: usize = 64 * 1024;
+const SOFTWARE_NAME_HEADER: HeaderName = HeaderName::from_static("x-snusnu-software-name");
+const SOFTWARE_VERSION_HEADER: HeaderName = HeaderName::from_static("x-snusnu-software-version");
 
 #[derive(Debug)]
 pub enum Error {
     InvalidUrl,
     InsecureRemoteUrl,
     InvalidBearer,
+    InvalidSoftwareIdentity,
     Handshake(&'static str),
     Protocol(&'static str),
     MessageTooLarge,
@@ -45,6 +49,7 @@ impl fmt::Display for Error {
             Self::InvalidUrl => write!(f, "invalid router WebSocket URL"),
             Self::InsecureRemoteUrl => write!(f, "remote router WebSocket must use wss"),
             Self::InvalidBearer => write!(f, "invalid router bearer credential"),
+            Self::InvalidSoftwareIdentity => write!(f, "invalid client software identity"),
             Self::Handshake(reason) => write!(f, "WebSocket handshake: {reason}"),
             Self::Protocol(reason) => write!(f, "router protocol: {reason}"),
             Self::MessageTooLarge => write!(f, "router WebSocket message exceeds limit"),
@@ -111,13 +116,33 @@ impl WsClient {
     /// Connect using an HTTP Authorization header when a bearer is supplied.
     /// A plaintext `ws` URL is accepted only for loopback development servers.
     pub fn connect(url: &str, bearer: &str) -> Result<(Self, wire::RouterWelcome), Error> {
-        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL)
+        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL, None)
     }
 
     /// Connect with source-LU authenticated circuit opens. Both circuit ends
     /// must select v2 before the server will relay an LU gateway open.
     pub fn connect_v2(url: &str, bearer: &str) -> Result<(Self, wire::RouterWelcome), Error> {
-        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL_V2)
+        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL_V2, None)
+    }
+
+    /// Report a client's own software identity, without claiming to be the
+    /// bundled router. Third-party clients can use any distinct name.
+    pub fn connect_with_identity(
+        url: &str,
+        bearer: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<(Self, wire::RouterWelcome), Error> {
+        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL, Some((name, version)))
+    }
+
+    pub fn connect_v2_with_identity(
+        url: &str,
+        bearer: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<(Self, wire::RouterWelcome), Error> {
+        Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL_V2, Some((name, version)))
     }
 
     pub fn subprotocol(&self) -> &'static str {
@@ -128,6 +153,7 @@ impl WsClient {
         url: &str,
         bearer: &str,
         subprotocol: &'static str,
+        identity: Option<(&str, &str)>,
     ) -> Result<(Self, wire::RouterWelcome), Error> {
         validate_url(url)?;
         let mut request = url.into_client_request().map_err(|_| Error::InvalidUrl)?;
@@ -140,6 +166,15 @@ impl WsClient {
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static(subprotocol),
         );
+        if let Some((name, version)) = identity {
+            let name = HeaderValue::from_str(name).map_err(|_| Error::InvalidSoftwareIdentity)?;
+            let version =
+                HeaderValue::from_str(version).map_err(|_| Error::InvalidSoftwareIdentity)?;
+            request.headers_mut().insert(SOFTWARE_NAME_HEADER, name);
+            request
+                .headers_mut()
+                .insert(SOFTWARE_VERSION_HEADER, version);
+        }
         let (socket, response) = connect(request)?;
         if response
             .headers()
@@ -318,6 +353,7 @@ mod tests {
             max_circuits: 100,
             display_name: "Lab router".into(),
             allowed_netid: "SOLNET".into(),
+            software_update_available: None,
         };
         assert!(validate_welcome(&welcome).is_ok());
         welcome.allowed_netid = "1BAD".into();
@@ -362,6 +398,8 @@ mod tests {
                  mut response: tungstenite::handshake::server::Response| {
                     assert_eq!(request.headers()[AUTHORIZATION], "Bearer test-token");
                     assert_eq!(request.headers()[SEC_WEBSOCKET_PROTOCOL], SUBPROTOCOL);
+                    assert_eq!(request.headers()[SOFTWARE_NAME_HEADER], "sna_router");
+                    assert_eq!(request.headers()[SOFTWARE_VERSION_HEADER], "0.0.1");
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
                         HeaderValue::from_static(SUBPROTOCOL),
@@ -378,6 +416,9 @@ mod tests {
                     max_circuits: 16,
                     display_name: "Test router".into(),
                     allowed_netid: "SOLNET".into(),
+                    software_update_available: Some(wire::SoftwareUpdateAvailable {
+                        latest_version: "0.1.0".into(),
+                    }),
                 })),
             };
             socket
@@ -394,9 +435,14 @@ mod tests {
             ));
         });
         let url = format!("ws://{address}/router/v1/ws");
-        let (mut client, welcome) = WsClient::connect(&url, "test-token").unwrap();
+        let (mut client, welcome) =
+            WsClient::connect_with_identity(&url, "test-token", "sna_router", "0.0.1").unwrap();
         assert_eq!(client.peer_addr().unwrap(), address);
         assert_eq!(welcome.router_id, vec![7; 16]);
+        assert_eq!(
+            welcome.software_update_available.unwrap().latest_version,
+            "0.1.0"
+        );
         client
             .send(wire::WsEnvelope {
                 body: Some(wire::ws_envelope::Body::PublishRoutes(
@@ -438,6 +484,7 @@ mod tests {
                     max_circuits: 16,
                     display_name: "Unauthenticated test router".into(),
                     allowed_netid: "SOLNET".into(),
+                    software_update_available: None,
                 })),
             };
             socket
@@ -501,6 +548,7 @@ mod tests {
                     max_circuits: 16,
                     display_name: "Test router".into(),
                     allowed_netid: "SOLNET".into(),
+                    software_update_available: None,
                 })),
             };
             socket

@@ -127,6 +127,58 @@ func expectTestBody(t *testing.T, conn *websocket.Conn, kind string) *wire.WsEnv
 	t.Fatalf("missing %s", kind)
 	return nil
 }
+func TestRouterWebSocketSoftwareIdentityAndUpdate(t *testing.T) {
+	a := testApp(t)
+	ctx := context.Background()
+	ownerID := store.RandomUUID()
+	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", ownerID, "software@example.com", "unused", store.Now(), "SWTEST"); err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := a.DB.CreateRouter(ctx, ownerID, "Software test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(a.Handler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/router/v1/ws"
+	dial := func(name, version string) *wire.RouterWelcome {
+		t.Helper()
+		headers := http.Header{"Authorization": []string{"Bearer " + token}, "Sec-WebSocket-Protocol": []string{"snusnu.v2"}, softwareNameHeader: []string{name}, softwareVersionHeader: []string{version}}
+		conn, response, err := websocket.DefaultDialer.Dial(url, headers)
+		if err != nil {
+			t.Fatalf("dial %s %s: %v, response %+v", name, version, err, response)
+		}
+		defer conn.Close()
+		welcome := readTestEnvelope(t, conn).GetWelcome()
+		if welcome == nil {
+			t.Fatal("missing welcome")
+		}
+		return welcome
+	}
+	if update := dial("sna_router", "0.0.1").GetSoftwareUpdateAvailable(); update == nil || update.LatestVersion != latestSnaRouterVersion {
+		t.Fatalf("older first-party router missing update: %+v", update)
+	}
+	if update := dial("sna_router", "999.0.0").GetSoftwareUpdateAvailable(); update != nil {
+		t.Fatalf("newer router rejected or given update: %+v", update)
+	}
+	if update := dial("independent-router", "0.0.1").GetSoftwareUpdateAvailable(); update != nil {
+		t.Fatalf("third-party router given first-party update: %+v", update)
+	}
+	previousPolicy := snaRouterPolicy
+	snaRouterPolicy = softwarePolicy{minimumVersion: "0.1.0", blockedVersions: map[string]bool{"0.1.0": true}}
+	defer func() { snaRouterPolicy = previousPolicy }()
+	for _, version := range []string{"0.0.1", "0.1.0"} {
+		headers := http.Header{"Authorization": []string{"Bearer " + token}, "Sec-WebSocket-Protocol": []string{"snusnu.v2"}, softwareNameHeader: []string{"sna_router"}, softwareVersionHeader: []string{version}}
+		conn, response, err := websocket.DefaultDialer.Dial(url, headers)
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+			t.Fatalf("blocked version %s: error %v, response %+v", version, err, response)
+		}
+	}
+}
+
 func TestRouterWebSocketTwoPeerCircuit(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()

@@ -69,7 +69,7 @@ func (a *App) adminRouterSessionsPage(w http.ResponseWriter, r *http.Request, u 
 		filtered := items[:0]
 		needle := strings.ToLower(search)
 		for _, item := range items {
-			if strings.Contains(strings.ToLower(strings.Join([]string{item.ID, item.Name, item.IP, item.Protocol, item.Epoch}, " ")), needle) {
+			if strings.Contains(strings.ToLower(strings.Join([]string{item.ID, item.Name, item.IP, item.Protocol, item.Epoch, item.SoftwareName, item.SoftwareVersion}, " ")), needle) {
 				filtered = append(filtered, item)
 			}
 		}

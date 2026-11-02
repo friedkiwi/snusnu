@@ -1,9 +1,9 @@
 name: Go
 on:
   push:
-    paths: ['concentrator/**', 'sna/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
+    paths: ['concentrator/**', 'sna/**', 'proto/**', 'sna_router/crates/snusnu-router/Cargo.toml', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
   pull_request:
-    paths: ['concentrator/**', 'sna/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
+    paths: ['concentrator/**', 'sna/**', 'proto/**', 'sna_router/crates/snusnu-router/Cargo.toml', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/go.yml']
 permissions:
   contents: read
 jobs:

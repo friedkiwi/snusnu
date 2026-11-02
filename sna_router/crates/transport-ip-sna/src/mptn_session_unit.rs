@@ -68,11 +68,15 @@ mod tests {
 
     #[test]
     fn captured_normal_request_and_implied_response_preserve_snf() {
-        // V5R4 TCP/397 p8 and the observed implied-bracket positive response.
-        for bytes in [
-            &[0, 0, 0, 10, 0, 0, 2, 0x03, 0x90, 0x20][..],
-            &[0, 0, 0, 10, 0, 0x80, 0, 0x83, 0xa0, 0][..],
-        ] {
+        // V5R4 525-byte TCP/397 request prefix and captured positive response
+        // from tests/user_bind_attach.rs. Application payload is redacted.
+        let mut request = vec![
+            0, 0, 2, 0x0d, 0, 0, 2, 0x03, 0x90, 0x20, 0x02, 0x03, 0x12, 0xa0, 0, 0, 0x04, 0x10,
+            0x80, 0x03,
+        ];
+        request.resize(525, 0);
+        let response = [0, 0, 0, 10, 0, 0x80, 0, 0x83, 0xa0, 0];
+        for bytes in [&request[..], &response[..]] {
             let original = record(bytes);
             let unit = normal_record_to_unit(&original).unwrap();
             assert_eq!(unit.as_reduced(), &bytes[5..]);

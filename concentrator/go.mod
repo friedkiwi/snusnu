@@ -10,6 +10,7 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/pquerna/otp v1.5.0
 	golang.org/x/crypto v0.58.0
+	golang.org/x/mod v0.42.0
 	google.golang.org/protobuf v1.36.10
 	modernc.org/sqlite v1.61.1
 )

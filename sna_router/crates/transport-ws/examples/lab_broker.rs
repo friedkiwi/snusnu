@@ -317,6 +317,7 @@ fn main() -> io::Result<()> {
                         max_circuits: 1,
                         display_name: format!("V4R4 lab {}", if side == 0 { "A" } else { "B" }),
                         allowed_netid: "SOLNET".into(),
+                        software_update_available: None,
                     }),
                 )?;
                 eprintln!("broker: router {side} connected");

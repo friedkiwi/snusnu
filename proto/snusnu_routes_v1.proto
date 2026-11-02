@@ -13,6 +13,11 @@ message RouterWelcome {
   uint32 max_circuits = 4;
   string display_name = 5; // Server-owned user-facing name, 1-80 characters.
   string allowed_netid = 6; // NETID owned by the authenticated router's user.
+  SoftwareUpdateAvailable software_update_available = 7; // Present only for older first-party clients.
+}
+
+message SoftwareUpdateAvailable {
+  string latest_version = 1; // Version of snusnu-router known when Go was compiled.
 }
 
 // Sent by a Rust router to the concentrator after authentication and whenever

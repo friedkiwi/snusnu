@@ -585,9 +585,19 @@ impl WsRoutePort {
             }
         }
         let (mut client, welcome) = if source_lus.is_some() {
-            WsClient::connect_v2(&primary.url, &primary.bearer)
+            WsClient::connect_v2_with_identity(
+                &primary.url,
+                &primary.bearer,
+                "sna_router",
+                env!("CARGO_PKG_VERSION"),
+            )
         } else {
-            WsClient::connect(&primary.url, &primary.bearer)
+            WsClient::connect_with_identity(
+                &primary.url,
+                &primary.bearer,
+                "sna_router",
+                env!("CARGO_PKG_VERSION"),
+            )
         }
         .map_err(|error| {
             if let Some(status) = crate::status() {
@@ -603,6 +613,9 @@ impl WsRoutePort {
             }
             io_error(error)
         })?;
+        if let Some(update) = &welcome.software_update_available {
+            tracing::warn!(current_version = env!("CARGO_PKG_VERSION"), latest_version = %update.latest_version, "sna_router software update available");
+        }
         if configs
             .iter()
             .any(|config| config.local_cp.netid != welcome.allowed_netid)
@@ -2005,7 +2018,16 @@ impl AutoWsHub {
         control_points: &[wire::SnaName],
         logical_units: &[wire::LuReachability],
     ) -> io::Result<Self> {
-        let (client, welcome) = WsClient::connect_v2(url, bearer).map_err(io_error)?;
+        let (client, welcome) = WsClient::connect_v2_with_identity(
+            url,
+            bearer,
+            "sna_router",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .map_err(io_error)?;
+        if let Some(update) = &welcome.software_update_available {
+            tracing::warn!(current_version = env!("CARGO_PKG_VERSION"), latest_version = %update.latest_version, "sna_router software update available");
+        }
         let directory = Rc::new(RefCell::new(AutoDirectory::default()));
         let shared = Rc::new(RefCell::new(SharedWs {
             client,
@@ -2749,6 +2771,7 @@ mod tests {
                         max_circuits: 1,
                         display_name: "auto router".into(),
                         allowed_netid: "OWNED".into(),
+                        software_update_available: None,
                     }))
                     .encode_to_vec()
                     .into(),
@@ -2966,6 +2989,7 @@ mod tests {
                     max_circuits: 4,
                     display_name: "test router".into(),
                     allowed_netid: "SOLNET".into(),
+                    software_update_available: None,
                 }),
             );
             let WsMessage::Binary(payload) = socket.read().unwrap() else {
@@ -3187,6 +3211,7 @@ mod tests {
                     max_circuits: 4,
                     display_name: "legacy test".into(),
                     allowed_netid: "SOLNET".into(),
+                    software_update_available: None,
                 }),
             );
             let _snapshot = socket.read().unwrap();
@@ -3274,6 +3299,7 @@ mod tests {
                     max_circuits: 4,
                     display_name: "source router".into(),
                     allowed_netid: "SRCNET".into(),
+                    software_update_available: None,
                 }),
             );
             let _snapshot = socket.read().unwrap();
@@ -3369,6 +3395,7 @@ mod tests {
                     max_circuits: 4,
                     display_name: "v2 gateway".into(),
                     allowed_netid: "QABOB".into(),
+                    software_update_available: None,
                 }),
             );
             let WsMessage::Binary(payload) = socket.read().unwrap() else {
@@ -3504,6 +3531,7 @@ mod tests {
                     max_circuits: 4,
                     display_name: "v2 gateway".into(),
                     allowed_netid: "QABOB".into(),
+                    software_update_available: None,
                 }),
             );
             let WsMessage::Binary(payload) = socket.read().unwrap() else {
@@ -3630,6 +3658,7 @@ mod tests {
                     max_circuits: 4,
                     display_name: "v2 gateway".into(),
                     allowed_netid: "QABOB".into(),
+                    software_update_available: None,
                 }),
             );
             let WsMessage::Binary(payload) = socket.read().unwrap() else {
@@ -4016,6 +4045,7 @@ mod tests {
                         max_circuits: 1,
                         display_name: "test router".into(),
                         allowed_netid: "SOLNET".into(),
+                        software_update_available: None,
                     }))
                     .encode_to_vec()
                     .into(),

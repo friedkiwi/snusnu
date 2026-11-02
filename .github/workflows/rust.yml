@@ -1,9 +1,9 @@
 name: Rust
 on:
   push:
-    paths: ['sna_router/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/rust.yml']
+    paths: ['sna_router/**', 'proto/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/rust.yml']
   pull_request:
-    paths: ['sna_router/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/rust.yml']
+    paths: ['sna_router/**', 'proto/**', 'docs/protocol.md', 'docs/test-vectors/**', '.github/workflows/rust.yml']
 permissions:
   contents: read
 jobs:

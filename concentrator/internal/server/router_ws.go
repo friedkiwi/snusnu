@@ -44,6 +44,7 @@ type routerSession struct {
 	router                         store.Router
 	token, epoch, ip, allowedNetID string
 	subprotocol                    string
+	softwareName, softwareVersion  string
 	conn                           *websocket.Conn
 	out                            *dynamicQueue[outboundMessage]
 	snapshot                       *wire.RouteSnapshot
@@ -130,6 +131,11 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "snusnu.v2 or snusnu.v1 subprotocol required", http.StatusUpgradeRequired)
 		return
 	}
+	software, err := inspectClientSoftware(r)
+	if err != nil {
+		http.Error(w, err.Error(), softwareErrorStatus(err))
+		return
+	}
 	parts := strings.Fields(r.Header.Get("Authorization"))
 	if len(parts) != 2 || parts[0] != "Bearer" || len(parts[1]) < 16 {
 		http.Error(w, "router bearer token required", http.StatusUnauthorized)
@@ -165,7 +171,7 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}, connectedAt: time.Now(), done: make(chan struct{})}
+	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), softwareName: software.name, softwareVersion: software.version, conn: conn, out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}, connectedAt: time.Now(), done: make(chan struct{})}
 	h := a.hub
 	h.revocationMu.Lock()
 	_, policyErr := h.loadPolicy(r.Context())
@@ -208,7 +214,13 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 	if loaded {
 		h.remove(previous.(*routerSession))
 	}
-	h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}}}, "", 0)
+	welcome := &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}
+	if software.updateVersion != "" {
+		welcome.SoftwareUpdateAvailable = &wire.SoftwareUpdateAvailable{LatestVersion: software.updateVersion}
+	}
+	log.Printf("router %s connected: software=%s version=%s protocol=%s ip=%s", router.ID, software.name, software.version, conn.Subprotocol(), host)
+	a.enqueueRouterLog(store.LogEntry{RouterID: router.ID, Direction: "system", Level: "info", EventType: "connection", SourceIP: host, Summary: "connected: " + software.name + " " + software.version + " via " + conn.Subprotocol()})
+	h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: welcome}}, "", 0)
 	go h.write(c)
 	h.reconcileConnect(c)
 	if h.running.CompareAndSwap(false, true) {
@@ -321,7 +333,7 @@ func (h *routerHub) read(c *routerSession) {
 		}
 		err = h.handle(c, &envelope)
 		if err != nil {
-			log.Printf("router %s protocol: %v", c.router.ID, err)
+			log.Printf("router %s (%s %s) protocol: %v", c.router.ID, c.softwareName, c.softwareVersion, err)
 			h.a.enqueueRouterLog(store.LogEntry{RouterID: c.router.ID, Direction: "system", Level: "error", EventType: "protocol", SourceIP: c.ip, Summary: err.Error()})
 			return
 		}

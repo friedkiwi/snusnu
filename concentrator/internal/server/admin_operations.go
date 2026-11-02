@@ -204,7 +204,7 @@ func (m *maintenanceManager) list(ctx context.Context) ([]maintenanceRun, error)
 }
 
 type adminRouterSession struct {
-	ID, Name, IP, Protocol, Epoch                                               string
+	ID, Name, IP, Protocol, Epoch, SoftwareName, SoftwareVersion                string
 	ConnectedAt                                                                 int64
 	RouteCount                                                                  int
 	RouteRevision                                                               uint64
@@ -217,7 +217,7 @@ func (h *routerHub) adminRouterSessions() []adminRouterSession {
 	for _, c := range h.sessions() {
 		c.mu.Lock()
 		queue := c.out.stats()
-		item := adminRouterSession{ID: c.router.ID, Name: c.router.DisplayName, IP: c.ip, Protocol: c.subprotocol, Epoch: c.epoch, ConnectedAt: c.connectedAt.Unix(), OutboundQueued: queue.Depth, OutboundLimit: queue.Limit, OutboundBytes: queue.Bytes, OutboundHighWater: queue.HighWater, OutboundDropped: queue.Dropped}
+		item := adminRouterSession{ID: c.router.ID, Name: c.router.DisplayName, IP: c.ip, Protocol: c.subprotocol, Epoch: c.epoch, SoftwareName: c.softwareName, SoftwareVersion: c.softwareVersion, ConnectedAt: c.connectedAt.Unix(), OutboundQueued: queue.Depth, OutboundLimit: queue.Limit, OutboundBytes: queue.Bytes, OutboundHighWater: queue.HighWater, OutboundDropped: queue.Dropped}
 		if c.snapshot != nil {
 			item.RouteCount = len(c.snapshot.Routes)
 			item.RouteRevision = c.snapshot.Revision
