@@ -785,7 +785,10 @@ fn encode_data_nlp(
     nlp.extend_from_slice(&path.peer_anr_label);
     nlp.extend_from_slice(&[0xff, 0]);
     nlp.extend_from_slice(&tcid.to_be_bytes());
-    nlp.extend_from_slice(&[0x30, 4]);
+    // The first outbound data packet can precede the peer's STATUS echo.
+    // Request a prompt STATUS so the CIE-assigned TCID and receive window
+    // are confirmed before subsequent traffic (V5R4 direct EE packet 16).
+    nlp.extend_from_slice(&[if cie_tcid.is_some() { 0x3c } else { 0x30 }, 4]);
     nlp.extend_from_slice(&(8u16 + if cie_tcid.is_some() { 3 } else { 0 }).to_be_bytes());
     nlp.extend_from_slice(&(message.len() as u32).to_be_bytes());
     nlp.extend_from_slice(&bsn.to_be_bytes());
@@ -977,6 +980,12 @@ mod tests {
         );
         assert_eq!(endpoint.phase(), EndpointPhase::AwaitPeerStatus);
         let response = endpoint.prepare_message(b"RSETUP-OK", 10_000).unwrap();
+        // Direct V5R4 EE packet 16 (first RouteSetup reply) has THDR
+        // `3c 04 00 0b`: SOM/EOM, SR/RASAP, OS, and 44-byte data offset.
+        assert_eq!(
+            &RtpPacket::parse(&response).unwrap().thdr[8..12],
+            &[0x3c, 0x04, 0x00, 0x0b]
+        );
         assert_eq!(
             RtpPacket::parse(&response)
                 .unwrap()
@@ -1021,6 +1030,7 @@ mod tests {
         assert_eq!((parsed.sync, parsed.echo, parsed.rseq), (2, 1, 111));
         endpoint.confirm_status_sent(&status).unwrap();
         let output = endpoint.prepare_message(b"REPLY", 10_000).unwrap();
+        assert_eq!(RtpPacket::parse(&output).unwrap().thdr[8], 0x30);
         endpoint.confirm_message_sent(&output, 10_000).unwrap();
         assert_eq!(RtpPacket::parse(&output).unwrap().byte_sequence_number, 200);
         assert_eq!(endpoint.retransmit_due(259_999), Ok(None));
