@@ -313,9 +313,15 @@ impl ReverseUserFlow {
         {
             return Err(invalid("native user PIU belongs to another session"));
         }
-        if piu.len() == 9 && is_canonical_ipr(&piu[6..9], &piu[9..]) {
-            if piu[4..6] != [0, 0] {
-                return Err(invalid("native IPR has nonzero sequence"));
+        if piu[6..9] == [0x83, 1, 0] {
+            // V4R4's live QA user IPR has a three-byte grant RU 000003;
+            // successful direct runs also emitted 000006. Both grant one
+            // bounded local window. Other counts and trailing bytes are
+            // rejected until their semantics are captured and validated.
+            let valid_ru = is_canonical_ipr(&piu[6..9], &piu[9..])
+                || (piu.len() == 12 && matches!(&piu[9..], [0, 0, 3] | [0, 0, 6]));
+            if piu[4..6] != [0, 0] || !valid_ru {
+                return Err(invalid("native IPR sequence or grant RU is unsupported"));
             }
             self.pacing
                 .receive_pacing_response()
@@ -585,5 +591,36 @@ mod tests {
             .prepare_tcp_normal(&normal(1, [3, 0, 0], &[0xaa]))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn live_v4_adaptive_ipr_grants_local_window_and_rejects_stale_or_wrong_ru() {
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        for count in [3, 6] {
+            let mut flow = ReverseUserFlow::new(address, 3, 1).unwrap();
+            let attach = normal(1, [0x0b, 0x90, 0x20], &[0xaa]);
+            let piu = flow.prepare_tcp_normal(&attach).unwrap().unwrap().to_vec();
+            assert_eq!(&piu[..9], &[0x2e, 0, 2, 2, 0, 1, 0x0b, 0x91, 0x20]);
+            flow.mark_native_enqueued(&piu).unwrap();
+            let ipr = [0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0, 0, 0, count];
+            assert!(matches!(
+                flow.prepare_native_input(&ipr).unwrap(),
+                NativeInput::PacingGrant
+            ));
+            assert!(flow.prepare_native_input(&ipr).is_err()); // duplicate grant
+        }
+        for (mutation, mask) in [(0, 2), (2, 1), (4, 1), (11, 1)] {
+            let mut flow = ReverseUserFlow::new(address, 3, 1).unwrap();
+            let attach = normal(1, [3, 0, 0], &[0xaa]);
+            let piu = flow.prepare_tcp_normal(&attach).unwrap().unwrap().to_vec();
+            flow.mark_native_enqueued(&piu).unwrap();
+            let mut ipr = [0x2f, 0, 2, 2, 0, 0, 0x83, 1, 0, 0, 0, 3];
+            ipr[mutation] ^= mask;
+            assert!(flow.prepare_native_input(&ipr).is_err());
+        }
     }
 }
