@@ -69,7 +69,10 @@ impl DirectReplyTarget<'_> {
         let cos = unique_vector(request, 0x2c).ok_or(DirectReplyError::InvalidRoute)?;
         let forward = unique_vector(request, 0x80).ok_or(DirectReplyError::InvalidRoute)?;
         let mut forward = forward.to_vec();
-        validate_forward_route_information(&forward, &self.bootstrap.local.link_label)?;
+        // The origin appends its outbound ANR label to the forward path. The
+        // return path is built below from our outbound label. Keep the two
+        // directions distinct even when an attachment uses similar labels.
+        validate_forward_route_information(&forward, &self.bootstrap.peer.link_label)?;
         forward[2] |= 0x40; // IP hop requires REFIFO (RFC 2353 §2.6.5).
         let max_packet = u32::from(self.bootstrap.max_packet_size);
         let advertised = u32::from_be_bytes(forward[4..8].try_into().unwrap());
@@ -159,7 +162,7 @@ fn validate_direct_route(
 
 fn validate_forward_route_information(
     info: &[u8],
-    local_link_label: &[u8],
+    peer_link_label: &[u8],
 ) -> Result<(), DirectReplyError> {
     if info.len() < 25
         || info[0] as usize != info.len()
@@ -170,12 +173,12 @@ fn validate_forward_route_information(
         return Err(DirectReplyError::InvalidRoute);
     }
     let path = &info[20..];
-    if path.len() != 4 + local_link_label.len()
+    if path.len() != 4 + peer_link_label.len()
         || path[0] as usize != path.len()
         || path[1] != 0x67
-        || path[2] as usize != 2 + local_link_label.len()
+        || path[2] as usize != 2 + peer_link_label.len()
         || path[3] != 0
-        || path[4..] != *local_link_label
+        || path[4..] != *peer_link_label
     {
         return Err(DirectReplyError::InvalidLinkLabel);
     }
@@ -185,7 +188,7 @@ fn validate_forward_route_information(
 fn build_reverse_route_information(
     target: &DirectReplyTarget<'_>,
 ) -> Result<Vec<u8>, DirectReplyError> {
-    let label = &target.bootstrap.peer.link_label;
+    let label = &target.bootstrap.local.link_label;
     if !(1..=8).contains(&label.len()) || label[0] & 0x80 == 0 || label.contains(&0xff) {
         return Err(DirectReplyError::InvalidLinkLabel);
     }
@@ -304,8 +307,8 @@ mod tests {
     }
 
     fn request() -> Vec<u8> {
-        // Preserved direct V5R4 EE Route Setup request shape, with the local
-        // link label in its single-hop forward ANR path.
+        // Preserved direct V5R4 EE Route Setup request shape, with the
+        // origin's outbound label in its single-hop forward ANR path.
         let hex = "007012ce0001000000000000000000000e0ef3e2d6d3d5c5e34be2d5c1c2162b010112461080010be2d6d3d5c5e34be2d5c1c2211660cec37477b5dc29970be2d6d3d5c5e34be2d5c1c10c2c01087bc3d6d5d5c5c3e31a800000000005b500000114000010cc00000000066704008002";
         hex.as_bytes()
             .chunks_exact(2)
@@ -356,6 +359,48 @@ mod tests {
         assert_eq!(
             target.encode_positive(&parsed),
             Err(DirectReplyError::InvalidRoute)
+        );
+    }
+
+    #[test]
+    fn live_cross_netid_request_keeps_directional_anr_labels() {
+        // V5R4 EE 2026-11-02 17:43:44Z, initial X'12CE' after both CP-CP
+        // sessions came up. The guest's forward X'67' is 80 02; our reverse
+        // X'67' must be 80 80 from our own CV61 advertisement.
+        let hex = "006f12ce0001000000000000000000000e0ef3e2d5e4e2d5e44bd7c9d5c7152b010111460f80010ae2d5e4e2d5e44be2e5c3211660cec370e7b283a2960be2d6d3d5c5e34be2d5c1c20c2c01087bc3d6d5d5c5c3e31a800000000005b500000114000010cc00000000066704008002";
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let mut peer = advertisement("SOLNET.SNAB", &[0x80, 0x02]);
+        peer.node_id = [0, 0, 0, 3];
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            advertisement("SNUSNU.SVC", &[0x80, 0x80]),
+            peer,
+        )
+        .unwrap();
+        let lu: QualifiedName = "SNUSNU.PING".parse().unwrap();
+        let parsed = RouteSetupGds::parse(&bytes).unwrap();
+        let reply = setup(&bootstrap, &lu).encode_positive(&parsed).unwrap();
+        let decoded = RouteSetupGds::parse(&reply).unwrap();
+        let forward = decoded.vectors.iter().find(|cv| cv.key == 0x80).unwrap();
+        assert!(forward.wire.ends_with(&[0x06, 0x67, 0x04, 0, 0x80, 0x02]));
+        let reverse = decoded
+            .vectors
+            .iter()
+            .rev()
+            .find(|cv| cv.key == 0x80)
+            .unwrap();
+        assert!(reverse.wire.ends_with(&[0x06, 0x67, 0x04, 0, 0x80, 0x80]));
+
+        let mut wrong_path = bytes.clone();
+        *wrong_path.last_mut().unwrap() = 0x80;
+        let wrong = RouteSetupGds::parse(&wrong_path).unwrap();
+        assert_eq!(
+            setup(&bootstrap, &lu).encode_positive(&wrong),
+            Err(DirectReplyError::InvalidLinkLabel)
         );
     }
 }
