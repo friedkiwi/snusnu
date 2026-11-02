@@ -48,6 +48,7 @@ struct Bound {
     request_sa: u64,
     assigned_sa: u64,
     capabilities: Option<(Vec<u8>, Vec<u8>)>,
+    pacing_grant: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,11 +96,34 @@ impl CpManagementResponder {
                 return Err(CpManagementError::WrongConnection);
             }
             if let Some((request, response)) = &bound.capabilities {
-                return if bytes == request {
-                    Ok(vec![response.clone()])
-                } else {
-                    Err(CpManagementError::UnexpectedUnit)
-                };
+                if bytes == request {
+                    return Ok(vec![response.clone()]);
+                }
+                if let Some(grant) = &bound.pacing_grant {
+                    return if bytes == grant {
+                        Ok(Vec::new())
+                    } else {
+                        Err(CpManagementError::UnexpectedUnit)
+                    };
+                }
+                // The peer grants our adaptive BIND pacing window after
+                // receiving the CP capabilities reply, using an expedited
+                // solicited IPM (IBM SNA Formats §5-14). It is carrier
+                // control, not a CP service request to answer.
+                let window = u16::from_be_bytes([
+                    *fid5.ru.get(1).ok_or(CpManagementError::UnexpectedUnit)?,
+                    *fid5.ru.get(2).ok_or(CpManagementError::UnexpectedUnit)?,
+                ]);
+                if !fid5.expedited
+                    || fid5.rh != [0x83, 0x01, 0]
+                    || fid5.ru.len() != 3
+                    || fid5.ru[0] != 0
+                    || !(1..=32767).contains(&window)
+                {
+                    return Err(CpManagementError::UnexpectedUnit);
+                }
+                bound.pacing_grant = Some(bytes.to_vec());
+                return Ok(Vec::new());
             }
             let reply = Self::reply_capabilities(fid5, bound.request_sa)?;
             bound.capabilities = Some((bytes.to_vec(), reply.clone()));
@@ -136,6 +160,7 @@ impl CpManagementResponder {
             request_sa: u64::from_be_bytes(fid5.session_address) & !(ASSIGNOR | RESERVED),
             assigned_sa: ASSIGNOR | (self.scope.generation.get() & !(ASSIGNOR | RESERVED)),
             capabilities: None,
+            pacing_grant: None,
         });
         Ok(vec![response])
     }
@@ -380,6 +405,17 @@ mod tests {
         assert_eq!(
             responder.ingest(continued, &capabilities).unwrap(),
             vec![capability_reply]
+        );
+        let mut ipm = vec![0x5d, 0, 0, 0];
+        ipm.extend_from_slice(&generation.get().to_be_bytes());
+        ipm.extend_from_slice(&[0x83, 1, 0, 0, 0, 1]);
+        assert!(responder.ingest(continued, &ipm).unwrap().is_empty());
+        assert!(responder.ingest(continued, &ipm).unwrap().is_empty());
+        let mut wrong_window = ipm.clone();
+        *wrong_window.last_mut().unwrap() = 0;
+        assert_eq!(
+            responder.ingest(continued, &wrong_window),
+            Err(CpManagementError::UnexpectedUnit)
         );
         assert_eq!(
             responder.ingest(
