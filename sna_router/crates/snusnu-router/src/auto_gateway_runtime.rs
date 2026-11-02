@@ -5,9 +5,22 @@
 //! network. The target CP must come from an actual route's `hosting_cp` (or an
 //! explicit operator hint); it cannot be guessed from the target LU name.
 
-use crate::config;
+use crate::{
+    config::{self, MptnGatewayConfig},
+    mptn_bidirectional_gateway::{fresh_management, pump_virtual},
+    mptn_gateway_port::{GatewayConfig, GatewayEvent, MptnGatewayPort},
+    remote::WsRoutePort,
+    virtual_ws_port::VirtualWsPort,
+};
 use router_core::{xid3::{Role, Xid3}, xid3_local::LocalLlcProfile};
-use std::io;
+use std::{collections::HashMap, io, net::SocketAddr, time::{Duration, Instant}};
+use transport_ip_sna::{
+    anynet::TcpRecord,
+    mptn_compensations::CompensationSet,
+    mptn_ingress::IngressOffer,
+    mptn_management_responder::V5Options,
+    mptn_reverse_user_bind::NativeAddress,
+};
 use transport_ws::wire;
 
 const BASE36: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -129,6 +142,268 @@ pub(crate) fn require_hosting_cp(
         ));
     }
     Ok(cp)
+}
+
+/// One TCP62 listener and its active, independent native WebSocket circuits.
+/// The owning runtime calls `poll_once` alongside LLC and upstream polling.
+pub(crate) struct AutoMptnGateway<'a> {
+    config: &'a MptnGatewayConfig,
+    listener: MptnGatewayPort,
+    sessions: HashMap<u64, MptnToWsSession>,
+}
+
+impl<'a> AutoMptnGateway<'a> {
+    pub(crate) fn bind(config: &'a MptnGatewayConfig) -> io::Result<Self> {
+        let required = CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+            .map_err(io::Error::other)?;
+        let listener = MptnGatewayPort::bind_dynamic(GatewayConfig {
+            local: SocketAddr::new(config.local_ip, 397),
+            peer_ip: config.peer_ip,
+            source_lu: config.source_lu.clone(),
+            destination_lu: config.destination_lu.clone(),
+            available_compensations: required,
+            options: V5Options { son_handler: false, keepalive_handler: false },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })?;
+        Ok(Self { config, listener, sessions: HashMap::new() })
+    }
+
+    pub(crate) fn id(&self) -> &str { &self.config.id }
+
+    pub(crate) fn active_sessions(&self) -> usize { self.sessions.len() }
+
+    /// Poll one transport event while progressing all active converters. A
+    /// validated user BIND is returned to the owning fabric for destination
+    /// selection; it remains pending in the TCP62 association until accepted.
+    pub(crate) fn poll_once(&mut self) -> io::Result<Option<(u64, IngressOffer)>> {
+        let ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let result = self.sessions.get_mut(&id).expect("session ID collected").pump(
+                &mut self.listener,
+            );
+            match result {
+                Ok(true) => {}
+                Ok(false) => { self.sessions.remove(&id); }
+                Err(error) => {
+                    tracing::warn!(gateway = %self.config.id, association = id, error = %error,
+                        "automatic TCP62 circuit failed");
+                    let _ = self.listener.close_association_for(id);
+                    self.sessions.remove(&id);
+                }
+            }
+        }
+        let sessions = &self.sessions;
+        let event = self.listener.poll_association_once_with_credit(|id| {
+            sessions.get(&id).is_none_or(MptnToWsSession::can_accept)
+        })?;
+        let Some((id, event)) = event else { return Ok(None) };
+        if let Some(session) = self.sessions.get_mut(&id) {
+            match session.on_event(event, &mut self.listener) {
+                Ok(true) => {}
+                Ok(false) => { self.sessions.remove(&id); }
+                Err(error) => {
+                    tracing::warn!(gateway = %self.config.id, association = id, error = %error,
+                        "automatic TCP62 circuit event rejected");
+                    let _ = self.listener.close_association_for(id);
+                    self.sessions.remove(&id);
+                }
+            }
+            return Ok(None);
+        }
+        match event {
+            GatewayEvent::UserBind(offer) => Ok(Some((id, offer))),
+            GatewayEvent::ManagementReady | GatewayEvent::Closed => Ok(None),
+            GatewayEvent::Rejected(reason) => {
+                tracing::warn!(gateway = %self.config.id, association = id, reason,
+                    "automatic TCP62 association rejected");
+                Ok(None)
+            }
+            _ => {
+                self.listener.close_association_for(id)?;
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn offer_lus(offer: &IngressOffer) -> io::Result<(String, String)> {
+        MptnGatewayPort::offer_lus(offer)
+    }
+
+    /// Start one independently credited converter after the runtime has
+    /// selected a unique destination and obtained a WebSocket circuit port.
+    pub(crate) fn start_to_ws(
+        &mut self,
+        association: u64,
+        offer: IngressOffer,
+        ws: WsRoutePort,
+        local_cp: &wire::SnaName,
+        target_cp: &wire::SnaName,
+        seed: &[u8],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if self.sessions.contains_key(&association) || timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "TCP62 association already active or timeout invalid"));
+        }
+        let (source_lu, destination_lu) = Self::offer_lus(&offer)?;
+        let source = config::parse_cp(&source_lu)?;
+        let destination = config::parse_cp(&destination_lu)?;
+        if source.netid != local_cp.netid || destination.netid != target_cp.netid {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "TCP62 offer NETIDs disagree with selected CPs"));
+        }
+        let xid = virtual_xid(
+            local_cp, seed,
+            Some(&self.config.local_station),
+            Some(&self.config.local_node_id),
+            self.config.tg_number,
+        )?;
+        let local = format!("{}.{}", local_cp.netid, local_cp.name);
+        let target = format!("{}.{}", target_cp.netid, target_cp.name);
+        let mut port = VirtualWsPort::new(ws, xid, &local, &target)?;
+        port.attach_management(fresh_management(&local, &target)?)?;
+        self.sessions.insert(association, MptnToWsSession {
+            association,
+            port,
+            pending_offer: Some(offer),
+            pending_tcp: None,
+            pending_udp: None,
+            user_started: false,
+            setup_deadline: Instant::now() + timeout,
+        });
+        tracing::info!(gateway = %self.config.id, association, source_lu, destination_lu,
+            local_cp = %local, target_cp = %target,
+            "automatic TCP62 circuit selected WebSocket destination");
+        Ok(())
+    }
+
+    pub(crate) fn reject_offer(&mut self, association: u64, reason: &str) -> io::Result<()> {
+        tracing::warn!(gateway = %self.config.id, association, reason,
+            "automatic TCP62 offer has no route");
+        self.listener.close_association_for(association)
+    }
+
+    pub(crate) fn clone_udp_socket(&self) -> io::Result<std::net::UdpSocket> {
+        self.listener.clone_udp_socket()
+    }
+}
+
+struct MptnToWsSession {
+    association: u64,
+    port: VirtualWsPort<WsRoutePort>,
+    pending_offer: Option<IngressOffer>,
+    pending_tcp: Option<TcpRecord>,
+    pending_udp: Option<(u16, Vec<u8>, bool)>,
+    user_started: bool,
+    setup_deadline: Instant,
+}
+
+impl MptnToWsSession {
+    fn can_accept(&self) -> bool {
+        self.pending_tcp.is_none() && self.pending_udp.is_none()
+    }
+
+    /// Return false when this private circuit has completed and can retire.
+    fn pump(&mut self, listener: &mut MptnGatewayPort) -> io::Result<bool> {
+        if !self.user_started && Instant::now() >= self.setup_deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut,
+                "automatic TCP62 gateway setup timed out"));
+        }
+        pump_virtual(&mut self.port)?;
+        if self.port.management_complete() {
+            if let Some(offer) = self.pending_offer.take() {
+                // Native address assignment remains private to this circuit.
+                self.port.begin_user_bind(&offer, NativeAddress {
+                    daf: 2, oaf: 2, odai: true,
+                })?;
+            }
+        }
+        if self.port.user_closed() { return Ok(false) }
+        if self.port.take_expedited_native_completed() {
+            listener.complete_tcp_expedited_for(self.association)?;
+        }
+        if let Some(sequence) = self.port.take_completed_udp_expedited() {
+            listener.complete_udp_expedited_for(self.association, sequence)?;
+        }
+        if let Some(sequence) = self.port.take_completed_udp_abort() {
+            listener.complete_udp_abort_for(self.association, sequence)?;
+            return Ok(false);
+        }
+        if let Some((sequence, reduced, abort)) = self.pending_udp.as_ref() {
+            let accepted = if *abort {
+                self.port.submit_udp_abort(*sequence, reduced)?
+            } else {
+                self.port.submit_udp_expedited(*sequence, reduced)?
+            };
+            if accepted { self.pending_udp = None; }
+        }
+        if let Some(record) = self.pending_tcp.as_ref() {
+            if self.port.submit_tcp_user_record(record)? {
+                self.pending_tcp = None;
+                listener.complete_user_record_for(self.association)?;
+            }
+        }
+        if let Some(bytes) = self.port.tcp_bind_response().map(ToOwned::to_owned) {
+            if listener.queue_user_bind_response_for(self.association, &bytes)? {
+                self.port.mark_tcp_bind_response_enqueued(&bytes)?;
+            }
+        }
+        self.user_started |= listener.user_active_for(self.association);
+        if self.user_started {
+            if let Some(record) = self.port.udp_abort_record().cloned() {
+                if listener.queue_udp_abort_for(self.association, &record)? {
+                    self.port.mark_udp_abort_enqueued(&record)?;
+                }
+            }
+            if let Some(record) = self.port.tcp_user_record().cloned() {
+                if listener.queue_user_record_for(self.association, &record)? {
+                    self.port.mark_tcp_user_record_enqueued(&record)?;
+                }
+            }
+        }
+        self.port.complete_tcp_user_records(
+            listener.take_completed_user_records_for(self.association))?;
+        Ok(true)
+    }
+
+    fn on_event(&mut self, event: GatewayEvent, listener: &mut MptnGatewayPort)
+        -> io::Result<bool>
+    {
+        match event {
+            GatewayEvent::ManagementReady => Ok(true),
+            GatewayEvent::UserBind(_) => Err(io::Error::new(io::ErrorKind::InvalidData,
+                "duplicate TCP62 user BIND")),
+            GatewayEvent::UserNormal(record)
+            | GatewayEvent::UserExpedited(record)
+            | GatewayEvent::UserAbort(record) => {
+                if self.port.submit_tcp_user_record(&record)? {
+                    listener.complete_user_record_for(self.association)?;
+                } else { self.pending_tcp = Some(record); }
+                Ok(true)
+            }
+            GatewayEvent::UserUdpExpedited { sequence, reduced } => {
+                if !self.port.submit_udp_expedited(sequence, &reduced)? {
+                    self.pending_udp = Some((sequence, reduced, false));
+                }
+                Ok(true)
+            }
+            GatewayEvent::UserUdpAbort { sequence, reduced } => {
+                if !self.port.submit_udp_abort(sequence, &reduced)? {
+                    self.pending_udp = Some((sequence, reduced, true));
+                }
+                Ok(true)
+            }
+            GatewayEvent::OutboundUdpAbortAcknowledged => {
+                self.port.complete_udp_abort_response()?;
+                Ok(true)
+            }
+            GatewayEvent::Closed => Ok(false),
+            GatewayEvent::Rejected(reason) => Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("TCP62 peer rejected: {reason}"))),
+        }
+    }
 }
 
 #[cfg(test)]
