@@ -6,6 +6,7 @@
 //! active here is not an RTP connection or an admitted LU route.
 
 use router_core::{
+    hpr_control_bootstrap::{ControlAdvertisement, HprControlBootstrap},
     hpr_cv61::{ArbMode, ControlFlowsTower},
     hpr_ip_activation::{HprIpActivation, Observation, Phase},
     hpr_lan::{HprMedium, DEFAULT_BASE_SAP},
@@ -14,13 +15,14 @@ use router_core::{
     hpr_xid_leg::{local_ee_tg_descriptor, Side},
     session::QualifiedName,
     xid3::{ControlVector, ExchangeState, Role, Xid3},
+    ConnectionGeneration,
 };
 use std::{
     io,
     net::IpAddr,
     time::{Duration, Instant},
 };
-use transport_ip_sna::ee::{Datagram, EeSockets, LdlcKind, CONTROL_PORT};
+use transport_ip_sna::ee::{Datagram, EeSockets, LdlcKind, CONTROL_PORT, HIGH_PORT, LOW_PORT};
 
 const LIVE_INTERVAL: Duration = Duration::from_secs(10);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
@@ -34,6 +36,7 @@ fn invalid(reason: &'static str) -> io::Error {
 pub(crate) struct LocalEeXids {
     prenegotiation: Vec<u8>,
     negotiation: Vec<u8>,
+    expected_peer_cp: Option<QualifiedName>,
 }
 
 impl LocalEeXids {
@@ -124,12 +127,14 @@ impl LocalEeXids {
             .map_err(|_| invalid("invalid local EE negotiation XID"))?;
         np.set_cp_name(&local_cp.to_string())
             .map_err(|_| invalid("invalid local EE CP name"))?;
-        Self::new(
+        let mut result = Self::new(
             pre.encode()
                 .map_err(|_| invalid("invalid local EE XID encoding"))?,
             np.encode()
                 .map_err(|_| invalid("invalid local EE XID encoding"))?,
-        )
+        )?;
+        result.expected_peer_cp = Some(peer_cp.clone());
+        Ok(result)
     }
 
     /// Accept only a consistent, locally secondary EE profile. Constructing
@@ -156,6 +161,7 @@ impl LocalEeXids {
         Ok(Self {
             prenegotiation,
             negotiation,
+            expected_peer_cp: None,
         })
     }
 }
@@ -164,15 +170,39 @@ pub(crate) struct EeLdlcEndpoint {
     sockets: EeSockets,
     local_ip: IpAddr,
     peer_ip: IpAddr,
-    xids: LocalEeXids,
+    xids: Option<LocalEeXids>,
+    resolve_xids: Option<XidResolver>,
     activation: HprIpActivation,
+    peer_np: Option<Vec<u8>>,
+    generation: u64,
     next_live: Option<Instant>,
     retry_at: Option<Instant>,
     retries: u8,
 }
 
+type XidResolver = Box<dyn Fn(&Xid3) -> io::Result<LocalEeXids> + Send + Sync>;
+
 impl EeLdlcEndpoint {
     pub(crate) fn bind(local_ip: IpAddr, peer_ip: IpAddr, xids: LocalEeXids) -> io::Result<Self> {
+        let mut endpoint = Self::bind_dynamic(local_ip, peer_ip, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "static EE profile missing",
+            ))
+        })?;
+        endpoint.xids = Some(xids);
+        endpoint.resolve_xids = None;
+        Ok(endpoint)
+    }
+
+    /// Bind before the peer CP is known. The callback is called only for a
+    /// syntactically valid first prenegotiation XID3. It may return WouldBlock
+    /// until an authorized local proxy CP is available; no XID3 is sent then.
+    pub(crate) fn bind_dynamic(
+        local_ip: IpAddr,
+        peer_ip: IpAddr,
+        resolver: impl Fn(&Xid3) -> io::Result<LocalEeXids> + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         if local_ip == peer_ip
             || local_ip.is_unspecified()
             || peer_ip.is_unspecified()
@@ -187,8 +217,11 @@ impl EeLdlcEndpoint {
             sockets: EeSockets::bind(local_ip)?,
             local_ip,
             peer_ip,
-            xids,
+            xids: None,
+            resolve_xids: Some(Box::new(resolver)),
             activation: HprIpActivation::new(Side::Remote),
+            peer_np: None,
+            generation: 1,
             next_live: None,
             retry_at: None,
             retries: 0,
@@ -197,6 +230,65 @@ impl EeLdlcEndpoint {
 
     pub(crate) fn phase(&self) -> Phase {
         self.activation.phase()
+    }
+
+    pub(crate) fn generation(&self) -> ConnectionGeneration {
+        ConnectionGeneration::new(self.generation).expect("EE generation starts nonzero")
+    }
+
+    pub(crate) fn peer_cp(&self) -> Option<String> {
+        (self.phase() == Phase::Active)
+            .then(|| self.activation.agreement())
+            .flatten()
+            .map(|agreement| agreement.remote.cp_name)
+    }
+
+    /// Return validated CP and Route Setup bootstrap labels only after the
+    /// link has completed XID_DONE. The generation prevents a later link
+    /// reactivation from reusing old RTP/APPN control state.
+    pub(crate) fn control_bootstrap(&self) -> io::Result<Option<HprControlBootstrap>> {
+        if self.phase() != Phase::Active {
+            return Ok(None);
+        }
+        let local = self
+            .xids
+            .as_ref()
+            .ok_or_else(|| invalid("EE local XID unavailable"))?;
+        let peer = self
+            .peer_np
+            .as_ref()
+            .ok_or_else(|| invalid("EE peer NP XID unavailable"))?;
+        let local = ControlAdvertisement::from_xid3(&local.negotiation)
+            .map_err(|_| invalid("invalid local EE control advertisement"))?;
+        let peer = ControlAdvertisement::from_xid3(peer)
+            .map_err(|_| invalid("invalid peer EE control advertisement"))?;
+        HprControlBootstrap::new(self.generation(), local, peer)
+            .map(Some)
+            .map_err(|_| invalid("incompatible EE control bootstrap"))
+    }
+
+    /// Send one complete NLP on the requested EE priority port only after
+    /// negotiated LDLC activation. RTP owns ANR routing and reliability.
+    pub(crate) fn send_nlp(&self, priority_port: u16, nlp: &[u8]) -> io::Result<()> {
+        if self.phase() != Phase::Active || !(HIGH_PORT..=LOW_PORT).contains(&priority_port) {
+            return Err(invalid("EE NLP send before activation or wrong priority"));
+        }
+        let agreement = self
+            .activation
+            .agreement()
+            .ok_or_else(|| invalid("EE SAP agreement missing"))?;
+        if nlp.is_empty() || nlp.len() > usize::from(agreement.max_btu) {
+            return Err(invalid("EE NLP exceeds negotiated BTU"));
+        }
+        let mut bytes = Vec::with_capacity(3 + nlp.len());
+        bytes.extend_from_slice(&[
+            agreement.remote.advertised_sap,
+            agreement.local.advertised_sap,
+            0x03,
+        ]);
+        bytes.extend_from_slice(nlp);
+        let datagram = Datagram::decode(priority_port, bytes)?;
+        self.sockets.send(self.peer_ip, &datagram)
     }
 
     /// Returns an NLP only after link/SAP validation. The caller must still
@@ -221,6 +313,7 @@ impl EeLdlcEndpoint {
         }
         match self.process(packet, now) {
             Ok(result) => Ok(result),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 tracing::warn!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
                     error=%error, "invalid EE control or link state discarded");
@@ -270,15 +363,43 @@ impl EeLdlcEndpoint {
             &[][..]
         } else {
             let xid = Xid3::decode(information).map_err(|_| invalid("invalid remote EE XID3"))?;
+            if self.xids.is_none() {
+                if xid.exchange_state() != ExchangeState::Prenegotiation {
+                    return Err(invalid("EE negotiation XID before peer identity"));
+                }
+                let resolver = self
+                    .resolve_xids
+                    .as_ref()
+                    .ok_or_else(|| invalid("EE local profile unavailable"))?;
+                self.xids = Some(resolver(&xid)?);
+            }
+            let profile = self
+                .xids
+                .as_ref()
+                .ok_or_else(|| invalid("EE local profile unavailable"))?;
+            let observed: QualifiedName = xid
+                .cp_name()
+                .map_err(|_| invalid("invalid remote EE CP"))?
+                .parse()
+                .map_err(|_| invalid("invalid remote EE CP"))?;
+            if let Some(expected) = &profile.expected_peer_cp {
+                if observed != *expected {
+                    tracing::warn!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                        observed_cp=%observed, expected_cp=%expected,
+                        "EE XID CP/NETID does not match configured peer");
+                    return Err(invalid("unexpected EE peer CP or NETID"));
+                }
+            }
             match xid.exchange_state() {
-                ExchangeState::Prenegotiation => &self.xids.prenegotiation,
-                ExchangeState::NegotiationProceeding => &self.xids.negotiation,
+                ExchangeState::Prenegotiation => &profile.prenegotiation,
+                ExchangeState::NegotiationProceeding => &profile.negotiation,
                 _ => return Err(invalid("unsupported EE XID phase")),
             }
         };
         if !information.is_empty() && information[9] & 0x0c == 0x04 {
             validate_tower(information)?;
         }
+        let was_active = self.phase() == Phase::Active;
         let previous = self.activation.clone();
         self.activation
             .observe_xid(Side::Remote, information)
@@ -295,6 +416,17 @@ impl EeLdlcEndpoint {
         self.activation
             .observe_xid(Side::Local, response)
             .map_err(|_| invalid("local EE XID profile rejected"))?;
+        if information.is_empty() || information[9] & 0x0c == 0x08 {
+            self.peer_np = None;
+            if was_active {
+                self.generation = self.generation.saturating_add(1);
+                self.next_live = None;
+                self.retry_at = None;
+                self.retries = 0;
+            }
+        } else {
+            self.peer_np = Some(information.to_vec());
+        }
         Ok(None)
     }
 
@@ -415,6 +547,8 @@ impl EeLdlcEndpoint {
 
     fn down(&mut self) {
         self.activation.observe_disconnect(Side::Remote);
+        self.peer_np = None;
+        self.generation = self.generation.saturating_add(1);
         self.next_live = None;
         self.retry_at = None;
         self.retries = 0;
@@ -472,7 +606,14 @@ mod tests {
         hpr_xid_leg::local_ee_tg_descriptor,
         xid3::{ControlVector, Xid3},
     };
-    use std::{net::UdpSocket, thread};
+    use std::{
+        net::UdpSocket,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+    };
 
     fn tower() -> ControlFlowsTower {
         let mut tower = ControlFlowsTower::decode(&[
@@ -565,6 +706,82 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn configured_peer_netid_is_checked_before_xid_response() {
+        let local: QualifiedName = "SNUSNU.SVC".parse().unwrap();
+        let expected: QualifiedName = "QAALICE.SNAB".parse().unwrap();
+        let profile = LocalEeXids::build(
+            &local,
+            &expected,
+            [0xff, 0xf1, 0x23, 0x45],
+            1,
+            [0x80, 2],
+            &tower(),
+            true,
+        )
+        .unwrap();
+        let pid = std::process::id();
+        let local_ip = IpAddr::from([127, 95, (pid >> 8) as u8, pid as u8]);
+        let peer_ip = IpAddr::from([127, 96, (pid >> 8) as u8, pid as u8]);
+        let mut endpoint = EeLdlcEndpoint::bind(local_ip, peer_ip, profile).unwrap();
+        let wrong =
+            Datagram::decode(CONTROL_PORT, [vec![4, 4, 0xaf], xid(false, false)].concat()).unwrap();
+        assert_eq!(
+            endpoint.process(wrong, Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(endpoint.phase(), Phase::Down);
+    }
+
+    #[test]
+    fn dynamic_profile_waits_for_authorized_local_cp() {
+        let pid = std::process::id();
+        let local_ip = IpAddr::from([127, 97, (pid >> 8) as u8, pid as u8]);
+        let peer_ip = IpAddr::from([127, 98, (pid >> 8) as u8, pid as u8]);
+        let ready = Arc::new(AtomicBool::new(false));
+        let shared = Arc::clone(&ready);
+        let mut endpoint = EeLdlcEndpoint::bind_dynamic(local_ip, peer_ip, move |peer_xid| {
+            if !shared.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "authorized proxy CP route not ready",
+                ));
+            }
+            let local: QualifiedName = "SNUSNU.SVC".parse().unwrap();
+            let peer: QualifiedName = peer_xid.cp_name().unwrap().parse().unwrap();
+            LocalEeXids::build(
+                &local,
+                &peer,
+                [0xff, 0xf1, 0x23, 0x45],
+                1,
+                [0x80, 2],
+                &tower(),
+                true,
+            )
+        })
+        .unwrap();
+        let peer = UdpSocket::bind((peer_ip, CONTROL_PORT)).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let now = Instant::now();
+        assert_eq!(exchange(&mut endpoint, &peer, &[], now), [4, 5, 0xaf]);
+        let mut request = vec![4, 4, 0xaf];
+        request.extend_from_slice(&xid(false, false));
+        peer.send_to(&request, (local_ip, CONTROL_PORT)).unwrap();
+        endpoint.poll(now).unwrap();
+        let mut scratch = [0u8; 512];
+        assert_eq!(
+            peer.recv_from(&mut scratch).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(endpoint.phase(), Phase::Down);
+        ready.store(true, Ordering::Relaxed);
+        assert_eq!(
+            exchange(&mut endpoint, &peer, &xid(false, false), now)[..3],
+            [4, 5, 0xaf]
+        );
+        assert_eq!(endpoint.phase(), Phase::Negotiating);
     }
 
     fn xid(local: bool, negotiation: bool) -> Vec<u8> {
@@ -679,6 +896,18 @@ mod tests {
             [vec![4, 4, 3], XidDone::Response.encode().to_vec()].concat()
         );
         assert_eq!(endpoint.phase(), Phase::Active);
+        assert_eq!(endpoint.peer_cp().as_deref(), Some("SOLNET.SNAB"));
+        let bootstrap = endpoint.control_bootstrap().unwrap().unwrap();
+        assert_eq!(bootstrap.peer.cp.to_string(), "SOLNET.SNAB");
+        assert_eq!(bootstrap.outbound_cp_label(), [0xa4, 0]);
+        let priority = UdpSocket::bind((peer_ip, transport_ip_sna::ee::MEDIUM_PORT)).unwrap();
+        priority.set_nonblocking(true).unwrap();
+        endpoint
+            .send_nlp(transport_ip_sna::ee::MEDIUM_PORT, &[0xc6, 0, 0xa4])
+            .unwrap();
+        let mut priority_reply = [0u8; 64];
+        let (size, _) = priority.recv_from(&mut priority_reply).unwrap();
+        assert_eq!(&priority_reply[..size], &[4, 4, 3, 0xc6, 0, 0xa4]);
 
         endpoint.tick(now + LIVE_INTERVAL).unwrap();
         let (size, _) = peer.recv_from(&mut reply).unwrap();
