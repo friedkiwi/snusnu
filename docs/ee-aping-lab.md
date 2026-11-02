@@ -25,27 +25,55 @@ Host address `10.99.4.11` and its source-based route currently belong to
 `10.99.4.10` as the router's local EE address; do not reassign `.11` or
 change table 109. Verify with `ip route get 10.99.4.3 from 10.99.4.10`.
 
-Once the Rust EE endpoint can truthfully negotiate its APPN/HPR capabilities,
-point `EETOA` at `10.99.4.10` while it remains varied off. It should identify
-the router's local CP as `SOLNET.SNAA` for the first same-NETID adjacency.
-Restore the `SNAA` remote configuration list entry to `SOLNET` and add a
-`SNUSNU.PING` remote location hosted by `SNUSNU.SVC`. V5R4's
-`ADDCFGLE TYPE(*APPNRMT)` prompt accepts remote location, remote NETID,
-local location, remote CP, and CP NETID as separate fields. The earlier V4R4
-APING lab used this entry shape:
+The guest is an APPN `*ENDNODE`. [IBM permits an end node to use a network
+node server in a different NETID](https://www.ibm.com/docs/en/zos-basic-skills?topic=types-end-nodes-en). This lab will make the router present the
+concentrator-owned `SNUSNU.SVC` identity as a network node server on the EE
+link, so `SNUSNU.PING` is local to that server's NETID. This must wait until
+the Rust APPN CP-CP service and its XID3 network-node claim are truthful.
+The source guest remains `SOLNET.SNAB`; a separate QA concentrator with Alice
+assigned `SOLNET` is used for its authenticated route export. An isolated
+instance can be started on `127.0.0.1:8083` with the QA binary's
+`-alice-netid SOLNET` option, leaving the existing `:8081` instance alone.
+The router must not publish `SNUSNU.SVC` as an Alice-owned route: it presents
+that server-owned CP only on the local EE adjacency and exports the guest's
+`SOLNET.SNAB` source LU upstream.
+
+When the endpoint is ready, change only the varied-off `EETOA` controller,
+the end node's preferred server, and the PING remote location:
 
 ```text
+CHGCTLAPPC CTLD(EETOA) RMTINTNETA('10.99.4.10') RMTNETID(SNUSNU) RMTCPNAME(SVC)
+CHGNETA NETSERVER((SNUSNU SVC))
 ADDCFGLE TYPE(*APPNRMT) APPNRMTE((PING SNUSNU SNAB SVC SNUSNU *NONE *NO))
 ```
+
+The `CHGCTLAPPC`, `CHGNETA`, and `ADDCFGLE` V5R4 prompts were checked
+without executing them. The existing `SNAA`/`QAALICE` configuration-list
+entry can remain during this test; it does not match the `PING` target.
+If the PING entry already exists, inspect `DSPCFGL CFGL(QAPPNRMT)` before
+adding another. The earlier V4R4 APING lab used the same PING entry shape.
 
 Check the resulting `DSPCFGL CFGL(QAPPNRMT)` display before varying `EETOA`
 on. The authenticated router must export the guest's source LU as LU 6.2 and
 see the concentrator's live `SNUSNU.SVC` and `SNUSNU.PING` routes. The Go
 responder currently expects its native circuit profile; EE acceptance also
 requires the agreed carrier-neutral session profile or a complete virtual
-native adapter. The route to the `SNUSNU` NETID is an additional APPN
-cross-network problem; the configuration-list entry alone does not make the
-Rust node a border node or prove that OS/400 will select this path.
+native adapter. The end-node-to-network-node design avoids the separate
+network-node border function; the live trace must still prove that V5R4
+selects the server and locates PING.
+
+To return the guest to the recorded pre-test values, vary `EETOA` off, then
+run:
+
+```text
+RMVCFGLE TYPE(*APPNRMT) APPNRMTE((PING SNUSNU SNAB))
+CHGNETA NETSERVER((*LCLNETID *ANY))
+CHGCTLAPPC CTLD(EETOA) RMTINTNETA('10.99.4.11') RMTNETID(SOLNET) RMTCPNAME(SNAA)
+```
+
+Do not vary `EETOA` on after restoring it while `.11` belongs to the other
+isolated TAP lab. `RMVCFGLE` needs only the remote location, NETID, and local
+location key, as verified in the guest prompt.
 
 ## Capture and result
 
