@@ -6,6 +6,7 @@ pub mod cnos;
 pub mod fid2_bind;
 pub mod fid2_session_control;
 pub mod fixed_pacing;
+pub mod hpr_fid5;
 pub mod hpr_ip_activation;
 pub mod hpr_lan;
 pub mod hpr_rtp;
