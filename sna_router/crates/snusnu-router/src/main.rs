@@ -23,6 +23,8 @@ mod mptn_gateway_port;
 #[cfg(target_os = "linux")]
 mod mptn_ingress_lab;
 #[cfg(target_os = "linux")]
+mod mptn_llc_reverse;
+#[cfg(target_os = "linux")]
 mod mptn_outbound_port;
 #[cfg(target_os = "linux")]
 mod mptn_ws_gateway_lab;
@@ -43,6 +45,8 @@ mod routing;
 #[cfg(target_os = "linux")]
 mod runtime;
 mod virtual_native_cp;
+#[cfg(target_os = "linux")]
+mod ws_native_responder;
 #[cfg(target_os = "linux")]
 mod virtual_ws_management_lab;
 mod virtual_ws_port;
