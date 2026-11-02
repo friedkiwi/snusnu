@@ -1,7 +1,7 @@
 //! Declarative local router configuration. Each LLC entry is one independent
 //! association, even when several entries share an Ethernet interface.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
@@ -10,23 +10,65 @@ use std::{
 };
 use transport_ws::wire;
 
+#[derive(Debug)]
+pub(crate) struct RouterConfig {
+    pub(crate) llc: Vec<LlcConfig>,
+    pub(crate) ee: Vec<EeConfig>,
+    pub(crate) anynet: Vec<AnyNetConfig>,
+    pub(crate) mptn_gateway: Vec<MptnGatewayConfig>,
+    pub(crate) hpr_lan: Vec<HprLanConfig>,
+    pub(crate) route: Vec<RouteConfig>,
+    pub(crate) remote: Vec<RemoteConfig>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouterConfig {
+struct RawRouterConfig {
     #[serde(default)]
-    pub(crate) llc: Vec<LlcConfig>,
+    llc: Vec<LlcConfig>,
     #[serde(default)]
-    pub(crate) ee: Vec<EeConfig>,
+    ee: Vec<EeConfig>,
     #[serde(default)]
-    pub(crate) anynet: Vec<AnyNetConfig>,
+    mptn: Vec<MptnConfig>,
     #[serde(default)]
-    pub(crate) mptn_gateway: Vec<MptnGatewayConfig>,
+    hpr_lan: Vec<HprLanConfig>,
     #[serde(default)]
-    pub(crate) hpr_lan: Vec<HprLanConfig>,
-    #[serde(default)]
-    pub(crate) route: Vec<RouteConfig>,
+    route: Vec<RouteConfig>,
     #[serde(default, rename = "concentrator", alias = "remote")]
-    pub(crate) remote: Vec<RemoteConfig>,
+    remote: Vec<RemoteConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "profile", rename_all = "snake_case")]
+enum MptnConfig {
+    Relay(AnyNetConfig),
+    Gateway(MptnGatewayConfig),
+}
+
+impl<'de> Deserialize<'de> for RouterConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawRouterConfig::deserialize(deserializer)?;
+        let mut anynet = Vec::new();
+        let mut mptn_gateway = Vec::new();
+        for peer in raw.mptn {
+            match peer {
+                MptnConfig::Relay(peer) => anynet.push(peer),
+                MptnConfig::Gateway(peer) => mptn_gateway.push(peer),
+            }
+        }
+        Ok(Self {
+            llc: raw.llc,
+            ee: raw.ee,
+            anynet,
+            mptn_gateway,
+            hpr_lan: raw.hpr_lan,
+            route: raw.route,
+            remote: raw.remote,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,7 +277,7 @@ impl RouterConfig {
             && self.hpr_lan.is_empty()
         {
             return Err(invalid(
-                "at least one [[llc]], [[ee]], [[anynet]], [[mptn_gateway]] or [[hpr_lan]] peer is required",
+                "at least one [[llc]], [[ee]], [[mptn]] or [[hpr_lan]] peer is required",
             ));
         }
         let mut peers = HashSet::new();
@@ -356,17 +398,17 @@ impl RouterConfig {
             if !ids.insert(peer.id.as_str()) {
                 return Err(invalid(format!("duplicate port ID {}", peer.id)));
             }
-            kinds.insert(&peer.id, "anynet");
+            kinds.insert(&peer.id, "mptn_relay");
             if peer.local_ip == peer.peer_ip
                 || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
                 || peer.local_ip.is_unspecified()
                 || peer.peer_ip.is_unspecified()
             {
-                return Err(invalid(format!("invalid AnyNet IP pair for {}", peer.id)));
+                return Err(invalid(format!("invalid MPTN relay IP pair for {}", peer.id)));
             }
             if !anynet_listeners.insert(peer.local_ip) {
                 return Err(invalid(format!(
-                    "duplicate AnyNet TCP/UDP listener IP {}",
+                    "duplicate MPTN TCP/UDP listener IP {}",
                     peer.local_ip
                 )));
             }
@@ -376,7 +418,7 @@ impl RouterConfig {
                     let remote = parse_cp(remote)?;
                     if local == remote {
                         return Err(invalid(format!(
-                            "AnyNet LU pair for {} is identical",
+                            "MPTN relay LU pair for {} is identical",
                             peer.id
                         )));
                     }
@@ -384,7 +426,7 @@ impl RouterConfig {
                 (None, None) => {}
                 _ => {
                     return Err(invalid(format!(
-                        "AnyNet peer {} requires both local_lu and remote_lu",
+                        "MPTN relay peer {} requires both local_lu and remote_lu",
                         peer.id
                     )));
                 }
@@ -519,12 +561,12 @@ impl RouterConfig {
                 }
                 if matches!(
                     (source_kind, target_kind),
-                    ("llc", "anynet") | ("anynet", "llc")
+                    ("llc", "mptn_relay") | ("mptn_relay", "llc")
                 ) && matches!(converter, RouteConverter::MptnLu62)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "LLC to AnyNet LU6.2 conversion requires an operational MPTN session gateway",
+                        "LLC to MPTN relay LU6.2 conversion requires an operational MPTN session gateway",
                     ));
                 }
                 return Err(invalid(format!(
@@ -540,14 +582,14 @@ impl RouterConfig {
                     | ("ee", "ee")
                     | ("hpr_lan", "ee")
                     | ("ee", "hpr_lan")
-                    | ("anynet", "anynet")
+                    | ("mptn_relay", "mptn_relay")
             ) {
                 return Err(invalid(format!(
                     "unsupported route {} ({source_kind}) -> {} ({target_kind})",
                     route.from, route.to
                 )));
             }
-            if source_kind == "anynet" {
+            if source_kind == "mptn_relay" {
                 let from = self
                     .anynet
                     .iter()
@@ -560,7 +602,7 @@ impl RouterConfig {
                     .expect("kind checked");
                 if from.local_lu != to.remote_lu || from.remote_lu != to.local_lu {
                     return Err(invalid(format!(
-                        "AnyNet LU policy mismatch between {} and {}",
+                        "MPTN relay LU policy mismatch between {} and {}",
                         route.from, route.to
                     )));
                 }
@@ -1104,7 +1146,8 @@ to = "upstream_b"
     #[test]
     fn tcp62_gateway_derives_exports_and_target_from_gateway_definition() {
         let gateway = r#"
-[[mptn_gateway]]
+[[mptn]]
+profile = "gateway"
 id = "bob"
 local_ip = "10.99.4.11"
 peer_ip = "10.99.4.3"
@@ -1148,11 +1191,13 @@ converter = "mptn_lu62"
     #[test]
     fn anynet_only_route_is_valid_and_mixed_profile_is_rejected() {
         let anynet = r#"
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "east"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "west"
 local_ip = "127.0.0.4"
 peer_ip = "127.0.0.5"
@@ -1164,7 +1209,8 @@ to = "west"
         let duplicate_listener = anynet.replace("127.0.0.4", "127.0.0.2");
         assert!(parse(&duplicate_listener).validate().is_err());
         let mixed = r#"
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "mptn"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
@@ -1186,15 +1232,42 @@ to = "hpr"
     }
 
     #[test]
+    fn mptn_profile_is_required_and_old_sections_are_rejected() {
+        let relay = r#"
+[[mptn]]
+profile = "relay"
+id = "east"
+local_ip = "127.0.0.2"
+peer_ip = "127.0.0.3"
+[[mptn]]
+profile = "relay"
+id = "west"
+local_ip = "127.0.0.4"
+peer_ip = "127.0.0.5"
+[[route]]
+from = "east"
+to = "west"
+"#;
+        parse(relay).validate().unwrap();
+        assert!(toml::from_str::<RouterConfig>(&relay.replace("profile = \"relay\"\n", "")).is_err());
+        assert!(toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[anynet]]")).is_err());
+        assert!(toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[mptn_gateway]]")).is_err());
+        assert!(toml::from_str::<RouterConfig>(&relay.replace("profile = \"relay\"", "profile = \"gateway\"")).is_err());
+        assert!(toml::from_str::<RouterConfig>(&relay.replace("peer_ip = \"127.0.0.3\"", "peer_ip = \"127.0.0.3\"\nlocal_cp = \"SOLNET.SNAA\"")).is_err());
+    }
+
+    #[test]
     fn anynet_lu_policy_must_be_complete_and_reciprocal() {
         let strict = r#"
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "east"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
 local_lu = "SOLNET.SNAA"
 remote_lu = "SOLNET.SNAB"
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "west"
 local_ip = "127.0.0.4"
 peer_ip = "127.0.0.5"
@@ -1258,7 +1331,7 @@ to = "ip"
                 .is_err()
         );
         assert!(
-            parse(&mixed.replace("[[ee]]", "[[anynet]]"))
+            parse(&mixed.replace("[[ee]]", "[[mptn]]\nprofile = \"relay\""))
                 .validate()
                 .is_err()
         );
@@ -1271,7 +1344,8 @@ to = "ip"
 id = "lan"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-[[anynet]]
+[[mptn]]
+profile = "relay"
 id = "mptn"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
