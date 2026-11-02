@@ -1834,6 +1834,19 @@ impl AutoDirectory {
         }
     }
 
+    pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName) -> io::Result<Option<[u8; 6]>> {
+        let mut found = None;
+        for (mac, (name, candidates)) in &self.managed {
+            if name != cp || !candidates.iter().any(|candidate|
+                self.route_for_reference(candidate).is_some())
+            { continue; }
+            if found.replace(*mac).is_some() {
+                return Err(protocol("ambiguous managed MAC for CP"));
+            }
+        }
+        Ok(found)
+    }
+
     fn resolve(&self, matches: impl Fn(&wire::route_export::Resource) -> bool) -> io::Result<Option<wire::RouteReference>> {
         let mut found = None;
         for (router_id, (epoch, routes)) in &self.origins {
@@ -2005,6 +2018,12 @@ impl AutoWsHub {
             _ => return Err(protocol("managed MAC points to missing CP route")),
         };
         Ok(Some((reference, cp)))
+    }
+
+    pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName)
+        -> io::Result<Option<[u8; 6]>>
+    {
+        self.directory.borrow().managed_mac_for_cp(cp)
     }
 
     pub(crate) fn open_lu(&mut self, target_lu: &wire::SnaName, source_lu: &wire::SnaName)
