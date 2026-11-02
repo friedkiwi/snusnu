@@ -69,7 +69,7 @@ impl CpGate {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "guest XID3 NETID {} differs from assigned {}",
+                    "guest XID3 NETID {} differs from configured {}",
                     observed_netid.unwrap_or("<missing>"),
                     expected_netid.unwrap_or("<missing>")
                 ),
@@ -810,7 +810,7 @@ to = "upstream"
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error
             .to_string()
-            .contains("NETID SOLNET differs from assigned OTHNET"));
+            .contains("NETID SOLNET differs from configured OTHNET"));
         assert!(!wrong_netid.verified);
         let mut malformed = pdu;
         malformed[4] = 0x2e; // Declared XID length no longer matches.

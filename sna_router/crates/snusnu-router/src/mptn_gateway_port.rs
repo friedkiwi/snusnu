@@ -758,22 +758,22 @@ impl MptnGatewayPort {
                 let route = inspect_connect(&record.bytes).ok();
                 if let Some(route) = &route {
                     let observed_netid = route.source_lu.split_once('.').map(|(netid, _)| netid);
-                    let allowed_netid = self
+                    let configured_netid = self
                         .config
                         .source_lu
                         .split_once('.')
                         .map(|(netid, _)| netid);
-                    if observed_netid != allowed_netid {
+                    if observed_netid != configured_netid {
                         tracing::warn!(
                             local_ip = %self.config.local.ip(),
                             peer_ip = %self.config.peer_ip,
                             source_lu = %route.source_lu,
                             destination_lu = %route.destination_lu,
                             observed_netid = observed_netid.unwrap_or("<missing>"),
-                            allowed_netid = allowed_netid.unwrap_or("<missing>"),
+                            configured_netid = configured_netid.unwrap_or("<missing>"),
                             "TCP62 source NETID rejected"
                         );
-                        return Err(invalid("TCP62 source NETID differs from assigned NETID"));
+                        return Err(invalid("TCP62 source NETID differs from configured NETID"));
                     }
                 }
                 let (source_lu, destination_lu) = route
@@ -1350,7 +1350,7 @@ mod tests {
         }
         assert_eq!(
             rejected.as_deref(),
-            Some("TCP62 source NETID differs from assigned NETID")
+            Some("TCP62 source NETID differs from configured NETID")
         );
     }
 
