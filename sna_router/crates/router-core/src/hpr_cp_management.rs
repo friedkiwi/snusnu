@@ -213,13 +213,13 @@ impl CpManagementResponder {
         response_ru[9] = 0x80;
         response_ru[12] = 0x80;
         response_ru[13] = 0;
-        response_ru[23] = 0;
+        // The V5R4 CP's positive reciprocal BIND response echoes its request
+        // security and limited-resource flags, so use the same profile here.
         // The V5R4 CP PLU BIND requests syncpoint support (X'43'). Sending
         // X'23' here causes its UNBIND type X'06' with sense X'08350018':
         // invalid BIND negotiation at this byte. Retain the CP session's
         // requested profile; no application syncpoint traffic is handled here.
         response_ru[24] = ru[24];
-        response_ru[25] = 0x40;
         response_ru.extend_from_slice(&[0, 0x18, 0, 8, 2]);
         response_ru.extend_from_slice(&CPSVCMG);
         response_ru.extend_from_slice(&[2, 3, 2]);
@@ -507,5 +507,52 @@ mod tests {
                 sense: 0x0835_0018,
             })
         );
+    }
+
+    #[test]
+    fn echoes_v5r4_cp_bind_security_and_resource_profile() {
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let scope = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: 0x80e8_992c_bb00_0188,
+            subsequent_plu_tcid: 0x0000_0001_0000_0006,
+            slu_tcid: 0x00e8_992c_bb00_0188,
+        };
+        let mut responder = CpManagementResponder::for_peers(
+            "SNUSNU.SVC".parse().unwrap(),
+            "SOLNET.SNAB".parse().unwrap(),
+            scope,
+        );
+        // Complete guest BIND from 2026-11-02 17:37:00 UTC. The guest later
+        // terminated this session with UNBIND X'06'/X'08350018'.
+        let bind: Vec<u8> = concat!(
+            "5d00000080020300f0f100016b800031001307b0b05133",
+            "078786868707060200000000000000944300000be2d6d3d5",
+            "c5e34be2d5c1c22c000802c3d7e2e5c3d4c709030124",
+            "e3340b2780000c04e2d6d3d5c5e34be2d5c1c20a1300",
+            "b024e3340b278000000ae2d5e4e2d5e44be2e5c36014",
+            "cec370e7b283a2880be2d6d3d5c5e34be2d5c1c22c",
+            "090407c3d7e2e5c3d4c7",
+        )
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+        assert_eq!(bind.len(), 144);
+        let request = Fid5WholeBiu::parse_complete(&bind).unwrap();
+        assert_eq!(&request.ru[23..26], &[0x94, 0x43, 0x00]);
+        let reply = responder
+            .ingest(
+                RtpObservation {
+                    generation,
+                    tcid: scope.initial_plu_tcid,
+                },
+                &bind,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let response = Fid5WholeBiu::parse_complete(&reply).unwrap();
+        assert_eq!(&response.ru[23..26], &request.ru[23..26]);
     }
 }

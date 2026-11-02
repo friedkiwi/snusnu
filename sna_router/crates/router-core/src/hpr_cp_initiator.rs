@@ -19,7 +19,7 @@ const RESERVED: u64 = 1 << 62;
 const CPSVCMG: [u8; 7] = [0xc3, 0xd7, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7];
 const REQUEST_FIXED: [u8; 27] = [
     0x31, 0, 0x13, 7, 0xb0, 0xb0, 0x51, 0x33, 7, 0x87, 0x86, 0x86, 0x87, 7, 6, 2, 0, 0, 0, 0, 0, 0,
-    0, 0x94, 0x23, 0, 0,
+    0, 0x94, 0x43, 0, 0,
 ];
 const LOCAL_CAPABILITIES: [u8; 12] = [0, 12, 0x12, 0xc1, 0, 0, 0, 0, 0xe0, 0x80, 0, 0];
 const CAP_ATTACH: [u8; 17] = [
@@ -349,7 +349,7 @@ mod tests {
         let bind = session.prepare_bind().unwrap().to_vec();
         let parsed = Fid5WholeBiu::parse_complete(&bind).unwrap();
         assert_eq!(parsed.session_address, (ASSIGNOR | nonce).to_be_bytes());
-        assert_eq!(parsed.ru[24], 0x23); // Confirm, parallel sessions, CNOS.
+        assert_eq!(parsed.ru[24], 0x43); // Guest's CPSVCMG syncpoint and parallel profile.
         assert_eq!(parsed.classify_bind().unwrap().unwrap().plu, "SNUSNU.SVC");
         assert_eq!(parsed.classify_bind().unwrap().unwrap().slu, "SOLNET.SNAB");
         assert!(parsed
