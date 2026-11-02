@@ -4,7 +4,12 @@
 //! negotiate an LDLC link, terminate RTP, or expose LU sessions. Automatic
 //! configuration remains gated until those functions can consume its events.
 
-use router_core::xid3::Xid3;
+use router_core::{
+    hpr_ip_activation::{HprIpActivation, Observation, Phase},
+    hpr_setmode::XidDone,
+    hpr_xid_leg::Side,
+    xid3::Xid3,
+};
 use std::{io, net::IpAddr};
 use transport_ip_sna::ee::{Datagram, EeSockets, LdlcKind};
 
@@ -12,6 +17,8 @@ pub(crate) struct HprIpIngress {
     pub(crate) datagram: Datagram,
     /// A newly verified CP, or None if this datagram supplied no identity.
     pub(crate) observed_cp: Option<String>,
+    /// A link-control observation. This is not a usable local HPR endpoint.
+    pub(crate) link_observation: Option<Observation>,
 }
 
 pub(crate) struct AutoHprIpListener {
@@ -19,6 +26,7 @@ pub(crate) struct AutoHprIpListener {
     local_ip: IpAddr,
     peer_ip: IpAddr,
     peer_cp: Option<String>,
+    activation: HprIpActivation,
 }
 
 impl AutoHprIpListener {
@@ -38,6 +46,7 @@ impl AutoHprIpListener {
             local_ip,
             peer_ip,
             peer_cp: None,
+            activation: HprIpActivation::new(Side::Remote),
         })
     }
 
@@ -64,9 +73,11 @@ impl AutoHprIpListener {
                         peer_cp = %cp, "HPR/IP neighbor CP observed in XID3");
                     self.peer_cp = Some(cp.clone());
                 }
+                let link_observation = self.observe_remote_control(&datagram);
                 Ok(Some(HprIpIngress {
                     datagram,
                     observed_cp,
+                    link_observation,
                 }))
             }
             Err(error) => {
@@ -79,6 +90,46 @@ impl AutoHprIpListener {
 
     pub(crate) fn peer_cp(&self) -> Option<&str> {
         self.peer_cp.as_deref()
+    }
+
+    pub(crate) fn activation_phase(&self) -> Phase {
+        self.activation.phase()
+    }
+
+    fn observe_remote_control(&mut self, datagram: &Datagram) -> Option<Observation> {
+        let result = match datagram.kind {
+            LdlcKind::Xid => self
+                .activation
+                .observe_xid(Side::Remote, &datagram.payload[3..]),
+            LdlcKind::Test => self
+                .activation
+                .observe_test(Side::Remote, datagram.ssap & 1 != 0),
+            LdlcKind::Disc | LdlcKind::Dm => {
+                return Some(self.activation.observe_disconnect(Side::Remote));
+            }
+            LdlcKind::UiNlp if datagram.port == transport_ip_sna::ee::CONTROL_PORT => {
+                let nlp = &datagram.payload[3..];
+                XidDone::parse(nlp).ok()?;
+                self.activation.observe_xid_done(Side::Remote, nlp)
+            }
+            LdlcKind::UiNlp => return None,
+        };
+        match result {
+            Ok(observation) => {
+                tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip,
+                    peer_cp = ?self.peer_cp, phase = ?self.activation.phase(),
+                    kind = ?datagram.kind, observation = ?observation,
+                    "HPR/IP remote link control observed");
+                (observation != Observation::None).then_some(observation)
+            }
+            Err(error) => {
+                tracing::debug!(local_ip = %self.local_ip, peer_ip = %self.peer_ip,
+                    peer_cp = ?self.peer_cp, phase = ?self.activation.phase(),
+                    kind = ?datagram.kind, error = ?error,
+                    "HPR/IP remote link control not yet valid for activation");
+                None
+            }
+        }
     }
 }
 
@@ -106,7 +157,11 @@ fn observe_xid3_cp(datagram: &Datagram, existing: Option<&str>) -> io::Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use router_core::{xid3::Role, xid3_local::LocalLlcProfile};
+    use router_core::{
+        hpr_xid_leg::local_ee_tg_descriptor,
+        xid3::{ControlVector, ExchangeState, Role},
+        xid3_local::LocalLlcProfile,
+    };
     use std::{net::UdpSocket, thread, time::Duration};
     use transport_ip_sna::ee::CONTROL_PORT;
 
@@ -125,6 +180,50 @@ mod tests {
         .encode()
         .unwrap();
         Datagram::decode(CONTROL_PORT, [vec![4, 4, 0xaf], xid].concat()).unwrap()
+    }
+
+    fn ee_xid3(state: ExchangeState) -> Datagram {
+        let mut fixed = [0u8; 29];
+        fixed[2..6].copy_from_slice(&[0xff, 0xf0, 0, 1]);
+        fixed[9] = match state {
+            ExchangeState::Prenegotiation => 0x08,
+            ExchangeState::NegotiationProceeding => 0x04,
+            _ => panic!("unexpected test XID state"),
+        };
+        fixed[12] = 0x80;
+        fixed[16] = 1;
+        fixed[19] = 0x30;
+        fixed[21..23].copy_from_slice(&1461u16.to_be_bytes());
+        fixed[27] = 7;
+        let mut vectors = vec![
+            ControlVector {
+                key: 0x0e,
+                data: vec![
+                    0xf4, 0xe2, 0xd6, 0xd3, 0xd5, 0xc5, 0xe3, 0x4b, 0xe2, 0xd5, 0xc1, 0xc1,
+                ],
+            },
+            local_ee_tg_descriptor(1),
+        ];
+        if state == ExchangeState::NegotiationProceeding {
+            vectors.push(ControlVector {
+                key: 0x61,
+                data: vec![0xf8, 0, 2, 0x80, 2, 3, 0x80, 4],
+            });
+        }
+        let xid = Xid3::from_parts(fixed, vectors).unwrap().encode().unwrap();
+        Datagram::decode(CONTROL_PORT, [vec![4, 4, 0xaf], xid].concat()).unwrap()
+    }
+
+    fn receive_one(listener: &mut AutoHprIpListener) -> HprIpIngress {
+        (0..100)
+            .find_map(|_| {
+                let result = listener.poll().unwrap();
+                if result.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result
+            })
+            .expect("configured peer control datagram received")
     }
 
     #[test]
@@ -173,5 +272,35 @@ mod tests {
         assert_eq!(ingress.observed_cp.as_deref(), Some("NETA.PEERA"));
         assert_eq!(ingress.datagram.port, CONTROL_PORT);
         assert_eq!(listener.peer_cp(), Some("NETA.PEERA"));
+    }
+
+    #[test]
+    fn remote_only_xid_and_setmode_never_activate_local_endpoint() {
+        let pid = std::process::id();
+        let local_ip = IpAddr::from([127, 76, (pid >> 8) as u8, pid as u8]);
+        let peer_ip = IpAddr::from([127, 77, (pid >> 8) as u8, pid as u8]);
+        let mut listener = AutoHprIpListener::bind(local_ip, peer_ip).unwrap();
+        let peer = UdpSocket::bind((peer_ip, 0)).unwrap();
+        let null_xid = Datagram::decode(CONTROL_PORT, vec![4, 4, 0xaf]).unwrap();
+        for datagram in [
+            null_xid,
+            ee_xid3(ExchangeState::Prenegotiation),
+            ee_xid3(ExchangeState::NegotiationProceeding),
+        ] {
+            peer.send_to(&datagram.payload, (local_ip, CONTROL_PORT))
+                .unwrap();
+            assert!(receive_one(&mut listener).link_observation.is_none());
+        }
+        assert_eq!(listener.peer_cp(), Some("SOLNET.SNAA"));
+        assert_eq!(listener.activation_phase(), Phase::Negotiating);
+        let xid_done = Datagram::decode(
+            CONTROL_PORT,
+            [vec![4, 4, 3], XidDone::Request.encode().to_vec()].concat(),
+        )
+        .unwrap();
+        peer.send_to(&xid_done.payload, (local_ip, CONTROL_PORT))
+            .unwrap();
+        assert!(receive_one(&mut listener).link_observation.is_none());
+        assert_eq!(listener.activation_phase(), Phase::Negotiating);
     }
 }
