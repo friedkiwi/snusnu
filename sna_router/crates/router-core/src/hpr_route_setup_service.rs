@@ -12,6 +12,7 @@ use crate::{
     hpr_control_bootstrap::HprControlBootstrap,
     hpr_route_setup::{RouteSetupError, RouteSetupGds, RouteSetupKind},
     hpr_route_setup_reply::{DirectReplyError, DirectReplyTarget, ReverseLinkMetrics},
+    hpr_switching_path::AuthorizedUserRoute,
     session::QualifiedName,
     ConnectionGeneration,
 };
@@ -29,6 +30,9 @@ pub enum ServiceError {
     NotRequest,
     ConflictingPcid,
     Reply(DirectReplyError),
+    UnknownPcid,
+    WrongReply,
+    ReplyNotSent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +40,8 @@ struct CachedReply {
     pcid: [u8; 8],
     request: Vec<u8>,
     reply: Vec<u8>,
+    cos_tpf: Vec<u8>,
+    sent: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,6 +151,15 @@ impl DirectRouteSetupService {
         let reply = target
             .encode_positive(&request)
             .map_err(ServiceError::Reply)?;
+        let cos_tpf = request
+            .vectors
+            .iter()
+            .find(|cv| cv.key == 0x2c)
+            .ok_or(ServiceError::InvalidRequest(
+                RouteSetupError::MissingRequiredVector,
+            ))?
+            .wire
+            .to_vec();
         if self.replies.len() == self.limit {
             self.replies.pop_front();
         }
@@ -152,11 +167,65 @@ impl DirectRouteSetupService {
             pcid: request.pcid,
             request: message.to_vec(),
             reply: reply.clone(),
+            cos_tpf,
+            sent: false,
         });
         Ok(PreparedRouteSetupReply {
             gds: reply,
             duplicate: false,
             pcid: request.pcid,
+        })
+    }
+
+    /// Call only after the exact positive GDS was successfully handed to the
+    /// RTP egress. A prepared reply alone never admits a user RTP connection.
+    pub fn confirm_reply_sent(
+        &mut self,
+        generation: ConnectionGeneration,
+        pcid: [u8; 8],
+        gds: &[u8],
+    ) -> Result<AuthorizedUserRoute, ServiceError> {
+        if generation != self.bootstrap.generation {
+            return Err(ServiceError::StaleGeneration);
+        }
+        let cached = self
+            .replies
+            .iter_mut()
+            .find(|reply| reply.pcid == pcid)
+            .ok_or(ServiceError::UnknownPcid)?;
+        if cached.reply != gds {
+            return Err(ServiceError::WrongReply);
+        }
+        cached.sent = true;
+        self.authorized_route(generation, pcid)
+    }
+
+    /// Retrieve authorization for a route whose positive reply was sent.
+    pub fn authorized_route(
+        &self,
+        generation: ConnectionGeneration,
+        pcid: [u8; 8],
+    ) -> Result<AuthorizedUserRoute, ServiceError> {
+        if generation != self.bootstrap.generation {
+            return Err(ServiceError::StaleGeneration);
+        }
+        let cached = self
+            .replies
+            .iter()
+            .find(|reply| reply.pcid == pcid)
+            .ok_or(ServiceError::UnknownPcid)?;
+        if !cached.sent {
+            return Err(ServiceError::ReplyNotSent);
+        }
+        Ok(AuthorizedUserRoute {
+            generation,
+            target_lu: self.local_lu.clone(),
+            local_nce_label: self.lu_nce_label.clone(),
+            local_nce_instance: self.lu_nce_instance,
+            cos_tpf: cached.cos_tpf.clone(),
+            tg_number: self.tg_number,
+            return_link_label: self.bootstrap.peer.link_label.clone(),
+            maximum_packet_size: self.bootstrap.max_packet_size,
         })
     }
 
@@ -304,6 +373,25 @@ mod tests {
         assert!(again.duplicate);
         assert_eq!(first.gds, again.gds);
         assert_eq!(service.cached_replies(), 1);
+        assert_eq!(
+            service.authorized_route(ConnectionGeneration::new(1).unwrap(), first.pcid),
+            Err(ServiceError::ReplyNotSent)
+        );
+        assert_eq!(
+            service.confirm_reply_sent(ConnectionGeneration::new(1).unwrap(), first.pcid, &request),
+            Err(ServiceError::WrongReply)
+        );
+        let authorized = service
+            .confirm_reply_sent(
+                ConnectionGeneration::new(1).unwrap(),
+                first.pcid,
+                &first.gds,
+            )
+            .unwrap();
+        assert_eq!(authorized.generation, ConnectionGeneration::new(1).unwrap());
+        assert_eq!(authorized.target_lu, "SOLNET.SNAB".parse().unwrap());
+        assert_eq!(authorized.local_nce_label, [0xa4, 0]);
+        assert_eq!(authorized.cos_tpf[1], 0x2c);
 
         let mut conflicting = request.clone();
         conflicting[85] = 0xe4; // COS name changed while PCID stayed the same.

@@ -25,6 +25,7 @@ pub mod hpr_rtp_setup;
 pub mod hpr_session_adapter;
 pub mod hpr_session_address;
 pub mod hpr_setmode;
+pub mod hpr_switching_path;
 pub mod hpr_xid_evidence;
 pub mod hpr_xid_leg;
 pub mod llc;
