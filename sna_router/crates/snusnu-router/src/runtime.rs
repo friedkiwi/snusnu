@@ -6,6 +6,7 @@ use crate::{
     endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
     hpr_lan_port::HprLanPort,
     ip_ports::EePort,
+    mptn_llc_reverse::{self, ReverseLlcConfig},
     remote::{Config as RemoteConfig, WsRoutePort},
     routing::{PortId, RouteAddress, RoutePort, RoutedUnit, Router, RouterEvent},
 };
@@ -276,6 +277,9 @@ fn configured_proxy_mac(config: &RouterConfig, peer: &config::LlcConfig) -> io::
 /// The route table is checked before any raw socket is opened.
 pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     config.validate()?;
+    if let Some(reverse) = config.reverse_llc_config()? {
+        return run_reverse_llc(reverse);
+    }
     if !config.mptn_gateway.is_empty() {
         return crate::mptn_ws_gateway_lab::run_config(config, false);
     }
@@ -449,6 +453,59 @@ pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// A native-to-TCP62 converter owns one private LLC/TCP/UDP circuit at a
+/// time. Reopen it after a completed or transiently failed session so the
+/// configured route remains available for the next OS/400 contact.
+fn run_reverse_llc(config: ReverseLlcConfig) -> io::Result<()> {
+    config.validate()?;
+    let mut delay = Duration::from_millis(500);
+    tracing::info!(
+        interface = %config.interface,
+        guest_cp = %config.guest_cp,
+        source_lu = %config.source_lu,
+        destination_lu = %config.destination_lu,
+        local_ip = %config.endpoint.local_ip,
+        peer_ip = %config.endpoint.peer_ip,
+        "native LLC to MPTN route starting"
+    );
+    while !crate::STOP.load(Ordering::Relaxed) {
+        match mptn_llc_reverse::run_once(&config) {
+            Ok(()) => {
+                delay = Duration::from_millis(500);
+                tracing::info!(source_lu = %config.source_lu, destination_lu = %config.destination_lu, "native LLC to MPTN circuit closed");
+                wait_or_stop(Duration::from_millis(200));
+            }
+            Err(error) if retryable_reverse_error(&error) => {
+                tracing::warn!(
+                    peer_ip = %config.endpoint.peer_ip,
+                    source_lu = %config.source_lu,
+                    destination_lu = %config.destination_lu,
+                    error = %error,
+                    retry_ms = delay.as_millis(),
+                    "native LLC to MPTN circuit failed"
+                );
+                wait_or_stop(delay);
+                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn retryable_reverse_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn install_config_route(
     router: &mut Router,
     config: &RouterConfig,
@@ -585,6 +642,14 @@ mod reconnect_tests {
         assert!(retryable_remote_error(&closed));
         assert!(!retryable_remote_error(&io::Error::other(
             "local TAP failed"
+        )));
+        assert!(retryable_reverse_error(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "TCP62 reset"
+        )));
+        assert!(!retryable_reverse_error(&io::Error::new(
+            io::ErrorKind::Unsupported,
+            "MPTN abort compensation unavailable"
         )));
     }
 
