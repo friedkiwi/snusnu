@@ -237,10 +237,22 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         tracing::info!("held TCP62 user BIND offered to virtual native link");
     }
     let mut pending_user_input: Option<TcpRecord> = None;
+    let mut pending_udp_input: Option<(u16, Vec<u8>)> = None;
     // The deadline bounds setup only. An established user conversation runs
     // until STOP or a correlated transport/session close.
     while !STOP.load(Ordering::Relaxed) && (tcp.user_active() || Instant::now() < deadline) {
         pump_virtual(&mut virtual_port)?;
+        if virtual_port.take_expedited_native_completed() {
+            tcp.complete_tcp_expedited()?;
+        }
+        if let Some(sequence) = virtual_port.take_completed_udp_expedited() {
+            tcp.complete_udp_expedited(sequence)?;
+        }
+        if let Some((sequence, reduced)) = pending_udp_input.as_ref() {
+            if virtual_port.submit_udp_expedited(*sequence, reduced)? {
+                pending_udp_input = None;
+            }
+        }
         if let Some(record) = pending_user_input.as_ref() {
             if virtual_port.submit_tcp_user_record(record)? {
                 pending_user_input = None;
@@ -276,6 +288,11 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
                         tcp.complete_user_record()?;
                     } else {
                         pending_user_input = Some(record);
+                    }
+                }
+                GatewayEvent::UserUdpExpedited { sequence, reduced } => {
+                    if !virtual_port.submit_udp_expedited(sequence, &reduced)? {
+                        pending_udp_input = Some((sequence, reduced));
                     }
                 }
                 GatewayEvent::Closed => {

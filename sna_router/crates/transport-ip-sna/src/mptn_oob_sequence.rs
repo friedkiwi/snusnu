@@ -23,7 +23,7 @@ pub enum Delivery {
 
 /// One direction of one MPTN connection. Keep separate windows for the two
 /// directions; each sender owns its own expedited sequence.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SequenceWindow {
     tcp_count: u64,
     delivered_udp: BTreeSet<u16>,
