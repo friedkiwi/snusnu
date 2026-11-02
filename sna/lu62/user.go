@@ -84,7 +84,7 @@ func CandidateUserResponse(request []byte, expectedPLU, expectedSLU string, mana
 	}
 	o += 2 + len(slu)
 	fq, err := RequestFQPCID(request)
-	if err != nil || bytes.Equal(fq, managementFQPCID) || o+len(fq)+12 != len(ru) || !bytes.Equal(ru[o:o+len(fq)], fq) || ru[o+len(fq)] != 0x2c || ru[o+len(fq)+1] != 0x0a {
+	if err != nil || (len(managementFQPCID) != 0 && bytes.Equal(fq, managementFQPCID)) || o+len(fq)+12 != len(ru) || !bytes.Equal(ru[o:o+len(fq)], fq) || ru[o+len(fq)] != 0x2c || ru[o+len(fq)+1] != 0x0a {
 		return nil, ErrUserBind
 	}
 	responseUser := []byte{0, 9, 2, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 2, 3, 2, byte(1 + len(slu)), 5}

@@ -37,6 +37,7 @@ message OpenRequest {
   RouteReference target = 2;
   uint64 receive_allowance_bytes = 3; // Initial total data bytes peer may send.
   RouteReference source_route = 4; // Required for snusnu.v2; live LU owned by sender.
+  CircuitProfile profile = 5; // Unspecified retains the existing native DLC/PIU profile.
 }
 
 // Go allocates a 16-byte circuit ID and stamps the authenticated source.
@@ -46,6 +47,14 @@ message IncomingOpen {
   RouteReference target = 3;
   uint64 source_receive_allowance_bytes = 4;
   RouteReference source_route = 5; // Server-validated source LU; snusnu.v2 only.
+  CircuitProfile profile = 6; // Server-validated, immutable for this circuit.
+}
+
+// A profile describes the circuit event contract, never the local medium.
+// Native remains the default to preserve existing snusnu.v1/v2 clients.
+enum CircuitProfile {
+  CIRCUIT_PROFILE_NATIVE_DLC = 0;
+  CIRCUIT_PROFILE_SESSION_V1 = 1;
 }
 
 message OpenDecision {
@@ -85,7 +94,38 @@ message CircuitEvent {
     DlcType1 type1 = 2;
     LinkReady link_ready = 3;
     bytes sna_information = 4; // LLC2 I information field; may need SNA reassembly.
+    SessionEvent session_event = 5; // Complete reduced SNF/RH/RU session event.
   }
+}
+
+// One circuit carries exactly one LU session. Identity is taken from the
+// authenticated source and target route references on OPEN, not these units.
+// The carrier adapter owns link/RTP reliability and any session-address
+// assignment. Each reduced_unit is SNF(2), RH(3), then RU (possibly empty).
+message SessionEvent {
+  oneof event {
+    bytes bind_request = 1;
+    SessionBindResult bind_result = 2;
+    SessionInformation information = 3;
+    SessionPacingCredit pacing_credit = 4;
+    bytes unbind = 5;
+  }
+}
+
+message SessionBindResult {
+  bool accepted = 1;
+  bytes reduced_unit = 2;
+}
+
+message SessionInformation {
+  bool expedited = 1;
+  bytes reduced_unit = 2;
+}
+
+// Session pacing is distinct from CircuitCredit's byte-queue accounting.
+message SessionPacingCredit {
+  uint32 normal = 1;
+  uint32 expedited = 2;
 }
 
 message DlcType1 {

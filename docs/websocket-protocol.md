@@ -28,7 +28,20 @@ One `WsEnvelope` protobuf is encoded into one **binary WebSocket message**. No s
 
 The route advertisement contains only the SNA resource identity. `OpenRequest` names the target route handle and carries no claim about the target's local encapsulation. The current circuit event profile is the native DLC/PIU representation: structured XID/TEST command or response with P/F and SAPs, a link-ready event, and the opaque SNA information field accepted from an LLC2 I frame. MAC headers, LLC2 sequence numbers, SABME/UA/RR and retransmission timers stay with each local Rust adapter. The information field is not guaranteed to be one complete PIU; converters must parse/reassemble when required. The embedded APING endpoint currently requires one complete PIU of at most 1496 bytes.
 
-This event profile is a **data-plane contract**, not a claim that every CP or LU uses LLC2 locally. The constrained MPTN gateway can convert an LU 6.2 session into this native profile. EE/HPR still requires separate HPR conversion or a later overlay event profile. The owning router rejects unsupported opens. Go's relay checks message validity, route authorization, size, circuit binding, and credit without parsing SNA; the concentrator-owned APING endpoint is a distinct local consumer.
+This native event profile is a **data-plane contract**, not a claim that every CP or LU uses LLC2 locally. The constrained MPTN gateway can convert an LU 6.2 session into this native profile. EE/HPR still requires its own link, RTP, and session adapter before it can use the session profile below. The owning router rejects unsupported opens. Go's relay checks message validity, route authorization, size, circuit binding, and credit without parsing SNA; the concentrator-owned APING endpoint is a distinct local consumer.
+
+`OpenRequest.profile = CIRCUIT_PROFILE_SESSION_V1` selects a second, carrier-neutral
+event profile for one LU session per circuit. It requires `snusnu.v2`, a live
+authenticated source LU route, and a live target LU route. `SessionEvent`
+carries complete reduced SNA units (two-byte SNF, three-byte RH, then RU) for
+BIND, BIND result, information, and UNBIND; an explicit pacing-credit event
+keeps carrier pacing separate from `CircuitCredit` byte-queue accounting. The
+Go embedded `SNUSNU.PING` service accepts this profile and handles APINGD
+without a synthetic DLC exchange on the WebSocket. Its private FID2 envelope
+only adapts the established Go LU 6.2 responder's internal API; no FID2
+address appears in the session event. The default profile remains the native
+DLC/PIU profile used by existing LLC routes. Rust HPR/IP runtime integration
+still requires a verified EE/RTP session before emitting these events.
 
 ## Pressure and failure
 

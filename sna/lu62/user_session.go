@@ -68,6 +68,19 @@ func NewUserSession(remoteLU, localLU string, managementFQPCID []byte) (*UserSes
 	return &UserSession{remoteLU: remoteLU, localLU: localLU, managementFQ: append([]byte(nil), managementFQPCID...)}, nil
 }
 
+// NewStandaloneUserSession admits an LU session after its carrier adapter
+// has completed CP/control-flow activation. Its BIND is still validated and
+// correlated, but it has no native SNASVCMG FQPCID to compare against.
+func NewStandaloneUserSession(remoteLU, localLU string) (*UserSession, error) {
+	if _, err := encodeLUName(remoteLU); err != nil {
+		return nil, err
+	}
+	if _, err := encodeLUName(localLU); err != nil || remoteLU == localLU {
+		return nil, ErrUserState
+	}
+	return &UserSession{remoteLU: remoteLU, localLU: localLU}, nil
+}
+
 func (s *UserSession) Phase() UserPhase { return s.phase }
 func (s *UserSession) TPName() string   { return s.attachTP }
 func (s *UserSession) FQPCID() []byte   { return append([]byte(nil), s.bindFQPCID...) }

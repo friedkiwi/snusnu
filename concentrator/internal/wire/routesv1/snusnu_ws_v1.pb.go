@@ -21,6 +21,54 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// A profile describes the circuit event contract, never the local medium.
+// Native remains the default to preserve existing snusnu.v1/v2 clients.
+type CircuitProfile int32
+
+const (
+	CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC CircuitProfile = 0
+	CircuitProfile_CIRCUIT_PROFILE_SESSION_V1 CircuitProfile = 1
+)
+
+// Enum value maps for CircuitProfile.
+var (
+	CircuitProfile_name = map[int32]string{
+		0: "CIRCUIT_PROFILE_NATIVE_DLC",
+		1: "CIRCUIT_PROFILE_SESSION_V1",
+	}
+	CircuitProfile_value = map[string]int32{
+		"CIRCUIT_PROFILE_NATIVE_DLC": 0,
+		"CIRCUIT_PROFILE_SESSION_V1": 1,
+	}
+)
+
+func (x CircuitProfile) Enum() *CircuitProfile {
+	p := new(CircuitProfile)
+	*p = x
+	return p
+}
+
+func (x CircuitProfile) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CircuitProfile) Descriptor() protoreflect.EnumDescriptor {
+	return file_snusnu_ws_v1_proto_enumTypes[0].Descriptor()
+}
+
+func (CircuitProfile) Type() protoreflect.EnumType {
+	return &file_snusnu_ws_v1_proto_enumTypes[0]
+}
+
+func (x CircuitProfile) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CircuitProfile.Descriptor instead.
+func (CircuitProfile) EnumDescriptor() ([]byte, []int) {
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{0}
+}
+
 type OpenFailure int32
 
 const (
@@ -63,11 +111,11 @@ func (x OpenFailure) String() string {
 }
 
 func (OpenFailure) Descriptor() protoreflect.EnumDescriptor {
-	return file_snusnu_ws_v1_proto_enumTypes[0].Descriptor()
+	return file_snusnu_ws_v1_proto_enumTypes[1].Descriptor()
 }
 
 func (OpenFailure) Type() protoreflect.EnumType {
-	return &file_snusnu_ws_v1_proto_enumTypes[0]
+	return &file_snusnu_ws_v1_proto_enumTypes[1]
 }
 
 func (x OpenFailure) Number() protoreflect.EnumNumber {
@@ -76,7 +124,7 @@ func (x OpenFailure) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use OpenFailure.Descriptor instead.
 func (OpenFailure) EnumDescriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{0}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{1}
 }
 
 type Type1Kind int32
@@ -112,11 +160,11 @@ func (x Type1Kind) String() string {
 }
 
 func (Type1Kind) Descriptor() protoreflect.EnumDescriptor {
-	return file_snusnu_ws_v1_proto_enumTypes[1].Descriptor()
+	return file_snusnu_ws_v1_proto_enumTypes[2].Descriptor()
 }
 
 func (Type1Kind) Type() protoreflect.EnumType {
-	return &file_snusnu_ws_v1_proto_enumTypes[1]
+	return &file_snusnu_ws_v1_proto_enumTypes[2]
 }
 
 func (x Type1Kind) Number() protoreflect.EnumNumber {
@@ -125,7 +173,7 @@ func (x Type1Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Type1Kind.Descriptor instead.
 func (Type1Kind) EnumDescriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{1}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{2}
 }
 
 type ResetReason int32
@@ -170,11 +218,11 @@ func (x ResetReason) String() string {
 }
 
 func (ResetReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_snusnu_ws_v1_proto_enumTypes[2].Descriptor()
+	return file_snusnu_ws_v1_proto_enumTypes[3].Descriptor()
 }
 
 func (ResetReason) Type() protoreflect.EnumType {
-	return &file_snusnu_ws_v1_proto_enumTypes[2]
+	return &file_snusnu_ws_v1_proto_enumTypes[3]
 }
 
 func (x ResetReason) Number() protoreflect.EnumNumber {
@@ -183,7 +231,7 @@ func (x ResetReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ResetReason.Descriptor instead.
 func (ResetReason) EnumDescriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{2}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{3}
 }
 
 // One encoded Envelope is one binary WebSocket message. No extra length prefix.
@@ -528,6 +576,7 @@ type OpenRequest struct {
 	Target                *RouteReference        `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	ReceiveAllowanceBytes uint64                 `protobuf:"varint,3,opt,name=receive_allowance_bytes,json=receiveAllowanceBytes,proto3" json:"receive_allowance_bytes,omitempty"` // Initial total data bytes peer may send.
 	SourceRoute           *RouteReference        `protobuf:"bytes,4,opt,name=source_route,json=sourceRoute,proto3" json:"source_route,omitempty"`                                  // Required for snusnu.v2; live LU owned by sender.
+	Profile               CircuitProfile         `protobuf:"varint,5,opt,name=profile,proto3,enum=snusnu.control.v1.CircuitProfile" json:"profile,omitempty"`                      // Unspecified retains the existing native DLC/PIU profile.
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -590,6 +639,13 @@ func (x *OpenRequest) GetSourceRoute() *RouteReference {
 	return nil
 }
 
+func (x *OpenRequest) GetProfile() CircuitProfile {
+	if x != nil {
+		return x.Profile
+	}
+	return CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC
+}
+
 // Go allocates a 16-byte circuit ID and stamps the authenticated source.
 type IncomingOpen struct {
 	state                       protoimpl.MessageState `protogen:"open.v1"`
@@ -597,7 +653,8 @@ type IncomingOpen struct {
 	SourceRouterId              []byte                 `protobuf:"bytes,2,opt,name=source_router_id,json=sourceRouterId,proto3" json:"source_router_id,omitempty"`
 	Target                      *RouteReference        `protobuf:"bytes,3,opt,name=target,proto3" json:"target,omitempty"`
 	SourceReceiveAllowanceBytes uint64                 `protobuf:"varint,4,opt,name=source_receive_allowance_bytes,json=sourceReceiveAllowanceBytes,proto3" json:"source_receive_allowance_bytes,omitempty"`
-	SourceRoute                 *RouteReference        `protobuf:"bytes,5,opt,name=source_route,json=sourceRoute,proto3" json:"source_route,omitempty"` // Server-validated source LU; snusnu.v2 only.
+	SourceRoute                 *RouteReference        `protobuf:"bytes,5,opt,name=source_route,json=sourceRoute,proto3" json:"source_route,omitempty"`             // Server-validated source LU; snusnu.v2 only.
+	Profile                     CircuitProfile         `protobuf:"varint,6,opt,name=profile,proto3,enum=snusnu.control.v1.CircuitProfile" json:"profile,omitempty"` // Server-validated, immutable for this circuit.
 	unknownFields               protoimpl.UnknownFields
 	sizeCache                   protoimpl.SizeCache
 }
@@ -665,6 +722,13 @@ func (x *IncomingOpen) GetSourceRoute() *RouteReference {
 		return x.SourceRoute
 	}
 	return nil
+}
+
+func (x *IncomingOpen) GetProfile() CircuitProfile {
+	if x != nil {
+		return x.Profile
+	}
+	return CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC
 }
 
 type OpenDecision struct {
@@ -866,6 +930,7 @@ type CircuitEvent struct {
 	//	*CircuitEvent_Type1
 	//	*CircuitEvent_LinkReady
 	//	*CircuitEvent_SnaInformation
+	//	*CircuitEvent_SessionEvent
 	Event         isCircuitEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -942,6 +1007,15 @@ func (x *CircuitEvent) GetSnaInformation() []byte {
 	return nil
 }
 
+func (x *CircuitEvent) GetSessionEvent() *SessionEvent {
+	if x != nil {
+		if x, ok := x.Event.(*CircuitEvent_SessionEvent); ok {
+			return x.SessionEvent
+		}
+	}
+	return nil
+}
+
 type isCircuitEvent_Event interface {
 	isCircuitEvent_Event()
 }
@@ -958,11 +1032,308 @@ type CircuitEvent_SnaInformation struct {
 	SnaInformation []byte `protobuf:"bytes,4,opt,name=sna_information,json=snaInformation,proto3,oneof"` // LLC2 I information field; may need SNA reassembly.
 }
 
+type CircuitEvent_SessionEvent struct {
+	SessionEvent *SessionEvent `protobuf:"bytes,5,opt,name=session_event,json=sessionEvent,proto3,oneof"` // Complete reduced SNF/RH/RU session event.
+}
+
 func (*CircuitEvent_Type1) isCircuitEvent_Event() {}
 
 func (*CircuitEvent_LinkReady) isCircuitEvent_Event() {}
 
 func (*CircuitEvent_SnaInformation) isCircuitEvent_Event() {}
+
+func (*CircuitEvent_SessionEvent) isCircuitEvent_Event() {}
+
+// One circuit carries exactly one LU session. Identity is taken from the
+// authenticated source and target route references on OPEN, not these units.
+// The carrier adapter owns link/RTP reliability and any session-address
+// assignment. Each reduced_unit is SNF(2), RH(3), then RU (possibly empty).
+type SessionEvent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Event:
+	//
+	//	*SessionEvent_BindRequest
+	//	*SessionEvent_BindResult
+	//	*SessionEvent_Information
+	//	*SessionEvent_PacingCredit
+	//	*SessionEvent_Unbind
+	Event         isSessionEvent_Event `protobuf_oneof:"event"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SessionEvent) Reset() {
+	*x = SessionEvent{}
+	mi := &file_snusnu_ws_v1_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionEvent) ProtoMessage() {}
+
+func (x *SessionEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_snusnu_ws_v1_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionEvent.ProtoReflect.Descriptor instead.
+func (*SessionEvent) Descriptor() ([]byte, []int) {
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *SessionEvent) GetEvent() isSessionEvent_Event {
+	if x != nil {
+		return x.Event
+	}
+	return nil
+}
+
+func (x *SessionEvent) GetBindRequest() []byte {
+	if x != nil {
+		if x, ok := x.Event.(*SessionEvent_BindRequest); ok {
+			return x.BindRequest
+		}
+	}
+	return nil
+}
+
+func (x *SessionEvent) GetBindResult() *SessionBindResult {
+	if x != nil {
+		if x, ok := x.Event.(*SessionEvent_BindResult); ok {
+			return x.BindResult
+		}
+	}
+	return nil
+}
+
+func (x *SessionEvent) GetInformation() *SessionInformation {
+	if x != nil {
+		if x, ok := x.Event.(*SessionEvent_Information); ok {
+			return x.Information
+		}
+	}
+	return nil
+}
+
+func (x *SessionEvent) GetPacingCredit() *SessionPacingCredit {
+	if x != nil {
+		if x, ok := x.Event.(*SessionEvent_PacingCredit); ok {
+			return x.PacingCredit
+		}
+	}
+	return nil
+}
+
+func (x *SessionEvent) GetUnbind() []byte {
+	if x != nil {
+		if x, ok := x.Event.(*SessionEvent_Unbind); ok {
+			return x.Unbind
+		}
+	}
+	return nil
+}
+
+type isSessionEvent_Event interface {
+	isSessionEvent_Event()
+}
+
+type SessionEvent_BindRequest struct {
+	BindRequest []byte `protobuf:"bytes,1,opt,name=bind_request,json=bindRequest,proto3,oneof"`
+}
+
+type SessionEvent_BindResult struct {
+	BindResult *SessionBindResult `protobuf:"bytes,2,opt,name=bind_result,json=bindResult,proto3,oneof"`
+}
+
+type SessionEvent_Information struct {
+	Information *SessionInformation `protobuf:"bytes,3,opt,name=information,proto3,oneof"`
+}
+
+type SessionEvent_PacingCredit struct {
+	PacingCredit *SessionPacingCredit `protobuf:"bytes,4,opt,name=pacing_credit,json=pacingCredit,proto3,oneof"`
+}
+
+type SessionEvent_Unbind struct {
+	Unbind []byte `protobuf:"bytes,5,opt,name=unbind,proto3,oneof"`
+}
+
+func (*SessionEvent_BindRequest) isSessionEvent_Event() {}
+
+func (*SessionEvent_BindResult) isSessionEvent_Event() {}
+
+func (*SessionEvent_Information) isSessionEvent_Event() {}
+
+func (*SessionEvent_PacingCredit) isSessionEvent_Event() {}
+
+func (*SessionEvent_Unbind) isSessionEvent_Event() {}
+
+type SessionBindResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	ReducedUnit   []byte                 `protobuf:"bytes,2,opt,name=reduced_unit,json=reducedUnit,proto3" json:"reduced_unit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SessionBindResult) Reset() {
+	*x = SessionBindResult{}
+	mi := &file_snusnu_ws_v1_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionBindResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionBindResult) ProtoMessage() {}
+
+func (x *SessionBindResult) ProtoReflect() protoreflect.Message {
+	mi := &file_snusnu_ws_v1_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionBindResult.ProtoReflect.Descriptor instead.
+func (*SessionBindResult) Descriptor() ([]byte, []int) {
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *SessionBindResult) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *SessionBindResult) GetReducedUnit() []byte {
+	if x != nil {
+		return x.ReducedUnit
+	}
+	return nil
+}
+
+type SessionInformation struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Expedited     bool                   `protobuf:"varint,1,opt,name=expedited,proto3" json:"expedited,omitempty"`
+	ReducedUnit   []byte                 `protobuf:"bytes,2,opt,name=reduced_unit,json=reducedUnit,proto3" json:"reduced_unit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SessionInformation) Reset() {
+	*x = SessionInformation{}
+	mi := &file_snusnu_ws_v1_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionInformation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionInformation) ProtoMessage() {}
+
+func (x *SessionInformation) ProtoReflect() protoreflect.Message {
+	mi := &file_snusnu_ws_v1_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionInformation.ProtoReflect.Descriptor instead.
+func (*SessionInformation) Descriptor() ([]byte, []int) {
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *SessionInformation) GetExpedited() bool {
+	if x != nil {
+		return x.Expedited
+	}
+	return false
+}
+
+func (x *SessionInformation) GetReducedUnit() []byte {
+	if x != nil {
+		return x.ReducedUnit
+	}
+	return nil
+}
+
+// Session pacing is distinct from CircuitCredit's byte-queue accounting.
+type SessionPacingCredit struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Normal        uint32                 `protobuf:"varint,1,opt,name=normal,proto3" json:"normal,omitempty"`
+	Expedited     uint32                 `protobuf:"varint,2,opt,name=expedited,proto3" json:"expedited,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SessionPacingCredit) Reset() {
+	*x = SessionPacingCredit{}
+	mi := &file_snusnu_ws_v1_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionPacingCredit) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionPacingCredit) ProtoMessage() {}
+
+func (x *SessionPacingCredit) ProtoReflect() protoreflect.Message {
+	mi := &file_snusnu_ws_v1_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionPacingCredit.ProtoReflect.Descriptor instead.
+func (*SessionPacingCredit) Descriptor() ([]byte, []int) {
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *SessionPacingCredit) GetNormal() uint32 {
+	if x != nil {
+		return x.Normal
+	}
+	return 0
+}
+
+func (x *SessionPacingCredit) GetExpedited() uint32 {
+	if x != nil {
+		return x.Expedited
+	}
+	return 0
+}
 
 type DlcType1 struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -978,7 +1349,7 @@ type DlcType1 struct {
 
 func (x *DlcType1) Reset() {
 	*x = DlcType1{}
-	mi := &file_snusnu_ws_v1_proto_msgTypes[8]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -990,7 +1361,7 @@ func (x *DlcType1) String() string {
 func (*DlcType1) ProtoMessage() {}
 
 func (x *DlcType1) ProtoReflect() protoreflect.Message {
-	mi := &file_snusnu_ws_v1_proto_msgTypes[8]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1003,7 +1374,7 @@ func (x *DlcType1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DlcType1.ProtoReflect.Descriptor instead.
 func (*DlcType1) Descriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{8}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *DlcType1) GetKind() Type1Kind {
@@ -1056,7 +1427,7 @@ type LinkReady struct {
 
 func (x *LinkReady) Reset() {
 	*x = LinkReady{}
-	mi := &file_snusnu_ws_v1_proto_msgTypes[9]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1068,7 +1439,7 @@ func (x *LinkReady) String() string {
 func (*LinkReady) ProtoMessage() {}
 
 func (x *LinkReady) ProtoReflect() protoreflect.Message {
-	mi := &file_snusnu_ws_v1_proto_msgTypes[9]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1081,7 +1452,7 @@ func (x *LinkReady) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LinkReady.ProtoReflect.Descriptor instead.
 func (*LinkReady) Descriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{9}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{13}
 }
 
 // Absolute total number of sna_information bytes allowed in this direction
@@ -1096,7 +1467,7 @@ type CircuitCredit struct {
 
 func (x *CircuitCredit) Reset() {
 	*x = CircuitCredit{}
-	mi := &file_snusnu_ws_v1_proto_msgTypes[10]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1108,7 +1479,7 @@ func (x *CircuitCredit) String() string {
 func (*CircuitCredit) ProtoMessage() {}
 
 func (x *CircuitCredit) ProtoReflect() protoreflect.Message {
-	mi := &file_snusnu_ws_v1_proto_msgTypes[10]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1121,7 +1492,7 @@ func (x *CircuitCredit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CircuitCredit.ProtoReflect.Descriptor instead.
 func (*CircuitCredit) Descriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{10}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CircuitCredit) GetCircuitId() []byte {
@@ -1148,7 +1519,7 @@ type CircuitClose struct {
 
 func (x *CircuitClose) Reset() {
 	*x = CircuitClose{}
-	mi := &file_snusnu_ws_v1_proto_msgTypes[11]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1160,7 +1531,7 @@ func (x *CircuitClose) String() string {
 func (*CircuitClose) ProtoMessage() {}
 
 func (x *CircuitClose) ProtoReflect() protoreflect.Message {
-	mi := &file_snusnu_ws_v1_proto_msgTypes[11]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1173,7 +1544,7 @@ func (x *CircuitClose) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CircuitClose.ProtoReflect.Descriptor instead.
 func (*CircuitClose) Descriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{11}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *CircuitClose) GetCircuitId() []byte {
@@ -1194,7 +1565,7 @@ type CircuitReset struct {
 
 func (x *CircuitReset) Reset() {
 	*x = CircuitReset{}
-	mi := &file_snusnu_ws_v1_proto_msgTypes[12]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1206,7 +1577,7 @@ func (x *CircuitReset) String() string {
 func (*CircuitReset) ProtoMessage() {}
 
 func (x *CircuitReset) ProtoReflect() protoreflect.Message {
-	mi := &file_snusnu_ws_v1_proto_msgTypes[12]
+	mi := &file_snusnu_ws_v1_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1219,7 +1590,7 @@ func (x *CircuitReset) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CircuitReset.ProtoReflect.Descriptor instead.
 func (*CircuitReset) Descriptor() ([]byte, []int) {
-	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{12}
+	return file_snusnu_ws_v1_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *CircuitReset) GetCircuitId() []byte {
@@ -1263,20 +1634,22 @@ const file_snusnu_ws_v1_proto_rawDesc = "" +
 	"\x13managed_cp_bindings\x18\x0f \x01(\v2+.snusnu.control.v1.ManagedCpBindingSnapshotH\x00R\x11managedCpBindingsB\x06\n" +
 	"\x04body\"9\n" +
 	"\x14RouterIdentityUpdate\x12!\n" +
-	"\fdisplay_name\x18\x01 \x01(\tR\vdisplayName\"\xe5\x01\n" +
+	"\fdisplay_name\x18\x01 \x01(\tR\vdisplayName\"\xa2\x02\n" +
 	"\vOpenRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x129\n" +
 	"\x06target\x18\x02 \x01(\v2!.snusnu.control.v1.RouteReferenceR\x06target\x126\n" +
 	"\x17receive_allowance_bytes\x18\x03 \x01(\x04R\x15receiveAllowanceBytes\x12D\n" +
-	"\fsource_route\x18\x04 \x01(\v2!.snusnu.control.v1.RouteReferenceR\vsourceRoute\"\x9d\x02\n" +
+	"\fsource_route\x18\x04 \x01(\v2!.snusnu.control.v1.RouteReferenceR\vsourceRoute\x12;\n" +
+	"\aprofile\x18\x05 \x01(\x0e2!.snusnu.control.v1.CircuitProfileR\aprofile\"\xda\x02\n" +
 	"\fIncomingOpen\x12\x1d\n" +
 	"\n" +
 	"circuit_id\x18\x01 \x01(\fR\tcircuitId\x12(\n" +
 	"\x10source_router_id\x18\x02 \x01(\fR\x0esourceRouterId\x129\n" +
 	"\x06target\x18\x03 \x01(\v2!.snusnu.control.v1.RouteReferenceR\x06target\x12C\n" +
 	"\x1esource_receive_allowance_bytes\x18\x04 \x01(\x04R\x1bsourceReceiveAllowanceBytes\x12D\n" +
-	"\fsource_route\x18\x05 \x01(\v2!.snusnu.control.v1.RouteReferenceR\vsourceRoute\"\xb5\x01\n" +
+	"\fsource_route\x18\x05 \x01(\v2!.snusnu.control.v1.RouteReferenceR\vsourceRoute\x12;\n" +
+	"\aprofile\x18\x06 \x01(\x0e2!.snusnu.control.v1.CircuitProfileR\aprofile\"\xb5\x01\n" +
 	"\fOpenDecision\x12\x1d\n" +
 	"\n" +
 	"circuit_id\x18\x01 \x01(\fR\tcircuitId\x12\x16\n" +
@@ -1294,15 +1667,33 @@ const file_snusnu_ws_v1_proto_rawDesc = "" +
 	"\x06reason\x18\x05 \x01(\x0e2\x1e.snusnu.control.v1.OpenFailureR\x06reason\"*\n" +
 	"\tOpenReady\x12\x1d\n" +
 	"\n" +
-	"circuit_id\x18\x01 \x01(\fR\tcircuitId\"\xd5\x01\n" +
+	"circuit_id\x18\x01 \x01(\fR\tcircuitId\"\x9d\x02\n" +
 	"\fCircuitEvent\x12\x1d\n" +
 	"\n" +
 	"circuit_id\x18\x01 \x01(\fR\tcircuitId\x123\n" +
 	"\x05type1\x18\x02 \x01(\v2\x1b.snusnu.control.v1.DlcType1H\x00R\x05type1\x12=\n" +
 	"\n" +
 	"link_ready\x18\x03 \x01(\v2\x1c.snusnu.control.v1.LinkReadyH\x00R\tlinkReady\x12)\n" +
-	"\x0fsna_information\x18\x04 \x01(\fH\x00R\x0esnaInformationB\a\n" +
-	"\x05event\"\xc1\x01\n" +
+	"\x0fsna_information\x18\x04 \x01(\fH\x00R\x0esnaInformation\x12F\n" +
+	"\rsession_event\x18\x05 \x01(\v2\x1f.snusnu.control.v1.SessionEventH\x00R\fsessionEventB\a\n" +
+	"\x05event\"\xb9\x02\n" +
+	"\fSessionEvent\x12#\n" +
+	"\fbind_request\x18\x01 \x01(\fH\x00R\vbindRequest\x12G\n" +
+	"\vbind_result\x18\x02 \x01(\v2$.snusnu.control.v1.SessionBindResultH\x00R\n" +
+	"bindResult\x12I\n" +
+	"\vinformation\x18\x03 \x01(\v2%.snusnu.control.v1.SessionInformationH\x00R\vinformation\x12M\n" +
+	"\rpacing_credit\x18\x04 \x01(\v2&.snusnu.control.v1.SessionPacingCreditH\x00R\fpacingCredit\x12\x18\n" +
+	"\x06unbind\x18\x05 \x01(\fH\x00R\x06unbindB\a\n" +
+	"\x05event\"R\n" +
+	"\x11SessionBindResult\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x12!\n" +
+	"\freduced_unit\x18\x02 \x01(\fR\vreducedUnit\"U\n" +
+	"\x12SessionInformation\x12\x1c\n" +
+	"\texpedited\x18\x01 \x01(\bR\texpedited\x12!\n" +
+	"\freduced_unit\x18\x02 \x01(\fR\vreducedUnit\"K\n" +
+	"\x13SessionPacingCredit\x12\x16\n" +
+	"\x06normal\x18\x01 \x01(\rR\x06normal\x12\x1c\n" +
+	"\texpedited\x18\x02 \x01(\rR\texpedited\"\xc1\x01\n" +
 	"\bDlcType1\x120\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x1c.snusnu.control.v1.Type1KindR\x04kind\x12\x1a\n" +
 	"\bresponse\x18\x02 \x01(\bR\bresponse\x12\x1d\n" +
@@ -1322,7 +1713,10 @@ const file_snusnu_ws_v1_proto_rawDesc = "" +
 	"\fCircuitReset\x12\x1d\n" +
 	"\n" +
 	"circuit_id\x18\x01 \x01(\fR\tcircuitId\x126\n" +
-	"\x06reason\x18\x02 \x01(\x0e2\x1e.snusnu.control.v1.ResetReasonR\x06reason*\xb4\x01\n" +
+	"\x06reason\x18\x02 \x01(\x0e2\x1e.snusnu.control.v1.ResetReasonR\x06reason*P\n" +
+	"\x0eCircuitProfile\x12\x1e\n" +
+	"\x1aCIRCUIT_PROFILE_NATIVE_DLC\x10\x00\x12\x1e\n" +
+	"\x1aCIRCUIT_PROFILE_SESSION_V1\x10\x01*\xb4\x01\n" +
 	"\vOpenFailure\x12\x1c\n" +
 	"\x18OPEN_FAILURE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17OPEN_FAILURE_ROUTE_GONE\x10\x01\x12\x1a\n" +
@@ -1354,63 +1748,74 @@ func file_snusnu_ws_v1_proto_rawDescGZIP() []byte {
 	return file_snusnu_ws_v1_proto_rawDescData
 }
 
-var file_snusnu_ws_v1_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_snusnu_ws_v1_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_snusnu_ws_v1_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_snusnu_ws_v1_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_snusnu_ws_v1_proto_goTypes = []any{
-	(OpenFailure)(0),                 // 0: snusnu.control.v1.OpenFailure
-	(Type1Kind)(0),                   // 1: snusnu.control.v1.Type1Kind
-	(ResetReason)(0),                 // 2: snusnu.control.v1.ResetReason
-	(*WsEnvelope)(nil),               // 3: snusnu.control.v1.WsEnvelope
-	(*RouterIdentityUpdate)(nil),     // 4: snusnu.control.v1.RouterIdentityUpdate
-	(*OpenRequest)(nil),              // 5: snusnu.control.v1.OpenRequest
-	(*IncomingOpen)(nil),             // 6: snusnu.control.v1.IncomingOpen
-	(*OpenDecision)(nil),             // 7: snusnu.control.v1.OpenDecision
-	(*OpenResult)(nil),               // 8: snusnu.control.v1.OpenResult
-	(*OpenReady)(nil),                // 9: snusnu.control.v1.OpenReady
-	(*CircuitEvent)(nil),             // 10: snusnu.control.v1.CircuitEvent
-	(*DlcType1)(nil),                 // 11: snusnu.control.v1.DlcType1
-	(*LinkReady)(nil),                // 12: snusnu.control.v1.LinkReady
-	(*CircuitCredit)(nil),            // 13: snusnu.control.v1.CircuitCredit
-	(*CircuitClose)(nil),             // 14: snusnu.control.v1.CircuitClose
-	(*CircuitReset)(nil),             // 15: snusnu.control.v1.CircuitReset
-	(*RouterWelcome)(nil),            // 16: snusnu.control.v1.RouterWelcome
-	(*RouteSnapshot)(nil),            // 17: snusnu.control.v1.RouteSnapshot
-	(*OriginRouteSnapshot)(nil),      // 18: snusnu.control.v1.OriginRouteSnapshot
-	(*OriginWithdraw)(nil),           // 19: snusnu.control.v1.OriginWithdraw
-	(*ManagedCpBindingSnapshot)(nil), // 20: snusnu.control.v1.ManagedCpBindingSnapshot
-	(*RouteReference)(nil),           // 21: snusnu.control.v1.RouteReference
+	(CircuitProfile)(0),              // 0: snusnu.control.v1.CircuitProfile
+	(OpenFailure)(0),                 // 1: snusnu.control.v1.OpenFailure
+	(Type1Kind)(0),                   // 2: snusnu.control.v1.Type1Kind
+	(ResetReason)(0),                 // 3: snusnu.control.v1.ResetReason
+	(*WsEnvelope)(nil),               // 4: snusnu.control.v1.WsEnvelope
+	(*RouterIdentityUpdate)(nil),     // 5: snusnu.control.v1.RouterIdentityUpdate
+	(*OpenRequest)(nil),              // 6: snusnu.control.v1.OpenRequest
+	(*IncomingOpen)(nil),             // 7: snusnu.control.v1.IncomingOpen
+	(*OpenDecision)(nil),             // 8: snusnu.control.v1.OpenDecision
+	(*OpenResult)(nil),               // 9: snusnu.control.v1.OpenResult
+	(*OpenReady)(nil),                // 10: snusnu.control.v1.OpenReady
+	(*CircuitEvent)(nil),             // 11: snusnu.control.v1.CircuitEvent
+	(*SessionEvent)(nil),             // 12: snusnu.control.v1.SessionEvent
+	(*SessionBindResult)(nil),        // 13: snusnu.control.v1.SessionBindResult
+	(*SessionInformation)(nil),       // 14: snusnu.control.v1.SessionInformation
+	(*SessionPacingCredit)(nil),      // 15: snusnu.control.v1.SessionPacingCredit
+	(*DlcType1)(nil),                 // 16: snusnu.control.v1.DlcType1
+	(*LinkReady)(nil),                // 17: snusnu.control.v1.LinkReady
+	(*CircuitCredit)(nil),            // 18: snusnu.control.v1.CircuitCredit
+	(*CircuitClose)(nil),             // 19: snusnu.control.v1.CircuitClose
+	(*CircuitReset)(nil),             // 20: snusnu.control.v1.CircuitReset
+	(*RouterWelcome)(nil),            // 21: snusnu.control.v1.RouterWelcome
+	(*RouteSnapshot)(nil),            // 22: snusnu.control.v1.RouteSnapshot
+	(*OriginRouteSnapshot)(nil),      // 23: snusnu.control.v1.OriginRouteSnapshot
+	(*OriginWithdraw)(nil),           // 24: snusnu.control.v1.OriginWithdraw
+	(*ManagedCpBindingSnapshot)(nil), // 25: snusnu.control.v1.ManagedCpBindingSnapshot
+	(*RouteReference)(nil),           // 26: snusnu.control.v1.RouteReference
 }
 var file_snusnu_ws_v1_proto_depIdxs = []int32{
-	16, // 0: snusnu.control.v1.WsEnvelope.welcome:type_name -> snusnu.control.v1.RouterWelcome
-	17, // 1: snusnu.control.v1.WsEnvelope.publish_routes:type_name -> snusnu.control.v1.RouteSnapshot
-	18, // 2: snusnu.control.v1.WsEnvelope.origin_routes:type_name -> snusnu.control.v1.OriginRouteSnapshot
-	19, // 3: snusnu.control.v1.WsEnvelope.origin_withdraw:type_name -> snusnu.control.v1.OriginWithdraw
-	5,  // 4: snusnu.control.v1.WsEnvelope.open_request:type_name -> snusnu.control.v1.OpenRequest
-	6,  // 5: snusnu.control.v1.WsEnvelope.incoming_open:type_name -> snusnu.control.v1.IncomingOpen
-	7,  // 6: snusnu.control.v1.WsEnvelope.open_decision:type_name -> snusnu.control.v1.OpenDecision
-	8,  // 7: snusnu.control.v1.WsEnvelope.open_result:type_name -> snusnu.control.v1.OpenResult
-	9,  // 8: snusnu.control.v1.WsEnvelope.open_ready:type_name -> snusnu.control.v1.OpenReady
-	10, // 9: snusnu.control.v1.WsEnvelope.circuit_event:type_name -> snusnu.control.v1.CircuitEvent
-	13, // 10: snusnu.control.v1.WsEnvelope.circuit_credit:type_name -> snusnu.control.v1.CircuitCredit
-	14, // 11: snusnu.control.v1.WsEnvelope.circuit_close:type_name -> snusnu.control.v1.CircuitClose
-	15, // 12: snusnu.control.v1.WsEnvelope.circuit_reset:type_name -> snusnu.control.v1.CircuitReset
-	4,  // 13: snusnu.control.v1.WsEnvelope.identity_update:type_name -> snusnu.control.v1.RouterIdentityUpdate
-	20, // 14: snusnu.control.v1.WsEnvelope.managed_cp_bindings:type_name -> snusnu.control.v1.ManagedCpBindingSnapshot
-	21, // 15: snusnu.control.v1.OpenRequest.target:type_name -> snusnu.control.v1.RouteReference
-	21, // 16: snusnu.control.v1.OpenRequest.source_route:type_name -> snusnu.control.v1.RouteReference
-	21, // 17: snusnu.control.v1.IncomingOpen.target:type_name -> snusnu.control.v1.RouteReference
-	21, // 18: snusnu.control.v1.IncomingOpen.source_route:type_name -> snusnu.control.v1.RouteReference
-	0,  // 19: snusnu.control.v1.OpenDecision.reason:type_name -> snusnu.control.v1.OpenFailure
-	0,  // 20: snusnu.control.v1.OpenResult.reason:type_name -> snusnu.control.v1.OpenFailure
-	11, // 21: snusnu.control.v1.CircuitEvent.type1:type_name -> snusnu.control.v1.DlcType1
-	12, // 22: snusnu.control.v1.CircuitEvent.link_ready:type_name -> snusnu.control.v1.LinkReady
-	1,  // 23: snusnu.control.v1.DlcType1.kind:type_name -> snusnu.control.v1.Type1Kind
-	2,  // 24: snusnu.control.v1.CircuitReset.reason:type_name -> snusnu.control.v1.ResetReason
-	25, // [25:25] is the sub-list for method output_type
-	25, // [25:25] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	21, // 0: snusnu.control.v1.WsEnvelope.welcome:type_name -> snusnu.control.v1.RouterWelcome
+	22, // 1: snusnu.control.v1.WsEnvelope.publish_routes:type_name -> snusnu.control.v1.RouteSnapshot
+	23, // 2: snusnu.control.v1.WsEnvelope.origin_routes:type_name -> snusnu.control.v1.OriginRouteSnapshot
+	24, // 3: snusnu.control.v1.WsEnvelope.origin_withdraw:type_name -> snusnu.control.v1.OriginWithdraw
+	6,  // 4: snusnu.control.v1.WsEnvelope.open_request:type_name -> snusnu.control.v1.OpenRequest
+	7,  // 5: snusnu.control.v1.WsEnvelope.incoming_open:type_name -> snusnu.control.v1.IncomingOpen
+	8,  // 6: snusnu.control.v1.WsEnvelope.open_decision:type_name -> snusnu.control.v1.OpenDecision
+	9,  // 7: snusnu.control.v1.WsEnvelope.open_result:type_name -> snusnu.control.v1.OpenResult
+	10, // 8: snusnu.control.v1.WsEnvelope.open_ready:type_name -> snusnu.control.v1.OpenReady
+	11, // 9: snusnu.control.v1.WsEnvelope.circuit_event:type_name -> snusnu.control.v1.CircuitEvent
+	18, // 10: snusnu.control.v1.WsEnvelope.circuit_credit:type_name -> snusnu.control.v1.CircuitCredit
+	19, // 11: snusnu.control.v1.WsEnvelope.circuit_close:type_name -> snusnu.control.v1.CircuitClose
+	20, // 12: snusnu.control.v1.WsEnvelope.circuit_reset:type_name -> snusnu.control.v1.CircuitReset
+	5,  // 13: snusnu.control.v1.WsEnvelope.identity_update:type_name -> snusnu.control.v1.RouterIdentityUpdate
+	25, // 14: snusnu.control.v1.WsEnvelope.managed_cp_bindings:type_name -> snusnu.control.v1.ManagedCpBindingSnapshot
+	26, // 15: snusnu.control.v1.OpenRequest.target:type_name -> snusnu.control.v1.RouteReference
+	26, // 16: snusnu.control.v1.OpenRequest.source_route:type_name -> snusnu.control.v1.RouteReference
+	0,  // 17: snusnu.control.v1.OpenRequest.profile:type_name -> snusnu.control.v1.CircuitProfile
+	26, // 18: snusnu.control.v1.IncomingOpen.target:type_name -> snusnu.control.v1.RouteReference
+	26, // 19: snusnu.control.v1.IncomingOpen.source_route:type_name -> snusnu.control.v1.RouteReference
+	0,  // 20: snusnu.control.v1.IncomingOpen.profile:type_name -> snusnu.control.v1.CircuitProfile
+	1,  // 21: snusnu.control.v1.OpenDecision.reason:type_name -> snusnu.control.v1.OpenFailure
+	1,  // 22: snusnu.control.v1.OpenResult.reason:type_name -> snusnu.control.v1.OpenFailure
+	16, // 23: snusnu.control.v1.CircuitEvent.type1:type_name -> snusnu.control.v1.DlcType1
+	17, // 24: snusnu.control.v1.CircuitEvent.link_ready:type_name -> snusnu.control.v1.LinkReady
+	12, // 25: snusnu.control.v1.CircuitEvent.session_event:type_name -> snusnu.control.v1.SessionEvent
+	13, // 26: snusnu.control.v1.SessionEvent.bind_result:type_name -> snusnu.control.v1.SessionBindResult
+	14, // 27: snusnu.control.v1.SessionEvent.information:type_name -> snusnu.control.v1.SessionInformation
+	15, // 28: snusnu.control.v1.SessionEvent.pacing_credit:type_name -> snusnu.control.v1.SessionPacingCredit
+	2,  // 29: snusnu.control.v1.DlcType1.kind:type_name -> snusnu.control.v1.Type1Kind
+	3,  // 30: snusnu.control.v1.CircuitReset.reason:type_name -> snusnu.control.v1.ResetReason
+	31, // [31:31] is the sub-list for method output_type
+	31, // [31:31] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_snusnu_ws_v1_proto_init() }
@@ -1440,14 +1845,22 @@ func file_snusnu_ws_v1_proto_init() {
 		(*CircuitEvent_Type1)(nil),
 		(*CircuitEvent_LinkReady)(nil),
 		(*CircuitEvent_SnaInformation)(nil),
+		(*CircuitEvent_SessionEvent)(nil),
+	}
+	file_snusnu_ws_v1_proto_msgTypes[8].OneofWrappers = []any{
+		(*SessionEvent_BindRequest)(nil),
+		(*SessionEvent_BindResult)(nil),
+		(*SessionEvent_Information)(nil),
+		(*SessionEvent_PacingCredit)(nil),
+		(*SessionEvent_Unbind)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_snusnu_ws_v1_proto_rawDesc), len(file_snusnu_ws_v1_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   13,
+			NumEnums:      4,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -25,6 +25,7 @@ type localSNAAck struct {
 type localSNACircuit struct {
 	id               string
 	peer             sna.Peer
+	profile          wire.CircuitProfile
 	xid              *xid3.Activation
 	linkReady        bool
 	management       *lu62.ManagementSession
@@ -36,6 +37,7 @@ type localSNACircuit struct {
 	outboundSent     uint64
 	acks             []localSNAAck
 	early            [][]byte
+	earlySession     []*wire.SessionEvent
 }
 
 // localSNAService is invoked by the hub's one local-delivery goroutine. Its
@@ -99,6 +101,8 @@ func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {
 			err = s.linkReady(c)
 		case *wire.CircuitEvent_SnaInformation:
 			err = s.information(c, value.SnaInformation)
+		case *wire.CircuitEvent_SessionEvent:
+			err = s.sessionEvent(c, value.SessionEvent)
 		default:
 			err = errLocalSNA
 		}
@@ -138,7 +142,7 @@ func (s *localSNAService) open(open *wire.IncomingOpen, source LocalPeer) {
 		reject()
 		return
 	}
-	c := &localSNACircuit{id: id, peer: peer, xid: activation, management: management, inboundAllowance: 1500, outboundBase: open.SourceReceiveAllowanceBytes}
+	c := &localSNACircuit{id: id, peer: peer, profile: open.Profile, xid: activation, management: management, inboundAllowance: 1500, outboundBase: open.SourceReceiveAllowanceBytes}
 	s.circuits[id] = c
 	if err := s.hub.decision(s.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Accept: true, ReceiveAllowanceBytes: c.inboundAllowance}); err != nil {
 		delete(s.circuits, id)
@@ -225,6 +229,9 @@ func (s *localSNAService) credit(c *localSNACircuit, allowance uint64) error {
 		if err := ack.fn(); err != nil {
 			return err
 		}
+	}
+	if c.profile == wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1 {
+		return s.drainSessionEarly(c)
 	}
 	return s.drainEarly(c)
 }

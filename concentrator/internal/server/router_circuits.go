@@ -22,6 +22,7 @@ type wsCircuit struct {
 	targetRef      *wire.RouteReference
 	sourceRef      *wire.RouteReference
 	sourcePeer     LocalPeer
+	profile        wire.CircuitProfile
 	pending        bool
 	allowance      [2]uint64 // data bytes each side may send
 	sent           [2]uint64
@@ -174,6 +175,12 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
 		return errors.New("invalid open request")
 	}
+	if req.Profile != wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC && req.Profile != wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1 {
+		return errors.New("unsupported circuit profile")
+	}
+	if req.Profile == wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1 && source.subprotocol != "snusnu.v2" {
+		return errors.New("session circuit requires snusnu.v2")
+	}
 	if !reservePendingRequest(source, req.RequestId) {
 		return errors.New("duplicate outstanding request ID")
 	}
@@ -212,7 +219,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 		} else if h.circuitCount(source) >= maxWSCircuits || h.circuitCount(target) >= maxWSCircuits {
 			reason = wire.OpenFailure_OPEN_FAILURE_BUSY
 		} else {
-			candidate := &wsCircuit{source: source, target: target, targetRef: proto.Clone(ref).(*wire.RouteReference), openedAt: time.Now(), lastActivityAt: time.Now()}
+			candidate := &wsCircuit{source: source, target: target, targetRef: proto.Clone(ref).(*wire.RouteReference), profile: req.Profile, openedAt: time.Now(), lastActivityAt: time.Now()}
 			if req.SourceRoute != nil {
 				candidate.sourceRef = proto.Clone(req.SourceRoute).(*wire.RouteReference)
 				if sourceLU := h.routeForRef(source, req.SourceRoute).GetLogicalUnit(); sourceLU != nil {
@@ -230,7 +237,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 					candidate.allowance[1] = req.ReceiveAllowanceBytes
 					h.circuits.Store(id, candidate)
 					requestOwnedByCircuit = true
-					if h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef}}}, "", 0) {
+					if h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef, Profile: candidate.profile}}}, "", 0) {
 						return nil
 					}
 					h.circuits.CompareAndDelete(id, candidate)
@@ -362,6 +369,10 @@ func (h *routerHub) event(sender *routerSession, event *wire.CircuitEvent) error
 	cost := 0
 	switch value := event.Event.(type) {
 	case *wire.CircuitEvent_SnaInformation:
+		if c.profile != wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC {
+			c.mu.Unlock()
+			return errors.New("native event on session circuit")
+		}
 		cost = len(value.SnaInformation)
 		if cost == 0 || cost > 16*1024 {
 			c.mu.Unlock()
@@ -373,11 +384,34 @@ func (h *routerHub) event(sender *routerSession, event *wire.CircuitEvent) error
 			return nil
 		}
 	case *wire.CircuitEvent_Type1:
+		if c.profile != wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC {
+			c.mu.Unlock()
+			return errors.New("native event on session circuit")
+		}
 		if value.Type1 == nil || len(value.Type1.Information) > 16*1024 || (value.Type1.Kind != wire.Type1Kind_TYPE1_KIND_XID && value.Type1.Kind != wire.Type1Kind_TYPE1_KIND_TEST) || value.Type1.Dsap < 2 || value.Type1.Dsap > 254 || value.Type1.Dsap%2 != 0 || value.Type1.Ssap < 2 || value.Type1.Ssap > 254 || value.Type1.Ssap%2 != 0 {
 			c.mu.Unlock()
 			return errors.New("invalid DLC type 1 event")
 		}
 	case *wire.CircuitEvent_LinkReady:
+		if c.profile != wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC {
+			c.mu.Unlock()
+			return errors.New("native event on session circuit")
+		}
+	case *wire.CircuitEvent_SessionEvent:
+		if c.profile != wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1 {
+			c.mu.Unlock()
+			return errors.New("session event on native circuit")
+		}
+		cost, err = validateSessionWireEvent(value.SessionEvent)
+		if err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		if c.sent[side] > c.allowance[side] || uint64(cost) > c.allowance[side]-c.sent[side] {
+			h.resetCircuitValue(id, c, wire.ResetReason_RESET_REASON_CREDIT, "system", "")
+			c.mu.Unlock()
+			return nil
+		}
 	default:
 		c.mu.Unlock()
 		return errors.New("invalid circuit event")
@@ -516,6 +550,10 @@ func (h *routerHub) logEvent(sender, peer *routerSession, event *wire.CircuitEve
 	case *wire.CircuitEvent_SnaInformation:
 		size = len(v.SnaInformation)
 		details["information_hex_prefix"] = hexPrefix(v.SnaInformation)
+	case *wire.CircuitEvent_SessionEvent:
+		kind = "LU session event"
+		size, _ = validateSessionWireEvent(v.SessionEvent)
+		details["session_event"] = sessionEventKind(v.SessionEvent)
 	}
 	details["bytes"] = size
 	encoded, _ := json.Marshal(details)

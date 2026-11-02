@@ -839,6 +839,7 @@ impl WsRoutePort {
             target: Some(target),
             receive_allowance_bytes: INITIAL_ALLOWANCE,
             source_route: self.source_route.clone(),
+            profile: wire::CircuitProfile::NativeDlc as i32,
         }))
     }
 
@@ -1189,11 +1190,14 @@ impl WsRoutePort {
         };
         let accept = target_ok
             && source_ok
+            && incoming.profile == wire::CircuitProfile::NativeDlc as i32
             && self.circuit.is_none()
             && !self.opening
             && (!self.require_managed_binding || self.managed_mac.is_some());
         let reason = if accept {
             wire::OpenFailure::Unspecified
+        } else if incoming.profile != wire::CircuitProfile::NativeDlc as i32 {
+            wire::OpenFailure::Unsupported
         } else if v2
             && self.target_lu.is_some()
             && self.target.is_none()
@@ -1371,6 +1375,9 @@ impl WsRoutePort {
                 self.pending_information.push_back(data);
                 self.record_circuit_status();
                 Ok(Vec::new())
+            }
+            wire::circuit_event::Event::SessionEvent(_) => {
+                Err(protocol("session event on native circuit"))
             }
         }
     }
@@ -3039,6 +3046,7 @@ mod tests {
                         }),
                         source_receive_allowance_bytes: 1500,
                         source_route: None,
+                        profile: wire::CircuitProfile::NativeDlc as i32,
                     }),
                 );
             }
@@ -3718,6 +3726,7 @@ mod tests {
                             route_id: 91,
                             route_generation: 1,
                         }),
+                        profile: wire::CircuitProfile::NativeDlc as i32,
                     }),
                 );
             }
@@ -4143,6 +4152,7 @@ mod tests {
             target: Some(hosted),
             source_receive_allowance_bytes: 1500,
             source_route: Some(source),
+            profile: wire::CircuitProfile::NativeDlc as i32,
         };
         assert_eq!(gateway.owner(&open), Some(1));
         open.source_router_id = vec![3; 16];

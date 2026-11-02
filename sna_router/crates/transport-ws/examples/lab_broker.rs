@@ -105,6 +105,7 @@ impl Broker {
                         target: Some(reference),
                         source_receive_allowance_bytes: request.receive_allowance_bytes,
                         source_route: None,
+                        profile: wire::CircuitProfile::NativeDlc as i32,
                     }),
                 )?;
             }
@@ -151,6 +152,9 @@ impl Broker {
                     Some(wire::circuit_event::Event::Type1(_)) => "XID/TEST",
                     Some(wire::circuit_event::Event::LinkReady(_)) => "link-ready",
                     Some(wire::circuit_event::Event::SnaInformation(_)) => "SNA information",
+                    Some(wire::circuit_event::Event::SessionEvent(_)) => {
+                        return Err(invalid("session event on native lab circuit"));
+                    }
                     None => return Err(invalid("empty circuit event")),
                 };
                 eprintln!("broker: router {side} -> {} {kind}", 1 - side);

@@ -169,6 +169,7 @@ fn two_authenticated_peers_exchange_routes_and_circuit_traffic() {
                     target: Some(target.clone()),
                     receive_allowance_bytes: 1500,
                     source_route: None,
+                    profile: wire::CircuitProfile::NativeDlc as i32,
                 })
             );
             send_server(
@@ -179,6 +180,7 @@ fn two_authenticated_peers_exchange_routes_and_circuit_traffic() {
                     target: Some(target),
                     source_receive_allowance_bytes: 1500,
                     source_route: None,
+                    profile: wire::CircuitProfile::NativeDlc as i32,
                 }),
             );
             assert_eq!(
@@ -252,6 +254,7 @@ fn two_authenticated_peers_exchange_routes_and_circuit_traffic() {
                     }),
                     receive_allowance_bytes: 1500,
                     source_route: None,
+                    profile: wire::CircuitProfile::NativeDlc as i32,
                 }),
             );
             assert!(
