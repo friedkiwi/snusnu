@@ -173,6 +173,18 @@ func TestRoleAndClientVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	userRouter, _, err := a.DB.CreateRouter(ctx, userID, "User router")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []store.LogEntry{
+		{RouterID: userRouter.ID, PeerUserID: otherID, Direction: "inbound", Level: "info", EventType: "PIU", Summary: "USER_API_FLOW"},
+		{RouterID: otherRouter.ID, PeerUserID: userID, Direction: "outbound", Level: "info", EventType: "PIU", Summary: "OTHER_API_FLOW"},
+	} {
+		if err := a.DB.AppendRouterLog(ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, tc := range []struct {
 		path   string
 		cookie *http.Cookie
@@ -200,6 +212,39 @@ func TestRoleAndClientVisibility(t *testing.T) {
 	a.Handler().ServeHTTP(w, r)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "my connection") || strings.Contains(w.Body.String(), "other connection") {
 		t.Fatalf("API visibility: %d %s", w.Code, w.Body.String())
+	}
+	r = httptest.NewRequest("GET", "/api/v1/flows?q=API_FLOW", nil)
+	r.Header.Set("Authorization", "Bearer "+token[1])
+	w = httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "USER_API_FLOW") || strings.Contains(w.Body.String(), "OTHER_API_FLOW") {
+		t.Fatalf("user API flow visibility: %d %s", w.Code, w.Body.String())
+	}
+	adminSecret := "admin-api-key-for-tests"
+	if _, err := a.DB.Exec(ctx, "INSERT INTO api_clients(id,user_id,name,secret_hash,created_at) VALUES(?,?,?,?,?)", store.RandomUUID(), adminID, "admin test", store.Hash(adminSecret), store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r = httptest.NewRequest("GET", "/api/v1/flows", nil)
+	r.Header.Set("Authorization", "Bearer "+adminSecret)
+	w = httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "USER_API_FLOW") || !strings.Contains(w.Body.String(), "OTHER_API_FLOW") {
+		t.Fatalf("admin API flow visibility: %d %s", w.Code, w.Body.String())
+	}
+	spec := httptest.NewRecorder()
+	a.Handler().ServeHTTP(spec, httptest.NewRequest("GET", "/openapi.json", nil))
+	for _, want := range []string{`"openapi":"3.1.0"`, `"/api/v1/directory"`, `"/api/v1/connections"`, `"/api/v1/flows"`, `"bearerAuth"`} {
+		if spec.Code != 200 || !strings.Contains(spec.Body.String(), want) {
+			t.Fatalf("OpenAPI spec missing %q: %d %s", want, spec.Code, spec.Body.String())
+		}
+	}
+	clientsPage := uiGet(t, a, "/clients", userCookie).Body.String()
+	if !strings.Contains(clientsPage, `href="/openapi.json"`) || !strings.Contains(clientsPage, "API keys") {
+		t.Fatalf("API key page lacks OpenAPI link: %s", clientsPage)
+	}
+	dashboardPage := uiGet(t, a, "/dashboard", userCookie).Body.String()
+	if strings.Contains(dashboardPage, `class="nav-link" href="/clients"`) || !strings.Contains(dashboardPage, `<a class="dropdown-item" href="/clients">API keys</a>`) {
+		t.Fatalf("API key navigation placement: %s", dashboardPage)
 	}
 }
 

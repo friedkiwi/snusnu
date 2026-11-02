@@ -28,6 +28,6 @@ Every launch creates a new private directory under the OS temporary directory an
 
 Alice's router is LLC-facing; Bob's TCP62 gateway is not. A stable virtual MAC is allocated automatically when either router connects and first advertises its CP; there are no pre-created or user-managed address entries. Each router uses `ws://localhost:8081/router/v1/ws` with its token in the `Authorization: Bearer` header. Native LLC relay tests can use `snusnu.v1`; the cross-NETID LU gateway requires `snusnu.v2` source-route validation. Assigned MACs appear alongside live CPs and hosted LUs in the global directory; administrators also have a read-only allocation view.
 
-The admin account also has a read-only API client named `QA admin API` with token `qa-admin-api-token-1234567890`. Use it for `/api/v1/directory` and `/api/v1/connections`.
+The admin account also has a read-only API key named `QA admin API` with token `qa-admin-api-token-1234567890`. Use it for `/api/v1/directory`, `/api/v1/connections` and `/api/v1/flows`; `/openapi.json` contains the generated contract.
 
 These credentials are public test fixtures. For a local-only QA run, set `-listen 127.0.0.1:8081`; otherwise run it only on an isolated QA network.

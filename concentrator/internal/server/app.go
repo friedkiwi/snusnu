@@ -69,6 +69,7 @@ func (a *App) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprint(w, "ok\n")
 	})
+	m.HandleFunc("GET /openapi.json", a.openAPISpec)
 	m.HandleFunc("GET /router/v1/ws", a.routerWebSocket)
 	m.HandleFunc("GET /", a.home)
 	m.HandleFunc("GET /register", a.registerPage)
@@ -140,8 +141,9 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /admin/connections", a.admin(a.createConnection))
 	m.HandleFunc("POST /admin/connections/update", a.admin(a.updateConnection))
 	m.HandleFunc("POST /admin/connections/delete", a.admin(a.deleteConnection))
-	m.HandleFunc("GET /api/v1/directory", a.api(a.apiDirectory))
-	m.HandleFunc("GET /api/v1/connections", a.api(a.apiConnections))
+	for _, endpoint := range a.apiEndpoints() {
+		m.HandleFunc(endpoint.Method+" "+endpoint.Path, a.api(endpoint.Handler))
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -618,7 +620,9 @@ func dbError(w http.ResponseWriter, err error) {
 }
 func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 	pageLayout := strings.Replace(layout, `<a class="nav-link" href="/llc-macs">LLC MACs</a>`, "", 1)
+	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/clients">API clients</a>`, "", 1)
 	pageLayout = strings.Replace(pageLayout, `>All MACs</a>`, `>LLC allocations</a>`, 1)
+	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/settings">Settings</a>`, `<a class="dropdown-item" href="/settings">Settings</a><a class="dropdown-item" href="/clients">API keys</a>`, 1)
 	t, err := template.New("page").Funcs(template.FuncMap{"date": func(unix int64) string {
 		if unix == 0 {
 			return "Never"
