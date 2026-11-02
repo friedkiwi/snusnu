@@ -264,14 +264,14 @@ impl OutboundCompletions {
 
 impl WsRoutePort {
     pub(crate) fn connect(config: Config) -> io::Result<Self> {
-        Ok(Self::connect_many_with_mode(vec![config], vec![], false, None)?.remove(0))
+        Ok(Self::connect_many_with_mode(vec![config], vec![], false, None, false)?.remove(0))
     }
 
     pub(crate) fn connect_many(
         configs: Vec<Config>,
         logical_units: Vec<wire::LuReachability>,
     ) -> io::Result<Vec<Self>> {
-        Self::connect_many_with_mode(configs, logical_units, true, None)
+        Self::connect_many_with_mode(configs, logical_units, true, None, false)
     }
 
     /// One virtual native gateway circuit. The source LU must be a locally
@@ -286,8 +286,55 @@ impl WsRoutePort {
             logical_units,
             false,
             Some(vec![Some(source_lu)]),
+            false,
         )?
         .remove(0))
+    }
+
+    /// Publish one hosted LU while opening separate v2 circuits to several
+    /// destination LUs. Every returned port owns its own circuit and credit,
+    /// but all ports use one WebSocket and the same authenticated source LU.
+    /// Incoming opens for the published LU are delivered to the first port;
+    /// a listener must dispatch those by source route before accepting them.
+    pub(crate) fn connect_gateway_targets_v2(
+        configs: Vec<Config>,
+        logical_units: Vec<wire::LuReachability>,
+        source_lu: wire::SnaName,
+    ) -> io::Result<Vec<Self>> {
+        if configs.is_empty() || configs.iter().any(|config| config.target_lu.is_none()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gateway targets require target LUs",
+            ));
+        }
+        let local_cp = &configs[0].local_cp;
+        if logical_units.len() != 1
+            || logical_units[0].lu.as_ref() != Some(&source_lu)
+            || logical_units[0].hosting_cp.as_ref() != Some(local_cp)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gateway targets require one source LU export under the local CP",
+            ));
+        }
+        if configs.iter().any(|config| &config.local_cp != local_cp) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gateway targets must share one local CP",
+            ));
+        }
+        let mut targets = HashSet::new();
+        if configs
+            .iter()
+            .any(|config| !targets.insert(config.target_lu.clone().unwrap()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate gateway target LU",
+            ));
+        }
+        let source_lus = vec![Some(source_lu); configs.len()];
+        Self::connect_many_with_mode(configs, logical_units, false, Some(source_lus), true)
     }
 
     /// LLC-facing v2 ports may receive source-LU authenticated opens while
@@ -297,7 +344,7 @@ impl WsRoutePort {
         logical_units: Vec<wire::LuReachability>,
         source_lus: Vec<Option<wire::SnaName>>,
     ) -> io::Result<Vec<Self>> {
-        Self::connect_many_with_mode(configs, logical_units, true, Some(source_lus))
+        Self::connect_many_with_mode(configs, logical_units, true, Some(source_lus), false)
     }
 
     fn connect_many_with_mode(
@@ -305,6 +352,7 @@ impl WsRoutePort {
         logical_units: Vec<wire::LuReachability>,
         require_managed_binding: bool,
         source_lus: Option<Vec<Option<wire::SnaName>>>,
+        shared_local_cp: bool,
     ) -> io::Result<Vec<Self>> {
         let primary = configs
             .first()
@@ -377,14 +425,16 @@ impl WsRoutePort {
             local_route_count = configs.len(),
             "connected to concentrator"
         );
+        let additional_cps = configs[1..]
+            .iter()
+            .map(|config| config.local_cp.clone())
+            .filter(|cp| !shared_local_cp || cp != &primary.local_cp)
+            .collect::<Vec<_>>();
         let snapshot = local_route_snapshot(
             &welcome.connection_epoch,
             1,
             &primary.local_cp,
-            &configs[1..]
-                .iter()
-                .map(|config| config.local_cp.clone())
-                .collect::<Vec<_>>(),
+            &additional_cps,
             &logical_units,
         )?;
         let source_routes = source_lus.as_ref().map(|lus| {
@@ -2001,6 +2051,156 @@ mod tests {
         }
         assert!(port.request_id > first_request_id);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn v2_gateway_targets_share_one_export_and_open_independent_circuits() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request.headers()[SEC_WEBSOCKET_PROTOCOL],
+                        transport_ws::SUBPROTOCOL_V2
+                    );
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL_V2),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, body| {
+                socket
+                    .send(WsMessage::Binary(envelope(body).encode_to_vec().into()))
+                    .unwrap();
+            };
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                    router_id: vec![7; 16],
+                    connection_epoch: vec![8; 16],
+                    max_message_bytes: 65536,
+                    max_circuits: 4,
+                    display_name: "v2 gateway".into(),
+                    allowed_netid: "QABOB".into(),
+                }),
+            );
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("snapshot")
+            };
+            let Some(wire::ws_envelope::Body::PublishRoutes(snapshot)) =
+                wire::WsEnvelope::decode(payload).unwrap().body
+            else {
+                panic!("published routes")
+            };
+            assert_eq!(snapshot.routes.len(), 2);
+            let source_id = snapshot.routes.iter().find(|route| matches!(route.resource.as_ref(),
+                Some(wire::route_export::Resource::LogicalUnit(lu)) if lu.lu.as_ref() == Some(&name("QABOB", "LUB")))).unwrap().id;
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16],
+                        revision: 1,
+                        routes: ["LUA", "LUC"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, lu)| wire::RouteExport {
+                                id: 90 + index as u64,
+                                generation: 1,
+                                resource: Some(wire::route_export::Resource::LogicalUnit(
+                                    wire::LuReachability {
+                                        lu: Some(name("QAALICE", lu)),
+                                        hosting_cp: Some(name("QAALICE", "SNAA")),
+                                        supported_types: vec![wire::LuType::LuType62 as i32],
+                                    },
+                                )),
+                            })
+                            .collect(),
+                    }),
+                }),
+            );
+            let mut target_ids = HashSet::new();
+            let mut request_ids = HashSet::new();
+            for _ in 0..2 {
+                let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                    panic!("open")
+                };
+                let Some(wire::ws_envelope::Body::OpenRequest(open)) =
+                    wire::WsEnvelope::decode(payload).unwrap().body
+                else {
+                    panic!("open request")
+                };
+                assert_eq!(open.source_route.as_ref().unwrap().route_id, source_id);
+                target_ids.insert(open.target.unwrap().route_id);
+                request_ids.insert(open.request_id);
+            }
+            assert_eq!(target_ids, HashSet::from([90, 91]));
+            assert_eq!(request_ids.len(), 2);
+        });
+        let configs = ["LUA", "LUC"]
+            .into_iter()
+            .map(|lu| Config {
+                url: url.clone(),
+                bearer: "test-token".into(),
+                local_cp: name("QABOB", "SNAB"),
+                target_cp: name("QAALICE", "SNAA"),
+                target_lu: Some(name("QAALICE", lu)),
+            })
+            .collect();
+        let source_lu = name("QABOB", "LUB");
+        let mut ports = WsRoutePort::connect_gateway_targets_v2(
+            configs,
+            vec![wire::LuReachability {
+                lu: Some(source_lu.clone()),
+                hosting_cp: Some(name("QABOB", "SNAB")),
+                supported_types: vec![wire::LuType::LuType62 as i32],
+            }],
+            source_lu,
+        )
+        .unwrap();
+        for port in &mut ports {
+            port.send(RoutedUnit::DlcType1(vec![4, 4, 0xaf])).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ports.iter().any(|port| !port.opening) && Instant::now() < deadline {
+            for port in &mut ports {
+                port.poll(true).unwrap();
+            }
+        }
+        assert!(ports.iter().all(|port| port.opening));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn v2_gateway_targets_reject_duplicate_targets_before_connecting() {
+        let config = Config {
+            url: "ws://127.0.0.1:9/router/v1/ws".into(),
+            bearer: String::new(),
+            local_cp: name("QABOB", "SNAB"),
+            target_cp: name("QAALICE", "SNAA"),
+            target_lu: Some(name("QAALICE", "LUA")),
+        };
+        let error = WsRoutePort::connect_gateway_targets_v2(
+            vec![config.clone(), config],
+            vec![wire::LuReachability {
+                lu: Some(name("QABOB", "LUB")),
+                hosting_cp: Some(name("QABOB", "SNAB")),
+                supported_types: vec![wire::LuType::LuType62 as i32],
+            }],
+            name("QABOB", "LUB"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("duplicate gateway target LU"));
     }
 
     #[test]
