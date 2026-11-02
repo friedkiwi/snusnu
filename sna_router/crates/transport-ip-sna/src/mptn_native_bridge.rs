@@ -399,6 +399,29 @@ impl Bridge {
         Ok(Some(prepared))
     }
 
+    /// Convert a correlated UDP X'83' expedited PIU. The caller owns the
+    /// UDP response and may send it only after native LLC completion.
+    pub fn next_mptn_udp_expedited(&mut self, reduced: &[u8]) -> io::Result<Vec<u8>> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        let length = reduced
+            .len()
+            .checked_add(5)
+            .ok_or_else(|| invalid("UDP expedited PIU too long"))?;
+        let mut bytes = Vec::with_capacity(length);
+        bytes.extend_from_slice(&(length as u32).to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(reduced);
+        let record = TcpRecord::decode(bytes)?;
+        let (piu, _tcp_ack) = self.gateway.mptn_expedited(&record)?;
+        Ok(piu)
+    }
+
+    pub fn complete_mptn_udp_expedited(&mut self, piu_bytes: usize) -> io::Result<()> {
+        self.gateway.complete_native_expedited_delivery(piu_bytes)
+    }
+
     /// Commit the exact PIU after it enters the native LLC egress queue.
     /// Failed enqueue attempts leave both the prepared PIU and TCP credit.
     pub fn mark_native_normal_enqueued(&mut self, piu: &[u8]) -> io::Result<()> {

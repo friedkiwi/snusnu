@@ -41,6 +41,7 @@ struct PendingOob {
     sequence: u16,
     packet: Vec<u8>,
     response: Vec<u8>,
+    source: SocketAddr,
 }
 
 /// Session-local UDP/397 correlation for an outbound MPTN Connect. The
@@ -145,6 +146,7 @@ impl OutboundUdp {
                     sequence: oob.sequence,
                     packet: packet.to_vec(),
                     response,
+                    source,
                 });
                 Ok(action)
             }
@@ -155,7 +157,10 @@ impl OutboundUdp {
         }
     }
 
-    pub(crate) fn complete_native_delivery(&mut self, sequence: u16) -> io::Result<Vec<u8>> {
+    pub(crate) fn complete_native_delivery(
+        &mut self,
+        sequence: u16,
+    ) -> io::Result<(Vec<u8>, SocketAddr)> {
         if self
             .pending
             .as_ref()
@@ -168,12 +173,17 @@ impl OutboundUdp {
         }
         let pending = self.pending.take().unwrap();
         let response = pending.response.clone();
+        let source = pending.source;
         if self.completed.len() == RECENT_OOB {
             self.completed.pop_front();
         }
         self.completed
             .push_back((pending.sequence, pending.packet, pending.response));
-        Ok(response)
+        Ok((response, source))
+    }
+
+    pub(crate) fn pending_sequence(&self) -> Option<u16> {
+        self.pending.as_ref().map(|pending| pending.sequence)
     }
 }
 
@@ -493,7 +503,8 @@ mod tests {
             state.receive(&packet, source).unwrap(),
             OutboundUdpAction::PendingDuplicate
         );
-        let ack = state.complete_native_delivery(0).unwrap();
+        let (ack, destination) = state.complete_native_delivery(0).unwrap();
+        assert_eq!(destination, source);
         assert_eq!(
             OobDatagram::decode(&ack).unwrap().kind,
             OobKind::PositiveResponse

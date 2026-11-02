@@ -428,7 +428,11 @@ fn observe_udp(socket: &UdpSocket) -> io::Result<()> {
 /// The sustained reverse diagnostic can answer node-pair keepalives. An
 /// X'83' request is admitted by correlator and held without a positive ACK
 /// until the native edge gains an expedited/abort delivery API.
-fn observe_outbound_udp(socket: &UdpSocket, oob: &mut OutboundUdp) -> io::Result<()> {
+fn observe_outbound_udp(
+    socket: &UdpSocket,
+    oob: &mut OutboundUdp,
+    edge: &mut GatewayEdge<NativeLlcPort>,
+) -> io::Result<()> {
     let mut packet = [0u8; MAX_RECORD];
     match socket.recv_from(&mut packet) {
         Ok((length, source)) => match oob.receive(&packet[..length], source)? {
@@ -442,18 +446,40 @@ fn observe_outbound_udp(socket: &UdpSocket, oob: &mut OutboundUdp) -> io::Result
             OutboundUdpAction::Deliver {
                 sequence,
                 compensation,
-                ..
-            } => {
-                tracing::warn!(source = %source, sequence, ?compensation, "outbound UDP X'83' requires native delivery before acknowledgement");
-                Err(io::Error::new(
+                reduced,
+            } => match compensation {
+                transport_ip_sna::mptn_oob::Compensation::Expedited => {
+                    edge.submit_udp_expedited(&reduced)?;
+                    tracing::debug!(source = %source, sequence, "outbound UDP X'83' expedited queued to native LLC");
+                    Ok(())
+                }
+                transport_ip_sna::mptn_oob::Compensation::Abort => Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "native UDP X'83' delivery is unavailable",
-                ))
-            }
+                    "native UDP X'83' abort delivery is unavailable",
+                )),
+            },
         },
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn complete_outbound_udp(
+    socket: &UdpSocket,
+    oob: &mut OutboundUdp,
+    edge: &mut GatewayEdge<NativeLlcPort>,
+) -> io::Result<()> {
+    if edge.take_completed_udp_expedited() {
+        let sequence = oob
+            .pending_sequence()
+            .ok_or_else(|| invalid("native UDP completion has no X'83' request"))?;
+        let (response, peer) = oob.complete_native_delivery(sequence)?;
+        if socket.send_to(&response, peer)? != response.len() {
+            return Err(invalid("partial MPTN UDP X'83' acknowledgement"));
+        }
+        tracing::debug!(sequence, peer = %peer, "outbound UDP X'83' acknowledged after native LLC completion");
+    }
+    Ok(())
 }
 
 /// Inspect one reverse TCP/397 connection from the configured V5 peer. A
@@ -712,10 +738,11 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
                     "reverse V5 management Connect requires a responder",
                 ));
             }
-            observe_outbound_udp(&udp, &mut outbound_udp)?;
+            observe_outbound_udp(&udp, &mut outbound_udp, &mut edge)?;
             let before = flow_snapshot(&edge);
             edge.poll_native_once()?;
             log_flow_change(&edge, before, "native", remote_ip);
+            complete_outbound_udp(&udp, &mut outbound_udp, &mut edge)?;
             if edge.is_closed() {
                 return Ok("native peer closed");
             }
@@ -743,7 +770,7 @@ pub(crate) fn run_v5_flow(path: &Path, local_ip: Ipv4Addr, remote_ip: Ipv4Addr) 
                     Err(error) => return Err(error),
                 }
             }
-            observe_outbound_udp(&udp, &mut outbound_udp)?;
+            observe_outbound_udp(&udp, &mut outbound_udp, &mut edge)?;
             thread::sleep(Duration::from_micros(200));
         }
     })();

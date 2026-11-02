@@ -36,6 +36,7 @@ enum NativeReply {
     Bind,
     Ipr,
     UserNormal,
+    UdpExpedited,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +64,8 @@ pub struct GatewayEdge<L: NativeLeg> {
     ipr_ack_outstanding: bool,
     ipr_ack_received: bool,
     attach_fully_sent: bool,
+    udp_expedited_pending: Option<usize>,
+    udp_expedited_completed: bool,
     closed: bool,
 }
 
@@ -88,6 +91,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             ipr_ack_outstanding: false,
             ipr_ack_received: false,
             attach_fully_sent: false,
+            udp_expedited_pending: None,
+            udp_expedited_completed: false,
             closed: false,
         }
     }
@@ -116,6 +121,31 @@ impl<L: NativeLeg> GatewayEdge<L> {
         self.bridge.pending_bytes()
     }
 
+    /// Accept one UDP X'83' expedited PIU for this circuit. The caller keeps
+    /// its UDP response pending until `take_completed_udp_expedited` is true.
+    pub fn submit_udp_expedited(&mut self, reduced: &[u8]) -> io::Result<()> {
+        if self.closed
+            || !self.first_attach_delivery_complete()
+            || self.bridge.phase() != Phase::Active
+            || self.native_reply.is_some()
+            || self.udp_expedited_pending.is_some()
+            || self.udp_expedited_completed
+            || self.ipr_ack_outstanding
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native UDP expedited delivery is busy",
+            ));
+        }
+        let piu = self.bridge.next_mptn_udp_expedited(reduced)?;
+        self.native_reply = Some((NativeReply::UdpExpedited, piu));
+        self.drive_queues()
+    }
+
+    pub fn take_completed_udp_expedited(&mut self) -> bool {
+        std::mem::take(&mut self.udp_expedited_completed)
+    }
+
     pub fn poll_native_once(&mut self) -> io::Result<()> {
         let result = self.poll_native_inner();
         if result.is_err() {
@@ -138,6 +168,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
                 && self.normal.is_none()
                 && self.native_reply.is_none()
                 && !self.ipr_ack_outstanding
+                && self.udp_expedited_pending.is_none()
+                && !self.udp_expedited_completed
                 && !charged_write
         } else {
             self.attach.is_none() && !charged_write
@@ -185,6 +217,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     if self.ipr_ack_outstanding {
                         self.ipr_ack_outstanding = false;
                         self.ipr_ack_received = true;
+                    } else if let Some(bytes) = self.udp_expedited_pending.take() {
+                        self.bridge.complete_mptn_udp_expedited(bytes)?;
+                        self.udp_expedited_completed = true;
                     } else if self.bridge.phase() == Phase::AwaitNativeNormalAck {
                         self.bridge.acknowledge_native_normal(n)?;
                     } else {
@@ -274,6 +309,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     if !self.first_attach_delivery_complete()
                         || self.bridge.phase() != Phase::Active
                         || self.native_reply.is_some()
+                        || self.udp_expedited_pending.is_some()
+                        || self.udp_expedited_completed
                     {
                         return Ok(());
                     }
@@ -347,6 +384,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     self.ipr_ack_outstanding = true;
                 }
                 NativeReply::UserNormal => self.bridge.mark_native_normal_enqueued(&piu)?,
+                NativeReply::UdpExpedited => self.udp_expedited_pending = Some(piu.len()),
             }
         }
         if let Some(record) = self.connect.take() {
@@ -434,6 +472,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.ipr_ack_outstanding = false;
             self.ipr_ack_received = false;
             self.attach_fully_sent = false;
+            self.udp_expedited_pending = None;
+            self.udp_expedited_completed = false;
             self.native.close()?;
         }
         Ok(())
