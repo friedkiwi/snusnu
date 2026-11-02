@@ -2428,6 +2428,7 @@ mod tests {
                     max_message_bytes: 65536, max_circuits: 4,
                     display_name: "auto router".into(), allowed_netid: "OWNED".into(),
                 })).encode_to_vec().into())).unwrap();
+            let mut local_cp_route = None;
             for expected_revision in 1..=2 {
                 let WsMessage::Binary(payload) = socket.read().unwrap() else { panic!("snapshot expected") };
                 let envelope = wire::WsEnvelope::decode(payload).unwrap();
@@ -2440,6 +2441,13 @@ mod tests {
                     wire::route_export::Resource::LogicalUnit(lu) => lu.lu.as_ref().unwrap().netid == "OWNED",
                 }));
                 assert_eq!(snapshot.routes.len(), if expected_revision == 1 { 0 } else { 2 });
+                if expected_revision == 2 {
+                    local_cp_route = snapshot.routes.iter().find_map(|route| match route.resource.as_ref() {
+                        Some(wire::route_export::Resource::ControlPoint(cp))
+                            if cp == &name("OWNED", "CPA") => Some(route.id),
+                        _ => None,
+                    });
+                }
             }
             socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::OriginRoutes(
                 wire::OriginRouteSnapshot {
@@ -2473,7 +2481,13 @@ mod tests {
                         }],
                     }],
                 })).encode_to_vec().into())).unwrap();
-            thread::sleep(Duration::from_millis(100));
+            let WsMessage::Binary(payload) = socket.read().unwrap() else { panic!("open expected") };
+            let message = wire::WsEnvelope::decode(payload).unwrap();
+            let Some(wire::ws_envelope::Body::OpenRequest(open)) = message.body else {
+                panic!("open request expected")
+            };
+            assert_eq!(open.target.as_ref().unwrap().route_id, 30);
+            assert_eq!(open.source_route.as_ref().unwrap().route_id, local_cp_route.unwrap());
         });
         let mut hub = AutoWsHub::connect(&url, "", &[], &[]).unwrap();
         let source = name("OWNED", "LUA");
@@ -2502,6 +2516,12 @@ mod tests {
         assert!(advertised.contains(&RouteAddress::LogicalUnit {
             netid: "TARGET".into(), cp: Some("CPB".into()), name: "LUB".into(),
         }));
+        let (target_ref, target_cp) = hub.resolve_mac(&mac).unwrap().unwrap();
+        let local_cp = name("OWNED", "CPA");
+        let source_ref = hub.local_reference_cp(&local_cp).unwrap();
+        let mut cp_port = hub.open_ref(target_ref, target_cp, None,
+            Some(source_ref), local_cp).unwrap();
+        cp_port.send(RoutedUnit::DlcType1(vec![4, 4, 0xaf])).unwrap();
         server.join().unwrap();
     }
 
