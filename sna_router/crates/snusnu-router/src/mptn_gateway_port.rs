@@ -1303,6 +1303,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tcp62_connect_from_another_netid_before_management() {
+        let mut port = MptnGatewayPort::bind(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: "QABOB.SNAB".into(),
+            destination_lu: "QAALICE.SNAA".into(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        let mut fqpcid = vec![0x60, 20];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(11);
+        fqpcid.extend_from_slice(&[
+            0xd6, 0xe3, 0xc8, 0xd5, 0xc5, 0xe3, 0x4b, 0xe2, 0xd5, 0xc1, 0xc2,
+        ]);
+        let request = ManagementInitiator::new(
+            "OTHNET.SNAB",
+            "QAALICE.SNAA",
+            fqpcid,
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let mut peer = peer_socket(port.listener.local_addr().unwrap());
+        peer.write_all(request.connect_request()).unwrap();
+        let mut rejected = None;
+        for _ in 0..20 {
+            if let Some((_, GatewayEvent::Rejected(reason))) =
+                port.poll_association_once(true).unwrap()
+            {
+                rejected = Some(reason);
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            rejected.as_deref(),
+            Some("TCP62 source NETID differs from assigned NETID")
+        );
+    }
+
+    #[test]
     fn concurrent_peers_select_distinct_lu_routes_on_one_listener() {
         let mut port = MptnGatewayPort::bind(GatewayConfig {
             local: "127.0.0.1:0".parse().unwrap(),

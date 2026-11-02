@@ -808,7 +808,9 @@ to = "upstream"
         };
         let error = wrong_netid.observe(&pdu).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("NETID SOLNET differs from assigned OTHNET"));
+        assert!(error
+            .to_string()
+            .contains("NETID SOLNET differs from assigned OTHNET"));
         assert!(!wrong_netid.verified);
         let mut malformed = pdu;
         malformed[4] = 0x2e; // Declared XID length no longer matches.
