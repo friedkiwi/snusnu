@@ -64,7 +64,6 @@ impl fmt::Display for QualifiedName {
 fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 8
-        && matches!(value.as_bytes()[0], b'A'..=b'Z' | b'@' | b'#' | b'$')
         && value.bytes().all(|byte| {
             byte.is_ascii_uppercase() || byte.is_ascii_digit() || matches!(byte, b'@' | b'#' | b'$')
         })
@@ -114,26 +113,53 @@ pub enum Flow {
     Expedited,
 }
 
+/// One complete reduced SNA session unit: three-byte RH followed by RU.
+/// FID2 addressing or HPR framing belongs to the carrier adapter. An empty
+/// RU is valid for some control units; BIND and UNBIND require a nonempty RU.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionUnit(Vec<u8>);
+
+impl SessionUnit {
+    pub fn from_reduced(bytes: &[u8]) -> Result<Self, SessionError> {
+        if !(3..=MAX_SESSION_UNIT).contains(&bytes.len()) {
+            return Err(SessionError::InvalidUnit);
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    pub fn rh(&self) -> &[u8] {
+        &self.0[..3]
+    }
+
+    pub fn ru(&self) -> &[u8] {
+        &self.0[3..]
+    }
+
+    pub fn as_reduced(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
-    /// SNA BIND RU after the ingress adapter has removed carrier framing.
-    BindRequest(Vec<u8>),
-    /// Positive or negative BIND response, with its SNA response RU.
+    /// BIND RH/RU after the ingress adapter has removed carrier framing.
+    BindRequest(SessionUnit),
+    /// Positive or negative BIND response as reduced RH/RU.
     BindResult {
         accepted: bool,
-        ru: Vec<u8>,
+        unit: SessionUnit,
     },
-    /// One complete normalized SNA PIU, never a raw TCP62 or HPR record.
+    /// One complete reduced SNA unit, never a raw TCP62 or HPR record.
     Information {
         flow: Flow,
-        piu: Vec<u8>,
+        unit: SessionUnit,
     },
     /// Capacity admitted by the destination side, not a carrier window byte.
     Credit {
         normal: u32,
         expedited: u32,
     },
-    Unbind(Vec<u8>),
+    Unbind(SessionUnit),
     Reset,
 }
 
@@ -167,30 +193,30 @@ impl SessionContract {
     /// session unchanged, so a malformed carrier record cannot advance it.
     pub fn accept(&mut self, event: &SessionEvent) -> Result<(), SessionError> {
         let next = match (self.phase, event) {
-            (SessionPhase::AwaitBind, SessionEvent::BindRequest(ru)) => {
-                check_unit(ru)?;
+            (SessionPhase::AwaitBind, SessionEvent::BindRequest(unit)) => {
+                if unit.ru().is_empty() {
+                    return Err(SessionError::InvalidUnit);
+                }
                 SessionPhase::AwaitBindResult
             }
-            (SessionPhase::AwaitBindResult, SessionEvent::BindResult { accepted, ru }) => {
-                check_optional_unit(ru)?;
+            (SessionPhase::AwaitBindResult, SessionEvent::BindResult { accepted, .. }) => {
                 if *accepted {
                     SessionPhase::Open
                 } else {
                     SessionPhase::Closed
                 }
             }
-            (SessionPhase::Open, SessionEvent::Information { piu, .. }) => {
-                check_unit(piu)?;
-                SessionPhase::Open
-            }
+            (SessionPhase::Open, SessionEvent::Information { .. }) => SessionPhase::Open,
             (SessionPhase::Open, SessionEvent::Credit { normal, expedited }) => {
                 if *normal > MAX_WINDOW_GRANT || *expedited > MAX_WINDOW_GRANT {
                     return Err(SessionError::InvalidCredit);
                 }
                 SessionPhase::Open
             }
-            (SessionPhase::Open, SessionEvent::Unbind(ru)) => {
-                check_unit(ru)?;
+            (SessionPhase::Open, SessionEvent::Unbind(unit)) => {
+                if unit.ru().is_empty() {
+                    return Err(SessionError::InvalidUnit);
+                }
                 SessionPhase::Closed
             }
             (
@@ -202,20 +228,6 @@ impl SessionContract {
         self.phase = next;
         Ok(())
     }
-}
-
-fn check_unit(unit: &[u8]) -> Result<(), SessionError> {
-    if unit.is_empty() || unit.len() > MAX_SESSION_UNIT {
-        return Err(SessionError::InvalidUnit);
-    }
-    Ok(())
-}
-
-fn check_optional_unit(unit: &[u8]) -> Result<(), SessionError> {
-    if unit.len() > MAX_SESSION_UNIT {
-        return Err(SessionError::InvalidUnit);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -231,18 +243,22 @@ mod tests {
             .unwrap()
     }
 
+    fn unit(bytes: &[u8]) -> SessionUnit {
+        SessionUnit::from_reduced(bytes).unwrap()
+    }
+
     #[test]
     fn names_and_hosts_are_bounded_and_network_qualified() {
         assert_eq!(
             "NETA.LUA".parse::<QualifiedName>().unwrap().to_string(),
             "NETA.LUA"
         );
+        assert!("NETA.1LU".parse::<QualifiedName>().is_ok());
         for invalid in [
             "NETA",
             "NETA.",
             "NETA.LUA.EXTRA",
             "neta.LUA",
-            "NETA.1LU",
             "NINECHARS.LUA",
         ] {
             assert!(invalid.parse::<QualifiedName>().is_err(), "{invalid}");
@@ -255,41 +271,54 @@ mod tests {
     }
 
     #[test]
+    fn reduced_unit_has_one_consistent_boundary() {
+        let bind = unit(&[0x31, 0, 0, 0x31]);
+        assert_eq!(bind.rh(), &[0x31, 0, 0]);
+        assert_eq!(bind.ru(), &[0x31]);
+        assert_eq!(bind.as_reduced(), &[0x31, 0, 0, 0x31]);
+        assert_eq!(
+            SessionUnit::from_reduced(&[1, 2]),
+            Err(SessionError::InvalidUnit)
+        );
+        assert_eq!(
+            SessionUnit::from_reduced(&vec![0; MAX_SESSION_UNIT + 1]),
+            Err(SessionError::InvalidUnit)
+        );
+    }
+
+    #[test]
     fn bind_data_credit_and_close_have_explicit_order_and_bounds() {
         let mut session = SessionContract::new(identity());
-        assert_eq!(session.phase(), SessionPhase::AwaitBind);
         assert_eq!(
             session.accept(&SessionEvent::Information {
                 flow: Flow::Normal,
-                piu: vec![1]
+                unit: unit(&[0, 0, 0])
             }),
             Err(SessionError::InvalidTransition)
         );
+        assert_eq!(
+            session.accept(&SessionEvent::BindRequest(unit(&[0x31, 0, 0]))),
+            Err(SessionError::InvalidUnit)
+        );
+        assert_eq!(session.phase(), SessionPhase::AwaitBind);
         session
-            .accept(&SessionEvent::BindRequest(vec![0x31]))
+            .accept(&SessionEvent::BindRequest(unit(&[0x31, 0, 0, 1])))
             .unwrap();
         assert_eq!(
-            session.accept(&SessionEvent::BindRequest(vec![0x31])),
+            session.accept(&SessionEvent::BindRequest(unit(&[0x31, 0, 0, 1]))),
             Err(SessionError::InvalidTransition)
         );
         session
             .accept(&SessionEvent::BindResult {
                 accepted: true,
-                ru: vec![],
+                unit: unit(&[0, 0, 0]),
             })
             .unwrap();
-        assert_eq!(
-            session.accept(&SessionEvent::Information {
-                flow: Flow::Expedited,
-                piu: vec![]
-            }),
-            Err(SessionError::InvalidUnit)
-        );
         assert_eq!(session.phase(), SessionPhase::Open);
         session
             .accept(&SessionEvent::Information {
                 flow: Flow::Expedited,
-                piu: vec![1, 2],
+                unit: unit(&[0, 0, 0, 1]),
             })
             .unwrap();
         assert_eq!(
@@ -305,7 +334,9 @@ mod tests {
                 expedited: 1,
             })
             .unwrap();
-        session.accept(&SessionEvent::Unbind(vec![0x01])).unwrap();
+        session
+            .accept(&SessionEvent::Unbind(unit(&[0, 0, 0, 1])))
+            .unwrap();
         assert_eq!(session.phase(), SessionPhase::Closed);
         assert_eq!(
             session.accept(&SessionEvent::Reset),
@@ -317,12 +348,12 @@ mod tests {
     fn rejected_bind_and_reset_are_terminal() {
         let mut rejected = SessionContract::new(identity());
         rejected
-            .accept(&SessionEvent::BindRequest(vec![0x31]))
+            .accept(&SessionEvent::BindRequest(unit(&[0x31, 0, 0, 1])))
             .unwrap();
         rejected
             .accept(&SessionEvent::BindResult {
                 accepted: false,
-                ru: vec![0x08],
+                unit: unit(&[0, 0, 0, 8]),
             })
             .unwrap();
         assert_eq!(rejected.phase(), SessionPhase::Closed);

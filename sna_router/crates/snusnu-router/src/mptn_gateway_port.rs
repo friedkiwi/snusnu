@@ -12,7 +12,9 @@ use std::{
 };
 
 use crate::local_status::{now_ms, LocalPeerStatus};
-use router_core::session::{QualifiedName, SessionIdentity};
+use router_core::session::{
+    QualifiedName, SessionContract, SessionEvent, SessionIdentity, SessionUnit,
+};
 use std::time::Instant;
 use transport_ip_sna::{
     anynet::{bind_udp, listen_tcp, TcpKind, TcpRecord, TcpSession, MAX_RECORD},
@@ -78,7 +80,7 @@ enum Completion {
     ManagementConnect(Vec<u8>),
     ManagementCnos(Vec<u8>),
     ManagementBis(Vec<u8>),
-    UserConnect,
+    UserConnect(SessionUnit),
     UserRecord,
     TcpExpeditedAck,
 }
@@ -104,6 +106,7 @@ struct Association {
     state: SessionState,
     /// Network-qualified identities admitted from this association's Connect.
     selected_lus: Option<(String, String)>,
+    session: Option<SessionContract>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
     writes: VecDeque<(usize, Completion)>,
@@ -137,6 +140,16 @@ pub(crate) struct MptnGatewayPort {
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+fn reduced_connect_unit(data: &[u8]) -> io::Result<SessionUnit> {
+    // TCP62 Connect connection data starts with the two-byte SNF. The
+    // following three bytes are RH, then RU. Ingress validates this BIND.
+    SessionUnit::from_reduced(
+        data.get(2..)
+            .ok_or_else(|| invalid("short TCP62 connection data"))?,
+    )
+    .map_err(io::Error::other)
 }
 
 fn remember_completed(recent: &mut VecDeque<u16>, sequence: u16) {
@@ -422,6 +435,7 @@ impl MptnGatewayPort {
                     tcp: TcpSession::new(stream)?,
                     state: SessionState::AwaitConnect,
                     selected_lus: None,
+                    session: None,
                     incoming: VecDeque::new(),
                     incoming_bytes: 0,
                     writes: VecDeque::new(),
@@ -827,7 +841,16 @@ impl MptnGatewayPort {
                 (SessionState::Management(responder), Completion::ManagementBis(bytes)) => {
                     responder.mark_bis_reply_sent(&bytes)?;
                 }
-                (SessionState::UserResponseQueued(offer), Completion::UserConnect) => {
+                (SessionState::UserResponseQueued(offer), Completion::UserConnect(unit)) => {
+                    association
+                        .session
+                        .as_mut()
+                        .ok_or_else(|| invalid("missing TCP62 user session"))?
+                        .accept(&SessionEvent::BindResult {
+                            accepted: true,
+                            unit,
+                        })
+                        .map_err(io::Error::other)?;
                     association.state = SessionState::UserActive(offer.clone());
                 }
                 (SessionState::UserActive(_), Completion::UserRecord) => {
@@ -848,6 +871,9 @@ impl MptnGatewayPort {
         if let Some(records) = match association.tcp.receive_once() {
             Ok(records) => records,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                if let Some(session) = association.session.as_mut() {
+                    let _ = session.accept(&SessionEvent::Reset);
+                }
                 return Ok((Some(GatewayEvent::Closed), false));
             }
             Err(error) => return Err(error),
@@ -977,6 +1003,16 @@ impl MptnGatewayPort {
                     IngressKind::User { .. }
                         if self.management_ready || self.config.allow_resumed_user =>
                     {
+                        let identity = SessionIdentity::new(
+                            source_lu.parse().map_err(io::Error::other)?,
+                            destination_lu.parse().map_err(io::Error::other)?,
+                        );
+                        let unit = reduced_connect_unit(offer.connect().connection_data())?;
+                        let mut session = SessionContract::new(identity);
+                        session
+                            .accept(&SessionEvent::BindRequest(unit))
+                            .map_err(io::Error::other)?;
+                        association.session = Some(session);
                         association.state = SessionState::UserAwaitResponse(offer.clone());
                         Ok((Some(GatewayEvent::UserBind(offer)), true))
                     }
@@ -1010,6 +1046,9 @@ impl MptnGatewayPort {
             }
             SessionState::UserAwaitResponse(_) | SessionState::UserResponseQueued(_) => {
                 if record.kind == TcpKind::Abort {
+                    if let Some(session) = association.session.as_mut() {
+                        let _ = session.accept(&SessionEvent::Reset);
+                    }
                     Ok((Some(GatewayEvent::UserAbort(record)), false))
                 } else {
                     Err(invalid("TCP62 user data before native BIND response"))
@@ -1101,8 +1140,19 @@ impl MptnGatewayPort {
         if association.writes.len() >= MAX_WRITES || !association.tcp.has_capacity() {
             return Ok(false);
         }
+        let unit = reduced_connect_unit(response.connection_data())?;
+        association
+            .session
+            .as_ref()
+            .ok_or_else(|| invalid("missing TCP62 user session"))?
+            .clone()
+            .accept(&SessionEvent::BindResult {
+                accepted: true,
+                unit: unit.clone(),
+            })
+            .map_err(io::Error::other)?;
         let offer = offer.clone();
-        Self::queue(association, bytes.to_vec(), Completion::UserConnect)?;
+        Self::queue(association, bytes.to_vec(), Completion::UserConnect(unit))?;
         association.state = SessionState::UserResponseQueued(offer);
         Ok(true)
     }
@@ -1720,6 +1770,7 @@ mod tests {
                 tcp: TcpSession::new(stream).unwrap(),
                 state: SessionState::UserActive(offer),
                 selected_lus: None,
+                session: None,
                 incoming: VecDeque::new(),
                 incoming_bytes: 0,
                 writes: VecDeque::new(),
@@ -1854,6 +1905,7 @@ mod tests {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
             selected_lus: None,
+            session: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
@@ -2060,6 +2112,19 @@ mod tests {
             MptnGatewayPort::offer_lus(&offer).unwrap(),
             ("QABOB.SNAB".into(), "QAALICE.SNAA".into())
         );
+        let session = port.active.as_ref().unwrap().session.as_ref().unwrap();
+        assert_eq!(
+            session.phase(),
+            router_core::session::SessionPhase::AwaitBindResult
+        );
+        assert_eq!(session.identity.source_lu.to_string(), "QABOB.SNAB");
+        assert_eq!(session.identity.target_lu.to_string(), "QAALICE.SNAA");
+        assert_eq!(
+            reduced_connect_unit(offer.connect().connection_data())
+                .unwrap()
+                .ru()[0],
+            0x31
+        );
         peer.set_nonblocking(true).unwrap();
         assert_eq!(
             peer.read(&mut [0; 1]).unwrap_err().kind(),
@@ -2183,6 +2248,7 @@ mod tests {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
             selected_lus: None,
+            session: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
@@ -2295,6 +2361,7 @@ mod tests {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
             selected_lus: None,
+            session: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
