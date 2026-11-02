@@ -123,6 +123,7 @@ pub struct ReliableSendWindow {
     max_retained_bytes: usize,
     last_peer_sync: Option<u16>,
     last_echo: Option<u16>,
+    last_status: Option<PeerStatus>,
     local_syncs: VecDeque<u16>,
 }
 
@@ -153,6 +154,7 @@ impl ReliableSendWindow {
             max_retained_bytes,
             last_peer_sync: None,
             last_echo: None,
+            last_status: None,
             local_syncs: VecDeque::new(),
         })
     }
@@ -244,7 +246,10 @@ impl ReliableSendWindow {
         let status = parse_peer_status(packet)?;
         if let Some(last) = self.last_peer_sync {
             let advance = status.sync.wrapping_sub(last) as i16;
-            if advance == 0 {
+            // V5R4 can keep SYNC at zero while ECHO and RSEQ advance.
+            // Distinguish an identical replay from new acknowledgment state;
+            // nonzero repeated SYNC remains a protocol duplicate.
+            if advance == 0 && (status.sync != 0 || self.last_status.as_ref() == Some(&status)) {
                 return Err(SendError::DuplicateStatus);
             }
             if advance < 0 {
@@ -324,6 +329,7 @@ impl ReliableSendWindow {
         self.ack_abs = ack_abs;
         self.last_peer_sync = Some(status.sync);
         self.last_echo = Some(status.echo);
+        self.last_status = Some(status);
         Ok(StatusEffect {
             acknowledged_packets: before - self.retained.len(),
             retransmit_nlps,
@@ -437,6 +443,32 @@ mod tests {
         let second = ack(&mut window, 1, 0, 4, &[]).unwrap();
         assert_eq!(second.acknowledged_packets, 1);
         assert_eq!(window.retained_packets(), 0);
+    }
+
+    #[test]
+    fn v5r4_zero_sync_accepts_advancing_echo_and_rseq_but_rejects_exact_replay() {
+        let mut window = ReliableSendWindow::new(generation(1), SEND, STATUS, 10, 1024).unwrap();
+        window.record_local_sync(generation(1), 1).unwrap();
+        window.record_local_sync(generation(1), 2).unwrap();
+        sent(&mut window, 10, b"A", true);
+        assert_eq!(
+            ack(&mut window, 0, 1, 10, &[])
+                .unwrap()
+                .acknowledged_packets,
+            0
+        );
+        assert_eq!(
+            ack(&mut window, 0, 2, 12, &[])
+                .unwrap()
+                .acknowledged_packets,
+            1
+        );
+        assert_eq!(window.retained_packets(), 0);
+        assert_eq!(
+            ack(&mut window, 0, 2, 12, &[]),
+            Err(SendError::DuplicateStatus)
+        );
+        assert_eq!(ack(&mut window, 0, 1, 12, &[]), Err(SendError::WrongEcho));
     }
 
     #[test]

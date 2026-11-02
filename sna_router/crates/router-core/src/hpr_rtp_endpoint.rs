@@ -506,10 +506,14 @@ impl RtpInboundEndpoint {
         }
         let mut send = self.send.as_ref().unwrap().clone();
         let status: Option<StatusEffect> = if has_status {
-            Some(
-                send.observe_status(self.config.generation, packet)
-                    .map_err(EndpointError::Send)?,
-            )
+            match send.observe_status(self.config.generation, packet) {
+                Ok(effect) => Some(effect),
+                // A peer may repeat an identical STATUS while carrying new
+                // data on a fresh BSN. Ignore only its duplicate ledger
+                // update; the receive window still validates that data.
+                Err(SendError::DuplicateStatus) => None,
+                Err(error) => return Err(EndpointError::Send(error)),
+            }
         } else {
             None
         };
@@ -1155,6 +1159,45 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed.messages, vec![b"CP-FMH5".to_vec()]);
         assert_eq!(endpoint.phase(), EndpointPhase::Active);
+    }
+
+    #[test]
+    fn live_zero_sync_status_progress_and_duplicate_status_data_are_both_delivered_once() {
+        let cfg = config();
+        let mut endpoint = RtpInboundEndpoint::new(cfg.clone()).unwrap();
+        let reply = endpoint.prepare_inbound_setup(&setup_packet(&cfg)).unwrap();
+        endpoint.confirm_setup_reply_sent(&reply).unwrap();
+        endpoint
+            .receive(&peer_packet(
+                ASSIGNED & !ASSIGNOR,
+                107,
+                &[],
+                Some((0, 1, 200)),
+            ))
+            .unwrap();
+        let local_status = endpoint.prepare_status().unwrap();
+        endpoint.confirm_status_sent(&local_status).unwrap();
+        let response = endpoint.prepare_message(b"RSP", 10_000).unwrap();
+        endpoint.confirm_message_sent(&response, 10_000).unwrap();
+
+        // V5R4 retained SYNC=0 but advanced ECHO/RSEQ after our CP reply;
+        // its STATUS can share the NLP with a FID5 management BIU.
+        let first = endpoint
+            .receive(&peer_packet(
+                ASSIGNED & !ASSIGNOR,
+                107,
+                b"IPM",
+                Some((0, 2, 204)),
+            ))
+            .unwrap();
+        assert_eq!(first.messages, vec![b"IPM".to_vec()]);
+        assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 0);
+        let second = peer_packet(ASSIGNED & !ASSIGNOR, 111, b"NEXT", Some((0, 2, 204)));
+        assert_eq!(
+            endpoint.receive(&second).unwrap().messages,
+            vec![b"NEXT".to_vec()]
+        );
+        assert!(endpoint.receive(&second).unwrap().messages.is_empty());
     }
 
     #[test]
