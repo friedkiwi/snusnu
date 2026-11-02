@@ -35,7 +35,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn fresh_management(local_cp: &str, peer_cp: &str) -> io::Result<NativeManagementInitiator> {
+pub(crate) fn fresh_management(local_cp: &str, peer_cp: &str) -> io::Result<NativeManagementInitiator> {
     let mut random = [0u8; 14];
     File::open("/dev/urandom")?.read_exact(&mut random)?;
     let mut token = [0u8; 7];
@@ -55,7 +55,7 @@ fn fresh_management(local_cp: &str, peer_cp: &str) -> io::Result<NativeManagemen
     .map_err(|error| invalid(format!("native management: {error}")))
 }
 
-fn pump_virtual(port: &mut VirtualWsPort<WsRoutePort>) -> io::Result<()> {
+pub(crate) fn pump_virtual(port: &mut VirtualWsPort<WsRoutePort>) -> io::Result<()> {
     if let Some(events) = port.poll(false)? {
         for event in events {
             match event {
@@ -83,7 +83,7 @@ fn pump_virtual(port: &mut VirtualWsPort<WsRoutePort>) -> io::Result<()> {
     port.flush()
 }
 
-fn run_mptn_initiated(
+pub(crate) fn run_mptn_initiated(
     listener: &mut MptnGatewayPort,
     association: u64,
     offer: IngressOffer,
