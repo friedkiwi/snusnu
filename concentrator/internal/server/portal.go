@@ -198,11 +198,10 @@ func (a *App) removeBlock(w http.ResponseWriter, r *http.Request, u store.User, 
 		http.Error(w, "cannot block yourself", 400)
 		return
 	}
-	if err := a.DB.SetBlock(r.Context(), u.ID, id, false); err != nil {
+	if err := a.setBlock(r.Context(), u.ID, id, false); err != nil {
 		dbError(w, err)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/blocks", 303)
 }
 func (a *App) profileEditPage(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
@@ -316,10 +315,9 @@ func (a *App) profileBlock(w http.ResponseWriter, r *http.Request, u store.User,
 		dbError(w, err)
 		return
 	}
-	if err := a.DB.SetBlock(r.Context(), u.ID, id, r.FormValue("blocked") == "1"); err != nil {
+	if err := a.setBlock(r.Context(), u.ID, id, r.FormValue("blocked") == "1"); err != nil {
 		dbError(w, err)
 		return
 	}
-	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/profiles/"+id, 303)
 }

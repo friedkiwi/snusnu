@@ -23,5 +23,6 @@ func (a *App) routerLLCFacing(w http.ResponseWriter, r *http.Request, u store.Us
 		dbError(w, err)
 		return
 	}
+	a.routerPolicyChanged(r.Context())
 	http.Redirect(w, r, "/routers/"+item.ID, 303)
 }

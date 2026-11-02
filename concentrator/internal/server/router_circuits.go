@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -15,6 +16,7 @@ import (
 
 type wsCircuit struct {
 	mu             sync.Mutex
+	discardQueued  atomic.Bool
 	source, target *routerSession
 	requestID      uint64
 	targetRef      *wire.RouteReference
@@ -54,6 +56,7 @@ func (h *routerHub) expireCircuits(now time.Time) {
 		id, c := key.(string), value.(*wsCircuit)
 		c.mu.Lock()
 		if !c.closed && c.pending && now.Sub(c.openedAt) >= 10*time.Second {
+			c.discardQueued.Store(true)
 			h.send(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_BUSY}}}, "", 0)
 			h.send(c.target, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: wire.ResetReason_RESET_REASON_REMOTE_LINK}}}, "", 0)
 			c.closed = true
@@ -247,6 +250,7 @@ func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision)
 	h.circuits.CompareAndDelete(id, c)
 	accepted := decision.Accept && decision.ReceiveAllowanceBytes > 0 && decision.ReceiveAllowanceBytes <= 1<<20 && h.routeValid(c) && h.allowed(c.source, target)
 	if decision.Accept && !accepted {
+		c.discardQueued.Store(true)
 		h.send(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_PROTOCOL}}}, "", 0)
 		c.closed = true
 		releaseCircuitValue(c)
@@ -268,6 +272,7 @@ func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision)
 		reason = wire.OpenFailure_OPEN_FAILURE_PROTOCOL
 	}
 	if !accepted {
+		c.discardQueued.Store(true)
 		c.closed = true
 		releaseCircuitValue(c)
 		h.archiveCircuitLocked(id, c, reason.String(), "router", target.router.ID)
@@ -457,6 +462,7 @@ func (h *routerHub) resetCircuitValue(id string, c *wsCircuit, reason wire.Reset
 		return
 	}
 	c.closed = true
+	c.discardQueued.Store(true)
 	releaseCircuitValue(c)
 	for _, peer := range []*routerSession{c.source, c.target} {
 		h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: reason}}}, "", 0)

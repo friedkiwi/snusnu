@@ -191,14 +191,16 @@ func TestRouterWebSocketTwoPeerCircuit(t *testing.T) {
 	}
 	sendTestEnvelope(t, ca, &wire.WsEnvelope_CircuitClose{CircuitClose: &wire.CircuitClose{CircuitId: incoming.CircuitId}})
 	expectTestBody(t, cb, "close")
-	if err := a.DB.SetBlock(ctx, ids[0], ids[1], true); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.hub.refreshPolicyAndRoutes(ctx); err != nil {
+	if err := a.setBlock(ctx, ids[0], ids[1], true); err != nil {
 		t.Fatal(err)
 	}
 	expectTestBody(t, ca, "withdraw")
 	expectTestBody(t, cb, "withdraw")
+	if err := a.setBlock(ctx, ids[0], ids[1], false); err != nil {
+		t.Fatal(err)
+	}
+	expectTestBody(t, ca, "routes")
+	expectTestBody(t, cb, "routes")
 }
 
 func TestRouterWebSocketManagedBindingsAndRevocation(t *testing.T) {
@@ -245,10 +247,7 @@ func TestRouterWebSocketManagedBindingsAndRevocation(t *testing.T) {
 	if string(entry.AddressId) != string(uuidBytes(cp.ID)) || string(entry.VirtualMac) != string(mac[:]) || len(entry.Candidates) != 1 || string(entry.Candidates[0].RouterId) != string(uuidBytes(origin.ID)) {
 		t.Fatalf("incorrect binding %+v", entry)
 	}
-	if err := a.DB.SetBlock(ctx, recipientOwner, owner, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.hub.refreshPolicyAndRoutes(ctx); err != nil {
+	if err := a.setBlock(ctx, recipientOwner, owner, true); err != nil {
 		t.Fatal(err)
 	}
 	expectTestBody(t, llc, "withdraw")

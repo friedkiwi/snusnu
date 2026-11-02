@@ -212,7 +212,36 @@ func (h *routerHub) allowed(source, target *routerSession) bool {
 	if source == nil || target == nil || !h.isCurrent(source) || !h.isCurrent(target) {
 		return false
 	}
+	if _, denied := h.blockDenials.Load(ownerPair(source.router.OwnerID, target.router.OwnerID)); denied {
+		return false
+	}
 	return h.policy.Load().allows(source.router.ID, target.router.ID)
+}
+
+// setBlock installs a fast denial before the database transaction. A failed
+// transaction removes it; a successful one retains it until policy is loaded.
+func (a *App) setBlock(ctx context.Context, ownerID, targetID string, blocked bool) error {
+	h := a.hub
+	h.blockMu.Lock()
+	defer h.blockMu.Unlock()
+	pair := ownerPair(ownerID, targetID)
+	_, priorDenial := h.blockDenials.Load(pair)
+	if blocked {
+		h.blockDenials.Store(pair, struct{}{})
+	}
+	if err := a.DB.SetBlock(ctx, ownerID, targetID, blocked); err != nil {
+		if blocked && !priorDenial {
+			h.blockDenials.Delete(pair)
+		}
+		return err
+	}
+	if _, err := h.loadPolicy(ctx); err != nil {
+		// A denial stays active until a later successful policy refresh.
+		return err
+	}
+	h.blockDenials.Delete(pair)
+	h.reconcileOwnerPair(ownerID, targetID)
+	return nil
 }
 
 func (h *routerHub) refreshPolicyAndRoutes(ctx context.Context) error {

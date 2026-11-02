@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
+	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 )
 
 func cachedTestSession(id, owner, token, epoch string) *routerSession {
@@ -81,6 +82,55 @@ func TestPolicyChecksUseMemorySnapshot(t *testing.T) {
 	}
 	if !a.hub.allowed(source, target) {
 		t.Fatal("cached policy denied an allowed pair after database became unavailable")
+	}
+}
+
+func TestTemporaryBlockDeniesBeforePolicyReload(t *testing.T) {
+	a := testApp(t)
+	source := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "source-token", store.RandomUUID())
+	target := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "target-token", store.RandomUUID())
+	installTestPolicy(a.hub, source, target)
+	if !a.hub.allowed(source, target) {
+		t.Fatal("expected initial permission")
+	}
+	pair := ownerPair(source.router.OwnerID, target.router.OwnerID)
+	a.hub.blockDenials.Store(pair, struct{}{})
+	if a.hub.allowed(source, target) || a.hub.allowed(target, source) {
+		t.Fatal("temporary block must deny both directions")
+	}
+	if a.hub.outboundAllowed(target, outboundMessage{bindingOrigins: []string{source.router.ID}}) {
+		t.Fatal("temporary block allowed queued managed binding")
+	}
+	a.hub.blockDenials.Delete(pair)
+	if !a.hub.allowed(source, target) {
+		t.Fatal("temporary block removal did not restore policy")
+	}
+}
+
+func TestQueuedCircuitDataSurvivesNormalClose(t *testing.T) {
+	a := testApp(t)
+	source := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "source-token", store.RandomUUID())
+	target := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "target-token", store.RandomUUID())
+	installTestPolicy(a.hub, source, target)
+	target.snapshot = &wire.RouteSnapshot{Routes: []*wire.RouteExport{{Id: 1, Generation: 1}}}
+	circuit := &wsCircuit{source: source, target: target, targetRef: &wire.RouteReference{
+		RouterId: uuidBytes(target.router.ID), Epoch: uuidBytes(target.epoch), RouteId: 1, RouteGeneration: 1,
+	}}
+	id := store.RandomUUID()
+	a.hub.circuits.Store(id, circuit)
+	message := outboundMessage{circuit: id, circuitRef: circuit}
+	a.hub.circuits.Delete(id)
+	if !a.hub.outboundAllowed(target, message) {
+		t.Fatal("normal close discarded already queued data")
+	}
+	a.hub.blockDenials.Store(ownerPair(source.router.OwnerID, target.router.OwnerID), struct{}{})
+	if a.hub.outboundAllowed(target, message) {
+		t.Fatal("block allowed queued circuit data")
+	}
+	a.hub.blockDenials.Delete(ownerPair(source.router.OwnerID, target.router.OwnerID))
+	circuit.discardQueued.Store(true)
+	if a.hub.outboundAllowed(target, message) {
+		t.Fatal("reset allowed queued circuit data")
 	}
 }
 
