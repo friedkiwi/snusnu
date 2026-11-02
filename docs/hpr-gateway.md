@@ -100,6 +100,31 @@ layer. They are not LU session attributes.
    gateway disabled in normal configuration until the live link, RTP and LU
    gates pass; retain the working explicit HPR/IP relay throughout.
 
+## Embedded APING acceptance test
+
+The first end-to-end application target is an OS/400 guest connected to
+`sna_router` over EE and running
+`VFYAPPCCNN RMTLOCNAME(SNUSNU.PING) PKTLEN(16) NBRITER(1)`.
+The concentrator publishes `SNUSNU.SVC` and its LU 6.2 service
+`SNUSNU.PING`. A `snusnu.v2` open must reference a live, authenticated source
+LU 6.2 route and the PING target route. A passing test needs the guest command
+to report success, with captured EE XID/TG activation, control RTP, user BIND,
+APINGD Attach, version, echo, and orderly close across the router and
+concentrator. The existing LLC APING trace reached echo and close but did not
+capture the guest's final command result.
+
+The Go APING service currently consumes native XID/TEST, `LinkReady`, and
+complete FID2 PIUs. EE supplies LDLC, RTP, and FID5. A gateway cannot send
+the FID5 bytes directly to that service or simply replace the FID5 header:
+directional session addresses and FID2 address fields have different owners,
+and the native service has its own management session state. One integration
+option is a versioned carrier-neutral session circuit for BIND, BIND result,
+information, credit, UNBIND, and reset; the existing native profile remains
+for LLC. Another is a complete virtual native DLC/FID2 adapter in Rust. The
+Go and Rust sides must agree on one of these contracts before the APING route
+is enabled for EE. The `SNUSNU` target NETID also makes cross-NETID APPN
+reachability a separate live test after same-NETID EE adjacency works.
+
 An earlier, independent milestone may transport validated HPR/IP datagrams
 between two routers through a typed WebSocket link profile. That preserves
 EE↔EE behavior across the concentrator but **does not** enter the LU session
