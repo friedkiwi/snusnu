@@ -130,6 +130,17 @@ fn run() -> io::Result<()> {
             tracing::warn!(path = %cache_path.display(), error = %error, "local peer cache unavailable");
             local_status::LocalStatus::new()
         });
+        if let Some(remote) = config.remote.first() {
+            status.set_concentrator(Some(local_status::ConcentratorStatus {
+                state: "connecting".into(),
+                authority: remote::server_authority(&remote.url).into(),
+                router_id: None,
+                allowed_netid: None,
+                connection_epoch: None,
+                last_change_ms: local_status::now_ms(),
+                last_error: None,
+            }));
+        }
         LOCAL_STATUS.set(status.clone()).map_err(|_| {
             io::Error::new(io::ErrorKind::AlreadyExists, "local status already initialized")
         })?;

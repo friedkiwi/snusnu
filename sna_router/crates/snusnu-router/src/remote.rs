@@ -532,7 +532,20 @@ impl WsRoutePort {
         } else {
             WsClient::connect(&primary.url, &primary.bearer)
         }
-        .map_err(io_error)?;
+        .map_err(|error| {
+            if let Some(status) = crate::status() {
+                status.set_concentrator(Some(ConcentratorStatus {
+                    state: "disconnected".into(),
+                    authority: server_authority(&primary.url).into(),
+                    router_id: None,
+                    allowed_netid: None,
+                    connection_epoch: None,
+                    last_change_ms: local_status::now_ms(),
+                    last_error: Some("connection failed; see router logs".into()),
+                }));
+            }
+            io_error(error)
+        })?;
         if configs
             .iter()
             .any(|config| config.local_cp.netid != welcome.allowed_netid)
@@ -1694,7 +1707,7 @@ fn format_mac(mac: &[u8]) -> String {
         .join(":")
 }
 
-fn server_authority(url: &str) -> &str {
+pub(crate) fn server_authority(url: &str) -> &str {
     let authority = url.split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url)
