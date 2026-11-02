@@ -7,6 +7,7 @@ import (
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
+	"github.com/friedkiwi/snusnu/sna"
 	"github.com/google/uuid"
 )
 
@@ -18,6 +19,10 @@ const serviceMACSuffix = 0xffffff
 // advertisement. Services can use OwnerID to keep per-user data isolated.
 type LocalPeer struct {
 	RouterID, OwnerID, NetID, LU string
+}
+
+func (p LocalPeer) SNAPeer() sna.Peer {
+	return sna.Peer{Principal: p.OwnerID, NetID: p.NetID, LU: p.LU}
 }
 
 type localDelivery struct {

@@ -3,6 +3,7 @@ module github.com/friedkiwi/snusnu/concentrator
 go 1.26.0
 
 require (
+	github.com/friedkiwi/snusnu/sna v0.0.0
 	github.com/go-webauthn/webauthn v0.18.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
@@ -12,6 +13,8 @@ require (
 	google.golang.org/protobuf v1.36.10
 	modernc.org/sqlite v1.61.1
 )
+
+replace github.com/friedkiwi/snusnu/sna => ../sna
 
 require (
 	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect

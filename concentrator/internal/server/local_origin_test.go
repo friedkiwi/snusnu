@@ -24,6 +24,9 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 			if peer.OwnerID != owner || peer.NetID != "PEERNET" || peer.LU != "LU" {
 				t.Errorf("wrong local peer: %+v", peer)
 			}
+			if stamped := peer.SNAPeer(); !stamped.Valid() || stamped.Principal != owner || stamped.NetID != "PEERNET" || stamped.LU != "LU" {
+				t.Errorf("wrong SNA peer: %+v", stamped)
+			}
 			incoming <- open
 			_ = a.hub.decision(a.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500})
 		}
