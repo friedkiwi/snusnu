@@ -7,10 +7,14 @@
 
 use crate::{
     config::{self, MptnGatewayConfig},
+    local_status::{self, CircuitStatus},
     mptn_bidirectional_gateway::{fresh_management, pump_virtual},
     mptn_gateway_port::{GatewayConfig, GatewayEvent, MptnGatewayPort},
-    remote::WsRoutePort,
+    mptn_outbound_port::OutboundEndpoint,
+    mptn_ws_reverse::{AutoReverseWsSession, ReverseWsConfig},
+    remote::{Config as RemoteConfig, WsRoutePort},
     virtual_ws_port::VirtualWsPort,
+    ws_native_responder::WsNativeResponder,
 };
 use router_core::{xid3::{Role, Xid3}, xid3_local::LocalLlcProfile};
 use std::{collections::HashMap, io, net::SocketAddr, time::{Duration, Instant}};
@@ -150,7 +154,22 @@ pub(crate) struct AutoMptnGateway<'a> {
     config: &'a MptnGatewayConfig,
     listener: MptnGatewayPort,
     sessions: HashMap<u64, MptnToWsSession>,
+    reverse: Option<AutoReverseWsSession>,
+    reverse_status_id: Option<String>,
     udp_leased: bool,
+}
+
+impl Drop for AutoMptnGateway<'_> {
+    fn drop(&mut self) {
+        if let Some(status) = crate::status() {
+            for session in self.sessions.values() {
+                status.remove_circuit(&session.status_id);
+            }
+            if let Some(id) = &self.reverse_status_id {
+                status.remove_circuit(id);
+            }
+        }
+    }
 }
 
 impl<'a> AutoMptnGateway<'a> {
@@ -168,17 +187,54 @@ impl<'a> AutoMptnGateway<'a> {
             cnos_limit: 8,
             allow_resumed_user: true,
         })?;
-        Ok(Self { config, listener, sessions: HashMap::new(), udp_leased: false })
+        Ok(Self { config, listener, sessions: HashMap::new(), reverse: None,
+            reverse_status_id: None, udp_leased: false })
     }
 
     pub(crate) fn id(&self) -> &str { &self.config.id }
 
+    pub(crate) fn outbound_endpoint(&self) -> OutboundEndpoint {
+        OutboundEndpoint { local_ip: self.config.local_ip, peer_ip: self.config.peer_ip }
+    }
+
     pub(crate) fn active_sessions(&self) -> usize { self.sessions.len() }
+
+    pub(crate) fn udp_available(&self) -> bool {
+        !self.udp_leased && self.sessions.is_empty() && self.reverse.is_none()
+    }
 
     /// Poll one transport event while progressing all active converters. A
     /// validated user BIND is returned to the owning fabric for destination
     /// selection; it remains pending in the TCP62 association until accepted.
     pub(crate) fn poll_once(&mut self) -> io::Result<Option<(u64, IngressOffer)>> {
+        if let Some(reverse) = &mut self.reverse {
+            match reverse.poll_once() {
+                Ok(true) => {
+                    if reverse.is_active() {
+                        if let (Some(status), Some(id)) = (crate::status(), &self.reverse_status_id) {
+                            if let Some(mut circuit) = status.snapshot().circuits.into_iter()
+                                .find(|circuit| &circuit.id == id && circuit.state != "connected") {
+                                circuit.state = "connected".into();
+                                circuit.last_change_ms = local_status::now_ms();
+                                status.upsert_circuit(circuit);
+                            }
+                        }
+                    }
+                }
+                Ok(false) => {
+                    self.reverse = None;
+                    self.clear_reverse_status();
+                    self.release_udp();
+                }
+                Err(error) => {
+                    tracing::warn!(gateway = %self.config.id, error = %error,
+                        "automatic concentrator to TCP62 circuit failed");
+                    self.reverse = None;
+                    self.clear_reverse_status();
+                    self.release_udp();
+                }
+            }
+        }
         let ids = self.sessions.keys().copied().collect::<Vec<_>>();
         for id in ids {
             let result = self.sessions.get_mut(&id).expect("session ID collected").pump(
@@ -186,12 +242,12 @@ impl<'a> AutoMptnGateway<'a> {
             );
             match result {
                 Ok(true) => {}
-                Ok(false) => { self.sessions.remove(&id); }
+                Ok(false) => { self.retire_session(id); }
                 Err(error) => {
                     tracing::warn!(gateway = %self.config.id, association = id, error = %error,
                         "automatic TCP62 circuit failed");
                     let _ = self.listener.close_association_for(id);
-                    self.sessions.remove(&id);
+                    self.retire_session(id);
                 }
             }
         }
@@ -206,12 +262,12 @@ impl<'a> AutoMptnGateway<'a> {
         if let Some(session) = self.sessions.get_mut(&id) {
             match session.on_event(event, &mut self.listener) {
                 Ok(true) => {}
-                Ok(false) => { self.sessions.remove(&id); }
+                Ok(false) => { self.retire_session(id); }
                 Err(error) => {
                     tracing::warn!(gateway = %self.config.id, association = id, error = %error,
                         "automatic TCP62 circuit event rejected");
                     let _ = self.listener.close_association_for(id);
-                    self.sessions.remove(&id);
+                    self.retire_session(id);
                 }
             }
             return Ok(None);
@@ -274,8 +330,10 @@ impl<'a> AutoMptnGateway<'a> {
         let target = format!("{}.{}", target_cp.netid, target_cp.name);
         let mut port = VirtualWsPort::new(ws, xid, &local, &target)?;
         port.attach_management(fresh_management(&local, &target)?)?;
+        let status_id = format!("mptn:{}:{association}", self.config.id);
         self.sessions.insert(association, MptnToWsSession {
             association,
+            status_id: status_id.clone(),
             port,
             pending_offer: Some(offer),
             pending_tcp: None,
@@ -286,6 +344,15 @@ impl<'a> AutoMptnGateway<'a> {
         tracing::info!(gateway = %self.config.id, association, source_lu, destination_lu,
             local_cp = %local, target_cp = %target,
             "automatic TCP62 circuit selected WebSocket destination");
+        if let Some(status) = crate::status() {
+            status.upsert_circuit(CircuitStatus {
+                id: status_id,
+                ingress: format!("mptn:{}:{source_lu}", self.config.id),
+                egress: format!("concentrator:{destination_lu}"),
+                state: "opening".into(), bytes_in: 0, bytes_out: 0,
+                last_change_ms: local_status::now_ms(),
+            });
+        }
         Ok(())
     }
 
@@ -298,7 +365,7 @@ impl<'a> AutoMptnGateway<'a> {
     /// One UDP socket reader owns expedited and keepalive traffic at a time.
     /// The lease must be returned when an outbound session closes.
     pub(crate) fn lease_udp(&mut self) -> io::Result<std::net::UdpSocket> {
-        if self.udp_leased || !self.sessions.is_empty() {
+        if !self.udp_available() {
             return Err(io::Error::new(io::ErrorKind::WouldBlock,
                 "gateway UDP/397 is already owned by an active circuit"));
         }
@@ -310,10 +377,112 @@ impl<'a> AutoMptnGateway<'a> {
     pub(crate) fn release_udp(&mut self) {
         self.udp_leased = false;
     }
+
+    fn retire_session(&mut self, id: u64) {
+        if let Some(session) = self.sessions.remove(&id) {
+            if let Some(status) = crate::status() {
+                status.remove_circuit(&session.status_id);
+            }
+        }
+    }
+
+    fn clear_reverse_status(&mut self) {
+        if let Some(id) = self.reverse_status_id.take() {
+            if let Some(status) = crate::status() { status.remove_circuit(&id); }
+        }
+    }
+
+    /// Start an authenticated concentrator circuit toward this gateway's
+    /// MPTN peer. The caller has already selected the local hosted LU and
+    /// obtained a private WebSocket port from AutoWsHub.
+    pub(crate) fn start_from_ws(
+        &mut self,
+        mut ws: WsRoutePort,
+        hosted_lu: &wire::SnaName,
+        hosted_cp: &wire::SnaName,
+        source_lu: &wire::SnaName,
+        source_cp: &wire::SnaName,
+        seed: &[u8],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if !self.udp_available() || timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "TCP62 gateway is busy"));
+        }
+        let incoming = ws.take_inbound_open().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "WebSocket circuit has no incoming Open")
+        })?;
+        if source_lu.netid != source_cp.netid || hosted_lu.netid != hosted_cp.netid {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "automatic reverse LU and hosting CP NETIDs differ"));
+        }
+        let xid = virtual_xid(
+            hosted_cp, seed,
+            Some(&self.config.local_station),
+            Some(&self.config.local_node_id),
+            self.config.tg_number,
+        )?;
+        let hosted_cp_name = format!("{}.{}", hosted_cp.netid, hosted_cp.name);
+        let hosted_lu_name = format!("{}.{}", hosted_lu.netid, hosted_lu.name);
+        let source_cp_name = format!("{}.{}", source_cp.netid, source_cp.name);
+        let source_lu_name = format!("{}.{}", source_lu.netid, source_lu.name);
+        let reverse = ReverseWsConfig {
+            remote: RemoteConfig {
+                url: String::new(), bearer: String::new(),
+                local_cp: hosted_cp.clone(), target_cp: source_cp.clone(),
+                target_lu: Some(source_lu.clone()),
+            },
+            hosted_cp: hosted_cp_name.clone(), hosted_lu: hosted_lu_name.clone(),
+            source_cp: source_cp_name.clone(), source_lu: source_lu_name.clone(),
+            local_station: self.config.local_station.clone().is_empty()
+                .then(|| hosted_cp.name.clone())
+                .unwrap_or_else(|| self.config.local_station.clone()),
+            local_node_id: xid.node_id(), tg_number: self.config.tg_number,
+            user_tp: [0; 4],
+            endpoint: OutboundEndpoint {
+                local_ip: self.config.local_ip, peer_ip: self.config.peer_ip,
+            },
+            timeout,
+        };
+        let responder = WsNativeResponder::new(
+            ws, xid, &hosted_cp_name, &source_cp_name,
+            &source_lu_name, &hosted_lu_name,
+        )?;
+        let socket = self.lease_udp()?;
+        match AutoReverseWsSession::new(
+            reverse, responder, socket, Instant::now() + timeout,
+        ) {
+            Ok(session) => {
+                self.reverse = Some(session);
+                let status_id = format!("mptn:{}:inbound:{}", self.config.id,
+                    incoming.circuit_id.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+                if let Some(status) = crate::status() {
+                    status.upsert_circuit(CircuitStatus {
+                        id: status_id.clone(),
+                        ingress: format!("concentrator:{source_lu_name}"),
+                        egress: format!("mptn:{}:{hosted_lu_name}", self.config.id),
+                        state: "opening".into(), bytes_in: 0, bytes_out: 0,
+                        last_change_ms: local_status::now_ms(),
+                    });
+                }
+                self.reverse_status_id = Some(status_id);
+                tracing::info!(gateway = %self.config.id,
+                    circuit_id = ?incoming.circuit_id,
+                    source_lu = %source_lu_name, hosted_lu = %hosted_lu_name,
+                    "automatic concentrator circuit selected TCP62 destination");
+                Ok(())
+            }
+            Err(error) => {
+                self.release_udp();
+                Err(error)
+            }
+        }
+    }
 }
 
 struct MptnToWsSession {
     association: u64,
+    status_id: String,
     port: VirtualWsPort<WsRoutePort>,
     pending_offer: Option<IngressOffer>,
     pending_tcp: Option<TcpRecord>,
@@ -372,7 +541,18 @@ impl MptnToWsSession {
                 self.port.mark_tcp_bind_response_enqueued(&bytes)?;
             }
         }
+        let was_started = self.user_started;
         self.user_started |= listener.user_active_for(self.association);
+        if self.user_started && !was_started {
+            if let Some(status) = crate::status() {
+                if let Some(mut circuit) = status.snapshot().circuits.into_iter()
+                    .find(|circuit| circuit.id == self.status_id) {
+                    circuit.state = "connected".into();
+                    circuit.last_change_ms = local_status::now_ms();
+                    status.upsert_circuit(circuit);
+                }
+            }
+        }
         if self.user_started {
             if let Some(record) = self.port.udp_abort_record().cloned() {
                 if listener.queue_udp_abort_for(self.association, &record)? {

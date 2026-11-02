@@ -214,6 +214,10 @@ enum AutoReversePhase {
 }
 
 impl AutoReverseWsSession {
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.phase, Some(AutoReversePhase::Active { .. }))
+    }
+
     pub(crate) fn new(
         config: ReverseWsConfig,
         mut native: WsNativeResponder<WsRoutePort>,
