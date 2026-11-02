@@ -10,7 +10,7 @@ import (
 func cachedTestSession(id, owner, token, epoch string) *routerSession {
 	return &routerSession{
 		router: store.Router{ID: id, OwnerID: owner, DisplayName: id}, token: token, epoch: epoch, allowedNetID: "SOLNET",
-		out: make(chan outboundMessage, 16), done: make(chan struct{}), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{},
+		out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), done: make(chan struct{}), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{},
 	}
 }
 

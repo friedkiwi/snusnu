@@ -9,41 +9,21 @@ import (
 )
 
 func (a *App) enqueueRouterLog(entry store.LogEntry) {
-	a.queueMu.RLock()
-	defer a.queueMu.RUnlock()
-	if !a.queuesOpen {
-		a.routerLogDrops.Add(1)
-		return
-	}
-	select {
-	case a.routerLogs <- entry:
-	default:
-		a.routerLogDrops.Add(1)
+	if !a.routerLogs.push(entry) {
 		log.Printf("router log queue full; dropping %s event for router %s", entry.EventType, entry.RouterID)
 	}
 }
 
 func (a *App) startRouterLogWriter(ctx context.Context) {
-	a.queueMu.Lock()
-	a.queuesOpen = true
-	a.queueMu.Unlock()
 	a.workersWG.Add(1)
 	go func() {
 		defer a.workersWG.Done()
 		for {
-			select {
-			case <-ctx.Done():
-				for {
-					select {
-					case entry := <-a.routerLogs:
-						a.persistRouterLog(entry)
-					default:
-						return
-					}
-				}
-			case entry := <-a.routerLogs:
-				a.persistRouterLog(entry)
+			entry, ok := a.routerLogs.pop(ctx.Done())
+			if !ok {
+				return
 			}
+			a.persistRouterLog(entry)
 		}
 	}()
 }

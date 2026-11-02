@@ -187,7 +187,7 @@ func TestSNACircuitVisibilityResetAndHistory(t *testing.T) {
 	}
 	cookie := &http.Cookie{Name: "snusnu_session", Value: token}
 	makeRouterSession := func(id, owner, name string) *routerSession {
-		return &routerSession{router: store.Router{ID: id, OwnerID: owner, DisplayName: name}, out: make(chan outboundMessage, 16), queued: map[string]int{}}
+		return &routerSession{router: store.Router{ID: id, OwnerID: owner, DisplayName: name}, out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), queued: map[string]int{}}
 	}
 	ownedSource := makeRouterSession(store.RandomUUID(), ownerID, "Owned router")
 	ownedTarget := makeRouterSession(store.RandomUUID(), peerID, "Peer router")

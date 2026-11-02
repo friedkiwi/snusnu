@@ -80,28 +80,37 @@ func main() {
 	srv.Handler = app.Handler()
 	done := make(chan error, 1)
 	go func() { done <- srv.ListenAndServe() }()
+	var serveErr error
+	serverDone := false
 	select {
 	case err := <-done:
-		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
+		serveErr = err
+		serverDone = true
 	case <-ctx.Done():
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		app.BeginDrain(drainCtx)
-		drainCancel()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP shutdown: %v", err)
-		}
-		cancel()
-		backgroundCtx, backgroundCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := app.ShutdownBackground(backgroundCtx); err != nil {
-			log.Printf("background shutdown: %v", err)
-		}
-		backgroundCancel()
-		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
+	case err := <-app.Fatal():
+		serveErr = err
+		log.Printf("fatal concentrator condition: %v", err)
+	}
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if clean := app.BeginDrain(drainCtx); !clean {
+		log.Printf("router drain deadline exceeded; forcing process shutdown")
+	}
+	drainCancel()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
+	}
+	cancel()
+	backgroundCtx, backgroundCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := app.ShutdownBackground(backgroundCtx); err != nil {
+		log.Printf("background shutdown: %v; pending records discarded", err)
+	}
+	backgroundCancel()
+	if !serverDone {
+		serveErr = <-done
+	}
+	if !errors.Is(serveErr, http.ErrServerClosed) && serveErr != nil {
+		log.Printf("server stopped: %v", serveErr)
 	}
 }
 

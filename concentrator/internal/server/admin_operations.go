@@ -64,12 +64,10 @@ func newMaintenanceManager(a *App) *maintenanceManager {
 // Calling it more than once is harmless only when the caller owns one App.
 func (a *App) StartMaintenance(ctx context.Context) {
 	a.workersOnce.Do(func() {
-		a.queueMu.Lock()
-		a.queuesOpen = true
-		a.queueMu.Unlock()
 		a.workersRunning.Store(true)
 		workerCtx, cancel := context.WithCancel(context.Background())
 		a.workerCancel = cancel
+		context.AfterFunc(ctx, cancel)
 		a.startCircuitHistoryWriter(workerCtx)
 		a.startRouterLogWriter(workerCtx)
 		a.workersWG.Add(1)
@@ -79,11 +77,11 @@ func (a *App) StartMaintenance(ctx context.Context) {
 			defer ticker.Stop()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
 					for name := range a.maintenance.tasks {
-						runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+						runCtx, cancel := context.WithTimeout(workerCtx, 10*time.Minute)
 						_, _ = a.maintenance.run(runCtx, name, "scheduled", "")
 						cancel()
 					}
@@ -96,12 +94,8 @@ func (a *App) StartMaintenance(ctx context.Context) {
 // ShutdownBackground fences producers before waiting for both persistence
 // queues and the maintenance scheduler to stop.
 func (a *App) ShutdownBackground(ctx context.Context) error {
-	a.queueMu.Lock()
-	a.queuesOpen = false
-	a.queueMu.Unlock()
-	if a.workerCancel != nil {
-		a.workerCancel()
-	}
+	a.routerLogs.close(false)
+	a.circuitHistory.close(false)
 	done := make(chan struct{})
 	go func() { a.workersWG.Wait(); close(done) }()
 	select {
@@ -109,6 +103,11 @@ func (a *App) ShutdownBackground(ctx context.Context) error {
 		a.workersRunning.Store(false)
 		return nil
 	case <-ctx.Done():
+		a.routerLogs.close(true)
+		a.circuitHistory.close(true)
+		if a.workerCancel != nil {
+			a.workerCancel()
+		}
 		return ctx.Err()
 	}
 }
@@ -201,11 +200,12 @@ func (m *maintenanceManager) list(ctx context.Context) ([]maintenanceRun, error)
 }
 
 type adminRouterSession struct {
-	ID, Name, IP, Protocol, Epoch                string
-	ConnectedAt                                  int64
-	RouteCount                                   int
-	RouteRevision                                uint64
-	OutboundQueued, OutboundCapacity, DataQueued int
+	ID, Name, IP, Protocol, Epoch                                               string
+	ConnectedAt                                                                 int64
+	RouteCount                                                                  int
+	RouteRevision                                                               uint64
+	OutboundQueued, OutboundLimit, OutboundBytes, OutboundHighWater, DataQueued int
+	OutboundDropped                                                             uint64
 }
 
 type adminCircuit struct {
@@ -217,7 +217,8 @@ func (h *routerHub) adminSnapshot() ([]adminRouterSession, []adminCircuit) {
 	routers := make([]adminRouterSession, 0, h.sessionCount())
 	for _, c := range h.sessions() {
 		c.mu.Lock()
-		item := adminRouterSession{ID: c.router.ID, Name: c.router.DisplayName, IP: c.ip, Protocol: c.subprotocol, Epoch: c.epoch, ConnectedAt: c.connectedAt.Unix(), OutboundQueued: len(c.out), OutboundCapacity: cap(c.out)}
+		queue := c.out.stats()
+		item := adminRouterSession{ID: c.router.ID, Name: c.router.DisplayName, IP: c.ip, Protocol: c.subprotocol, Epoch: c.epoch, ConnectedAt: c.connectedAt.Unix(), OutboundQueued: queue.Depth, OutboundLimit: queue.Limit, OutboundBytes: queue.Bytes, OutboundHighWater: queue.HighWater, OutboundDropped: queue.Dropped}
 		if c.snapshot != nil {
 			item.RouteCount = len(c.snapshot.Routes)
 			item.RouteRevision = c.snapshot.Revision
@@ -257,7 +258,8 @@ func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.Us
 	if policy := a.hub.policy.Load(); policy != nil {
 		policyVersion, policyRouters, policyBlocks = policy.version, len(policy.routers), len(policy.blocks)
 	}
-	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": len(a.routerLogs), "RouterLogCapacity": cap(a.routerLogs)})
+	logs, history := a.routerLogs.stats(), a.circuitHistory.stats()
+	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
 }
 
 func (a *App) runMaintenanceTask(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {

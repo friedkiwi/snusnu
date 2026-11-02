@@ -35,24 +35,23 @@ type Config struct {
 	Development                                        bool
 }
 type App struct {
-	DB             *store.Store
-	Config         Config
-	webauthn       *webauthn.WebAuthn
-	client         *http.Client
-	hub            *routerHub
-	maintenance    *maintenanceManager
-	circuitHistory chan circuitHistoryRecord
-	routerLogs     chan store.LogEntry
-	workersOnce    sync.Once
-	workersWG      sync.WaitGroup
-	workerCancel   context.CancelFunc
-	queueMu        sync.RWMutex
-	queuesOpen     bool
-	workersRunning atomic.Bool
-	routerLogDrops atomic.Uint64
-	historyDrops   atomic.Uint64
-	writeFailures  atomic.Uint64
-	leaseHealthy   atomic.Bool
+	DB                *store.Store
+	Config            Config
+	webauthn          *webauthn.WebAuthn
+	client            *http.Client
+	hub               *routerHub
+	maintenance       *maintenanceManager
+	circuitHistory    *dynamicQueue[circuitHistoryRecord]
+	routerLogs        *dynamicQueue[store.LogEntry]
+	workersOnce       sync.Once
+	workersWG         sync.WaitGroup
+	workerCancel      context.CancelFunc
+	workersRunning    atomic.Bool
+	writeFailures     atomic.Uint64
+	leaseHealthy      atomic.Bool
+	heartbeatFailures atomic.Uint64
+	lastHeartbeat     atomic.Int64
+	fatal             chan error
 }
 
 func NewApp(db *store.Store, cfg Config) (*App, error) {
@@ -73,7 +72,7 @@ func NewApp(db *store.Store, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: make(chan circuitHistoryRecord, 256), routerLogs: make(chan store.LogEntry, 4096)}
+	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: newDynamicQueue[circuitHistoryRecord](4096, 0, nil), routerLogs: newDynamicQueue[store.LogEntry](65536, 64<<20, func(x store.LogEntry) int { return len(x.Summary) + len(x.DetailsJSON) + 256 }), fatal: make(chan error, 1)}
 	a.hub = newRouterHub(a)
 	a.maintenance = newMaintenanceManager(a)
 	return a, nil

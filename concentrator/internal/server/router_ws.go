@@ -36,7 +36,7 @@ type routerSession struct {
 	token, epoch, ip, allowedNetID string
 	subprotocol                    string
 	conn                           *websocket.Conn
-	out                            chan outboundMessage
+	out                            *dynamicQueue[outboundMessage]
 	snapshot                       *wire.RouteSnapshot
 	sent                           map[string]routeVersion
 	binding                        *wire.ManagedCpBindingSnapshot
@@ -76,6 +76,8 @@ type routerHub struct {
 	policy          atomic.Pointer[routerPolicySnapshot]
 	reconciliations atomic.Uint64
 	draining        atomic.Bool
+	lifecycleMu     sync.Mutex
+	sessionWG       sync.WaitGroup
 }
 
 func newRouterHub(a *App) *routerHub {
@@ -148,21 +150,36 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: make(chan outboundMessage, 16), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}, connectedAt: time.Now(), done: make(chan struct{})}
+	c := &routerSession{router: router, token: parts[1], epoch: epoch, ip: host, allowedNetID: owner.NetID, subprotocol: conn.Subprotocol(), conn: conn, out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{}, connectedAt: time.Now(), done: make(chan struct{})}
 	h := a.hub
 	if _, err := h.loadPolicy(r.Context()); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = a.DB.EndRouterEpoch(cleanupCtx, router.ID, epoch)
+		cancel()
 		conn.Close()
 		return
 	}
+	h.lifecycleMu.Lock()
+	if h.draining.Load() {
+		h.lifecycleMu.Unlock()
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = a.DB.EndRouterEpoch(cleanupCtx, router.ID, epoch)
+		cancel()
+		conn.Close()
+		return
+	}
+	h.sessionWG.Add(1)
+	h.lifecycleMu.Unlock()
+	defer h.sessionWG.Done()
 	if previous, loaded := h.clients.Swap(router.ID, c); loaded {
 		h.remove(previous.(*routerSession))
 	}
 	h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_Welcome{Welcome: &wire.RouterWelcome{RouterId: uuidBytes(router.ID), ConnectionEpoch: uuidBytes(epoch), MaxMessageBytes: maxWSMessage, MaxCircuits: maxWSCircuits, DisplayName: router.DisplayName, AllowedNetid: owner.NetID}}}, "", 0)
+	go h.write(c)
 	h.refresh()
 	if h.running.CompareAndSwap(false, true) {
 		go h.tick()
 	}
-	go h.write(c)
 	h.read(c)
 }
 func (h *routerHub) tick() {
@@ -192,7 +209,11 @@ func (h *routerHub) write(c *routerSession) {
 		select {
 		case <-c.done:
 			return
-		case msg := <-c.out:
+		case <-c.out.notify:
+			msg, ok := c.out.pop(c.done)
+			if !ok {
+				return
+			}
 			c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := c.conn.WriteMessage(websocket.BinaryMessage, msg.data); err != nil {
 				h.detach(c)
@@ -251,6 +272,7 @@ func (h *routerHub) remove(c *routerSession) {
 		return
 	}
 	close(c.done)
+	c.out.close(true)
 	h.circuits.Range(func(key, value any) bool {
 		id, circuit := key.(string), value.(*wsCircuit)
 		circuit.mu.Lock()
@@ -286,15 +308,13 @@ func (h *routerHub) send(c *routerSession, e *wire.WsEnvelope, circuit string, c
 	if c.closed.Load() || cost > 0 && c.queued[circuit]+cost > 64*1024 {
 		return false
 	}
-	select {
-	case c.out <- outboundMessage{data: data, circuit: circuit, cost: cost}:
+	if c.out.push(outboundMessage{data: data, circuit: circuit, cost: cost}) {
 		c.queued[circuit] += cost
 		return true
-	default:
-		// A slow receiver must not block route publication or another circuit.
-		go c.conn.Close()
-		return false
 	}
+	// A peer exceeding the explicit dynamic queue limits is unhealthy.
+	go c.conn.Close()
+	return false
 }
 func (h *routerHub) session(id string) *routerSession {
 	value, ok := h.clients.Load(id)

@@ -47,16 +47,7 @@ func (h *routerHub) archiveCircuitLocked(id string, c *wsCircuit, reason, actorT
 		OpenedAt: c.openedAt.Unix(), ActivatedAt: unixTime(c.activatedAt), ClosedAt: store.Now(),
 		SourceBytes: c.sent[0], TargetBytes: c.sent[1], SourceEvents: c.events[0], TargetEvents: c.events[1], PeakQueuedBytes: c.peakQueued,
 	}
-	h.a.queueMu.RLock()
-	defer h.a.queueMu.RUnlock()
-	if !h.a.queuesOpen {
-		h.a.historyDrops.Add(1)
-		return
-	}
-	select {
-	case h.a.circuitHistory <- record:
-	default:
-		h.a.historyDrops.Add(1)
+	if !h.a.circuitHistory.push(record) {
 		log.Printf("SNA circuit history queue full; summary for %s was not persisted", id)
 	}
 }
@@ -69,26 +60,15 @@ func unixTime(value time.Time) int64 {
 }
 
 func (a *App) startCircuitHistoryWriter(ctx context.Context) {
-	a.queueMu.Lock()
-	a.queuesOpen = true
-	a.queueMu.Unlock()
 	a.workersWG.Add(1)
 	go func() {
 		defer a.workersWG.Done()
 		for {
-			select {
-			case <-ctx.Done():
-				for {
-					select {
-					case record := <-a.circuitHistory:
-						a.persistCircuitHistory(record)
-					default:
-						return
-					}
-				}
-			case record := <-a.circuitHistory:
-				a.persistCircuitHistory(record)
+			record, ok := a.circuitHistory.pop(ctx.Done())
+			if !ok {
+				return
 			}
+			a.persistCircuitHistory(record)
 		}
 	}()
 }
