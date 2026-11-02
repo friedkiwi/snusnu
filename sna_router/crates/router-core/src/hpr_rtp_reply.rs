@@ -2,14 +2,18 @@
 //!
 //! IBM *SNA Formats* GA27-3136-20 pp. 2-7, 2-11–2-18 defines these fields.
 //! The observed V5R4 reply has a 20-byte no-gap STATUS, a 12-byte CIE,
-//! a 52-byte THDR, and no data. The caller must validate the receive stream
-//! before supplying RSEQ, the status exchange numbers, and the outbound BSN.
+//! a 52-byte THDR, and no data. Later STATUS packets can contain ABSPs.
+//! RSEQ and ABSPs come from the bounded reliable receive window; the caller
+//! supplies the status exchange numbers and outbound BSN.
 //! This encoder does not transmit, perform RTP reliability, or activate a
 //! connection.
 
+use crate::hpr_rtp_receive::ReceiveStatus;
+
 const ASSIGNOR: u64 = 1 << 63;
 const RESERVED: u64 = 1 << 62;
-const THDR_LEN: usize = 52;
+const BASE_THDR_LEN: usize = 52;
+const MAX_ABSP: usize = 125; // One-byte STATUS length/4: (20 + 8*125)/4 = 255.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplyEncodeError {
@@ -17,6 +21,8 @@ pub enum ReplyEncodeError {
     InvalidAssignedTcid,
     InvalidPriority,
     InvalidAnrLabel,
+    TooManySpans,
+    InvalidSpan,
 }
 
 /// The entire ANR routing field for a directly adjacent peer, excluding its
@@ -29,13 +35,20 @@ pub struct ReplyPath<'a> {
     pub priority: u8,
 }
 
-/// STATUS values supplied only after the caller validates receive ordering
-/// and status exchange state. No-gap/NABSP=0 is the only supported template.
+/// Legacy no-gap STATUS values supplied after caller receive validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallerStatus {
     pub sync: u16,
     pub echo: u16,
     pub rseq: u32,
+    pub outbound_bsn: u32,
+}
+
+/// Status exchange values supplied by the caller's RTP control state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusExchange {
+    pub sync: u16,
+    pub echo: u16,
     pub outbound_bsn: u32,
 }
 
@@ -49,6 +62,33 @@ pub fn encode_setup_reply(
     assigned_tcid: u64,
     path: ReplyPath<'_>,
     status: CallerStatus,
+) -> Result<Vec<u8>, ReplyEncodeError> {
+    encode_setup_reply_from_snapshot(
+        origin_tcid,
+        assigned_tcid,
+        path,
+        StatusExchange {
+            sync: status.sync,
+            echo: status.echo,
+            outbound_bsn: status.outbound_bsn,
+        },
+        &ReceiveStatus {
+            rseq: status.rseq,
+            spans: Vec::new(),
+        },
+    )
+}
+
+/// Encode STATUS + CIE from a validated receive snapshot. The snapshot is
+/// caller-provided so this function does not itself establish the connection
+/// or decide when a STATUS is due. ABSPs must be ordered and lie ahead of
+/// RSEQ in an unambiguous 32-bit half-window.
+pub fn encode_setup_reply_from_snapshot(
+    origin_tcid: u64,
+    assigned_tcid: u64,
+    path: ReplyPath<'_>,
+    exchange: StatusExchange,
+    snapshot: &ReceiveStatus,
 ) -> Result<Vec<u8>, ReplyEncodeError> {
     if origin_tcid & (ASSIGNOR | RESERVED) != ASSIGNOR {
         return Err(ReplyEncodeError::InvalidOriginTcid);
@@ -68,31 +108,54 @@ pub fn encode_setup_reply(
     {
         return Err(ReplyEncodeError::InvalidAnrLabel);
     }
+    if snapshot.spans.len() > MAX_ABSP {
+        return Err(ReplyEncodeError::TooManySpans);
+    }
+    let mut last_end = 0u32;
+    for span in &snapshot.spans {
+        let begin = span.begin.wrapping_sub(snapshot.rseq) as i32;
+        let end = span.end.wrapping_sub(snapshot.rseq) as i32;
+        if begin <= 0 || end < begin || (begin as u32) < last_end {
+            return Err(ReplyEncodeError::InvalidSpan);
+        }
+        last_end = end as u32;
+    }
 
-    let mut packet = Vec::with_capacity(4 + path.anr_label.len() + THDR_LEN);
+    let thdr_len = BASE_THDR_LEN + 8 * snapshot.spans.len();
+    let mut packet = Vec::with_capacity(4 + path.anr_label.len() + thdr_len);
     packet.push(0xc0 | path.priority << 1); // NHDR: ANR switching mode.
     packet.push(0x08); // Time sensitive because STATUS is present.
     packet.extend_from_slice(path.anr_label);
     packet.extend_from_slice(&[0xff, 0]); // ANR delimiter, reserved byte.
 
-    let mut thdr = [0u8; THDR_LEN];
+    let mut thdr = vec![0u8; thdr_len];
     thdr[..8].copy_from_slice(&(origin_tcid & !ASSIGNOR).to_be_bytes());
     thdr[9] = 0x04; // Optional segments, no qualifier.
-    thdr[10..12].copy_from_slice(&((THDR_LEN / 4) as u16).to_be_bytes());
-    thdr[16..20].copy_from_slice(&status.outbound_bsn.to_be_bytes());
+    thdr[10..12].copy_from_slice(&((thdr_len / 4) as u16).to_be_bytes());
+    thdr[16..20].copy_from_slice(&exchange.outbound_bsn.to_be_bytes());
 
-    thdr[20] = 5; // STATUS length in four-byte words.
+    thdr[20] = (5 + 2 * snapshot.spans.len()) as u8;
     thdr[21] = 0x0e;
-    // Bytes 22–23 remain zero: no gap, not idle, NABSP=0.
-    thdr[24..26].copy_from_slice(&status.sync.to_be_bytes());
-    thdr[26..28].copy_from_slice(&status.echo.to_be_bytes());
-    thdr[28..32].copy_from_slice(&status.rseq.to_be_bytes());
+    if !snapshot.spans.is_empty() {
+        thdr[22] = 0x80; // GAPDETR, because NABSP is nonzero.
+    }
+    thdr[23] = snapshot.spans.len() as u8;
+    thdr[24..26].copy_from_slice(&exchange.sync.to_be_bytes());
+    thdr[26..28].copy_from_slice(&exchange.echo.to_be_bytes());
+    thdr[28..32].copy_from_slice(&snapshot.rseq.to_be_bytes());
     // Bytes 32–39 are reserved and zero.
 
-    thdr[40] = 3; // CIE length in four-byte words.
-    thdr[41] = 0x10;
-    // Bytes 42–43 are reserved and zero.
-    thdr[44..52].copy_from_slice(&assigned_tcid.to_be_bytes());
+    for (index, span) in snapshot.spans.iter().enumerate() {
+        let start = 40 + index * 8;
+        thdr[start..start + 4].copy_from_slice(&span.begin.to_be_bytes());
+        thdr[start + 4..start + 8].copy_from_slice(&span.end.to_be_bytes());
+    }
+
+    let cie_start = 40 + snapshot.spans.len() * 8;
+    thdr[cie_start] = 3; // CIE length in four-byte words.
+    thdr[cie_start + 1] = 0x10;
+    // Next two bytes are reserved and zero.
+    thdr[cie_start + 4..cie_start + 12].copy_from_slice(&assigned_tcid.to_be_bytes());
     packet.extend_from_slice(&thdr);
     Ok(packet)
 }
@@ -102,6 +165,8 @@ mod tests {
     use super::*;
     use crate::{
         hpr_rtp::RtpPacket,
+        hpr_rtp_receive::{AcknowledgedSpan, ReliableReceiveWindow},
+        hpr_rtp_send::parse_peer_status,
         hpr_rtp_setup::{RtpInboundSetup, RtpLocalTarget, SetupPhase},
         ConnectionGeneration,
     };
@@ -171,6 +236,19 @@ mod tests {
         packet
     }
 
+    fn synthetic_received(bsn: u32, payload: &[u8], eom: bool) -> Vec<u8> {
+        let mut packet = vec![0xc6, 0, 0xa4, 0, 0xff, 0];
+        let mut thdr = [0u8; 20];
+        thdr[..8].copy_from_slice(&(ASSIGNED & !ASSIGNOR).to_be_bytes());
+        thdr[8] = 0x20 | if eom { 0x10 } else { 0 };
+        thdr[10..12].copy_from_slice(&5u16.to_be_bytes());
+        thdr[12..16].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        thdr[16..20].copy_from_slice(&bsn.to_be_bytes());
+        packet.extend_from_slice(&thdr);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
     #[test]
     fn reply_fields_roundtrip_through_receive_parser() {
         let encoded = encode_setup_reply(ORIGIN, ASSIGNED, path(), status()).unwrap();
@@ -179,7 +257,7 @@ mod tests {
         let packet = RtpPacket::parse(&encoded).unwrap();
         assert_eq!(packet.tcid, ORIGIN & !ASSIGNOR);
         assert_eq!(packet.nhdr.len(), 6);
-        assert_eq!(packet.thdr.len(), THDR_LEN);
+        assert_eq!(packet.thdr.len(), BASE_THDR_LEN);
         assert!(packet.data.is_empty());
         assert_eq!(packet.byte_sequence_number, 19);
         assert_eq!(packet.thdr[8..12], [0, 4, 0, 13]);
@@ -224,6 +302,86 @@ mod tests {
             .observe_outbound_reply_sent(generation, RtpPacket::parse(&encoded).unwrap())
             .unwrap();
         assert_eq!(observer.phase(), SetupPhase::AwaitPeerUse);
+    }
+
+    #[test]
+    fn receive_window_snapshot_roundtrips_through_status_parser() {
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let mut receive =
+            ReliableReceiveWindow::new(generation, ASSIGNED & !ASSIGNOR, 10, 1024).unwrap();
+        for (bsn, data) in [(21, &b"XY"[..]), (31, &b"Z"[..])] {
+            let raw = synthetic_received(bsn, data, true);
+            receive
+                .observe(generation, RtpPacket::parse(&raw).unwrap())
+                .unwrap();
+        }
+        let snapshot = receive.status();
+        assert_eq!(snapshot.spans.len(), 2);
+        let encoded = encode_setup_reply_from_snapshot(
+            ORIGIN,
+            ASSIGNED,
+            path(),
+            StatusExchange {
+                sync: 7,
+                echo: 3,
+                outbound_bsn: 19,
+            },
+            &snapshot,
+        )
+        .unwrap();
+        let packet = RtpPacket::parse(&encoded).unwrap();
+        assert_eq!(packet.thdr.len(), 68);
+        assert_eq!(packet.thdr[20..24], [9, 0x0e, 0x80, 2]);
+        assert_eq!(packet.connection_identifier_exchange(), Ok(Some(ASSIGNED)));
+        let parsed = parse_peer_status(packet).unwrap();
+        assert_eq!((parsed.sync, parsed.echo, parsed.rseq), (7, 3, 10));
+        assert_eq!(parsed.spans[0].begin, 21);
+        assert_eq!(parsed.spans[0].end, 24);
+        assert_eq!(parsed.spans[1].begin, 31);
+        assert_eq!(parsed.spans[1].end, 33);
+    }
+
+    #[test]
+    fn maximum_architected_absp_count_and_bad_spans() {
+        let exchange = StatusExchange {
+            sync: 0,
+            echo: 0,
+            outbound_bsn: 0,
+        };
+        let mut snapshot = ReceiveStatus {
+            rseq: u32::MAX - 1,
+            spans: (0..MAX_ABSP)
+                .map(|index| AcknowledgedSpan {
+                    begin: snapshot_bsn(u32::MAX - 1, 1 + index as u32 * 2),
+                    end: snapshot_bsn(u32::MAX - 1, 2 + index as u32 * 2),
+                })
+                .collect(),
+        };
+        let encoded =
+            encode_setup_reply_from_snapshot(ORIGIN, ASSIGNED, path(), exchange, &snapshot)
+                .unwrap();
+        let packet = RtpPacket::parse(&encoded).unwrap();
+        assert_eq!(packet.thdr.len(), 1052);
+        assert_eq!(packet.thdr[20], 255);
+        assert_eq!(parse_peer_status(packet).unwrap().spans.len(), MAX_ABSP);
+        snapshot.spans.push(AcknowledgedSpan {
+            begin: 251,
+            end: 252,
+        });
+        assert_eq!(
+            encode_setup_reply_from_snapshot(ORIGIN, ASSIGNED, path(), exchange, &snapshot),
+            Err(ReplyEncodeError::TooManySpans)
+        );
+        snapshot.spans = vec![AcknowledgedSpan { begin: 2, end: 1 }];
+        snapshot.rseq = 0;
+        assert_eq!(
+            encode_setup_reply_from_snapshot(ORIGIN, ASSIGNED, path(), exchange, &snapshot),
+            Err(ReplyEncodeError::InvalidSpan)
+        );
+    }
+
+    fn snapshot_bsn(initial: u32, distance: u32) -> u32 {
+        initial.wrapping_add(distance)
     }
 
     #[test]
