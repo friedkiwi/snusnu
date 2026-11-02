@@ -21,7 +21,9 @@ use transport_ip_sna::{
     mptn_reverse_user_bind::{NativeAddress, Phase as UserBindPhase, ReverseUserBind},
     mptn_reverse_user_flow::{NativeInput, ReverseUserFlow},
     mptn_reverse_user_native_close::NativeUserClose,
-    mptn_reverse_user_teardown::{AbortAction, Phase as TeardownPhase, ReverseUserTeardown},
+    mptn_reverse_user_teardown::{
+        AbortAction, AbortBearer, Phase as TeardownPhase, ReverseUserTeardown,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -86,6 +88,9 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     user_closed: bool,
     udp_user_input: Option<(u16, Vec<u8>)>,
     udp_user_completion: Option<u16>,
+    udp_abort_input: Option<(u16, Vec<u8>)>,
+    udp_abort_pending: Option<u16>,
+    udp_abort_completion: Option<u16>,
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
@@ -131,6 +136,9 @@ impl<P: RoutePort> VirtualWsPort<P> {
             user_closed: false,
             udp_user_input: None,
             udp_user_completion: None,
+            udp_abort_input: None,
+            udp_abort_pending: None,
+            udp_abort_completion: None,
         })
     }
 
@@ -222,6 +230,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.tcp_user_input.is_some()
             || self.native_user_output.is_some()
             || self.deferred_user_normal
+            || self.udp_abort_input.is_some()
+            || self.udp_abort_pending.is_some()
             || self.expedited_ack.is_some()
             || self.udp_user_input.is_some()
         {
@@ -267,6 +277,8 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.tcp_user_input.is_some()
             || self.native_user_output.is_some()
             || self.deferred_user_normal
+            || self.udp_abort_input.is_some()
+            || self.udp_abort_pending.is_some()
         {
             return Ok(false);
         }
@@ -279,6 +291,31 @@ impl<P: RoutePort> VirtualWsPort<P> {
 
     pub(crate) fn take_completed_udp_expedited(&mut self) -> Option<u16> {
         self.udp_user_completion.take()
+    }
+
+    /// The gateway validates association, sequence and reduced X'83' body.
+    /// The positive UDP response is held until native +RSP(UNBIND) arrives.
+    pub(crate) fn submit_udp_abort(&mut self, sequence: u16, reduced: &[u8]) -> io::Result<bool> {
+        if self.user_flow.is_none()
+            || self.user_closed
+            || self.udp_abort_input.is_some()
+            || self.udp_abort_pending.is_some()
+            || self.udp_abort_completion.is_some()
+            || self.tcp_user_input.is_some()
+            || self.native_user_output.is_some()
+            || self.native_user_input.is_some()
+            || self.tcp_user_output.is_some()
+            || self.udp_user_input.is_some()
+            || self.udp_user_completion.is_some()
+        {
+            return Ok(false);
+        }
+        self.udp_abort_input = Some((sequence, reduced.to_vec()));
+        Ok(true)
+    }
+
+    pub(crate) fn take_completed_udp_abort(&mut self) -> Option<u16> {
+        self.udp_abort_completion.take()
     }
 
     pub(crate) fn take_expedited_native_completed(&mut self) -> bool {
@@ -375,6 +412,9 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.user_closed = false;
         self.udp_user_input = None;
         self.udp_user_completion = None;
+        self.udp_abort_input = None;
+        self.udp_abort_pending = None;
+        self.udp_abort_completion = None;
         if self.management.take().is_some() {
             // FQPCID and BIND token must be freshly minted on the next
             // circuit. A caller must construct a new virtual session.
@@ -691,10 +731,19 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     .as_ref()
                     .is_some_and(|teardown| teardown.phase() == TeardownPhase::AwaitNativeResponse)
                 {
-                    self.user_teardown
+                    let bearer = self
+                        .user_teardown
                         .as_mut()
                         .unwrap()
                         .accept_native_response(&piu)?;
+                    if bearer == AbortBearer::Udp {
+                        let sequence = self.udp_abort_pending.take().ok_or_else(|| {
+                            protocol("UDP X83 Abort native response lacks pending sequence")
+                        })?;
+                        if self.udp_abort_completion.replace(sequence).is_some() {
+                            return Err(protocol("unclaimed UDP X83 Abort completion"));
+                        }
+                    }
                     flow.close();
                     self.user_closed = true;
                 } else if piu.len() >= 10 && piu[6..9] == [0x6b, 0x80, 0] && piu[9] == 0x32 {
@@ -723,7 +772,18 @@ impl<P: RoutePort> VirtualWsPort<P> {
             }
         }
         if self.native_user_output.is_none() {
-            if let Some((sequence, reduced)) = self.udp_user_input.take() {
+            if let Some((sequence, reduced)) = self.udp_abort_input.take() {
+                let piu = self
+                    .user_teardown
+                    .as_mut()
+                    .ok_or_else(|| protocol("UDP X83 user teardown absent"))?
+                    .prepare_udp_abort(&reduced)?
+                    .to_vec();
+                self.native_user_output = Some(piu);
+                self.native_user_output_kind = Some(NativeUserOutputKind::TeardownUnbind);
+                self.udp_abort_pending = Some(sequence);
+                flow.close();
+            } else if let Some((sequence, reduced)) = self.udp_user_input.take() {
                 let piu = flow.prepare_udp_expedited(&reduced)?.to_vec();
                 self.native_user_output = Some(piu);
                 self.native_user_output_kind = Some(NativeUserOutputKind::UdpExpedited(sequence));
@@ -1203,6 +1263,121 @@ mod tests {
         assert_eq!(port.inner.inbound_completed, 1);
         port.inner.completed = 1;
         port.complete_management_egress().unwrap();
+    }
+
+    #[test]
+    fn native_expedited_accepts_one_logical_ack_after_tcp_or_udp_delivery() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::new(
+            inner,
+            xid("QABOB.SNAB", Role::Secondary),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+        )
+        .unwrap();
+        port.user_flow = Some(
+            ReverseUserFlow::new(
+                NativeAddress {
+                    daf: 2,
+                    oaf: 2,
+                    odai: true,
+                },
+                3,
+                1,
+            )
+            .unwrap(),
+        );
+        let native = hex("2f00020280004b8000c900010001");
+        port.native_user_input = Some(native.clone());
+        port.drive_user_flow().unwrap();
+        let first = port.tcp_user_record().unwrap().clone();
+        assert_eq!(first.bytes, hex("0000000f0180004b8000c900010001"));
+        port.mark_tcp_user_record_enqueued(&first).unwrap();
+        assert_eq!(port.inner.inbound_completed, 1);
+
+        // A correlated UDP X'83' positive is presented by the gateway as
+        // this same logical X'03'. A later TCP X'03' must not clear another
+        // expedited record; the gateway suppresses it before this API.
+        let ack = TcpRecord::decode(hex("0000000503")).unwrap();
+        assert!(port.submit_tcp_user_record(&ack).unwrap());
+        port.drive_user_flow().unwrap();
+        assert!(port.tcp_user_record().is_none());
+        assert_eq!(port.inner.inbound_completed, 1);
+
+        port.native_user_input = Some(native);
+        port.drive_user_flow().unwrap();
+        let second = port.tcp_user_record().unwrap().clone();
+        port.mark_tcp_user_record_enqueued(&second).unwrap();
+        assert!(port.submit_tcp_user_record(&ack).unwrap());
+        port.drive_user_flow().unwrap();
+        assert!(port.submit_tcp_user_record(&ack).unwrap());
+        assert!(port.drive_user_flow().is_err());
+    }
+
+    #[test]
+    fn udp_abort_completes_only_after_native_unbind_and_correlated_response() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::new(
+            inner,
+            xid("QABOB.SNAB", Role::Secondary),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+        )
+        .unwrap();
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        let offer = user_offer();
+        port.user_flow = Some(ReverseUserFlow::new(address, 3, 1).unwrap());
+        port.user_teardown = Some(ReverseUserTeardown::from_user_offer(&offer, address).unwrap());
+        let mut reduced = hex("00006b8000320f08010000");
+        reduced.extend_from_slice(offer.fqpcid());
+        let destination = &offer.connect().destination.node;
+        reduced.extend_from_slice(&[
+            0x35,
+            0x13,
+            0x08,
+            1,
+            0,
+            0,
+            (destination.len() + 1) as u8,
+            0,
+            destination.len() as u8,
+        ]);
+        reduced.extend_from_slice(destination);
+        reduced.push(0);
+        assert!(port.submit_udp_abort(9, &reduced).unwrap());
+        assert!(!port.submit_udp_abort(9, &reduced).unwrap());
+        port.drive_user_flow().unwrap();
+        let unbind = port.inner.information.last().unwrap();
+        assert_eq!(&unbind[..15], &hex("2f00020200006b8000320f08010000"));
+        assert_eq!(port.take_completed_udp_abort(), None);
+
+        port.inner.completed = 1;
+        port.complete_management_egress().unwrap();
+        assert_eq!(port.take_completed_udp_abort(), None);
+        port.native_user_input = Some(hex("2f0002020000eb800032"));
+        port.drive_user_flow().unwrap();
+        assert_eq!(port.inner.inbound_completed, 1);
+        assert_eq!(port.take_completed_udp_abort(), Some(9));
+        assert_eq!(port.take_completed_udp_abort(), None);
+        assert!(port.user_closed());
     }
 
     #[test]
