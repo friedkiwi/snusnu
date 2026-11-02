@@ -6,7 +6,10 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -24,6 +27,11 @@ type circuitHistoryRecord struct {
 	PeakQueuedBytes                                      uint64
 }
 
+type pendingCircuitHistory struct {
+	Record circuitHistoryRecord
+	Status string
+}
+
 type circuitView struct {
 	ID, SourceRouterID, SourceRouterName, SourceOwnerID  string
 	TargetRouterID, TargetRouterName, TargetOwnerID      string
@@ -32,6 +40,14 @@ type circuitView struct {
 	SourceBytes, TargetBytes, SourceEvents, TargetEvents uint64
 	SourceAllowance, TargetAllowance, PeakQueuedBytes    uint64
 	Historical, CanReset                                 bool
+	Persistence                                          string
+}
+
+type circuitHistoryPage struct {
+	Items, Pending                  []circuitView
+	Search, State, Reason, From, To string
+	Page, PageSize, Total, Pages    int
+	PrevURL, NextURL                string
 }
 
 func (h *routerHub) archiveCircuitLocked(id string, c *wsCircuit, reason, actorType, actorID string) {
@@ -47,7 +63,15 @@ func (h *routerHub) archiveCircuitLocked(id string, c *wsCircuit, reason, actorT
 		OpenedAt: c.openedAt.Unix(), ActivatedAt: unixTime(c.activatedAt), ClosedAt: store.Now(),
 		SourceBytes: c.sent[0], TargetBytes: c.sent[1], SourceEvents: c.events[0], TargetEvents: c.events[1], PeakQueuedBytes: c.peakQueued,
 	}
+	h.a.historyArchived.Add(1)
+	h.a.historyMu.Lock()
+	h.a.historyPending[id] = pendingCircuitHistory{Record: record, Status: "queued"}
+	h.a.historyMu.Unlock()
 	if !h.a.circuitHistory.push(record) {
+		h.a.historyFailed.Add(1)
+		h.a.historyMu.Lock()
+		h.a.historyPending[id] = pendingCircuitHistory{Record: record, Status: "failed"}
+		h.a.historyMu.Unlock()
 		log.Printf("SNA circuit history queue full; summary for %s was not persisted", id)
 	}
 }
@@ -68,6 +92,9 @@ func (a *App) startCircuitHistoryWriter(ctx context.Context) {
 			if !ok {
 				return
 			}
+			a.historyMu.Lock()
+			a.historyPending[record.ID] = pendingCircuitHistory{Record: record, Status: "writing"}
+			a.historyMu.Unlock()
 			a.persistCircuitHistory(record)
 		}
 	}()
@@ -81,11 +108,22 @@ func (a *App) persistCircuitHistory(record circuitHistoryRecord) {
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`, record.ID, record.SourceRouterID, record.SourceRouterName, record.SourceOwnerID, record.TargetRouterID, record.TargetRouterName, record.TargetOwnerID, record.Profile, record.OpenedAt, record.ActivatedAt, record.ClosedAt, record.State, record.CloseReason, record.SourceBytes, record.TargetBytes, record.SourceEvents, record.TargetEvents, record.PeakQueuedBytes, record.ActorType, record.ActorID)
 		cancel()
 		if err == nil {
+			a.historyPersisted.Add(1)
+			a.historyMu.Lock()
+			delete(a.historyPending, record.ID)
+			a.historyMu.Unlock()
 			return
+		}
+		if attempt != 2 {
+			a.historyRetries.Add(1)
 		}
 		time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
 	}
 	a.writeFailures.Add(1)
+	a.historyFailed.Add(1)
+	a.historyMu.Lock()
+	a.historyPending[record.ID] = pendingCircuitHistory{Record: record, Status: "failed"}
+	a.historyMu.Unlock()
 	log.Printf("persist SNA circuit history %s after retries: %v", record.ID, err)
 }
 
@@ -114,49 +152,177 @@ func (h *routerHub) liveCircuits(ownerID string, all bool) []circuitView {
 	return items
 }
 
-func (a *App) circuitHistoryRows(ctx context.Context, ownerID string, all bool, limit int) ([]circuitView, error) {
-	query := "SELECT id,source_router_id,source_router_name,source_owner_id,target_router_id,target_router_name,target_owner_id,profile,opened_at,activated_at,closed_at,state,close_reason,source_bytes,target_bytes,source_events,target_events,peak_queued_bytes,actor_type,actor_id FROM sna_circuit_history"
-	args := []any{}
+func circuitHistoryFilter(r *http.Request) circuitHistoryPage {
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	size, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	if size < 10 {
+		size = 50
+	}
+	if size > 200 {
+		size = 200
+	}
+	state := r.URL.Query().Get("state")
+	if state != "closed" && state != "reset" {
+		state = ""
+	}
+	return circuitHistoryPage{Search: strings.TrimSpace(r.URL.Query().Get("q")), State: state, Reason: strings.TrimSpace(r.URL.Query().Get("reason")), From: r.URL.Query().Get("from"), To: r.URL.Query().Get("to"), Page: page, PageSize: size}
+}
+
+func historyWhere(filter circuitHistoryPage, ownerID string, all bool) (string, []any) {
+	var clauses []string
+	var args []any
 	if !all {
-		query += " WHERE source_owner_id=? OR target_owner_id=?"
+		clauses = append(clauses, "(h.source_owner_id=? OR h.target_owner_id=?)")
 		args = append(args, ownerID, ownerID)
 	}
-	query += " ORDER BY closed_at DESC LIMIT ?"
-	args = append(args, limit)
-	rows, err := a.DB.Query(ctx, query, args...)
+	if filter.State != "" {
+		clauses = append(clauses, "h.state=?")
+		args = append(args, filter.State)
+	}
+	if filter.Reason != "" {
+		clauses = append(clauses, "LOWER(h.close_reason) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.Reason)+"%")
+	}
+	if filter.Search != "" {
+		like := "%" + strings.ToLower(filter.Search) + "%"
+		clauses = append(clauses, `(LOWER(h.id) LIKE ? OR LOWER(h.source_router_id) LIKE ? OR LOWER(h.source_router_name) LIKE ? OR LOWER(h.source_owner_id) LIKE ? OR LOWER(h.target_router_id) LIKE ? OR LOWER(h.target_router_name) LIKE ? OR LOWER(h.target_owner_id) LIKE ? OR LOWER(h.close_reason) LIKE ? OR LOWER(h.actor_id) LIKE ? OR LOWER(COALESCE(su.email,'')) LIKE ? OR LOWER(COALESCE(tu.email,'')) LIKE ?)`)
+		for i := 0; i < 11; i++ {
+			args = append(args, like)
+		}
+	}
+	if value, err := time.Parse("2006-01-02", filter.From); err == nil {
+		clauses = append(clauses, "h.closed_at>=?")
+		args = append(args, value.Unix())
+	}
+	if value, err := time.Parse("2006-01-02", filter.To); err == nil {
+		clauses = append(clauses, "h.closed_at<?")
+		args = append(args, value.Add(24*time.Hour).Unix())
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func (a *App) circuitHistoryRows(ctx context.Context, ownerID string, all bool, page *circuitHistoryPage) error {
+	from := " FROM sna_circuit_history h LEFT JOIN users su ON su.id=h.source_owner_id LEFT JOIN users tu ON tu.id=h.target_owner_id"
+	where, args := historyWhere(*page, ownerID, all)
+	if err := a.DB.Row(ctx, "SELECT COUNT(*)"+from+where, args...).Scan(&page.Total); err != nil {
+		return err
+	}
+	page.Pages = (page.Total + page.PageSize - 1) / page.PageSize
+	if page.Pages == 0 {
+		page.Pages = 1
+	}
+	if page.Page > page.Pages {
+		page.Page = page.Pages
+	}
+	query := "SELECT h.id,h.source_router_id,h.source_router_name,h.source_owner_id,h.target_router_id,h.target_router_name,h.target_owner_id,h.profile,h.opened_at,h.activated_at,h.closed_at,h.state,h.close_reason,h.source_bytes,h.target_bytes,h.source_events,h.target_events,h.peak_queued_bytes,h.actor_type,h.actor_id" + from + where + " ORDER BY h.closed_at DESC,h.id DESC LIMIT ? OFFSET ?"
+	queryArgs := append(append([]any{}, args...), page.PageSize, (page.Page-1)*page.PageSize)
+	rows, err := a.DB.Query(ctx, query, queryArgs...)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
-	var items []circuitView
 	for rows.Next() {
 		var x circuitView
 		if err = rows.Scan(&x.ID, &x.SourceRouterID, &x.SourceRouterName, &x.SourceOwnerID, &x.TargetRouterID, &x.TargetRouterName, &x.TargetOwnerID, &x.Profile, &x.OpenedAt, &x.ActivatedAt, &x.ClosedAt, &x.State, &x.CloseReason, &x.SourceBytes, &x.TargetBytes, &x.SourceEvents, &x.TargetEvents, &x.PeakQueuedBytes, &x.ActorType, &x.ActorID); err != nil {
-			return nil, err
+			return err
 		}
 		x.Historical = true
-		items = append(items, x)
+		x.Persistence = "persisted"
+		page.Items = append(page.Items, x)
 	}
-	return items, rows.Err()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	values := rValues(*page)
+	if page.Page > 1 {
+		values.Set("page", strconv.Itoa(page.Page-1))
+		page.PrevURL = "?" + values.Encode()
+	}
+	if page.Page < page.Pages {
+		values.Set("page", strconv.Itoa(page.Page+1))
+		page.NextURL = "?" + values.Encode()
+	}
+	return nil
 }
 
-func historyLimit(r *http.Request) int {
-	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	if err != nil || limit < 1 {
-		return 100
+func rValues(page circuitHistoryPage) url.Values {
+	v := url.Values{"page_size": {strconv.Itoa(page.PageSize)}}
+	if page.Search != "" {
+		v.Set("q", page.Search)
 	}
-	if limit > 500 {
-		return 500
+	if page.State != "" {
+		v.Set("state", page.State)
 	}
-	return limit
+	if page.Reason != "" {
+		v.Set("reason", page.Reason)
+	}
+	if page.From != "" {
+		v.Set("from", page.From)
+	}
+	if page.To != "" {
+		v.Set("to", page.To)
+	}
+	return v
+}
+
+func historyRecordView(record circuitHistoryRecord, persistence string) circuitView {
+	return circuitView{ID: record.ID, SourceRouterID: record.SourceRouterID, SourceRouterName: record.SourceRouterName, SourceOwnerID: record.SourceOwnerID, TargetRouterID: record.TargetRouterID, TargetRouterName: record.TargetRouterName, TargetOwnerID: record.TargetOwnerID, Profile: record.Profile, State: record.State, CloseReason: record.CloseReason, ActorType: record.ActorType, ActorID: record.ActorID, OpenedAt: record.OpenedAt, ActivatedAt: record.ActivatedAt, ClosedAt: record.ClosedAt, SourceBytes: record.SourceBytes, TargetBytes: record.TargetBytes, SourceEvents: record.SourceEvents, TargetEvents: record.TargetEvents, PeakQueuedBytes: record.PeakQueuedBytes, Historical: true, Persistence: persistence}
+}
+
+func pendingMatches(record circuitHistoryRecord, ownerID string, all bool, filter circuitHistoryPage) bool {
+	if !all && record.SourceOwnerID != ownerID && record.TargetOwnerID != ownerID {
+		return false
+	}
+	if filter.State != "" && record.State != filter.State {
+		return false
+	}
+	if filter.Reason != "" && !strings.Contains(strings.ToLower(record.CloseReason), strings.ToLower(filter.Reason)) {
+		return false
+	}
+	if value, err := time.Parse("2006-01-02", filter.From); err == nil && record.ClosedAt < value.Unix() {
+		return false
+	}
+	if value, err := time.Parse("2006-01-02", filter.To); err == nil && record.ClosedAt >= value.Add(24*time.Hour).Unix() {
+		return false
+	}
+	if filter.Search != "" {
+		haystack := strings.ToLower(strings.Join([]string{record.ID, record.SourceRouterID, record.SourceRouterName, record.SourceOwnerID, record.TargetRouterID, record.TargetRouterName, record.TargetOwnerID, record.CloseReason, record.ActorID}, " "))
+		if !strings.Contains(haystack, strings.ToLower(filter.Search)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) pendingCircuitHistory(ownerID string, all bool, filter circuitHistoryPage) []circuitView {
+	a.historyMu.Lock()
+	defer a.historyMu.Unlock()
+	items := make([]circuitView, 0, len(a.historyPending))
+	for _, pending := range a.historyPending {
+		if pendingMatches(pending.Record, ownerID, all, filter) {
+			items = append(items, historyRecordView(pending.Record, pending.Status))
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ClosedAt > items[j].ClosedAt || items[i].ClosedAt == items[j].ClosedAt && items[i].ID > items[j].ID
+	})
+	return items
 }
 
 func (a *App) renderSNACircuits(w http.ResponseWriter, r *http.Request, u store.User, s store.Session, all bool) {
-	history, err := a.circuitHistoryRows(r.Context(), u.ID, all, historyLimit(r))
+	history := circuitHistoryFilter(r)
+	err := a.circuitHistoryRows(r.Context(), u.ID, all, &history)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		dbError(w, err)
 		return
 	}
+	history.Pending = a.pendingCircuitHistory(u.ID, all, history)
 	a.render(w, "sna_circuits", map[string]any{"User": u, "CSRF": s.CSRF, "Active": a.hub.liveCircuits(u.ID, all), "History": history, "All": all})
 }
 

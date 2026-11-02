@@ -259,7 +259,10 @@ func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.Us
 		policyVersion, policyRouters, policyBlocks = policy.version, len(policy.routers), len(policy.blocks)
 	}
 	logs, history := a.routerLogs.stats(), a.circuitHistory.stats()
-	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
+	a.historyMu.Lock()
+	pendingHistory := len(a.historyPending)
+	a.historyMu.Unlock()
+	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "HistoryPending": pendingHistory, "HistoryArchived": a.historyArchived.Load(), "HistoryPersisted": a.historyPersisted.Load(), "HistoryRetries": a.historyRetries.Load(), "HistoryFailed": a.historyFailed.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
 }
 
 func (a *App) runMaintenanceTask(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {

@@ -86,9 +86,13 @@ func (a *App) metrics(w http.ResponseWriter, _ *http.Request) {
 		draining = 1
 	}
 	logs, history := a.routerLogs.stats(), a.circuitHistory.stats()
+	a.historyMu.Lock()
+	pendingHistory := len(a.historyPending)
+	a.historyMu.Unlock()
 	fmt.Fprintf(w, "# TYPE snusnu_connected_routers gauge\nsnusnu_connected_routers %d\n# TYPE snusnu_active_circuits gauge\nsnusnu_active_circuits %d\n", a.hub.sessionCount(), a.hub.activeCircuitCount())
 	fmt.Fprintf(w, "snusnu_queue_depth{queue=\"router_logs\"} %d\nsnusnu_queue_depth{queue=\"circuit_history\"} %d\nsnusnu_queue_high_water{queue=\"router_logs\"} %d\nsnusnu_queue_high_water{queue=\"circuit_history\"} %d\nsnusnu_queue_limit{queue=\"router_logs\"} %d\nsnusnu_queue_limit{queue=\"circuit_history\"} %d\nsnusnu_queue_dropped_total{queue=\"router_logs\"} %d\nsnusnu_queue_dropped_total{queue=\"circuit_history\"} %d\n", logs.Depth, history.Depth, logs.HighWater, history.HighWater, logs.Limit, history.Limit, logs.Dropped, history.Dropped)
 	fmt.Fprintf(w, "snusnu_queue_bytes{queue=\"router_logs\"} %d\nsnusnu_queue_bytes_limit{queue=\"router_logs\"} %d\nsnusnu_async_write_failures_total %d\nsnusnu_instance_heartbeat_failures_total %d\nsnusnu_instance_last_heartbeat_seconds %d\nsnusnu_policy_version %d\nsnusnu_route_reconciliations_total %d\nsnusnu_draining %d\n", logs.Bytes, logs.ByteLimit, a.writeFailures.Load(), a.heartbeatFailures.Load(), a.lastHeartbeat.Load(), policyVersion, a.hub.reconciliations.Load(), draining)
+	fmt.Fprintf(w, "snusnu_circuit_history_pending %d\nsnusnu_circuit_history_archived_total %d\nsnusnu_circuit_history_persisted_total %d\nsnusnu_circuit_history_retries_total %d\nsnusnu_circuit_history_failed_total %d\n", pendingHistory, a.historyArchived.Load(), a.historyPersisted.Load(), a.historyRetries.Load(), a.historyFailed.Load())
 	for _, session := range a.hub.sessions() {
 		stats := session.out.stats()
 		fmt.Fprintf(w, "snusnu_router_outbound_queue_depth{router_id=\"%s\"} %d\nsnusnu_router_outbound_queue_bytes{router_id=\"%s\"} %d\nsnusnu_router_outbound_queue_high_water{router_id=\"%s\"} %d\nsnusnu_router_outbound_queue_dropped_total{router_id=\"%s\"} %d\n", session.router.ID, stats.Depth, session.router.ID, stats.Bytes, session.router.ID, stats.HighWater, session.router.ID, stats.Dropped)

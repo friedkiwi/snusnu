@@ -53,6 +53,12 @@ type App struct {
 	heartbeatFailures atomic.Uint64
 	lastHeartbeat     atomic.Int64
 	fatal             chan error
+	historyMu         sync.Mutex
+	historyPending    map[string]pendingCircuitHistory
+	historyArchived   atomic.Uint64
+	historyPersisted  atomic.Uint64
+	historyRetries    atomic.Uint64
+	historyFailed     atomic.Uint64
 }
 
 func NewApp(db *store.Store, cfg Config) (*App, error) {
@@ -73,7 +79,7 @@ func NewApp(db *store.Store, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: newDynamicQueue[circuitHistoryRecord](4096, 0, nil), routerLogs: newDynamicQueue[store.LogEntry](65536, 64<<20, func(x store.LogEntry) int { return len(x.Summary) + len(x.DetailsJSON) + 256 }), fatal: make(chan error, 1)}
+	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: newDynamicQueue[circuitHistoryRecord](4096, 0, nil), routerLogs: newDynamicQueue[store.LogEntry](65536, 64<<20, func(x store.LogEntry) int { return len(x.Summary) + len(x.DetailsJSON) + 256 }), fatal: make(chan error, 1), historyPending: make(map[string]pendingCircuitHistory)}
 	a.hub = newRouterHub(a)
 	a.maintenance = newMaintenanceManager(a)
 	return a, nil
