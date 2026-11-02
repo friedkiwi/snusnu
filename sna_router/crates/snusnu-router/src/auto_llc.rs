@@ -89,13 +89,19 @@ impl LlcAutoListener {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
-        let Some((proxy_mac, peer_cp)) = classify_offer(
+        let classified = classify_offer(
             &bytes[..length],
             self.guest_mac,
             &self.allowed_proxy_macs,
             &self.active_proxy_macs,
-        )?
-        else {
+        );
+        let Some((proxy_mac, peer_cp)) = (match classified {
+            Ok(offer) => offer,
+            Err(error) => {
+                tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), error = %error, "invalid LLC session offer ignored");
+                return Ok(None);
+            }
+        }) else {
             return Ok(None);
         };
         self.active_proxy_macs.insert(proxy_mac);
@@ -320,6 +326,19 @@ mod tests {
             )
             .unwrap(),
             Some((proxy, Some("SOLNET.SNAB".into())))
+        );
+    }
+
+    #[test]
+    fn malformed_xid3_offer_is_rejected() {
+        let guest = [0x02, 0, 0, 0, 0, 1];
+        let proxy = [0x02, 0x53, 0x4e, 0, 0, 1];
+        let bytes = frame(proxy, guest, &[4, 4, 0xaf, 0x32]);
+        assert_eq!(
+            classify_offer(&bytes, guest, &HashSet::from([proxy]), &HashSet::new(),)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 }
