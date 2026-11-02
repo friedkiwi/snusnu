@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer};
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::Path,
     time::Duration,
 };
@@ -18,6 +18,7 @@ use transport_ws::wire;
 
 #[derive(Debug)]
 pub(crate) struct RouterConfig {
+    pub(crate) web: Option<WebConfig>,
     pub(crate) llc: Vec<LlcConfig>,
     pub(crate) ee: Vec<EeConfig>,
     pub(crate) anynet: Vec<AnyNetConfig>,
@@ -30,6 +31,7 @@ pub(crate) struct RouterConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRouterConfig {
+    web: Option<WebConfig>,
     #[serde(default)]
     llc: Vec<LlcConfig>,
     #[serde(default)]
@@ -81,6 +83,7 @@ impl<'de> Deserialize<'de> for RouterConfig {
             }
         }
         Ok(Self {
+            web: raw.web,
             llc: raw.llc,
             ee: raw.ee,
             anynet,
@@ -89,6 +92,24 @@ impl<'de> Deserialize<'de> for RouterConfig {
             route: raw.route,
             remote: raw.remote,
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebConfig {
+    pub(crate) listen: SocketAddr,
+    #[serde(default)]
+    pub(crate) password: String,
+}
+
+impl fmt::Debug for WebConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebConfig")
+            .field("listen", &self.listen)
+            .field("password", &"<redacted>")
+            .finish()
     }
 }
 
@@ -1179,6 +1200,18 @@ mod tests {
 
     fn parse(text: &str) -> RouterConfig {
         toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn local_web_requires_listen_and_defaults_to_no_password() {
+        let config = parse("[web]\nlisten = \"127.0.0.1:8082\"\n");
+        let web = config.web.unwrap();
+        assert_eq!(web.listen, "127.0.0.1:8082".parse().unwrap());
+        assert!(web.password.is_empty());
+        assert!(parse("").web.is_none());
+        assert!(toml::from_str::<RouterConfig>("[web]\npassword = \"secret\"\n").is_err());
+        let protected = parse("[web]\nlisten = \"127.0.0.1:8082\"\npassword = \"secret\"\n");
+        assert!(!format!("{:?}", protected.web.unwrap()).contains("secret"));
     }
 
     #[test]
