@@ -211,6 +211,55 @@ impl<'a> Datagram<'a> {
     }
 }
 
+/// Encode one X'83' request for the original TCP62 Connect identity. The
+/// caller owns retransmission timing and must reuse these exact bytes for
+/// every retry of the same sequence.
+pub fn build_request(
+    original: &Connect,
+    sequence: u16,
+    compensation: Compensation,
+    user_data: &[u8],
+) -> io::Result<Vec<u8>> {
+    if original.direction != Direction::Request
+        || !(3..=17).contains(&original.source.node.len())
+        || !(1..=8).contains(&original.correlator.len())
+        || (compensation == Compensation::Expedited && user_data.len() < MIN_SNA_HEADER)
+        || (!user_data.is_empty() && user_data.len() < MIN_SNA_HEADER)
+    {
+        return Err(invalid("TCP62 OOB request identity or payload unsupported"));
+    }
+    let mut bytes = vec![0; 4];
+    bytes.extend_from_slice(&[0x83, 0x02, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(&[0x0b, 0x01, (original.source.node.len() + 1) as u8]);
+    bytes.extend_from_slice(&original.source.node);
+    bytes.push(1);
+    bytes.push((original.correlator.len() + 1) as u8);
+    bytes.extend_from_slice(&original.correlator);
+    let command_len = (bytes.len() - REC_HEADER) as u32;
+    bytes[6..10].copy_from_slice(&command_len.to_be_bytes());
+    bytes.push(match compensation {
+        Compensation::Expedited => 0x01,
+        Compensation::Abort => 0x10,
+    });
+    bytes.extend_from_slice(user_data);
+    if bytes.len() > MAX_RECORD {
+        return Err(invalid("TCP62 OOB request exceeds record bound"));
+    }
+    let len = bytes.len() as u32;
+    bytes[..4].copy_from_slice(&len.to_be_bytes());
+    let parsed = Datagram::decode(&bytes)?;
+    if parsed.kind != Kind::Request
+        || parsed.sequence != sequence
+        || parsed.compensation != Some(compensation)
+        || !parsed.matches_connect(original)
+        || parsed.user_data != user_data
+    {
+        return Err(invalid("TCP62 OOB request construction failed"));
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Arrival {
     New,
@@ -311,6 +360,19 @@ mod tests {
             options: vec![],
         };
         assert!(parsed.matches_connect(&connect));
+        let encoded =
+            build_request(&connect, 7, Compensation::Expedited, &[0, 1, 3, 0, 0]).unwrap();
+        let encoded_request = Datagram::decode(&encoded).unwrap();
+        assert!(encoded_request.matches_connect(&connect));
+        assert_eq!(encoded_request.sequence, 7);
+        assert_eq!(encoded_request.user_data, &[0, 1, 3, 0, 0]);
+        assert_eq!(
+            build_request(&connect, 8, Compensation::Abort, &[])
+                .unwrap()
+                .last(),
+            Some(&0x10)
+        );
+        assert!(build_request(&connect, 9, Compensation::Expedited, &[]).is_err());
         let acknowledged = parsed.positive_response().unwrap();
         let acknowledged = Datagram::decode(&acknowledged).unwrap();
         assert_eq!(acknowledged.kind, Kind::PositiveResponse);
