@@ -5,7 +5,8 @@
 
 use crate::{
     endpoint::{format_mac, validate_mac_pair, Endpoint, Event},
-    routing::{RoutePort, RoutedUnit, RouterEvent},
+    local_status::{now_ms, LocalPeerStatus},
+    routing::{IdentityObservation, RoutePort, RoutedUnit, RouterEvent},
 };
 use link_linux::packet::{PacketPort, MAX_FRAME_LEN};
 use router_core::{
@@ -172,10 +173,16 @@ impl LlcIngressOffer {
 
     /// Open a private LLC2 association and replay the offered first frame.
     pub(crate) fn open_port(self) -> io::Result<AutoLlcPort> {
+        let interface = self.interface.clone();
+        let guest_mac = self.guest_mac;
         let (endpoint, first_events, _) = self.into_endpoint_with_gate(true)?;
         Ok(AutoLlcPort {
             endpoint,
             first_events: first_events.into(),
+            interface,
+            guest_mac,
+            observed_cp: None,
+            identity_observations: Vec::new(),
         })
     }
 }
@@ -183,6 +190,10 @@ impl LlcIngressOffer {
 pub(crate) struct AutoLlcPort {
     endpoint: Endpoint,
     first_events: VecDeque<Event>,
+    interface: String,
+    guest_mac: [u8; 6],
+    observed_cp: Option<String>,
+    identity_observations: Vec<IdentityObservation>,
 }
 
 impl AutoLlcPort {
@@ -197,23 +208,96 @@ impl AutoLlcPort {
         Ok(Self {
             endpoint: Endpoint::open(interface, guest_mac, proxy_mac)?,
             first_events: VecDeque::new(),
+            interface: interface.to_owned(),
+            guest_mac,
+            observed_cp: None,
+            identity_observations: Vec::new(),
         })
+    }
+
+    fn record_peer(&self, state: &str) {
+        let Some(status) = crate::status() else {
+            return;
+        };
+        let key = format!("llc:{}:{}", self.interface, format_mac(self.guest_mac));
+        let now = now_ms();
+        status.upsert_peer(LocalPeerStatus {
+            key,
+            transport: "llc2".into(),
+            locator: format!("{} {}", self.interface, format_mac(self.guest_mac)),
+            cp: self.observed_cp.clone(),
+            lus: Vec::new(),
+            state: state.into(),
+            first_seen_ms: now,
+            last_seen_ms: now,
+            last_error: None,
+        });
+    }
+
+    fn map_events(&mut self, events: Vec<Event>) -> Vec<RouterEvent> {
+        let mut routed = Vec::with_capacity(events.len());
+        for event in events {
+            match &event {
+                Event::Type1(pdu)
+                    if pdu.get(2).is_some_and(|byte| byte & !0x10 == 0xaf)
+                        && pdu.get(3) == Some(&0x32) =>
+                {
+                    match Xid3::decode(&pdu[3..]).and_then(|xid| xid.cp_name()) {
+                        Ok(cp) if self.observed_cp.as_deref() != Some(&cp) => {
+                            if let Some(assigned) = crate::status()
+                                .and_then(|status| status.snapshot().concentrator)
+                                .and_then(|upstream| upstream.allowed_netid)
+                            {
+                                if cp
+                                    .split_once('.')
+                                    .is_some_and(|(netid, _)| netid != assigned)
+                                {
+                                    tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), cp = %cp, assigned_netid = %assigned, "LLC CP outside upstream NETID; reachable locally only");
+                                }
+                            }
+                            self.observed_cp = Some(cp.clone());
+                            self.identity_observations
+                                .push(IdentityObservation::ControlPoint(cp));
+                            self.record_peer(if self.endpoint.state() == State::Connected {
+                                "connected"
+                            } else {
+                                "observed"
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac), error = %error, "invalid guest XID3 ignored")
+                        }
+                    }
+                }
+                Event::Connected => self.record_peer("connected"),
+                Event::Disconnected | Event::TimedOut => {
+                    self.record_peer("disconnected");
+                    self.observed_cp = None;
+                }
+                _ => {}
+            }
+            routed.push(map_event(event));
+        }
+        routed
     }
 }
 
 impl RoutePort for AutoLlcPort {
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
         if !self.first_events.is_empty() {
-            return Ok(Some(self.first_events.drain(..).map(map_event).collect()));
+            let first = self.first_events.drain(..).collect();
+            return Ok(Some(self.map_events(first)));
         }
         Ok(self
             .endpoint
             .poll(can_accept_information)?
-            .map(|events| events.into_iter().map(map_event).collect()))
+            .map(|events| self.map_events(events)))
     }
 
     fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
-        Ok(self.endpoint.tick()?.into_iter().map(map_event).collect())
+        let events = self.endpoint.tick()?;
+        Ok(self.map_events(events))
     }
 
     fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> {
@@ -249,7 +333,13 @@ impl RoutePort for AutoLlcPort {
         Ok(())
     }
     fn disconnect(&mut self) -> io::Result<()> {
-        self.endpoint.disconnect()
+        self.endpoint.disconnect()?;
+        self.record_peer("disconnected");
+        self.observed_cp = None;
+        Ok(())
+    }
+    fn take_identity_observations(&mut self) -> Vec<IdentityObservation> {
+        std::mem::take(&mut self.identity_observations)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.endpoint.flush()
