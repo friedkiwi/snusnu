@@ -30,6 +30,7 @@ pub enum CpManagementError {
     WrongIdentity,
     UnsupportedBind,
     InvalidCapabilities,
+    PeerUnbind { kind: u8, sense: u32 },
     UnexpectedUnit,
 }
 
@@ -94,6 +95,17 @@ impl CpManagementResponder {
                 Fid5WholeBiu::parse_complete(bytes).map_err(|_| CpManagementError::InvalidBiu)?;
             if u64::from_be_bytes(fid5.session_address) != bound.assigned_sa & !ASSIGNOR {
                 return Err(CpManagementError::WrongConnection);
+            }
+            if fid5.expedited
+                && fid5.rh == [0x6b, 0x80, 0]
+                && fid5.ru.len() >= 6
+                && fid5.ru[0] == 0x32
+                && matches!(fid5.ru[1], 0x06 | 0x0f)
+            {
+                return Err(CpManagementError::PeerUnbind {
+                    kind: fid5.ru[1],
+                    sense: u32::from_be_bytes(fid5.ru[2..6].try_into().unwrap()),
+                });
             }
             if let Some((request, response)) = &bound.capabilities {
                 if bytes == request {
@@ -176,6 +188,7 @@ impl CpManagementResponder {
         if ru[..8] != [0x31, 0, 0x13, 0x07, 0xb0, 0xb0, 0x51, 0x33]
             || ru[8..16] != [7, 0x87, 0x86, 0x86, 0x87, 7, 6, 2]
             || ru[16..23] != [0; 7]
+            || ru[24] != 0x43
             || ru[25] & !0x40 != 0
         {
             return Err(CpManagementError::UnsupportedBind);
@@ -191,7 +204,11 @@ impl CpManagementResponder {
         response_ru[12] = 0x80;
         response_ru[13] = 0;
         response_ru[23] = 0;
-        response_ru[24] = 0x23;
+        // The V5R4 CP PLU BIND requests syncpoint support (X'43'). Sending
+        // X'23' here causes its UNBIND type X'06' with sense X'08350018':
+        // invalid BIND negotiation at this byte. Retain the CP session's
+        // requested profile; no application syncpoint traffic is handled here.
+        response_ru[24] = ru[24];
         response_ru[25] = 0x40;
         response_ru.extend_from_slice(&[0, 0x18, 0, 8, 2]);
         response_ru.extend_from_slice(&CPSVCMG);
@@ -347,6 +364,7 @@ mod tests {
             0x0002_0100_f0f1_0001u64.to_be_bytes()
         );
         assert_eq!(parsed.ru[0], 0x31);
+        assert_eq!(parsed.ru[24], 0x43);
         assert!(parsed
             .ru
             .windows(10)
@@ -426,6 +444,54 @@ mod tests {
                 &bind
             ),
             Err(CpManagementError::WrongConnection)
+        );
+    }
+
+    #[test]
+    fn reports_live_v5r4_failed_bind_negotiation_unbind() {
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let scope = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: 0x80e8_992c_a900_00f0,
+            subsequent_plu_tcid: 0x0000_0001_0000_0002,
+            slu_tcid: 0x00e8_992c_a900_00f0,
+        };
+        let mut responder = CpManagementResponder::for_peers(
+            "SNUSNU.SVC".parse().unwrap(),
+            "SOLNET.SNAB".parse().unwrap(),
+            scope,
+        );
+        responder
+            .ingest(
+                RtpObservation {
+                    generation,
+                    tcid: scope.initial_plu_tcid,
+                },
+                &live_shape_bind(),
+            )
+            .unwrap();
+        // Complete FID5 BIU from V5R4 at 2026-11-02 17:26:05 UTC.
+        let unbind: Vec<u8> = concat!(
+            "5d00000000000000000000016b8000320608350018",
+            "6014cec370e7b283a27b0be2d6d3d5c5e34be2d5c1c2",
+            "3513083500180c000be2d6d3d5c5e34be2d5c1c200",
+        )
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+        assert_eq!(
+            responder.ingest(
+                RtpObservation {
+                    generation,
+                    tcid: scope.subsequent_plu_tcid,
+                },
+                &unbind,
+            ),
+            Err(CpManagementError::PeerUnbind {
+                kind: 0x06,
+                sense: 0x0835_0018,
+            })
         );
     }
 }
