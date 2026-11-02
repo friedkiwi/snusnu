@@ -604,7 +604,6 @@ mod reconnect_tests {
 id = "guest"
 interface = "definitely-missing-sna-tap"
 guest_mac = "02:00:35:27:23:01"
-proxy_mac = "02:53:4e:00:00:02"
 [[concentrator]]
 id = "upstream"
 url = "ws://127.0.0.1:9/router/v1/ws"
