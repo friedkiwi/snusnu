@@ -1,6 +1,6 @@
 # Isolated cross-NETID router lab
 
-The final lab target is V5R4 AnyNet to router A, WebSocket through the QA
+The completed lab route is V5R4 AnyNet to router A, WebSocket through the QA
 concentrator, router B to V4R4 LLC2. V5R4 initiates a pass-through to V4R4.
 The two OS/400 guests and routers must use different owners and NETIDs.
 This topology is separate from the `SOLNET` regression guests in the
@@ -48,14 +48,13 @@ Configure only the copied OS/400 guests after they reach Main Menu:
    Router B uses `sol8` and Bob's server-owned managed MAC toward V4. Both
    routers connect to the same QA WebSocket endpoint with their respective
    bearer tokens. Publish the local CP/LU on each router, then initiate
-   `STRPASTHR RMTLOCNAME(SNAA)` from V5.
+   `STRPASTHR RMTLOCNAME(SNAA) RMTNETID(QAALICE) LCLLOCNAME(SNAB)` from V5.
 
-The current production Rust config accepts a remote WebSocket port only with
-an LLC port; it cannot yet configure AnyNet to remote WebSocket conversion.
-The native APPN answer side, bidirectional session conversion, and remote
-circuit mapping must be ready before running the final test. Do not change
-the `SOLNET` regression guests or start the QA concentrator as part of guest
-preparation.
+The end-to-end route reached the remote V4R4 Sign On twice; the eighth run
+remained active past the former 180-second lab deadline. It currently uses
+the opt-in `--mptn-ws-gateway-lab` path. The ordinary `--config` runtime
+keeps `[[mptn_gateway]]` gated while X'83' UDP completion and teardown are
+finished. The `SOLNET` regression guests remain separate from this lab.
 
 ## Prepared clone state
 
