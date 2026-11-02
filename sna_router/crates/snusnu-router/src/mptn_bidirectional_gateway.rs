@@ -279,7 +279,8 @@ pub(crate) fn run_once(config: &BidirectionalGatewayConfig<'_>) -> io::Result<()
                 listener.clone_udp_socket()?,
                 open,
                 Instant::now() + reverse.timeout,
-            );
+            )
+            .map_err(session_error);
         }
         if let Some((id, event)) = listener.poll_association_once(false)? {
             match event {
@@ -314,7 +315,8 @@ pub(crate) fn run_once(config: &BidirectionalGatewayConfig<'_>) -> io::Result<()
                         offer,
                         virtual_port,
                         Instant::now() + reverse.timeout,
-                    );
+                    )
+                    .map_err(session_error);
                 }
                 GatewayEvent::ManagementReady | GatewayEvent::Closed => {}
                 GatewayEvent::Rejected(reason) => {
@@ -326,5 +328,15 @@ pub(crate) fn run_once(config: &BidirectionalGatewayConfig<'_>) -> io::Result<()
             }
         }
         thread::sleep(IDLE_POLL);
+    }
+}
+
+fn session_error(error: io::Error) -> io::Error {
+    // Peer protocol failures affect this circuit. Recreate its WebSocket and
+    // TCP62 state so a subsequent contact can still use the configured route.
+    if error.kind() == io::ErrorKind::InvalidData {
+        io::Error::new(io::ErrorKind::ConnectionAborted, error)
+    } else {
+        error
     }
 }
