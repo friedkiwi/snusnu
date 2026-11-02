@@ -2071,6 +2071,17 @@ impl AutoDirectory {
         })
     }
 
+    #[allow(dead_code)] // The EE runtime calls this once proxy identity wiring lands.
+    pub(crate) fn resolve_cp(
+        &self,
+        name: &wire::SnaName,
+    ) -> io::Result<Option<wire::RouteReference>> {
+        self.resolve(|resource| {
+            matches!(resource,
+            wire::route_export::Resource::ControlPoint(cp) if cp == name)
+        })
+    }
+
     pub(crate) fn resolve_mac(&self, mac: &[u8; 6]) -> io::Result<Option<wire::RouteReference>> {
         let Some((name, candidates)) = self.managed.get(mac) else {
             return Ok(None);
@@ -2366,6 +2377,17 @@ impl AutoWsHub {
             _ => None,
         };
         Ok(Some((reference, host)))
+    }
+
+    /// Resolve a CP from the authenticated upstream directory. This permits
+    /// EE proxy presentation of a concentrator-owned CP without publishing it
+    /// as a locally owned route.
+    #[allow(dead_code)] // The EE runtime calls this once proxy identity wiring lands.
+    pub(crate) fn resolve_cp(
+        &self,
+        cp: &wire::SnaName,
+    ) -> io::Result<Option<wire::RouteReference>> {
+        self.directory.borrow().resolve_cp(cp)
     }
 
     // Used by the automatic LLC bridge for concentrator-assigned proxy MACs.
@@ -2939,6 +2961,46 @@ mod tests {
             .resolve_lu(&name("TARGET", "LUA"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn automatic_directory_resolves_server_owned_cp_without_local_claim() {
+        let mut directory = AutoDirectory::default();
+        let service_cp = name("SNUSNU", "SVC");
+        assert!(directory.resolve_cp(&service_cp).unwrap().is_none());
+        let origin = wire::OriginRouteSnapshot {
+            router_id: vec![1; 16],
+            snapshot: Some(wire::RouteSnapshot {
+                epoch: vec![2; 16],
+                revision: 1,
+                routes: vec![wire::RouteExport {
+                    id: 41,
+                    generation: 2,
+                    resource: Some(wire::route_export::Resource::ControlPoint(
+                        service_cp.clone(),
+                    )),
+                }],
+            }),
+        };
+        directory.replace_origin(&origin).unwrap();
+        let reference = directory.resolve_cp(&service_cp).unwrap().unwrap();
+        assert_eq!(reference.router_id, origin.router_id);
+        assert_eq!(reference.route_id, 41);
+        assert!(directory
+            .resolve_cp(&name("SNUSNU", "OTHER"))
+            .unwrap()
+            .is_none());
+        let mut duplicate = origin.clone();
+        duplicate.router_id = vec![3; 16];
+        directory.replace_origin(&duplicate).unwrap();
+        assert!(directory.resolve_cp(&service_cp).is_err());
+        directory
+            .withdraw(&wire::OriginWithdraw {
+                router_id: duplicate.router_id,
+                epoch: vec![2; 16],
+            })
+            .unwrap();
+        assert_eq!(directory.resolve_cp(&service_cp).unwrap(), Some(reference));
     }
 
     #[test]
