@@ -7,7 +7,7 @@ use crate::{
     config,
     mptn_gateway_port::{GatewayConfig, GatewayEvent, MptnGatewayPort},
     remote::{Config as RemoteConfig, WsRoutePort},
-    routing::{RoutePort, RouterEvent},
+    routing::{FailureScope, RoutePort, RouterEvent},
     virtual_ws_port::VirtualWsPort,
     STOP,
 };
@@ -553,6 +553,9 @@ fn run_multi_target(config: &config::RouterConfig) -> io::Result<()> {
                 }
             }
             if let Err(error) = pump_virtual(&mut target.native) {
+                if target.native.failure_scope(&error) == FailureScope::SharedTransport {
+                    return Err(error);
+                }
                 if let Some(id) = target.association.take() {
                     let _ = tcp.close_association_for(id);
                     owners.remove(&id);
@@ -660,6 +663,10 @@ fn run_multi_target(config: &config::RouterConfig) -> io::Result<()> {
             })
         })? {
             let udp_abort = matches!(&event, GatewayEvent::UserUdpAbort { .. });
+            let rejection = match &event {
+                GatewayEvent::Rejected(reason) => Some(reason.clone()),
+                _ => None,
+            };
             match event {
                 GatewayEvent::ManagementReady => {
                     tracing::info!(association = id, "TCP62 management ready")
@@ -728,7 +735,10 @@ fn run_multi_target(config: &config::RouterConfig) -> io::Result<()> {
                         .ok_or_else(|| invalid("TCP62 abort ACK without route owner"))?;
                     targets[index].native.complete_udp_abort_response()?;
                 }
-                GatewayEvent::Closed => {
+                GatewayEvent::Closed | GatewayEvent::Rejected(_) => {
+                    if let Some(reason) = rejection.as_deref() {
+                        tracing::warn!(association = id, reason, "TCP62 association rejected");
+                    }
                     if let Some(index) = owners.remove(&id) {
                         let target = &mut targets[index];
                         target.association = None;
@@ -751,9 +761,6 @@ fn run_multi_target(config: &config::RouterConfig) -> io::Result<()> {
                             }
                         }
                     }
-                }
-                GatewayEvent::Rejected(reason) => {
-                    tracing::warn!(association = id, reason = %reason, "TCP62 association rejected");
                 }
             }
         }
