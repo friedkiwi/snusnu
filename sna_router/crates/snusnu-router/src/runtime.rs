@@ -242,10 +242,7 @@ impl RoutePort for LlcPort {
 pub(crate) fn run_config(config: &RouterConfig) -> io::Result<()> {
     config.validate()?;
     if !config.mptn_gateway.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TCP62 gateway runtime is not yet attached to the native WebSocket session",
-        ));
+        return crate::mptn_ws_gateway_lab::run_config(config, false);
     }
     const FIRST_RETRY: Duration = Duration::from_millis(500);
     const MAX_RETRY: Duration = Duration::from_secs(30);
