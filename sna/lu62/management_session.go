@@ -17,6 +17,12 @@ const (
 	ManagementCNOSPrepared
 	ManagementAwaitCNOSAck
 	ManagementCNOSComplete
+	ManagementBISPrepared
+	ManagementAwaitBISAck
+	ManagementBISComplete
+	ManagementUnbindPrepared
+	ManagementAwaitUnbindAck
+	ManagementClosed
 )
 
 // ManagementSession owns one responder-side SNASVCMG BIND and CNOS exchange.
@@ -33,6 +39,11 @@ type ManagementSession struct {
 	cnosIPR           []byte
 	cnosReply         []byte
 	cnosAcks          uint8
+	cnosTH0           byte
+	bisIPR, bisReply  []byte
+	bisPI             bool
+	bisAcks           uint8
+	unbindReply       []byte
 }
 
 func NewManagementSession(remoteCP, localCP string) (*ManagementSession, error) {
@@ -118,6 +129,7 @@ func (s *ManagementSession) PrepareCNOS(request []byte) ([]byte, []byte, error) 
 	ipr := []byte{s.bindRequest[0], 0, s.bindRequest[3], s.bindRequest[2], 0, 0, 0x83, 1, 0}
 	s.cnosIPR = ipr
 	s.cnosReply = reply
+	s.cnosTH0 = request[0]
 	s.cnos = responder
 	s.pacing = &trial
 	s.phase = ManagementCNOSPrepared
@@ -162,4 +174,86 @@ func (s *ManagementSession) ReceiveIPR(data []byte) error {
 		return ErrManagementState
 	}
 	return s.pacing.ReceiveIPR()
+}
+
+// PrepareBIS accepts the remote bilateral shutdown request after CNOS. The
+// local bracket must be empty and the caller chooses its own nonzero sequence.
+func (s *ManagementSession) PrepareBIS(request []byte, localSequence uint16, bracketFree bool) ([]byte, []byte, error) {
+	if s.phase != ManagementCNOSComplete || !bracketFree || localSequence == 0 || len(request) != 10 ||
+		request[0] != s.cnosTH0 || request[1] != 0 || request[2] != s.bindRequest[2] || request[3] != s.bindRequest[3] ||
+		request[4] == 0 && request[5] == 0 || !bytes.Equal(request[6:], []byte{0x4b, 0x91, 0, 0x70}) {
+		return nil, nil, ErrManagementState
+	}
+	trial := *s.pacing
+	if err := trial.ReceiveRequest(true); err != nil {
+		return nil, nil, err
+	}
+	pi, err := trial.PrepareSendRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	ipr := []byte{s.bindRequest[0], 0, s.bindRequest[3], s.bindRequest[2], 0, 0, 0x83, 1, 0}
+	reply := []byte{s.cnosTH0, 0, s.bindRequest[3], s.bindRequest[2], byte(localSequence >> 8), byte(localSequence), 0x4b, 0xb0, 0, 0x70}
+	if pi {
+		reply[7] |= 1
+	}
+	s.pacing = &trial
+	s.bisIPR, s.bisReply, s.bisPI = ipr, reply, pi
+	s.phase = ManagementBISPrepared
+	return append([]byte(nil), ipr...), append([]byte(nil), reply...), nil
+}
+
+func (s *ManagementSession) MarkBISSent(ipr, reply []byte) error {
+	if s.phase != ManagementBISPrepared || !bytes.Equal(ipr, s.bisIPR) || !bytes.Equal(reply, s.bisReply) {
+		return ErrManagementState
+	}
+	if err := s.pacing.GrantReceiveWindow(); err != nil {
+		return err
+	}
+	if err := s.pacing.MarkRequestSent(s.bisPI); err != nil {
+		return err
+	}
+	s.phase = ManagementAwaitBISAck
+	return nil
+}
+
+func (s *ManagementSession) AckBIS() error {
+	if s.phase != ManagementAwaitBISAck || s.bisAcks >= 2 {
+		return ErrManagementState
+	}
+	s.bisAcks++
+	if s.bisAcks == 2 {
+		s.bisIPR, s.bisReply = nil, nil
+		s.phase = ManagementBISComplete
+	}
+	return nil
+}
+
+func (s *ManagementSession) PrepareUnbind(request []byte) ([]byte, error) {
+	if s.phase != ManagementBISComplete || len(request) != 15+len(s.bindFQPCID) ||
+		request[0] != s.bindRequest[0] || request[1] != 0 || request[2] != s.bindRequest[2] || request[3] != s.bindRequest[3] ||
+		!bytes.Equal(request[4:15], []byte{0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}) ||
+		!bytes.Equal(request[15:], s.bindFQPCID) {
+		return nil, ErrManagementState
+	}
+	s.unbindReply = []byte{s.bindRequest[0], 0, s.bindRequest[3], s.bindRequest[2], 0, 0, 0xeb, 0x80, 0, 0x32}
+	s.phase = ManagementUnbindPrepared
+	return append([]byte(nil), s.unbindReply...), nil
+}
+
+func (s *ManagementSession) MarkUnbindSent(reply []byte) error {
+	if s.phase != ManagementUnbindPrepared || !bytes.Equal(reply, s.unbindReply) {
+		return ErrManagementState
+	}
+	s.phase = ManagementAwaitUnbindAck
+	return nil
+}
+
+func (s *ManagementSession) AckUnbind() error {
+	if s.phase != ManagementAwaitUnbindAck {
+		return ErrManagementState
+	}
+	s.unbindReply = nil
+	s.phase = ManagementClosed
+	return nil
 }

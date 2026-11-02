@@ -51,4 +51,37 @@ func TestManagementSessionRequiresAcknowledgedEgress(t *testing.T) {
 	if err := s.AckCNOS(); err != nil || s.Phase() != ManagementCNOSComplete {
 		t.Fatalf("second ACK: %v", err)
 	}
+	bis, _ := hex.DecodeString("2e00010200024b910070")
+	if _, _, err := s.PrepareBIS(bis, 2, false); !errors.Is(err, ErrManagementState) {
+		t.Fatalf("busy bracket: %v", err)
+	}
+	ipr, reply, err = s.PrepareBIS(bis, 2, true)
+	if err != nil || !bytes.Equal(ipr, []byte{0x2f, 0, 2, 1, 0, 0, 0x83, 1, 0}) || !bytes.Equal(reply, []byte{0x2e, 0, 2, 1, 0, 2, 0x4b, 0xb0, 0, 0x70}) {
+		t.Fatalf("BIS: %x %x %v", ipr, reply, err)
+	}
+	if err := s.MarkBISSent(ipr, reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckBIS(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckBIS(); err != nil || s.Phase() != ManagementBISComplete {
+		t.Fatalf("BIS ACK: %v", err)
+	}
+	unbind := append([]byte{0x2f, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}, s.FQPCID()...)
+	wrongUnbind := append([]byte(nil), unbind...)
+	wrongUnbind[len(wrongUnbind)-1] ^= 1
+	if _, err := s.PrepareUnbind(wrongUnbind); !errors.Is(err, ErrManagementState) {
+		t.Fatalf("wrong FQPCID: %v", err)
+	}
+	reply, err = s.PrepareUnbind(unbind)
+	if err != nil || !bytes.Equal(reply, []byte{0x2f, 0, 2, 1, 0, 0, 0xeb, 0x80, 0, 0x32}) {
+		t.Fatalf("UNBIND: %x %v", reply, err)
+	}
+	if err := s.MarkUnbindSent(reply); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckUnbind(); err != nil || s.Phase() != ManagementClosed {
+		t.Fatalf("UNBIND ACK: %v", err)
+	}
 }
