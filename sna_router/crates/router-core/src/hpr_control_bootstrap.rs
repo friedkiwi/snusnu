@@ -142,6 +142,27 @@ fn valid_anr_label(label: &[u8]) -> bool {
     (1..=8).contains(&label.len()) && label[0] & 0x80 != 0 && !label.contains(&0xff)
 }
 
+/// Encode one NETID or unqualified CP component for RTP Network Address
+/// CV X'05'/X'0D'. Its Node ID CV X'00' names the CP in EBCDIC; it is not
+/// the four-byte XID3 fixed-area node ID.
+pub fn encode_network_name_component(name: &str) -> Result<Vec<u8>, BootstrapError> {
+    if name.is_empty() || name.len() > 8 || !name.as_bytes()[0].is_ascii_uppercase() {
+        return Err(BootstrapError::InvalidIdentity);
+    }
+    name.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'I' => Ok(0xc1 + (byte - b'A')),
+            b'J'..=b'R' => Ok(0xd1 + (byte - b'J')),
+            b'S'..=b'Z' => Ok(0xe2 + (byte - b'S')),
+            b'0'..=b'9' => Ok(0xf0 + (byte - b'0')),
+            b'@' => Ok(0x7c),
+            b'#' => Ok(0x7b),
+            b'$' => Ok(0x5b),
+            _ => Err(BootstrapError::InvalidIdentity),
+        })
+        .collect()
+}
+
 /// Directional control labels for one active adjacency. End nodes can use a
 /// network-node server in a different NETID; the caller must separately
 /// prove the node roles, XID/TG agreement, and XID_DONE/TEST.
@@ -321,6 +342,24 @@ mod tests {
             other_netid,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn rtp_name_components_encode_cp_not_xid_node_id() {
+        assert_eq!(
+            encode_network_name_component("SNUSNU").unwrap(),
+            [0xe2, 0xd5, 0xe4, 0xe2, 0xd5, 0xe4]
+        );
+        assert_eq!(
+            encode_network_name_component("SVC").unwrap(),
+            [0xe2, 0xe5, 0xc3]
+        );
+        for invalid in ["", "1SVC", "lower", "TOO_LONG_", "N.ET"] {
+            assert_eq!(
+                encode_network_name_component(invalid),
+                Err(BootstrapError::InvalidIdentity)
+            );
+        }
     }
 
     fn local_advertisement(xid: &[u8]) -> ControlAdvertisement {

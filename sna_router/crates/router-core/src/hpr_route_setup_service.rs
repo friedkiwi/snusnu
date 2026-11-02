@@ -197,6 +197,17 @@ mod tests {
             .collect()
     }
 
+    fn qualified(name: &str) -> Vec<u8> {
+        let (netid, cp) = name.split_once('.').unwrap();
+        let mut result =
+            crate::hpr_control_bootstrap::encode_network_name_component(netid).unwrap();
+        result.push(0x4b);
+        result.extend_from_slice(
+            &crate::hpr_control_bootstrap::encode_network_name_component(cp).unwrap(),
+        );
+        result
+    }
+
     fn advertisement(cp: &str, node: u8) -> ControlAdvertisement {
         ControlAdvertisement {
             cp: cp.parse().unwrap(),
@@ -238,6 +249,45 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    fn cross_netid_aping_request() -> Vec<u8> {
+        // An EN in SOLNET reaches the concentrator-owned NN proxy CP and LU
+        // in SNUSNU. The RTP link remains one direct regular TG.
+        let mut wire = vec![0, 0, 0x12, 0xce, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut lu_name = vec![0xf3];
+        lu_name.extend_from_slice(&qualified("SNUSNU.PING"));
+        wire.extend_from_slice(&[(2 + lu_name.len()) as u8, 0x0e]);
+        wire.extend_from_slice(&lu_name);
+        let cp_name = qualified("SNUSNU.SVC");
+        let tg_len = 5 + cp_name.len();
+        wire.extend_from_slice(&[
+            (6 + tg_len) as u8,
+            0x2b,
+            1,
+            1,
+            (2 + tg_len) as u8,
+            0x46,
+            tg_len as u8,
+            0x80,
+            1,
+            cp_name.len() as u8,
+        ]);
+        wire.extend_from_slice(&cp_name);
+        wire.push(0x21);
+        let origin = qualified("SOLNET.SNAB");
+        wire.extend_from_slice(&[(11 + origin.len()) as u8, 0x60]);
+        wire.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        wire.push(origin.len() as u8);
+        wire.extend_from_slice(&origin);
+        wire.extend_from_slice(&[4, 0x2c, 1, 0]);
+        wire.extend_from_slice(&[
+            26, 0x80, 0, 0, 0, 0, 5, 0xb5, 0, 0, 1, 0x14, 0, 0, 0x10, 0xcc, 0, 0, 0, 0, 6, 0x67, 4,
+            0, 0x80, 2,
+        ]);
+        let length = wire.len() as u16;
+        wire[..2].copy_from_slice(&length.to_be_bytes());
+        wire
     }
 
     #[test]
@@ -308,5 +358,39 @@ mod tests {
                 .unwrap()
                 .duplicate
         );
+    }
+
+    #[test]
+    fn end_node_in_other_netid_can_reach_authorized_aping_lu() {
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            advertisement("SNUSNU.SVC", 2),
+            advertisement("SOLNET.SNAB", 1),
+        )
+        .unwrap();
+        let mut service = DirectRouteSetupService::new(
+            bootstrap,
+            "SNUSNU.PING".parse().unwrap(),
+            vec![0xa4, 0],
+            [0, 0, 0, 4],
+            1,
+            ReverseLinkMetrics {
+                transmission_time_us: 276,
+                capacity_kbps: 4300,
+                liveness_seconds: 0,
+            },
+            2,
+        )
+        .unwrap();
+        let request = cross_netid_aping_request();
+        let parsed = RouteSetupGds::parse(&request).unwrap();
+        assert_eq!(parsed.origin_cp_name, "SOLNET.SNAB");
+        assert_eq!(parsed.destination_lu_name.as_deref(), Some("SNUSNU.PING"));
+        let prepared = service
+            .prepare_reply(ConnectionGeneration::new(1).unwrap(), &request)
+            .unwrap();
+        let reply = RouteSetupGds::parse(&prepared.gds).unwrap();
+        assert_eq!(reply.destination_cp_name.as_deref(), Some("SNUSNU.SVC"));
+        assert_eq!(reply.pcid, parsed.pcid);
     }
 }
