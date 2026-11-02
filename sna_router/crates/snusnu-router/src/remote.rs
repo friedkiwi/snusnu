@@ -1610,6 +1610,81 @@ fn stable_route_id(kind: u8, name: &wire::SnaName) -> u64 {
     hash & i64::MAX as u64
 }
 
+/// Publish only locally learned identities owned by the NETID assigned in
+/// Welcome.  An automatic router may see other NETIDs on its local media;
+/// those identities remain available locally but must never be claimed on
+/// this authenticated upstream connection.
+pub(crate) fn automatic_route_snapshot(
+    epoch: &[u8],
+    revision: u64,
+    allowed_netid: &str,
+    control_points: &[wire::SnaName],
+    logical_units: &[wire::LuReachability],
+) -> io::Result<wire::RouteSnapshot> {
+    if epoch.len() != 16 || revision == 0 {
+        return Err(protocol("invalid route snapshot epoch or revision"));
+    }
+    let mut routes = Vec::new();
+    let mut identities = HashSet::new();
+    let mut route_ids = HashSet::new();
+    for cp in control_points {
+        validate_name(cp)?;
+        if cp.netid != allowed_netid {
+            warn!(local_cp = %format_cp(cp), assigned_netid = allowed_netid,
+                "local CP excluded from concentrator announcement: NETID mismatch");
+            continue;
+        }
+        if !identities.insert((cp.netid.clone(), cp.name.clone(), false)) {
+            return Err(protocol("duplicate local CP export"));
+        }
+        let id = stable_route_id(b'C', cp);
+        if id == 0 || !route_ids.insert(id) {
+            return Err(protocol("local route ID collision"));
+        }
+        routes.push(wire::RouteExport {
+            id,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::ControlPoint(cp.clone())),
+        });
+    }
+    for lu in logical_units {
+        let name = lu.lu.as_ref().ok_or_else(|| protocol("LU export missing name"))?;
+        validate_name(name)?;
+        if name.netid != allowed_netid {
+            warn!(local_lu = %format_cp(name), assigned_netid = allowed_netid,
+                "local LU excluded from concentrator announcement: NETID mismatch");
+            continue;
+        }
+        if let Some(host) = &lu.hosting_cp {
+            validate_name(host)?;
+            if !identities.contains(&(host.netid.clone(), host.name.clone(), false)) {
+                warn!(local_lu = %format_cp(name), hosting_cp = %format_cp(host),
+                    assigned_netid = allowed_netid,
+                    "local LU excluded from concentrator announcement: hosting CP unavailable");
+                continue;
+            }
+        }
+        if !identities.insert((name.netid.clone(), name.name.clone(), true)) {
+            return Err(protocol("duplicate local LU export"));
+        }
+        let id = stable_route_id(b'L', name);
+        if id == 0 || !route_ids.insert(id) {
+            return Err(protocol("local route ID collision"));
+        }
+        routes.push(wire::RouteExport {
+            id,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::LogicalUnit(lu.clone())),
+        });
+    }
+    routes.sort_by_key(|route| route.id);
+    Ok(wire::RouteSnapshot {
+        epoch: epoch.to_vec(),
+        revision,
+        routes,
+    })
+}
+
 fn accept_managed_revision(last: &mut u64, next: u64) -> io::Result<()> {
     if next == 0 || next <= *last {
         return Err(protocol("managed CP binding revision is not increasing"));
@@ -1733,6 +1808,38 @@ mod tests {
         http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue},
         Message as WsMessage,
     };
+
+    #[test]
+    fn automatic_snapshot_announces_only_assigned_netid_and_its_hosted_lus() {
+        let owned = name("OWNED", "CPA");
+        let foreign = name("OTHER", "CPB");
+        let lu = |name: wire::SnaName, host: wire::SnaName| wire::LuReachability {
+            lu: Some(name),
+            hosting_cp: Some(host),
+            supported_types: Vec::new(),
+        };
+        let snapshot = automatic_route_snapshot(
+            &[7; 16], 1, "OWNED",
+            &[owned.clone(), foreign.clone()],
+            &[
+                lu(name("OWNED", "LUA"), owned.clone()),
+                lu(name("OTHER", "LUB"), foreign.clone()),
+                lu(name("OWNED", "LUC"), foreign),
+            ],
+        ).unwrap();
+        assert_eq!(snapshot.routes.len(), 2);
+        assert!(snapshot.routes.iter().any(|route| matches!(
+            route.resource.as_ref(),
+            Some(wire::route_export::Resource::ControlPoint(cp)) if cp == &owned
+        )));
+        assert!(snapshot.routes.iter().any(|route| matches!(
+            route.resource.as_ref(),
+            Some(wire::route_export::Resource::LogicalUnit(lu))
+                if lu.lu.as_ref() == Some(&name("OWNED", "LUA"))
+        )));
+        assert!(automatic_route_snapshot(&[7; 16], 2, "OWNED", &[], &[])
+            .unwrap().routes.is_empty());
+    }
 
     #[test]
     fn circuit_credit_retires_only_whole_outbound_information_frames() {
