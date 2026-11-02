@@ -85,18 +85,52 @@ impl EndpointRegistry {
         self.associations.insert(new);
         Ok(())
     }
+
+    /// First binding for an endpoint opened without any configured target
+    /// address. No zero-MAC association is registered or sent on the wire.
+    pub(crate) fn bind_unbound(
+        &mut self,
+        endpoint: &mut Endpoint,
+        proxy_mac: [u8; 6],
+    ) -> io::Result<()> {
+        if !endpoint.is_unbound() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LLC endpoint already has a proxy MAC",
+            ));
+        }
+        validate_managed_proxy_mac(endpoint.guest_mac, proxy_mac)?;
+        let association = (endpoint.interface.clone(), endpoint.guest_mac, proxy_mac);
+        if self.associations.contains(&association) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed proxy MAC duplicates an LLC association",
+            ));
+        }
+        endpoint.set_managed_proxy_mac(proxy_mac)?;
+        self.associations.insert(association);
+        Ok(())
+    }
 }
 
 fn validate_mac_pair(guest_mac: [u8; 6], proxy_mac: [u8; 6]) -> io::Result<()> {
     if guest_mac == proxy_mac
-        || guest_mac == [0; 6]
-        || proxy_mac == [0; 6]
-        || guest_mac[0] & 1 != 0
-        || proxy_mac[0] & 1 != 0
+        || validate_unicast_mac(guest_mac).is_err()
+        || validate_unicast_mac(proxy_mac).is_err()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "LLC guest and proxy MACs must be distinct nonzero unicast addresses",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unicast_mac(mac: [u8; 6]) -> io::Result<()> {
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LLC MAC must be a nonzero unicast address",
         ));
     }
     Ok(())
@@ -141,18 +175,33 @@ impl Endpoint {
         proxy_mac: [u8; 6],
     ) -> io::Result<Self> {
         validate_mac_pair(guest_mac, proxy_mac)?;
+        Self::open_checked(interface, guest_mac, proxy_mac)
+    }
+
+    /// Open an AF_PACKET receiver before the concentrator has provided the
+    /// target CP's managed MAC. The all-zero value is internal state only.
+    pub(crate) fn open_unbound(interface: &str, guest_mac: [u8; 6]) -> io::Result<Self> {
+        validate_unicast_mac(guest_mac)?;
+        Self::open_checked(interface, guest_mac, [0; 6])
+    }
+
+    fn open_checked(interface: &str, guest_mac: [u8; 6], proxy_mac: [u8; 6]) -> io::Result<Self> {
         let port = PacketPort::open(interface).map_err(|error| {
             tracing::error!(interface, error = %error, "failed to open AF_PACKET interface");
             error
         })?;
-        tracing::info!(interface, guest_mac = %format_mac(guest_mac), proxy_mac = %format_mac(proxy_mac), sap = SNA_SAP, "LLC endpoint opened");
+        if proxy_mac == [0; 6] {
+            tracing::info!(interface, guest_mac = %format_mac(guest_mac), sap = SNA_SAP, "LLC endpoint waiting for managed MAC");
+        } else {
+            tracing::info!(interface, guest_mac = %format_mac(guest_mac), proxy_mac = %format_mac(proxy_mac), sap = SNA_SAP, "LLC endpoint opened");
+        }
         Ok(Self {
             port,
             interface: interface.to_owned(),
             guest_mac,
             proxy_mac,
             llc: Llc2::new(SNA_SAP, SNA_SAP),
-            connect_allowed: true,
+            connect_allowed: proxy_mac != [0; 6],
             queued: VecDeque::new(),
             deadline: None,
             connect_after: None,
@@ -162,6 +211,10 @@ impl Endpoint {
 
     pub(crate) fn state(&self) -> State {
         self.llc.state()
+    }
+
+    pub(crate) fn is_unbound(&self) -> bool {
+        self.proxy_mac == [0; 6]
     }
 
     /// Native APPN peers may defer LLC2 contact until XID3 role negotiation
@@ -200,13 +253,17 @@ impl Endpoint {
     }
 
     pub(crate) fn has_capacity(&self) -> bool {
-        self.available_receive_slots() > 0
+        !self.is_unbound() && self.available_receive_slots() > 0
     }
 
     /// Free complete information frames, including the local LLC send window
     /// in the occupied count. Routers can charge one slot per routed PIU.
     pub(crate) fn available_receive_slots(&self) -> usize {
-        QUEUE_LIMIT.saturating_sub(self.buffered_information_count())
+        if self.is_unbound() {
+            0
+        } else {
+            QUEUE_LIMIT.saturating_sub(self.buffered_information_count())
+        }
     }
 
     /// Include the sent I-frame retained for LLC retransmission. A routed
@@ -240,6 +297,9 @@ impl Endpoint {
         bytes: &[u8],
         can_accept_information: bool,
     ) -> io::Result<Vec<Event>> {
+        if self.is_unbound() {
+            return Ok(Vec::new());
+        }
         let frame = match parse_8023(bytes) {
             Ok(frame) => frame,
             Err(error) => {
@@ -337,6 +397,9 @@ impl Endpoint {
     }
 
     pub(crate) fn begin_connect_after(&mut self, delay: Duration) {
+        if self.is_unbound() {
+            return;
+        }
         self.connect_after = Some(Instant::now() + delay);
         tracing::debug!(interface = %self.interface, delay_ms = delay.as_millis(), "LLC active connect scheduled");
     }
@@ -357,6 +420,9 @@ impl Endpoint {
     }
 
     pub(crate) fn tick(&mut self) -> io::Result<Vec<Event>> {
+        if self.is_unbound() {
+            return Ok(Vec::new());
+        }
         let now = Instant::now();
         if self.connect_after.is_some_and(|deadline| now >= deadline) {
             self.connect_after = None;
@@ -408,17 +474,7 @@ impl Endpoint {
     }
 
     fn send_llc(&self, pdu: &[u8]) -> io::Result<()> {
-        if pdu.len() > 1500 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "LLC PDU too large",
-            ));
-        }
-        let mut frame = Vec::with_capacity(14 + pdu.len());
-        frame.extend_from_slice(&self.guest_mac);
-        frame.extend_from_slice(&self.proxy_mac);
-        frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
-        frame.extend_from_slice(pdu);
+        let frame = build_ethernet_frame(self.guest_mac, self.proxy_mac, pdu)?;
         self.port.send_frame(&frame).map_err(|error| {
             tracing::error!(interface = %self.interface, destination_mac = %format_mac(self.guest_mac), error = %error, "failed to send Ethernet frame");
             error
@@ -435,6 +491,27 @@ impl Endpoint {
             self.deadline = None;
         }
     }
+}
+
+fn build_ethernet_frame(guest_mac: [u8; 6], proxy_mac: [u8; 6], pdu: &[u8]) -> io::Result<Vec<u8>> {
+    if proxy_mac == [0; 6] {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "LLC endpoint awaits managed proxy MAC",
+        ));
+    }
+    if pdu.len() > 1500 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LLC PDU too large",
+        ));
+    }
+    let mut frame = Vec::with_capacity(14 + pdu.len());
+    frame.extend_from_slice(&guest_mac);
+    frame.extend_from_slice(&proxy_mac);
+    frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
+    frame.extend_from_slice(pdu);
+    Ok(frame)
 }
 
 pub(crate) fn format_mac(mac: [u8; 6]) -> String {
@@ -548,5 +625,22 @@ mod tests {
         );
         let managed_guest = [0x02, 0x53, 0x4e, 0, 0, 1];
         assert!(validate_managed_proxy_mac(managed_guest, managed_guest).is_err());
+    }
+
+    #[test]
+    fn unbound_proxy_cannot_be_an_ethernet_source() {
+        let guest = [0x02, 0, 0, 0, 0, 1];
+        let pdu = [SNA_SAP, SNA_SAP, 0xbf];
+        assert_eq!(
+            build_ethernet_frame(guest, [0; 6], &pdu)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let managed = [0x02, 0x53, 0x4e, 0, 0, 2];
+        let frame = build_ethernet_frame(guest, managed, &pdu).unwrap();
+        assert_eq!(&frame[..6], &guest);
+        assert_eq!(&frame[6..12], &managed);
+        assert_eq!(&frame[12..], &[0, 3, 4, 4, 0xbf]);
     }
 }
