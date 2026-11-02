@@ -4,7 +4,7 @@
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fmt, fs, io,
     net::IpAddr,
     path::Path,
 };
@@ -25,7 +25,7 @@ pub(crate) struct RouterConfig {
     pub(crate) hpr_lan: Vec<HprLanConfig>,
     #[serde(default)]
     pub(crate) route: Vec<RouteConfig>,
-    #[serde(default)]
+    #[serde(default, rename = "concentrator", alias = "remote")]
     pub(crate) remote: Vec<RemoteConfig>,
 }
 
@@ -84,6 +84,8 @@ pub(crate) struct LlcConfig {
     pub(crate) local_cp: Option<String>,
     #[serde(default)]
     pub(crate) lus: Vec<String>,
+    #[serde(default)]
+    pub(crate) lu_types: HashMap<String, Vec<ConfiguredLuType>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,21 +106,29 @@ pub(crate) enum RouteConverter {
     MptnLu62,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RemoteConfig {
     pub(crate) id: String,
     pub(crate) url: String,
-    pub(crate) local_cp: String,
-    pub(crate) target_cp: String,
+    pub(crate) target_cp: Option<String>,
     pub(crate) target_lu: Option<String>,
-    /// A locally exported LU used as the authenticated source of v2 opens.
-    /// Omit for legacy v1 native LLC circuits.
-    pub(crate) source_lu: Option<String>,
+    /// Concentrator bearer credential. Empty selects an unauthenticated link.
     #[serde(default)]
-    pub(crate) lus: Vec<String>,
-    #[serde(default)]
-    pub(crate) lu_types: HashMap<String, Vec<ConfiguredLuType>>,
+    pub(crate) token: String,
+}
+
+impl fmt::Debug for RemoteConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteConfig")
+            .field("id", &self.id)
+            .field("url", &"<redacted>")
+            .field("target_cp", &self.target_cp)
+            .field("target_lu", &self.target_lu)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
@@ -163,7 +173,28 @@ pub(crate) fn load(path: &Path) -> io::Result<RouterConfig> {
     Ok(config)
 }
 
+impl RemoteConfig {
+    pub(crate) fn bearer_token(&self) -> io::Result<String> {
+        Ok(self.token.clone())
+    }
+}
+
 impl RouterConfig {
+    pub(crate) fn concentrator_local_id<'a>(&'a self, entry: &RemoteConfig) -> io::Result<&'a str> {
+        self.route
+            .iter()
+            .find_map(|route| {
+                if route.from == entry.id {
+                    Some(route.to.as_str())
+                } else if route.to == entry.id && route.bidirectional {
+                    Some(route.from.as_str())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| invalid(format!("concentrator {} has no local route", entry.id)))
+    }
+
     pub(crate) fn validate(&self) -> io::Result<()> {
         if self.llc.is_empty()
             && self.ee.is_empty()
@@ -215,10 +246,33 @@ impl RouterConfig {
             let mut local_lus = HashSet::new();
             for lu in &peer.lus {
                 let name = parse_cp(lu)?;
+                if peer
+                    .local_cp
+                    .as_ref()
+                    .is_some_and(|cp| parse_cp(cp).ok().is_some_and(|cp| cp.netid != name.netid))
+                {
+                    return Err(invalid(format!(
+                        "LLC peer {} LU {lu} is outside its local NETID",
+                        peer.id
+                    )));
+                }
                 if !local_lus.insert((name.netid, name.name)) {
                     return Err(invalid(format!(
                         "duplicate LU {lu} on LLC peer {}",
                         peer.id
+                    )));
+                }
+            }
+            for (lu, types) in &peer.lu_types {
+                if !peer.lus.contains(lu) {
+                    return Err(invalid(format!(
+                        "LU type declaration for unexported LU {lu}"
+                    )));
+                }
+                let mut unique = HashSet::new();
+                if types.is_empty() || types.iter().any(|lu_type| !unique.insert(*lu_type)) {
+                    return Err(invalid(format!(
+                        "empty or duplicate LU type declaration for {lu}"
                     )));
                 }
             }
@@ -313,7 +367,7 @@ impl RouterConfig {
                     return Err(invalid(format!(
                         "AnyNet peer {} requires both local_lu and remote_lu",
                         peer.id
-                    )))
+                    )));
                 }
             }
         }
@@ -355,8 +409,6 @@ impl RouterConfig {
                 )));
             }
         }
-        let mut exported_cps = HashSet::new();
-        let mut exported_lus = HashSet::new();
         for remote in &self.remote {
             validate_id(&remote.id)?;
             if !ids.insert(remote.id.as_str()) {
@@ -364,57 +416,19 @@ impl RouterConfig {
             }
             kinds.insert(&remote.id, "remote");
             if !remote.url.starts_with("ws://") && !remote.url.starts_with("wss://") {
-                return Err(invalid("remote.url must be a ws:// or wss:// URL"));
+                return Err(invalid("concentrator.url must be a ws:// or wss:// URL"));
             }
-            let local_cp = parse_cp(&remote.local_cp)?;
-            if !exported_cps.insert((local_cp.netid.clone(), local_cp.name.clone())) {
-                return Err(invalid(format!(
-                    "duplicate exported CP {}",
-                    remote.local_cp
-                )));
-            }
-            let target_cp = parse_cp(&remote.target_cp)?;
+            let target_cp = remote.target_cp.as_deref().map(parse_cp).transpose()?;
             if let Some(target_lu) = &remote.target_lu {
                 let target_lu = parse_cp(target_lu)?;
-                if target_lu.netid != target_cp.netid {
+                if target_cp
+                    .as_ref()
+                    .is_some_and(|cp| target_lu.netid != cp.netid)
+                {
                     return Err(invalid(format!(
                         "target LU {} has a different NETID from target CP {}",
                         remote.target_lu.as_deref().unwrap_or_default(),
-                        remote.target_cp
-                    )));
-                }
-            }
-            if let Some(source_lu) = &remote.source_lu {
-                let source_lu = parse_cp(source_lu)?;
-                if source_lu.netid != local_cp.netid
-                    || remote.target_lu.is_none()
-                    || !remote
-                        .lus
-                        .iter()
-                        .any(|lu| parse_cp(lu).ok().as_ref() == Some(&source_lu))
-                {
-                    return Err(invalid(format!(
-                        "remote {} v2 source LU must be a local exported LU with a target LU",
-                        remote.id
-                    )));
-                }
-            }
-            for lu in &remote.lus {
-                let lu_name = parse_cp(lu)?;
-                if !exported_lus.insert((lu_name.netid, lu_name.name)) {
-                    return Err(invalid(format!("duplicate exported LU {lu}")));
-                }
-            }
-            for (lu, types) in &remote.lu_types {
-                if !remote.lus.contains(lu) {
-                    return Err(invalid(format!(
-                        "LU type declaration for unexported LU {lu}"
-                    )));
-                }
-                let mut unique = HashSet::new();
-                if types.is_empty() || types.iter().any(|lu_type| !unique.insert(*lu_type)) {
-                    return Err(invalid(format!(
-                        "empty or duplicate LU type declaration for {lu}"
+                        remote.target_cp.as_deref().unwrap_or_default()
                     )));
                 }
             }
@@ -424,13 +438,17 @@ impl RouterConfig {
             .windows(2)
             .any(|pair| pair[0].url != pair[1].url)
         {
-            return Err(invalid("all remote circuits must share one WebSocket URL"));
+            return Err(invalid(
+                "all concentrator circuits must share one WebSocket URL",
+            ));
         }
-        if self.remote.iter().any(|remote| remote.source_lu.is_some())
-            && self.remote.iter().any(|remote| remote.source_lu.is_none())
+        if self
+            .remote
+            .windows(2)
+            .any(|pair| pair[0].token != pair[1].token)
         {
             return Err(invalid(
-                "all remote circuits on one WebSocket must use the same protocol version",
+                "all concentrator circuits must share one bearer token",
             ));
         }
         let mut directed = HashMap::<&str, &str>::new();
@@ -511,6 +529,8 @@ impl RouterConfig {
                 add_directed(&mut directed, &route.to, &route.from)?;
             }
         }
+        let mut exported_cps = HashSet::new();
+        let mut exported_lus = HashSet::new();
         for remote in &self.remote {
             // The current WebSocket adapter has one circuit and one credit
             // stream. It cannot safely multiplex several local associations.
@@ -525,16 +545,26 @@ impl RouterConfig {
             }
             let local_id = directed[remote.id.as_str()];
             if let Some(gateway) = self.mptn_gateway.iter().find(|peer| peer.id == local_id) {
-                if parse_cp(&remote.local_cp)? != parse_cp(&gateway.local_cp)?
-                    || parse_cp(&remote.target_cp)? != parse_cp(&gateway.peer_cp)?
-                    || remote.source_lu.as_deref() != Some(gateway.source_lu.as_str())
-                    || remote.target_lu.as_deref() != Some(gateway.destination_lu.as_str())
-                    || !remote.lus.contains(&gateway.source_lu)
+                if remote
+                    .target_cp
+                    .as_deref()
+                    .is_some_and(|cp| cp != gateway.peer_cp)
+                    || remote
+                        .target_lu
+                        .as_deref()
+                        .is_some_and(|lu| lu != gateway.destination_lu)
                 {
                     return Err(invalid(format!(
-                        "remote {} does not match TCP62 gateway {} LU and CP route",
+                        "concentrator {} target does not match TCP62 gateway {} destination",
                         remote.id, gateway.id
                     )));
+                }
+                let local_cp = parse_cp(&gateway.local_cp)?;
+                let source_lu = parse_cp(&gateway.source_lu)?;
+                if !exported_cps.insert((local_cp.netid, local_cp.name))
+                    || !exported_lus.insert((source_lu.netid, source_lu.name))
+                {
+                    return Err(invalid("duplicate local CP or LU export"));
                 }
                 continue;
             }
@@ -554,27 +584,30 @@ impl RouterConfig {
             }
             let owned_cp = peer.local_cp.as_ref().ok_or_else(|| {
                 invalid(format!(
-                    "remote {} cannot publish CP without local_cp on LLC peer {}",
+                    "concentrator {} cannot publish CP without local_cp on LLC peer {}",
                     remote.id, peer.id
                 ))
             })?;
-            if parse_cp(owned_cp)? != parse_cp(&remote.local_cp)? {
+            if remote.target_cp.is_none() {
                 return Err(invalid(format!(
-                    "remote {} publishes CP {} not owned by LLC peer {}",
-                    remote.id, remote.local_cp, peer.id
+                    "concentrator {} LLC route requires target_cp",
+                    remote.id
                 )));
             }
-            let owned_lus = peer
-                .lus
-                .iter()
-                .map(|lu| parse_cp(lu))
-                .collect::<io::Result<HashSet<_>>>()?;
-            for lu in &remote.lus {
-                if !owned_lus.contains(&parse_cp(lu)?) {
-                    return Err(invalid(format!(
-                        "remote {} publishes LU {lu} not owned by LLC peer {}",
-                        remote.id, peer.id
-                    )));
+            if remote.target_lu.is_some() && peer.lus.len() != 1 {
+                return Err(invalid(format!(
+                    "concentrator {} v2 route requires exactly one local LU",
+                    remote.id
+                )));
+            }
+            let local_cp = parse_cp(owned_cp)?;
+            if !exported_cps.insert((local_cp.netid, local_cp.name)) {
+                return Err(invalid("duplicate local CP export"));
+            }
+            for lu in &peer.lus {
+                let name = parse_cp(lu)?;
+                if !exported_lus.insert((name.netid, name.name)) {
+                    return Err(invalid("duplicate local LU export"));
                 }
             }
         }
@@ -709,26 +742,32 @@ to = "b"
 
     #[test]
     fn rejects_missing_and_ambiguous_routes() {
-        assert!(parse(&GOOD.replace("to = \"b\"", "to = \"missing\""))
+        assert!(
+            parse(&GOOD.replace("to = \"b\"", "to = \"missing\""))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(&format!(
+                "{GOOD}\n[[route]]\nfrom = \"a\"\nto = \"b\"\nbidirectional = false\n"
+            ))
             .validate()
-            .is_err());
-        assert!(parse(&format!(
-            "{GOOD}\n[[route]]\nfrom = \"a\"\nto = \"b\"\nbidirectional = false\n"
-        ))
-        .validate()
-        .is_ok());
+            .is_ok()
+        );
         assert!(parse(&format!("{GOOD}\n[[llc]]\nid=\"c\"\ninterface=\"sol6\"\nguest_mac=\"02:00:00:00:00:05\"\nproxy_mac=\"02:53:4e:00:00:06\"\n[[route]]\nfrom=\"a\"\nto=\"c\"\n")).validate().is_err());
     }
 
     #[test]
     fn rejects_duplicate_association_and_malformed_mac() {
-        assert!(parse(
-            &GOOD
-                .replace("02:00:00:00:00:03", "02:00:00:00:00:01")
-                .replace("02:53:4e:00:00:04", "02:53:4e:00:00:02")
-        )
-        .validate()
-        .is_err());
+        assert!(
+            parse(
+                &GOOD
+                    .replace("02:00:00:00:00:03", "02:00:00:00:00:01")
+                    .replace("02:53:4e:00:00:04", "02:53:4e:00:00:02")
+            )
+            .validate()
+            .is_err()
+        );
         assert!(
             parse(&GOOD.replace("02:53:4e:00:00:04", "03:53:4e:00:00:04"))
                 .validate()
@@ -801,16 +840,18 @@ peer_ip = "127.0.0.3"
 from = "a"
 to = "east"
 "#;
-        assert!(parse(mixed)
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported route"));
+        assert!(
+            parse(mixed)
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported route")
+        );
     }
 
     #[test]
-    fn remote_exports_require_managed_mac_and_one_local_peer() {
-        let remote = r#"
+    fn concentrator_exports_are_derived_from_attached_llc_peer() {
+        let config = r#"
 [[llc]]
 id = "a"
 interface = "sol5"
@@ -818,101 +859,80 @@ guest_mac = "02:00:35:27:23:01"
 proxy_mac = "02:53:4e:00:00:01"
 local_cp = "SOLNET.SNAA"
 lus = ["SOLNET.LUA"]
-[[remote]]
+lu_types = { "SOLNET.LUA" = ["lu_6_2"] }
+[[concentrator]]
 id = "upstream"
 url = "ws://127.0.0.1:8081/router/v1/ws"
-local_cp = "SOLNET.SNAA"
-target_cp = "SOLNET.SNAB"
-lus = ["SOLNET.LUA"]
-lu_types = { "SOLNET.LUA" = ["lu_6_2"] }
+target_cp = "DSTNET.SNAB"
+target_lu = "DSTNET.PAYROLL"
+token = "test-token"
 [[route]]
 from = "a"
 to = "upstream"
 "#;
-        let configured = parse(remote);
-        configured.validate().unwrap();
+        let parsed = parse(config);
+        parsed.validate().unwrap();
         assert_eq!(
-            configured.remote[0].lu_types["SOLNET.LUA"],
+            parsed.concentrator_local_id(&parsed.remote[0]).unwrap(),
+            "a"
+        );
+        assert_eq!(parsed.remote[0].bearer_token().unwrap(), "test-token");
+        assert!(!format!("{:?}", parsed).contains("test-token"));
+        parse(&config.replace("[[concentrator]]", "[[remote]]"))
+            .validate()
+            .unwrap();
+        assert_eq!(
+            parsed.llc[0].lu_types["SOLNET.LUA"],
             vec![ConfiguredLuType::Lu6_2]
         );
-        let cross_netid = remote.replace(
-            "target_cp = \"SOLNET.SNAB\"",
-            "target_cp = \"DSTNET.SNAB\"\ntarget_lu = \"DSTNET.PAYROLL\"",
-        );
-        parse(&cross_netid).validate().unwrap();
-        assert_eq!(
-            parse(&cross_netid).remote[0].target_lu.as_deref(),
-            Some("DSTNET.PAYROLL")
-        );
-        let v2 = cross_netid.replace(
-            "target_lu = \"DSTNET.PAYROLL\"",
-            "target_lu = \"DSTNET.PAYROLL\"\nsource_lu = \"SOLNET.LUA\"",
-        );
-        parse(&v2).validate().unwrap();
         assert!(
-            parse(&v2.replace("source_lu = \"SOLNET.LUA\"", "source_lu = \"OTHER.LUA\""))
+            parse(&config.replace("02:53:4e", "02:00:4e"))
                 .validate()
-                .is_err()
+                .unwrap_err()
+                .to_string()
+                .contains("virtual MAC")
         );
         assert!(
-            parse(&v2.replace("source_lu = \"SOLNET.LUA\"", "source_lu = \"SOLNET.OTHER\""))
+            parse(&config.replace("target_cp = \"DSTNET.SNAB\"", ""))
                 .validate()
-                .is_err()
+                .unwrap_err()
+                .to_string()
+                .contains("requires target_cp")
         );
-        assert!(parse(&v2.replace("target_lu = \"DSTNET.PAYROLL\"\n", ""))
-            .validate()
-            .is_err());
         assert!(
-            parse(&cross_netid.replace("DSTNET.PAYROLL", "SOLNET.PAYROLL"))
+            parse(&config.replace("DSTNET.PAYROLL", "SOLNET.PAYROLL"))
                 .validate()
                 .unwrap_err()
                 .to_string()
                 .contains("different NETID")
         );
-        assert!(parse(&remote.replace("02:53:4e", "02:00:4e"))
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("virtual MAC"));
-        assert!(parse(&remote.replace("SOLNET.LUA", "bad.lu"))
-            .validate()
-            .is_err());
         assert!(
-            parse(&remote.replace("local_cp = \"SOLNET.SNAA\"\nlus = [\"SOLNET.LUA\"]\n", ""))
+            parse(&config.replace("SOLNET.LUA", "OTHER.LUA"))
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("cannot publish CP")
+                .contains("outside its local NETID")
         );
-        assert!(parse(&remote.replacen(
-            "local_cp = \"SOLNET.SNAA\"\n",
-            "local_cp = \"SOLNET.OTHER\"\n",
-            1
-        ))
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("not owned"));
-        assert!(parse(&remote.replace(
-            "target_cp = \"SOLNET.SNAB\"\nlus = [\"SOLNET.LUA\"]\nlu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
-            "target_cp = \"SOLNET.SNAB\"\nlus = [\"SOLNET.LUB\"]"
-        ))
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("not owned"));
-        assert!(parse(&remote.replace(
-            "lu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
-            "lu_types = { \"SOLNET.LUB\" = [\"lu_6_2\"] }"
-        ))
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("unexported LU"));
+        assert!(
+            parse(&config.replace(
+                "lu_types = { \"SOLNET.LUA\" = [\"lu_6_2\"] }",
+                "lu_types = { \"SOLNET.OTHER\" = [\"lu_6_2\"] }"
+            ))
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unexported LU")
+        );
+        assert!(
+            toml::from_str::<RouterConfig>(
+                &config.replace("token = \"test-token\"", "source_lu = \"SOLNET.LUA\"")
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn tcp62_gateway_requires_explicit_converter_and_matching_v2_lu_exports() {
+    fn tcp62_gateway_derives_exports_and_target_from_gateway_definition() {
         let gateway = r#"
 [[mptn_gateway]]
 id = "bob"
@@ -925,36 +945,34 @@ destination_lu = "QAALICE.SNAA"
 local_station = "BOB"
 local_node_id = "FFF12345"
 tg_number = 1
-[[remote]]
+[[concentrator]]
 id = "upstream"
 url = "ws://127.0.0.1:8081/router/v1/ws"
-local_cp = "QABOB.SNAB"
-target_cp = "QAALICE.SNAA"
-source_lu = "QABOB.SNAB"
-target_lu = "QAALICE.SNAA"
-lus = ["QABOB.SNAB"]
-lu_types = { "QABOB.SNAB" = ["lu_6_2"] }
+token = ""
 [[route]]
 from = "bob"
 to = "upstream"
 converter = "mptn_lu62"
 "#;
-        parse(gateway).validate().unwrap();
-        assert!(parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
-            .validate()
-            .is_err());
-        assert!(parse(&gateway.replace(
-            "target_lu = \"QAALICE.SNAA\"",
-            "target_lu = \"QAALICE.OTHER\""
-        ))
-        .validate()
-        .is_err());
-        assert!(parse(&gateway.replace(
-            "source_lu = \"QABOB.SNAB\"\ntarget_lu",
-            "source_lu = \"QABOB.OTHER\"\ntarget_lu"
-        ))
-        .validate()
-        .is_err());
+        let parsed = parse(gateway);
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.concentrator_local_id(&parsed.remote[0]).unwrap(),
+            "bob"
+        );
+        assert_eq!(parsed.remote[0].bearer_token().unwrap(), "");
+        assert!(
+            parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(&gateway.replace("token = \"\"", "target_lu = \"QAALICE.OTHER\""))
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
     }
 
     #[test]
@@ -988,11 +1006,13 @@ peer_ip = "127.0.0.5"
 from = "mptn"
 to = "hpr"
 "#;
-        assert!(parse(mixed)
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported route"));
+        assert!(
+            parse(mixed)
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported route")
+        );
     }
 
     #[test]
@@ -1015,19 +1035,23 @@ from = "east"
 to = "west"
 "#;
         parse(strict).validate().unwrap();
-        assert!(parse(&strict.replace(
-            "remote_lu = \"SOLNET.SNAA\"",
-            "remote_lu = \"SOLNET.OTHER\""
-        ))
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("policy mismatch"));
-        assert!(parse(&strict.replace("local_lu = \"SOLNET.SNAA\"", ""))
+        assert!(
+            parse(&strict.replace(
+                "remote_lu = \"SOLNET.SNAA\"",
+                "remote_lu = \"SOLNET.OTHER\""
+            ))
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("requires both"));
+            .contains("policy mismatch")
+        );
+        assert!(
+            parse(&strict.replace("local_lu = \"SOLNET.SNAA\"", ""))
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires both")
+        );
     }
 
     #[test]
@@ -1058,12 +1082,16 @@ to = "ip"
                 .to_string()
                 .contains("experimental")
         );
-        assert!(parse(&mixed.replace("to = \"ip\"", "to = \"lan\""))
-            .validate()
-            .is_err());
-        assert!(parse(&mixed.replace("[[ee]]", "[[anynet]]"))
-            .validate()
-            .is_err());
+        assert!(
+            parse(&mixed.replace("to = \"ip\"", "to = \"lan\""))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(&mixed.replace("[[ee]]", "[[anynet]]"))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1088,14 +1116,18 @@ converter = "mptn_lu62"
         let error = parse(gateway).validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("MPTN session gateway"));
-        assert!(parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported route"));
-        assert!(toml::from_str::<RouterConfig>(
-            &gateway.replace("converter = \"mptn_lu62\"", "converter = \"unknown\"")
-        )
-        .is_err());
+        assert!(
+            parse(&gateway.replace("converter = \"mptn_lu62\"", ""))
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported route")
+        );
+        assert!(
+            toml::from_str::<RouterConfig>(
+                &gateway.replace("converter = \"mptn_lu62\"", "converter = \"unknown\"")
+            )
+            .is_err()
+        );
     }
 }
