@@ -237,7 +237,9 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         tracing::info!("held TCP62 user BIND offered to virtual native link");
     }
     let mut pending_user_input: Option<TcpRecord> = None;
-    while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+    // The deadline bounds setup only. An established user conversation runs
+    // until STOP or a correlated transport/session close.
+    while !STOP.load(Ordering::Relaxed) && (tcp.user_active() || Instant::now() < deadline) {
         pump_virtual(&mut virtual_port)?;
         if let Some(record) = pending_user_input.as_ref() {
             if virtual_port.submit_tcp_user_record(record)? {
