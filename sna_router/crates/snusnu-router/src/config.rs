@@ -98,6 +98,9 @@ pub(crate) struct RouteConfig {
     #[serde(default = "default_bidirectional")]
     pub(crate) bidirectional: bool,
     pub(crate) converter: Option<RouteConverter>,
+    /// LLC-facing address of this route's target. Omit for a concentrator
+    /// binding or when the target is another configured LLC peer.
+    pub(crate) proxy_mac: Option<String>,
 }
 
 /// A route names a converter explicitly before two different session
@@ -182,6 +185,39 @@ impl RemoteConfig {
 }
 
 impl RouterConfig {
+    /// Address presented to one local LLC peer for its configured route.
+    /// `None` means the concentrator must supply the managed target address.
+    pub(crate) fn llc_proxy_mac(&self, llc_id: &str) -> io::Result<Option<[u8; 6]>> {
+        let peer = self
+            .llc
+            .iter()
+            .find(|peer| peer.id == llc_id)
+            .ok_or_else(|| invalid(format!("unknown LLC peer {llc_id}")))?;
+        let route = self
+            .route
+            .iter()
+            .find(|route| route.from == llc_id || (route.to == llc_id && route.bidirectional))
+            .ok_or_else(|| invalid(format!("LLC peer {llc_id} has no outgoing route")))?;
+        let target_id = if route.from == llc_id {
+            route.to.as_str()
+        } else {
+            route.from.as_str()
+        };
+        let explicit = route.proxy_mac.as_deref().or(peer.proxy_mac.as_deref());
+        if let Some(mac) = explicit {
+            return Ok(Some(parse_mac(mac)?));
+        }
+        if let Some(target) = self.llc.iter().find(|target| target.id == target_id) {
+            return Ok(Some(parse_mac(&target.guest_mac)?));
+        }
+        if self.remote.iter().any(|target| target.id == target_id) {
+            return Ok(None);
+        }
+        Err(invalid(format!(
+            "LLC route {llc_id} to {target_id} requires proxy_mac"
+        )))
+    }
+
     pub(crate) fn concentrator_local_id<'a>(&'a self, entry: &RemoteConfig) -> io::Result<&'a str> {
         self.route
             .iter()
@@ -473,6 +509,21 @@ impl RouterConfig {
             }
             let source_kind = kinds[route.from.as_str()];
             let target_kind = kinds[route.to.as_str()];
+            if let Some(mac) = &route.proxy_mac {
+                parse_mac(mac)?;
+                if source_kind != "llc" && target_kind != "llc" {
+                    return Err(invalid(format!(
+                        "route {} -> {} proxy_mac requires an LLC endpoint",
+                        route.from, route.to
+                    )));
+                }
+                if source_kind == "llc" && target_kind == "llc" && route.bidirectional {
+                    return Err(invalid(format!(
+                        "bidirectional LLC route {} -> {} cannot use one proxy_mac for both peers",
+                        route.from, route.to
+                    )));
+                }
+            }
             if let Some(converter) = route.converter {
                 if matches!(
                     (source_kind, target_kind),
@@ -621,17 +672,45 @@ impl RouterConfig {
                 }
             }
         }
+        let mut resolved_associations = HashSet::new();
         for peer in &self.llc {
-            if peer.proxy_mac.is_none()
-                && !self.remote.iter().any(|remote| {
-                    directed.get(peer.id.as_str()) == Some(&remote.id.as_str())
-                        && directed.get(remote.id.as_str()) == Some(&peer.id.as_str())
+            let route = self
+                .route
+                .iter()
+                .find(|route| {
+                    route.from == peer.id || (route.to == peer.id && route.bidirectional)
                 })
-            {
+                .ok_or_else(|| invalid(format!("LLC peer {} has no route", peer.id)))?;
+            if peer.proxy_mac.is_some() && route.proxy_mac.is_some() {
                 return Err(invalid(format!(
-                    "LLC peer {} requires proxy_mac without a concentrator route",
+                    "LLC peer {} has proxy_mac on both [[llc]] and [[route]]",
                     peer.id
                 )));
+            }
+            let guest = parse_mac(&peer.guest_mac)?;
+            let proxy = self.llc_proxy_mac(&peer.id)?;
+            if !resolved_associations.insert((peer.interface.as_str(), guest, proxy)) {
+                return Err(invalid(format!(
+                    "duplicate resolved LLC association on {}",
+                    peer.interface
+                )));
+            }
+            if let Some(proxy) = proxy {
+                if proxy == guest {
+                    return Err(invalid(format!(
+                        "LLC peer {} has equal guest and proxy MACs",
+                        peer.id
+                    )));
+                }
+                let target_id = directed[peer.id.as_str()];
+                if self.remote.iter().any(|remote| remote.id == target_id)
+                    && proxy[..3] != [0x02, 0x53, 0x4e]
+                {
+                    return Err(invalid(format!(
+                        "concentrator LLC peer {} must use assigned 02:53:4e virtual MAC",
+                        peer.id
+                    )));
+                }
             }
         }
         for id in ids {
@@ -762,11 +841,58 @@ to = "b"
     fn permits_multiple_peers_on_one_interface() {
         parse(GOOD).validate().unwrap();
         let missing_proxy = GOOD.replace("proxy_mac = \"02:53:4e:00:00:02\"\n", "");
-        assert!(parse(&missing_proxy)
+        let derived = parse(&missing_proxy);
+        derived.validate().unwrap();
+        assert_eq!(
+            derived.llc_proxy_mac("a").unwrap(),
+            Some(parse_mac("02:00:00:00:00:03").unwrap())
+        );
+        let both_derived = parse(&missing_proxy.replace("proxy_mac = \"02:53:4e:00:00:04\"\n", ""));
+        both_derived.validate().unwrap();
+        assert_eq!(
+            both_derived.llc_proxy_mac("b").unwrap(),
+            Some(parse_mac("02:00:00:00:00:01").unwrap())
+        );
+        let ambiguous = GOOD.replace("to = \"b\"", "to = \"b\"\nproxy_mac = \"02:53:4e:00:00:05\"");
+        assert!(parse(&ambiguous)
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("requires proxy_mac"));
+            .contains("cannot use one proxy_mac"));
+    }
+
+    #[test]
+    fn directional_llc_routes_can_select_distinct_target_aliases() {
+        let config = r#"
+[[llc]]
+id = "a"
+interface = "sol5"
+guest_mac = "02:00:00:00:00:01"
+[[llc]]
+id = "b"
+interface = "sol5"
+guest_mac = "02:00:00:00:00:02"
+[[route]]
+from = "a"
+to = "b"
+bidirectional = false
+proxy_mac = "02:53:4e:00:00:05"
+[[route]]
+from = "b"
+to = "a"
+bidirectional = false
+proxy_mac = "02:53:4e:00:00:06"
+"#;
+        let config = parse(config);
+        config.validate().unwrap();
+        assert_eq!(
+            config.llc_proxy_mac("a").unwrap(),
+            Some(parse_mac("02:53:4e:00:00:05").unwrap())
+        );
+        assert_eq!(
+            config.llc_proxy_mac("b").unwrap(),
+            Some(parse_mac("02:53:4e:00:00:06").unwrap())
+        );
     }
 
     #[test]
@@ -904,6 +1030,24 @@ to = "upstream"
         let managed_proxy = parse(&config.replace("proxy_mac = \"02:53:4e:00:00:01\"\n", ""));
         managed_proxy.validate().unwrap();
         assert!(managed_proxy.llc[0].proxy_mac.is_none());
+        assert_eq!(managed_proxy.llc_proxy_mac("a").unwrap(), None);
+        let route_proxy = config
+            .replace("proxy_mac = \"02:53:4e:00:00:01\"\n", "")
+            .replace("to = \"upstream\"", "to = \"upstream\"\nproxy_mac = \"02:53:4e:00:00:09\"");
+        let route_proxy = parse(&route_proxy);
+        route_proxy.validate().unwrap();
+        assert_eq!(
+            route_proxy.llc_proxy_mac("a").unwrap(),
+            Some(parse_mac("02:53:4e:00:00:09").unwrap())
+        );
+        assert!(parse(&config.replace(
+            "to = \"upstream\"",
+            "to = \"upstream\"\nproxy_mac = \"02:53:4e:00:00:09\""
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("both [[llc]] and [[route]]"));
         assert_eq!(
             parsed.concentrator_local_id(&parsed.remote[0]).unwrap(),
             "a"
