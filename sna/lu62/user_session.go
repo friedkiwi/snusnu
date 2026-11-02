@@ -34,6 +34,7 @@ const (
 type UserSession struct {
 	remoteLU, localLU  string
 	managementFQ       []byte
+	standalone         bool
 	phase              UserPhase
 	bindRequest        []byte
 	bindResponse       []byte
@@ -78,7 +79,7 @@ func NewStandaloneUserSession(remoteLU, localLU string) (*UserSession, error) {
 	if _, err := encodeLUName(localLU); err != nil || remoteLU == localLU {
 		return nil, ErrUserState
 	}
-	return &UserSession{remoteLU: remoteLU, localLU: localLU}, nil
+	return &UserSession{remoteLU: remoteLU, localLU: localLU, standalone: true}, nil
 }
 
 func (s *UserSession) Phase() UserPhase { return s.phase }
@@ -89,7 +90,13 @@ func (s *UserSession) PrepareBind(request []byte) ([]byte, error) {
 	if s.phase != UserAwaitBind {
 		return nil, ErrUserState
 	}
-	response, err := CandidateUserResponse(request, s.remoteLU, s.localLU, s.managementFQ, 1)
+	var response []byte
+	var err error
+	if s.standalone {
+		response, err = CandidateStandaloneUserResponse(request, s.remoteLU, s.localLU, 1)
+	} else {
+		response, err = CandidateUserResponse(request, s.remoteLU, s.localLU, s.managementFQ, 1)
+	}
 	if err != nil {
 		return nil, err
 	}

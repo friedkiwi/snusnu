@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -149,4 +150,55 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 		t.Fatalf("UNBIND reply: %x", unbindReply)
 	}
 	expectTestBody(t, conn, "credit")
+}
+
+func TestLocalAPINGSessionAcceptsSanitizedV5R4EEBind(t *testing.T) {
+	encoded, err := os.ReadFile("../../../sna/lu62/testdata/v5r4_ee_bind_request.hex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reduced, err := hex.DecodeString(strings.TrimSpace(string(encoded)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := testApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := a.StartLocalSNA(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner := store.RandomUUID()
+	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "v5-ee-bind@example.com", "unused", store.Now(), "NETAAA"); err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := a.DB.CreateRouter(ctx, owner, "V5 EE router")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(a.Handler())
+	defer srv.Close()
+	conn, welcome := connectTestRouterVersion(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/router/v1/ws", token, "snusnu.v2")
+	routes := expectTestBody(t, conn, "routes").GetOriginRoutes()
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_PublishRoutes{PublishRoutes: &wire.RouteSnapshot{Epoch: welcome.ConnectionEpoch, Revision: 1, Routes: []*wire.RouteExport{
+		{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: &wire.SnaName{Netid: "NETAAA", Name: "CPAA"}}},
+		{Id: 2, Generation: 1, Resource: &wire.RouteExport_LogicalUnit{LogicalUnit: &wire.LuReachability{Lu: &wire.SnaName{Netid: "NETAAA", Name: "LUAA"}, HostingCp: &wire.SnaName{Netid: "NETAAA", Name: "CPAA"}, SupportedTypes: []wire.LuType{wire.LuType_LU_TYPE_6_2}}}},
+	}}})
+	source := &wire.RouteReference{RouterId: welcome.RouterId, Epoch: welcome.ConnectionEpoch, RouteId: 2, RouteGeneration: 1}
+	target := &wire.RouteReference{RouterId: uuidBytes(serviceRouterID), Epoch: routes.Snapshot.Epoch, RouteId: 2, RouteGeneration: 1}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenRequest{OpenRequest: &wire.OpenRequest{RequestId: 1, Target: target, SourceRoute: source, ReceiveAllowanceBytes: 1500, Profile: wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1}})
+	result := expectTestBody(t, conn, "result").GetOpenResult()
+	if !result.Accepted {
+		t.Fatalf("V5 session open rejected: %+v", result)
+	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SessionEvent{SessionEvent: &wire.SessionEvent{Event: &wire.SessionEvent_BindRequest{BindRequest: reduced}}}}})
+	response := expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetBindResult()
+	if response == nil || !response.Accepted || len(response.ReducedUnit) < 32 || response.ReducedUnit[2] != 0xeb || response.ReducedUnit[5] != 0x31 {
+		t.Fatalf("V5 BIND rejected or malformed: %+v", response)
+	}
+	if response.ReducedUnit[15] != 0x8c || response.ReducedUnit[16] != 0x8c {
+		t.Fatalf("V5 normal-flow RU size lost: %x", response.ReducedUnit[5:22])
+	}
+	if credit := expectTestBody(t, conn, "credit").GetCircuitCredit(); credit.AllowanceBytes != 1500+uint64(len(reduced)) {
+		t.Fatalf("V5 BIND inbound credit: %+v", credit)
+	}
 }

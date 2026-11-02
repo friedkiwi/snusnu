@@ -46,6 +46,17 @@ func RequestFQPCID(request []byte) ([]byte, error) {
 // blank-mode user BIND. It must not be sent before management, pacing, APPC
 // Attach, and all local transport conditions have been negotiated.
 func CandidateUserResponse(request []byte, expectedPLU, expectedSLU string, managementFQPCID []byte, receiveWindow byte) ([]byte, error) {
+	return candidateUserResponse(request, expectedPLU, expectedSLU, managementFQPCID, receiveWindow, false)
+}
+
+// CandidateStandaloneUserResponse also accepts the captured V5R4 EE BIND
+// profile after an HPR adapter has established its own control plane. The
+// native FID2 service keeps the older strict candidate profile above.
+func CandidateStandaloneUserResponse(request []byte, expectedPLU, expectedSLU string, receiveWindow byte) ([]byte, error) {
+	return candidateUserResponse(request, expectedPLU, expectedSLU, nil, receiveWindow, true)
+}
+
+func candidateUserResponse(request []byte, expectedPLU, expectedSLU string, managementFQPCID []byte, receiveWindow byte, allowV5 bool) ([]byte, error) {
 	b, err := ParseBind(request)
 	if err != nil || b == nil || b.Management || b.Mode != "" || b.PLU != expectedPLU || b.SLU != expectedSLU || receiveWindow < 1 || receiveWindow > 3 {
 		return nil, ErrUserBind
@@ -55,7 +66,13 @@ func CandidateUserResponse(request []byte, expectedPLU, expectedSLU string, mana
 		return nil, ErrUserBind
 	}
 	ru := request[9:]
-	if !bytes.Equal(ru[:27], v4UserFixed) {
+	// V5R4 EE uses the same LU 6.2 default-mode BIND with a larger normal
+	// flow RU encoding (X'8C') and no compression in byte 25. IBM SNA Formats
+	// permits the SLU to negotiate the pacing and supported synchronization
+	// fields in RSP(BIND). Keep the older V4R4 profile strict and distinct.
+	v5UserFixed := append([]byte(nil), v4UserFixed...)
+	v5UserFixed[10], v5UserFixed[11], v5UserFixed[25] = 0x8c, 0x8c, 0
+	if !bytes.Equal(ru[:27], v4UserFixed) && !(allowV5 && bytes.Equal(ru[:27], v5UserFixed)) {
 		return nil, ErrUserBind
 	}
 	plu, err := encodeLUName(expectedPLU)
@@ -89,7 +106,7 @@ func CandidateUserResponse(request []byte, expectedPLU, expectedSLU string, mana
 	}
 	responseUser := []byte{0, 9, 2, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 2, 3, 2, byte(1 + len(slu)), 5}
 	responseUser = append(responseUser, slu...)
-	fixed := append([]byte(nil), v4UserFixed...)
+	fixed := append([]byte(nil), ru[:27]...)
 	fixed[8], fixed[9], fixed[12], fixed[13] = 3, receiveWindow, 0x80|receiveWindow, 3
 	fixed[23], fixed[24] = 0, 0x23
 	response := []byte{request[0], 0, b.OAF, b.DAF, 0, 0, 0xeb, 0x80, 0}

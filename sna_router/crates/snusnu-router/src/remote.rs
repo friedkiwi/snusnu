@@ -2217,6 +2217,17 @@ impl AutoWsHub {
         &self.welcome.allowed_netid
     }
 
+    /// Server-owned router UUID from the authenticated welcome. This is
+    /// read-only; local configuration cannot select or change it.
+    #[allow(dead_code)]
+    pub(crate) fn router_id_bytes(&self) -> io::Result<[u8; 16]> {
+        self.welcome
+            .router_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| protocol("invalid server-owned router ID"))
+    }
+
     pub(crate) fn local_route(
         &self,
         reference: &wire::RouteReference,
