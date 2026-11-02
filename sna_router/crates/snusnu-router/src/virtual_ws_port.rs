@@ -197,7 +197,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 || self.udp_abort_completion.is_some()
                 || self.expedited_ack.is_some()
             {
-                return Err(protocol("virtual user close still has pending delivery"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "virtual user close still has pending delivery",
+                ));
             }
             self.inner.disconnect()?;
             self.reset_cp()?;
@@ -1286,7 +1289,12 @@ mod tests {
         assert!(port.rearm_management(fresh_management(2)).is_err());
         port.user_closed = true;
         port.tcp_user_writes.push_back(TcpUserOutputKind::Normal);
-        assert!(port.rearm_management(fresh_management(2)).is_err());
+        assert_eq!(
+            port.rearm_management(fresh_management(2))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         port.tcp_user_writes.clear();
         port.rearm_management(fresh_management(2)).unwrap();
         assert!(!port.management_invalidated);
