@@ -74,8 +74,13 @@ impl AutomaticDirectory {
         attachment: PortId,
         addresses: impl IntoIterator<Item = RouteAddress>,
     ) {
-        self.attachments
-            .insert(attachment, addresses.into_iter().collect());
+        self.attachments.insert(
+            attachment,
+            addresses
+                .into_iter()
+                .filter(|address| !matches!(address, RouteAddress::UnboundManagedMac))
+                .collect(),
+        );
     }
 
     pub(crate) fn withdraw(&mut self, attachment: &PortId) {
@@ -143,6 +148,7 @@ pub(crate) struct AutomaticFabric {
     router: Router,
     directory: AutomaticDirectory,
     sessions: HashMap<u64, (PortId, PortId)>,
+    closed_sessions: Vec<u64>,
 }
 
 impl AutomaticFabric {
@@ -151,6 +157,7 @@ impl AutomaticFabric {
             router: Router::new(),
             directory: AutomaticDirectory::default(),
             sessions: HashMap::new(),
+            closed_sessions: Vec::new(),
         }
     }
 
@@ -200,7 +207,30 @@ impl AutomaticFabric {
     }
 
     pub(crate) fn poll_once(&mut self) -> io::Result<bool> {
-        self.router.poll_once()
+        let received = self.router.poll_once()?;
+        let retired = self.router.take_retired_ports();
+        if !retired.is_empty() {
+            let closed = self
+                .sessions
+                .iter()
+                .filter_map(|(id, (left, right))| {
+                    (retired.contains(left) || retired.contains(right)).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in closed {
+                if let Some((left, right)) = self.sessions.remove(&id) {
+                    self.router.remove_pair(&left, &right)?;
+                    self.closed_sessions.push(id);
+                }
+            }
+        }
+        Ok(received)
+    }
+
+    /// Sessions that closed normally or failed on one route component since
+    /// the last call. The attachment runtime can release its listener state.
+    pub(crate) fn take_closed_sessions(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.closed_sessions)
     }
 
     pub(crate) fn close_pair(&mut self, session_id: u64) -> io::Result<()> {
@@ -292,6 +322,7 @@ pub(crate) struct Router {
     address_routes: HashMap<(PortId, RouteAddress), PortId>,
     destinations: HashMap<PortId, RouteAddress>,
     failures: HashMap<PortId, RouteFailure>,
+    retired: HashSet<PortId>,
 }
 
 #[derive(Clone, Copy)]
@@ -309,6 +340,7 @@ impl Router {
             address_routes: HashMap::new(),
             destinations: HashMap::new(),
             failures: HashMap::new(),
+            retired: HashSet::new(),
         }
     }
 
@@ -366,6 +398,7 @@ impl Router {
             self.destinations.remove(id);
             self.address_routes.retain(|(source, _), _| source != id);
             self.failures.remove(id);
+            self.retired.remove(id);
             self.order.retain(|entry| entry != id);
             tracing::info!(port = %id.0, "router circuit port removed");
         }
@@ -593,8 +626,13 @@ impl Router {
                 }
                 tracing::warn!(port = %id.0, error = %disconnect_error, "route port disconnect failed during quarantine");
             }
+            self.retired.insert(id);
         }
         Ok(())
+    }
+
+    fn take_retired_ports(&mut self) -> HashSet<PortId> {
+        std::mem::take(&mut self.retired)
     }
 
     /// End a local association before a failed transport is discarded. This
@@ -771,6 +809,8 @@ impl Router {
                     tracing::info!(source_port = %source.0, target_port = %target.0, "route closed");
                     self.port_mut(source)?.disconnect()?;
                     self.port_mut(&target)?.disconnect()?;
+                    self.retired.insert(source.clone());
+                    self.retired.insert(target.clone());
                 }
                 RouterEvent::TimedOut => {
                     tracing::warn!(source_port = %source.0, target_port = %target.0, "router port timed out")
@@ -1511,5 +1551,57 @@ mod tests {
         fabric.poll_once().unwrap();
         assert_eq!(left1.borrow().poll_count, 1);
         assert_eq!(left2.borrow().poll_count, 2);
+    }
+
+    #[test]
+    fn automatic_fabric_retires_only_closed_or_failed_session() {
+        let mut fabric = AutomaticFabric::new();
+        let ingress = PortId::new("ingress");
+        let egress = PortId::new("egress");
+        let destination = RouteAddress::ControlPoint {
+            netid: "NETA".into(),
+            name: "CPA".into(),
+        };
+        fabric
+            .directory_mut()
+            .replace(egress.clone(), [destination.clone()]);
+        let closed = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            next_event: Some(RouterEvent::Closed),
+            ..State::default()
+        }));
+        let failed = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            poll_failures_remaining: 1,
+            ..State::default()
+        }));
+        let live = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            ..State::default()
+        }));
+        for (id, source) in [(1, closed.clone()), (2, failed.clone()), (3, live.clone())] {
+            fabric
+                .open_pair(
+                    id,
+                    &ingress,
+                    &destination,
+                    &egress,
+                    Box::new(FakePort(source)),
+                    Box::new(FakePort(Rc::new(RefCell::new(State {
+                        free_slots: 1,
+                        ..State::default()
+                    })))),
+                )
+                .unwrap();
+        }
+        fabric.poll_once().unwrap();
+        let mut retired = fabric.take_closed_sessions();
+        retired.sort_unstable();
+        assert_eq!(retired, [1, 2]);
+        assert_eq!(fabric.sessions.len(), 1);
+        assert!(fabric.take_closed_sessions().is_empty());
+        let count = live.borrow().poll_count;
+        fabric.poll_once().unwrap();
+        assert_eq!(live.borrow().poll_count, count + 1);
     }
 }
