@@ -38,6 +38,20 @@ struct Circuit {
     received_bytes: u64,
 }
 
+/// A concentrator circuit accepted for a locally hosted LU. The runtime can
+/// use this identity to start the matching outbound MPTN session.
+#[derive(Clone, Debug)]
+pub(crate) struct InboundOpen {
+    pub(crate) circuit_id: Vec<u8>,
+    pub(crate) source_router_id: Vec<u8>,
+    pub(crate) source_route: wire::RouteReference,
+}
+
+struct GatewayInbound {
+    hosted_route: wire::RouteReference,
+    target_refs: Vec<Option<wire::RouteReference>>,
+}
+
 struct SharedWs {
     client: WsClient,
     inbox: Vec<VecDeque<wire::ws_envelope::Body>>,
@@ -48,6 +62,7 @@ struct SharedWs {
     closed_requests: VecDeque<u64>,
     next_request_id: u64,
     last_managed_revision: u64,
+    gateway_inbound: Option<GatewayInbound>,
 }
 
 impl SharedWs {
@@ -110,8 +125,27 @@ impl SharedWs {
                 }
             }
             Body::IncomingOpen(open) => {
-                let route_id = open.target.as_ref().map(|route| route.route_id);
-                if let Some(owner) = route_id.and_then(|id| self.route_owners.get(&id)).copied() {
+                let owner = if let Some(gateway) = &self.gateway_inbound {
+                    if open.target.as_ref() == Some(&gateway.hosted_route) {
+                        open.source_route.as_ref().and_then(|source| {
+                            if source.router_id != open.source_router_id {
+                                return None;
+                            }
+                            gateway
+                                .target_refs
+                                .iter()
+                                .position(|known| known.as_ref() == Some(source))
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    open.target
+                        .as_ref()
+                        .and_then(|route| self.route_owners.get(&route.route_id))
+                        .copied()
+                };
+                if let Some(owner) = owner {
                     self.inbox[owner].push_back(body);
                 } else {
                     self.client
@@ -218,6 +252,7 @@ pub(crate) struct WsRoutePort {
     // A-side CircuitCredit is issued by the remote LLC adapter only after
     // information delivery. Account by exact PIU lengths, not socket writes.
     outbound_completions: OutboundCompletions,
+    inbound_open: Option<InboundOpen>,
 }
 
 #[derive(Default)]
@@ -263,6 +298,19 @@ impl OutboundCompletions {
 }
 
 impl WsRoutePort {
+    fn sync_gateway_target(&self) {
+        if let Some(gateway) = self.shared.borrow_mut().gateway_inbound.as_mut() {
+            gateway.target_refs[self.index] = self.target.clone();
+        }
+    }
+
+    /// Return the authenticated source of a newly accepted inbound v2
+    /// circuit. The circuit remains owned by this port and subject to its
+    /// normal credit and close handling.
+    pub(crate) fn take_inbound_open(&mut self) -> Option<InboundOpen> {
+        self.inbound_open.take()
+    }
+
     pub(crate) fn connect(config: Config) -> io::Result<Self> {
         Ok(Self::connect_many_with_mode(vec![config], vec![], false, None, false)?.remove(0))
     }
@@ -294,8 +342,8 @@ impl WsRoutePort {
     /// Publish one hosted LU while opening separate v2 circuits to several
     /// destination LUs. Every returned port owns its own circuit and credit,
     /// but all ports use one WebSocket and the same authenticated source LU.
-    /// Incoming opens for the published LU are delivered to the first port;
-    /// a listener must dispatch those by source route before accepting them.
+    /// Incoming opens for the published LU select the port whose live target
+    /// route matches the authenticated source route.
     pub(crate) fn connect_gateway_targets_v2(
         configs: Vec<Config>,
         logical_units: Vec<wire::LuReachability>,
@@ -487,6 +535,22 @@ impl WsRoutePort {
             revision = 1,
             "published local reachability"
         );
+        let gateway_inbound = if shared_local_cp {
+            let hosted_route = source_routes
+                .as_ref()
+                .and_then(|routes| routes[0].clone())
+                .ok_or_else(|| protocol("gateway source LU route is absent"))?;
+            for ids in &mut local_route_ids {
+                ids.clear();
+                ids.insert(hosted_route.route_id);
+            }
+            Some(GatewayInbound {
+                hosted_route,
+                target_refs: vec![None; configs.len()],
+            })
+        } else {
+            None
+        };
         let shared = Rc::new(RefCell::new(SharedWs {
             client,
             inbox: vec![VecDeque::new(); configs.len()],
@@ -497,6 +561,7 @@ impl WsRoutePort {
             closed_requests: VecDeque::new(),
             next_request_id: 0,
             last_managed_revision: 0,
+            gateway_inbound,
         }));
         Ok(configs
             .into_iter()
@@ -527,6 +592,7 @@ impl WsRoutePort {
                 pending_information: VecDeque::new(),
                 downstream_sizes: VecDeque::new(),
                 outbound_completions: OutboundCompletions::default(),
+                inbound_open: None,
             })
             .collect())
     }
@@ -661,6 +727,7 @@ impl WsRoutePort {
                         "received target route"
                     );
                     self.target = Some(next_target);
+                    self.sync_gateway_target();
                     if retargeted && self.circuit.is_some() {
                         warn!(target_cp = %format_cp(&self.target_cp), "target route changed; closing circuit");
                         self.disconnect()?;
@@ -681,6 +748,7 @@ impl WsRoutePort {
                         "target resource withdrawn from route snapshot"
                     );
                     self.target = None;
+                    self.sync_gateway_target();
                     if self.circuit.is_some() {
                         self.disconnect()?;
                         return Ok(vec![RouterEvent::Closed]);
@@ -709,6 +777,7 @@ impl WsRoutePort {
                         "target router withdrew routes"
                     );
                     self.target = None;
+                    self.sync_gateway_target();
                     if self.circuit.is_some() {
                         self.disconnect()?;
                         return Ok(vec![RouterEvent::Closed]);
@@ -752,6 +821,7 @@ impl WsRoutePort {
                     let changed = target_changed || self.managed_mac != Some(mac);
                     if self.target_lu.is_none() {
                         self.target = next_target;
+                        self.sync_gateway_target();
                     }
                     self.managed_mac = Some(mac);
                     if changed && self.opening {
@@ -766,6 +836,7 @@ impl WsRoutePort {
                 if self.require_managed_binding || self.managed_mac.is_some() {
                     if self.target_lu.is_none() {
                         self.target = None;
+                        self.sync_gateway_target();
                     }
                     self.managed_mac = None;
                     if self.opening {
@@ -928,6 +999,13 @@ impl WsRoutePort {
                 .borrow_mut()
                 .circuit_owners
                 .insert(incoming.circuit_id.clone(), self.index);
+            if let Some(source_route) = incoming.source_route.clone() {
+                self.inbound_open = Some(InboundOpen {
+                    circuit_id: incoming.circuit_id.clone(),
+                    source_router_id: incoming.source_router_id.clone(),
+                    source_route,
+                });
+            }
             self.circuit = Some(Circuit {
                 id: incoming.circuit_id,
                 ready: false,
@@ -1074,6 +1152,7 @@ impl WsRoutePort {
         self.downstream_sizes.clear();
         self.outbound_completions = OutboundCompletions::default();
         self.local_ready = false;
+        self.inbound_open = None;
     }
 }
 
@@ -2176,6 +2255,180 @@ mod tests {
             }
         }
         assert!(ports.iter().all(|port| port.opening));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn v2_incoming_open_selects_configured_source_lu_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/router/v1/ws", listener.local_addr().unwrap());
+        let (routes_tx, routes_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (decisions_tx, decisions_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |_: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(transport_ws::SUBPROTOCOL_V2),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, body| {
+                socket
+                    .send(WsMessage::Binary(envelope(body).encode_to_vec().into()))
+                    .unwrap();
+            };
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                    router_id: vec![7; 16],
+                    connection_epoch: vec![8; 16],
+                    max_message_bytes: 65536,
+                    max_circuits: 4,
+                    display_name: "v2 gateway".into(),
+                    allowed_netid: "QABOB".into(),
+                }),
+            );
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("snapshot")
+            };
+            let Some(wire::ws_envelope::Body::PublishRoutes(snapshot)) =
+                wire::WsEnvelope::decode(payload).unwrap().body
+            else {
+                panic!("routes")
+            };
+            let hosted_id = snapshot.routes.iter().find(|route| matches!(route.resource.as_ref(),
+                Some(wire::route_export::Resource::LogicalUnit(lu)) if lu.lu.as_ref() == Some(&name("QABOB", "LUB")))).unwrap().id;
+            let target = wire::RouteReference {
+                router_id: vec![7; 16],
+                epoch: vec![8; 16],
+                route_id: hosted_id,
+                route_generation: 1,
+            };
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16],
+                        revision: 1,
+                        routes: ["LUA", "LUC"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, lu)| wire::RouteExport {
+                                id: 90 + index as u64,
+                                generation: 1,
+                                resource: Some(wire::route_export::Resource::LogicalUnit(
+                                    wire::LuReachability {
+                                        lu: Some(name("QAALICE", lu)),
+                                        hosting_cp: Some(name("QAALICE", "SNAA")),
+                                        supported_types: vec![wire::LuType::LuType62 as i32],
+                                    },
+                                )),
+                            })
+                            .collect(),
+                    }),
+                }),
+            );
+            routes_tx.send(()).unwrap();
+            start_rx.recv().unwrap();
+            for (id, source_router_id) in [(1u8, vec![9; 16]), (2u8, vec![6; 16])] {
+                send(
+                    &mut socket,
+                    wire::ws_envelope::Body::IncomingOpen(wire::IncomingOpen {
+                        circuit_id: vec![id; 16],
+                        source_router_id,
+                        target: Some(target.clone()),
+                        source_receive_allowance_bytes: 1500,
+                        source_route: Some(wire::RouteReference {
+                            router_id: vec![9; 16],
+                            epoch: vec![10; 16],
+                            route_id: 91,
+                            route_generation: 1,
+                        }),
+                    }),
+                );
+            }
+            let mut decisions = Vec::new();
+            for _ in 0..2 {
+                let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                    panic!("decision")
+                };
+                let Some(wire::ws_envelope::Body::OpenDecision(decision)) =
+                    wire::WsEnvelope::decode(payload).unwrap().body
+                else {
+                    panic!("open decision")
+                };
+                decisions.push(decision);
+            }
+            decisions_tx.send(decisions).unwrap();
+            done_rx.recv().unwrap();
+        });
+        let configs = ["LUA", "LUC"]
+            .into_iter()
+            .map(|lu| Config {
+                url: url.clone(),
+                bearer: "test-token".into(),
+                local_cp: name("QABOB", "SNAB"),
+                target_cp: name("QAALICE", "SNAA"),
+                target_lu: Some(name("QAALICE", lu)),
+            })
+            .collect();
+        let source_lu = name("QABOB", "LUB");
+        let mut ports = WsRoutePort::connect_gateway_targets_v2(
+            configs,
+            vec![wire::LuReachability {
+                lu: Some(source_lu.clone()),
+                hosting_cp: Some(name("QABOB", "SNAB")),
+                supported_types: vec![wire::LuType::LuType62 as i32],
+            }],
+            source_lu,
+        )
+        .unwrap();
+        routes_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ports.iter().any(|port| port.target.is_none()) && Instant::now() < deadline {
+            for port in &mut ports {
+                port.poll(true).unwrap();
+            }
+        }
+        assert!(ports.iter().all(|port| port.target.is_some()));
+        start_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ports[1].inbound_open.is_none() && Instant::now() < deadline {
+            for port in &mut ports {
+                port.poll(true).unwrap();
+            }
+        }
+        let inbound = ports[1].take_inbound_open().unwrap();
+        assert_eq!(inbound.circuit_id, vec![1; 16]);
+        assert_eq!(inbound.source_router_id, vec![9; 16]);
+        assert_eq!(inbound.source_route.route_id, 91);
+        assert!(ports[0].take_inbound_open().is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let decisions = loop {
+            if let Ok(decisions) = decisions_rx.try_recv() {
+                break decisions;
+            }
+            assert!(Instant::now() < deadline, "missing open decisions");
+            for port in &mut ports {
+                port.poll(true).unwrap();
+            }
+        };
+        assert!(decisions
+            .iter()
+            .any(|decision| decision.circuit_id == vec![1; 16] && decision.accept));
+        assert!(decisions
+            .iter()
+            .any(|decision| decision.circuit_id == vec![2; 16] && !decision.accept));
+        done_tx.send(()).unwrap();
         server.join().unwrap();
     }
 
