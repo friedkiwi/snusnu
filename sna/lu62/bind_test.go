@@ -46,14 +46,14 @@ func TestUserBindAndNonBind(t *testing.T) {
 
 func TestCandidateManagementResponse(t *testing.T) {
 	request, _ := hex.DecodeString("2d00010200006b800031001307b0b05133078786868707060200000000000000944340000be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c7090301000000000000000c04e2d6d3d5c5e34be2d5c1c10a13000000000000000000000be2d6d3d5c5e34be2d5c1c2601411111111111111110b11111111111111111111112c0a00000000000000000000")
-	response, err := CandidateManagementResponse(request, "SOLNET.SNAA", "SOLNET.SNAB")
+	response, err := CandidateManagementResponse(request, "SOLNET.SNAA", "SOLNET.SNAB", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(response) != 89 || response[2] != 2 || response[3] != 1 || response[6] != 0xeb || response[9] != 0x31 {
 		t.Fatalf("response envelope: %x", response)
 	}
-	if _, err := CandidateManagementResponse(request, "OTHER.SNAA", "SOLNET.SNAB"); !errors.Is(err, ErrManagement) {
+	if _, err := CandidateManagementResponse(request, "OTHER.SNAA", "SOLNET.SNAB", 1); !errors.Is(err, ErrManagement) {
 		t.Fatalf("identity gate: %v", err)
 	}
 }

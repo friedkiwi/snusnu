@@ -18,12 +18,13 @@ var managementResponseFixed = []byte{
 }
 var snaSvcMode = []byte{0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7}
 
-// CandidateManagementResponse builds the narrow V4R4 SNASVCMG BIND response.
-// A node must negotiate pacing, CNOS, parallel sessions, and CONFIRM before
+// CandidateManagementResponse builds a fixed one-stage V4R4 SNASVCMG BIND
+// response with a bounded local receive window. A node must implement pacing,
+// CNOS, parallel sessions, and CONFIRM before
 // transmitting this response. This function alone never activates a session.
-func CandidateManagementResponse(request []byte, remotePLU, localSLU string) ([]byte, error) {
+func CandidateManagementResponse(request []byte, remotePLU, localSLU string, receiveWindow byte) ([]byte, error) {
 	b, err := ParseBind(request)
-	if err != nil || b == nil || !b.Management || b.Mode != "SNASVCMG" || b.PLU != remotePLU || b.SLU != localSLU {
+	if err != nil || b == nil || !b.Management || b.Mode != "SNASVCMG" || b.PLU != remotePLU || b.SLU != localSLU || receiveWindow < 1 || receiveWindow > 7 {
 		return nil, ErrManagement
 	}
 	if len(request) < 9+28 || request[1] != 0 || request[4] != 0 || request[5] != 0 || request[6] != 0x6b ||
@@ -114,7 +115,9 @@ func CandidateManagementResponse(request []byte, remotePLU, localSLU string) ([]
 	userResponse = append(userResponse, 2, 3, 2, byte(1+len(sluName)), 5)
 	userResponse = append(userResponse, sluName...)
 	response := []byte{request[0], 0, b.OAF, b.DAF, 0, 0, 0xeb, 0x80, 0}
-	response = append(response, managementResponseFixed...)
+	fixed := append([]byte(nil), managementResponseFixed...)
+	fixed[8], fixed[9], fixed[12], fixed[13] = 7, receiveWindow, 0x80|receiveWindow, 7
+	response = append(response, fixed...)
 	response = append(response, 0, byte(len(userResponse)))
 	response = append(response, userResponse...)
 	response = append(response, 0, 0)

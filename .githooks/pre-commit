@@ -2,14 +2,4 @@
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -Eq '^(sna_router/|docs/protocol\.md$|docs/test-vectors/|\.github/workflows/rust\.yml$)'; then
-    exit 0
-fi
-
-cd "$repo_root/sna_router"
-echo 'Rust pre-commit: cargo fmt --check' >&2
-cargo fmt --check
-echo 'Rust pre-commit: cargo clippy --workspace --all-targets -- -D warnings' >&2
-cargo clippy --workspace --all-targets -- -D warnings
-echo 'Rust pre-commit: cargo test --workspace' >&2
-cargo test --workspace
+exec "$repo_root/scripts/pre-commit-check.sh"
