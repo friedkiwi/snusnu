@@ -144,7 +144,15 @@ impl HprRtpPort {
             Err(error) => return Err(endpoint_error(error)),
         };
         let port = priority_port(packet[0])?;
-        ee.send_nlp(port, &packet)?;
+        if let Err(error) = ee.send_nlp(port, &packet) {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                endpoint
+                    .cancel_unsent_message(&packet)
+                    .map_err(endpoint_error)?;
+                return Ok(false);
+            }
+            return Err(error);
+        }
         endpoint
             .confirm_message_sent(&packet, now_us)
             .map_err(endpoint_error)?;
@@ -161,11 +169,29 @@ impl HprRtpPort {
             let Some(endpoint) = self.endpoint_mut(kind) else {
                 continue;
             };
-            let Some(packet) = endpoint.retransmit_due(now_us).map_err(endpoint_error)? else {
+            if let Some(status) = endpoint.pending_status_nlp().map(ToOwned::to_owned) {
+                let port = priority_port(status[0])?;
+                match ee.send_nlp(port, &status) {
+                    Ok(()) => endpoint
+                        .confirm_status_sent(&status)
+                        .map_err(endpoint_error)?,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let packet = if let Some(pending) = endpoint.pending_retransmission_nlp() {
+                pending.to_vec()
+            } else if let Some(due) = endpoint.retransmit_due(now_us).map_err(endpoint_error)? {
+                due
+            } else {
                 continue;
             };
             let port = priority_port(packet[0])?;
-            ee.send_nlp(port, &packet)?;
+            match ee.send_nlp(port, &packet) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            }
             endpoint
                 .confirm_retransmission_sent(&packet, now_us)
                 .map_err(endpoint_error)?;
@@ -258,11 +284,18 @@ impl HprRtpPort {
             .receive(&datagram.payload[3..])
             .map_err(endpoint_error)?;
         if result.status_due {
-            let reply = endpoint.prepare_status().map_err(endpoint_error)?;
-            ee.send_nlp(datagram.port, &reply)?;
-            endpoint
-                .confirm_status_sent(&reply)
-                .map_err(endpoint_error)?;
+            let reply = if let Some(pending) = endpoint.pending_status_nlp() {
+                pending.to_vec()
+            } else {
+                endpoint.prepare_status().map_err(endpoint_error)?
+            };
+            match ee.send_nlp(datagram.port, &reply) {
+                Ok(()) => endpoint
+                    .confirm_status_sent(&reply)
+                    .map_err(endpoint_error)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
         }
         // Fast retransmit candidates are retained by the bounded send window;
         // the pacing timer handles them without allowing a peer STATUS to

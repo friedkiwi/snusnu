@@ -592,6 +592,12 @@ impl RtpInboundEndpoint {
         Ok(nlp)
     }
 
+    /// A STATUS prepared before a transient carrier backpressure response.
+    /// It must be sent and confirmed before another STATUS is prepared.
+    pub fn pending_status_nlp(&self) -> Option<&[u8]> {
+        self.pending_status.as_deref()
+    }
+
     pub fn confirm_status_sent(&mut self, nlp: &[u8]) -> Result<(), EndpointError> {
         if self.pending_status.as_deref() != Some(nlp) {
             return Err(EndpointError::InvalidTransmittedPacket);
@@ -678,6 +684,16 @@ impl RtpInboundEndpoint {
         Ok(())
     }
 
+    /// Drop an unsent preview after the carrier reports backpressure. No
+    /// sequence number, send window, or ARB state has been advanced yet.
+    pub fn cancel_unsent_message(&mut self, nlp: &[u8]) -> Result<(), EndpointError> {
+        if self.pending_data.as_deref() != Some(nlp) {
+            return Err(EndpointError::InvalidTransmittedPacket);
+        }
+        self.pending_data = None;
+        Ok(())
+    }
+
     /// Return the oldest still-unacknowledged NLP when a caller-owned timer
     /// fires. Sequence state is unchanged; the socket owner confirms a real
     /// retransmission with `confirm_retransmission_sent`.
@@ -712,6 +728,11 @@ impl RtpInboundEndpoint {
         let nlp = nlp.to_vec();
         self.pending_retransmission = Some(nlp.clone());
         Ok(Some(nlp))
+    }
+
+    /// A retransmission prepared before transient carrier backpressure.
+    pub fn pending_retransmission_nlp(&self) -> Option<&[u8]> {
+        self.pending_retransmission.as_deref()
     }
 
     pub fn confirm_retransmission_sent(
@@ -1019,6 +1040,48 @@ mod tests {
         assert_eq!(endpoint.retransmit_due(600_000), Ok(None));
         endpoint.close();
         assert_eq!(endpoint.phase(), EndpointPhase::Closed);
+    }
+
+    #[test]
+    fn carrier_backpressure_preserves_status_and_allows_data_retry_once() {
+        let cfg = config();
+        let mut endpoint = RtpInboundEndpoint::new(cfg.clone()).unwrap();
+        let reply = endpoint.prepare_inbound_setup(&setup_packet(&cfg)).unwrap();
+        endpoint.confirm_setup_reply_sent(&reply).unwrap();
+
+        let message = b"RSETUP-OK";
+        let preview = endpoint.prepare_message(message, 10_000).unwrap();
+        assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 0);
+        endpoint.cancel_unsent_message(&preview).unwrap();
+        assert_eq!(
+            endpoint.cancel_unsent_message(&preview),
+            Err(EndpointError::InvalidTransmittedPacket)
+        );
+        let retry = endpoint.prepare_message(message, 10_000).unwrap();
+        assert_eq!(retry, preview);
+        endpoint.confirm_message_sent(&retry, 10_000).unwrap();
+        assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 1);
+        assert_eq!(
+            endpoint.confirm_message_sent(&retry, 10_000),
+            Err(EndpointError::InvalidTransmittedPacket)
+        );
+
+        let status = endpoint.prepare_status().unwrap();
+        assert_eq!(endpoint.pending_status_nlp(), Some(status.as_slice()));
+        endpoint.confirm_status_sent(&status).unwrap();
+        assert_eq!(endpoint.pending_status_nlp(), None);
+
+        let retransmit = endpoint.retransmit_due(260_000).unwrap().unwrap();
+        assert_eq!(retransmit, retry);
+        assert_eq!(
+            endpoint.pending_retransmission_nlp(),
+            Some(retry.as_slice())
+        );
+        endpoint
+            .confirm_retransmission_sent(&retransmit, 260_000)
+            .unwrap();
+        assert_eq!(endpoint.pending_retransmission_nlp(), None);
+        assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 1);
     }
 
     #[test]
