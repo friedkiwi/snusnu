@@ -4,7 +4,10 @@
 //! transmission header followed by a 3-byte request/response header (RH) and
 //! an optional request/response unit (RU). The caller must first establish an
 //! RTP connection and reassemble one complete RTP message. This module does
-//! not infer an LU, assign a session address, or accept a BIND.
+//! not assign a session address or accept a BIND. Once framing is validated,
+//! it can classify a BIND's LU names and mode for route policy.
+
+use crate::fid2_bind::{classify_reduced_bind, BindError, BindIdentity};
 
 const FID5_TH_LEN: usize = 12;
 const RH_LEN: usize = 3;
@@ -35,6 +38,12 @@ pub struct Fid5WholeBiu<'a> {
 }
 
 impl<'a> Fid5WholeBiu<'a> {
+    /// Extract LU 6.2 BIND identity from a complete whole BIU. The FID5
+    /// session address stays opaque; this only interprets RH and RU.
+    pub fn classify_bind(&self) -> Result<Option<BindIdentity>, BindError> {
+        classify_reduced_bind(&self.rh, self.ru)
+    }
+
     /// Parse exactly one already-reassembled RTP message containing a whole
     /// FID5 BIU. FID5 segmentation (MPF 00/01/10) needs separate state and is
     /// rejected here. This method cannot prove the RTP message is complete;

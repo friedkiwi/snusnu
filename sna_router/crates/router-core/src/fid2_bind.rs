@@ -28,6 +28,16 @@ pub struct BindInfo {
     pub slu: String,
 }
 
+/// BIND identity independent of FID2 session addresses. A FID5 carrier can
+/// use this only after it has validated a complete whole BIU and its RH/RU.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindIdentity {
+    pub class: BindClass,
+    /// Network-qualified when supplied by the BIND.
+    pub plu: String,
+    pub slu: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindError {
     Truncated,
@@ -60,10 +70,30 @@ pub fn classify_bind(piu: &[u8]) -> Result<Option<BindInfo>, BindError> {
     if piu[6] & 0xe0 != 0x60 || piu.len() == 9 || piu[9] != 0x31 {
         return Ok(None);
     }
-    if piu.len() < 9 + 28 {
+    let identity = parse_bind_ru(&piu[9..])?;
+    Ok(Some(BindInfo {
+        class: identity.class,
+        daf: piu[2],
+        oaf: piu[3],
+        plu: identity.plu,
+        slu: identity.slu,
+    }))
+}
+
+/// Classify one already validated complete RH/RU from a carrier such as
+/// HPR FID5. This does not infer FID2 DAF/OAF or interpret FID5 addresses.
+/// Non-BIND session control units return `None`.
+pub fn classify_reduced_bind(rh: &[u8; 3], ru: &[u8]) -> Result<Option<BindIdentity>, BindError> {
+    if rh[0] & 0xe0 != 0x60 || ru.first() != Some(&0x31) {
+        return Ok(None);
+    }
+    parse_bind_ru(ru).map(Some)
+}
+
+fn parse_bind_ru(ru: &[u8]) -> Result<BindIdentity, BindError> {
+    if ru.len() < 28 {
         return Err(BindError::Truncated);
     }
-    let ru = &piu[9..];
     if ru.len() > 256 {
         return Err(BindError::UnsupportedBind);
     }
@@ -149,13 +179,7 @@ pub fn classify_bind(piu: &[u8]) -> Result<Option<BindInfo>, BindError> {
         Some(mode) => BindClass::NamedLu62 { mode },
         None => BindClass::Undetermined,
     };
-    Ok(Some(BindInfo {
-        class,
-        daf: piu[2],
-        oaf: piu[3],
-        plu,
-        slu,
-    }))
+    Ok(BindIdentity { class, plu, slu })
 }
 
 fn decode_mode(bytes: &[u8]) -> Result<String, BindError> {
@@ -217,6 +241,7 @@ fn decode_lu_name(bytes: &[u8]) -> Result<String, BindError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hpr_fid5::Fid5WholeBiu;
 
     fn bind_with_mode(subfield: &[u8]) -> Vec<u8> {
         // Sanitized form of the V4R4 LU6.2 BIND shape: synthetic PLU `ABC`,
@@ -233,6 +258,37 @@ mod tests {
         ru.extend_from_slice(&[0, 3, 0xc4, 0xc5, 0xc6]); // URC, SLU `DEF`
         piu.extend(ru);
         piu
+    }
+
+    #[test]
+    fn fid5_whole_biu_uses_same_bind_ru_parser_without_fid2_addresses() {
+        let piu = bind_with_mode(&[9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]);
+        let fid2 = classify_bind(&piu).unwrap().unwrap();
+        let mut fid5 = vec![0x5d, 0, 0x80, 1];
+        fid5.extend_from_slice(b"SESSION1");
+        fid5.extend_from_slice(&piu[6..]);
+        let whole = Fid5WholeBiu::parse_complete(&fid5).unwrap();
+        assert_eq!(
+            whole.classify_bind(),
+            Ok(Some(BindIdentity {
+                class: fid2.class,
+                plu: fid2.plu,
+                slu: fid2.slu,
+            }))
+        );
+        assert_eq!(whole.session_address, *b"SESSION1");
+
+        fid5[15] = 0x32;
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&fid5).unwrap().classify_bind(),
+            Ok(None)
+        );
+        fid5[15] = 0x31;
+        fid5.truncate(15 + 27);
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&fid5).unwrap().classify_bind(),
+            Err(BindError::Truncated)
+        );
     }
 
     #[test]
