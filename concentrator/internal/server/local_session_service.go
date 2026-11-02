@@ -182,13 +182,16 @@ func (s *localSNAService) dispatchSession(c *localSNACircuit, event *wire.Sessio
 		}
 		return s.sessionInformation(c, request)
 	case *wire.SessionEvent_PacingCredit:
-		if value.PacingCredit.Normal != 1 || value.PacingCredit.Expedited != 0 {
+		if value.PacingCredit.Expedited != 0 {
 			return errLocalSNA
 		}
 		if c.management.Phase() == lu62.ManagementAwaitCNOSAck || c.management.Phase() == lu62.ManagementCNOSComplete {
+			if value.PacingCredit.Normal != 7 {
+				return errLocalSNA
+			}
 			return c.management.ReceiveIPR([]byte{0x2e, 0, virtualFID2DAF, virtualFID2OAF, 0, 0, 0x83, 1, 0})
 		}
-		if c.user == nil {
+		if c.user == nil || value.PacingCredit.Normal != 1 {
 			return errLocalSNA
 		}
 		return c.user.ReceiveIPR([]byte{0x2f, 0, virtualFID2DAF, virtualFID2OAF, 0, 0, 0x83, 1, 0})

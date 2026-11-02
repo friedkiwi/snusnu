@@ -276,6 +276,9 @@ func TestLocalAPINGSessionAcceptsV5R4EESNASVCMGPingBind(t *testing.T) {
 	}
 	outbound := uint64(len(response.ReducedUnit) + len(cnosReply.ReducedUnit))
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + outbound}})
+	// V5R4 acknowledges the accepted-pending CNOS response with an IPR
+	// before sending its bilateral shutdown request.
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SessionEvent{SessionEvent: &wire.SessionEvent{Event: &wire.SessionEvent_PacingCredit{PacingCredit: &wire.SessionPacingCredit{Normal: 7}}}}}})
 	bis := []byte{0, 2, 0x4b, 0x90, 0, 0x70}
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SessionEvent{SessionEvent: &wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: bis}}}}}})
 	grant = expectTestBody(t, conn, "event").GetCircuitEvent().GetSessionEvent().GetPacingCredit()
