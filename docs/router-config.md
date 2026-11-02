@@ -89,9 +89,8 @@ to = "upstream"
 converter = "mptn_lu62"
 ```
 
-This gateway still requires `--mptn-ws-gateway-lab FILE
---acknowledge-experimental-x83`; the ordinary `--config` runtime rejects it
-because its native address selection and session lifecycle are specific to
+The MPTN-to-concentrator gateway still requires `--mptn-ws-gateway-lab FILE
+--acknowledge-experimental-x83`; its native address selection is specific to
 the QA fixture. See [the cross-NETID lab](cross-netid-lab.md).
 
 ### Several destinations on one TCP62 listener
@@ -150,7 +149,7 @@ The gateway publishes `QABOB.SNAB` once and uses separate circuit state for
 each destination. The URLs and tokens on these concentrator entries must
 match, and destination LUs must be unique on the listener. This remains an
 opt-in QA gateway configuration: the ordinary runtime does not yet provide
-general native session addressing, lifecycle, or reverse initiation. The
+general MPTN-to-concentrator native session addressing or lifecycle. The
 `peer_cp` and gateway `destination_lu` describe the original single-target
 profile; each additional route supplies its own exact target LU and CP.
 
@@ -164,15 +163,16 @@ MPTN management/CNOS exchange, and send an outbound Connect whose source is
 the initiating LU (for example `QAALICE.SNAA`) and destination is
 `QABOB.SNAB`. The Connect correlator and native BIND result belong to that
 one session; normal, expedited, abort, and close traffic must use its own
-state and credit. The router has a validated outbound Connect builder and a
-TCP connector, but this complete reverse path is not wired into `--config`.
+state and credit. The ordinary `--config` runtime supports one standalone
+LLC-to-MPTN route with a configured LU and TP; concentrator-to-MPTN initiation
+still needs its WebSocket native responder connected to the runtime.
 
 An LLC guest still needs a local adapter address for the target CP. On a
 standalone route, that address belongs on `[[route]] proxy_mac`; when the
 target is advertised through the concentrator, the concentrator assigns and
 publishes the virtual CP MAC. The MPTN peer itself is addressed by IP and
-does not need an Ethernet MAC. A configured LLC-to-MPTN gateway route remains
-rejected until the reverse native session adapter is connected to the runtime.
+does not need an Ethernet MAC. The standalone reverse example below uses a
+route-owned proxy MAC.
 
 When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the concentrator route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
 
@@ -254,24 +254,47 @@ Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 3
 
 The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the configured TCP relay.
 
-## LLC to MPTN gateway route intent
+## Standalone LLC to MPTN gateway
 
-The route syntax reserves an explicit converter for a native LU6.2 to MPTN
-gateway. Here `mptn_lu62` is a `[[mptn]] profile = "gateway"` port, rather
-than a `relay` port:
+An ordinary `--config` route can convert a native LLC2 LU6.2 session into
+TCP62 for one local MPTN peer. This staged Solstice example uses V4R4 on
+`sol5` as the initiator and V5R4 at `10.99.4.3` as the MPTN destination:
 
 ```toml
+[[llc]]
+id = "v4-alice"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+local_cp = "SOLNET.SNAA"
+lus = ["SOLNET.SNAA"]
+
+[[mptn]]
+profile = "gateway"
+id = "v5-bob"
+local_ip = "10.99.4.10"
+peer_ip = "10.99.4.3"
+local_cp = "SOLNET.SNAB"
+peer_cp = "SOLNET.SNAA"
+source_lu = "SOLNET.SNAB"
+destination_lu = "SOLNET.SNAA"
+local_station = "SNAB"
+local_node_id = "fff12345"
+tg_number = 1
+
 [[route]]
-from = "native_lu62"
-to = "mptn_lu62"
+from = "v4-alice"
+to = "v5-bob"
 converter = "mptn_lu62"
-proxy_mac = "02:53:4e:00:00:02"
+proxy_mac = "02:00:35:27:23:02"
+user_tp_hex = "30f0f0f5"
+timeout_seconds = 600
 ```
 
-This route currently fails configuration loading because reverse native
-initiation is not connected to the ordinary runtime. The proxy MAC is the
-address configured on the initiating LLC guest for the MPTN-hosted CP; it is
-not the MPTN peer's physical MAC. Native LLC2 information fields and TCP62
-records require session-state translation, including BIND negotiation and
-the requested MPTN compensations. A cross-profile route without a converter
-is rejected as an unsupported route.
+The proxy MAC is the address configured on the initiating LLC guest for the
+MPTN-hosted CP. `user_tp_hex` is the four-byte LU6.2 transaction program
+name in hexadecimal. The loader requires exactly one LLC peer, one gateway,
+one bidirectional route, one exported LLC LU, and matching CP/LU NETIDs.
+The converter runs one isolated circuit at a time and rearms after it closes.
+It handles TCP62 normal records and correlated UDP X'83' expedited delivery;
+UDP X'83' abort remains unsupported. The [Solstice lab](anynet-lab.md)
+records a V4R4-to-V5R4 Sign On through this ordinary config path.

@@ -297,6 +297,23 @@ run verifies the opt-in LLC2→TCP62 direction through Sign On. It did not
 exercise ordinary `--config`, normal `ENDPASTHR` teardown, UDP X'83', or the
 WebSocket concentrator.
 
+The extracted one-circuit runner repeated that Sign On through its opt-in
+`--mptn-llc-reverse-lab` entry. On 2 November 2026, the same staged guests
+then completed an **ordinary `--config`** run using the standalone
+LLC-to-MPTN example in [router-config.md](router-config.md). The router
+started from `/tmp/snusnu-reverse-ordinary.toml` at 09:49:55 UTC, completed
+V5R4 SNASVCMG/CNOS, and opened LLC2 after V4R4's `SNAB` controller was varied
+on. `STRPASTHR RMTLOCNAME(SNAB)` reached V5R4 Sign On at system `S1054504`,
+subsystem `QBASE`, display `QPADEV0001`. The TCP user connection
+`10.99.4.10:48697 → 10.99.4.3:397` remained established while the Sign On
+screen was held for over 50 seconds. Router output recorded XID3/LLC2,
+native management BIND/CNOS/BIS/UNBIND, and user BIND. The router was then
+stopped with SIGINT; it disconnected LLC cleanly and V4R4 returned to its
+Main Menu with a communications failure. The QA concentrator was not running.
+This verifies ordinary standalone LLC→MPTN routing through Sign On; normal
+`ENDPASTHR`, UDP X'83' abort, and concentrator→MPTN initiation remain untested
+or unsupported.
+
 The same `sol5`/`sol7` pair then reached the V5R4 remote Sign On through the
 extracted reverse runner, which uses the reusable outbound TCP62 connector,
 V5R4 management/CNOS initiator, `GatewayEdge`, and a route Connect template.
