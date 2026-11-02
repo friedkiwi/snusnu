@@ -1,9 +1,10 @@
 //! Strict captured V5R4 TCP62 Abort/UNBIND to native FID2 candidate.
 //!
 //! A data-bearing Abort is recognized only when its FQPCID and destination
-//! name match the admitted user Connect. The native UNBIND request still
-//! requires live V4R4 interoperability before a runtime may enable graceful
-//! teardown. An empty Abort forces local hard close.
+//! name match the admitted user Connect. UDP X'83' correlation, sequence,
+//! retransmission, and response scheduling belong to the owning gateway.
+//! An empty TCP Abort forces local hard close; an empty UDP Abort is rejected
+//! until the gateway can prove local completion before acknowledging it.
 
 use std::io;
 
@@ -26,11 +27,18 @@ pub enum AbortAction<'a> {
     NativeUnbind(&'a [u8]),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbortBearer {
+    Tcp,
+    Udp,
+}
+
 pub struct ReverseUserTeardown {
     fqpcid: Vec<u8>,
     destination: Vec<u8>,
     address: NativeAddress,
     pending: Option<Vec<u8>>,
+    bearer: Option<AbortBearer>,
     phase: Phase,
 }
 
@@ -49,6 +57,7 @@ impl ReverseUserTeardown {
             destination: offer.connect().destination.node.clone(),
             address,
             pending: None,
+            bearer: None,
             phase: Phase::Active,
         })
     }
@@ -69,21 +78,40 @@ impl ReverseUserTeardown {
             self.phase = Phase::Closed;
             return Ok(AbortAction::HardClose);
         }
-        if let Err(error) = self.check_abort(&checked.bytes[5..]) {
+        self.prepare_abort_body(&checked.bytes[5..], AbortBearer::Tcp)
+            .map(AbortAction::NativeUnbind)
+    }
+
+    /// A correlated X'83' Abort carries the same reduced SNF/RH/RU image as
+    /// the captured TCP62 Abort. Call this only after the UDP gateway checked
+    /// the source, Connect correlator, sequence, and retransmission identity.
+    /// A positive X'83' response must wait for `accept_native_response` to
+    /// return `AbortBearer::Udp`, after exact native enqueue and +RSP(UNBIND).
+    /// No empty UDP Abort is accepted because there is no native completion.
+    pub fn prepare_udp_abort(&mut self, reduced: &[u8]) -> io::Result<&[u8]> {
+        self.prepare_abort_body(reduced, AbortBearer::Udp)
+    }
+
+    fn prepare_abort_body(&mut self, body: &[u8], bearer: AbortBearer) -> io::Result<&[u8]> {
+        if self.phase != Phase::Active {
+            return Err(invalid("duplicate or retired TCP62 user Abort"));
+        }
+        if let Err(error) = self.check_abort(body) {
             self.phase = Phase::Closed;
             return Err(error);
         }
-        let mut native = Vec::with_capacity(checked.bytes.len() - 1);
+        let mut native = Vec::with_capacity(body.len() + 4);
         native.extend_from_slice(&[
             0x2d | (u8::from(self.address.odai) << 1),
             0,
             self.address.daf,
             self.address.oaf,
         ]);
-        native.extend_from_slice(&checked.bytes[5..]);
+        native.extend_from_slice(body);
         self.pending = Some(native);
+        self.bearer = Some(bearer);
         self.phase = Phase::NativeUnbindPrepared;
-        Ok(AbortAction::NativeUnbind(self.pending.as_ref().unwrap()))
+        Ok(self.pending.as_ref().unwrap())
     }
 
     fn check_abort(&self, body: &[u8]) -> io::Result<()> {
@@ -128,7 +156,7 @@ impl ReverseUserTeardown {
 
     /// A native peer's minimal positive RSP(UNBIND) retires this session.
     /// The caller still owns LLC completion and TCP close ordering.
-    pub fn accept_native_response(&mut self, piu: &[u8]) -> io::Result<()> {
+    pub fn accept_native_response(&mut self, piu: &[u8]) -> io::Result<AbortBearer> {
         if self.phase != Phase::AwaitNativeResponse
             || piu
                 != [
@@ -144,16 +172,19 @@ impl ReverseUserTeardown {
                     0x32,
                 ]
         {
-            self.phase = Phase::Closed;
+            self.close();
             return Err(invalid("native user UNBIND response is unsupported"));
         }
         self.pending = None;
         self.phase = Phase::Closed;
-        Ok(())
+        self.bearer
+            .take()
+            .ok_or_else(|| invalid("native user UNBIND bearer missing"))
     }
 
     pub fn close(&mut self) {
         self.pending = None;
+        self.bearer = None;
         self.phase = Phase::Closed;
     }
 }
@@ -215,9 +246,45 @@ mod tests {
         );
         assert_eq!(native.len(), 58);
         teardown.mark_native_unbind_enqueued(&native).unwrap();
-        teardown
-            .accept_native_response(&[0x2d, 0, 1, 2, 0, 0, 0xeb, 0x80, 0, 0x32])
-            .unwrap();
+        assert_eq!(
+            teardown
+                .accept_native_response(&[0x2d, 0, 1, 2, 0, 0, 0xeb, 0x80, 0, 0x32])
+                .unwrap(),
+            AbortBearer::Tcp
+        );
+        assert_eq!(teardown.phase(), Phase::Closed);
+    }
+
+    #[test]
+    fn udp_abort_reuses_captured_unbind_only_after_native_positive_response() {
+        let reduced = &hex(ABORT)[5..];
+        let mut teardown = fixture();
+        let native = teardown.prepare_udp_abort(reduced).unwrap().to_vec();
+        assert_eq!(native.len(), 58);
+        assert_eq!(&native[4..], reduced);
+        assert_eq!(teardown.phase(), Phase::NativeUnbindPrepared);
+        assert!(teardown.prepare_udp_abort(reduced).is_err());
+        assert!(teardown.mark_native_unbind_enqueued(&native[..native.len() - 1]).is_err());
+        assert_eq!(teardown.phase(), Phase::NativeUnbindPrepared);
+        teardown.mark_native_unbind_enqueued(&native).unwrap();
+        assert_eq!(teardown.phase(), Phase::AwaitNativeResponse);
+        assert_eq!(
+            teardown
+                .accept_native_response(&[0x2d, 0, 1, 2, 0, 0, 0xeb, 0x80, 0, 0x32])
+                .unwrap(),
+            AbortBearer::Udp
+        );
+        assert_eq!(teardown.phase(), Phase::Closed);
+        assert!(teardown.prepare_udp_abort(reduced).is_err());
+    }
+
+    #[test]
+    fn udp_abort_rejects_empty_and_wrong_session_identity() {
+        assert!(fixture().prepare_udp_abort(&[]).is_err());
+        let mut wrong = hex(ABORT)[5..].to_vec();
+        wrong[11] ^= 1; // FQPCID begins after the fixed reduced header.
+        let mut teardown = fixture();
+        assert!(teardown.prepare_udp_abort(&wrong).is_err());
         assert_eq!(teardown.phase(), Phase::Closed);
     }
 
