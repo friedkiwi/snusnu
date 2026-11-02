@@ -54,6 +54,7 @@ function summaryCard(label, number) {
 
 function render(snapshot) {
   const peers = snapshot.local_peers || [];
+  const localMacs = snapshot.local_proxy_macs || [];
   const routes = snapshot.upstream_routes || [];
   const macs = snapshot.managed_macs || [];
   const circuits = snapshot.circuits || [];
@@ -61,11 +62,13 @@ function render(snapshot) {
 
   $('summary').replaceChildren(
     summaryCard('Local peers', peers.length),
+    summaryCard('Local proxy MACs', localMacs.length),
     summaryCard('Upstream routes', routes.length),
     summaryCard('Managed MACs', macs.length),
     summaryCard('Circuits', circuits.length),
   );
   $('peer-count').textContent = peers.length;
+  $('local-mac-count').textContent = localMacs.length;
   $('route-count').textContent = routes.length;
   $('mac-count').textContent = macs.length;
   $('circuit-count').textContent = circuits.length;
@@ -104,6 +107,10 @@ function render(snapshot) {
     (r, p) => cell(r, p.locator, 'mono'),
     (r, p) => cell(r, time(p.last_seen_ms)),
     (r, p) => cell(r, p.last_error || p.key),
+  ]);
+  fillTable('local-macs', localMacs, [
+    (r, p) => cell(r, p.attachment_id),
+    (r, p) => cell(r, p.mac, 'mono'),
   ]);
   fillTable('routes', routes, [
     (r, p) => cell(r, p.resource),

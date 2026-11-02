@@ -23,6 +23,7 @@ static CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct StatusSnapshot {
     pub(crate) started_at_ms: u64,
     pub(crate) local_peers: Vec<LocalPeerStatus>,
+    pub(crate) local_proxy_macs: Vec<LocalProxyMacStatus>,
     pub(crate) upstream_routes: Vec<UpstreamRouteStatus>,
     pub(crate) managed_macs: Vec<ManagedMacStatus>,
     pub(crate) circuits: Vec<CircuitStatus>,
@@ -41,6 +42,12 @@ pub(crate) struct LocalPeerStatus {
     pub(crate) first_seen_ms: u64,
     pub(crate) last_seen_ms: u64,
     pub(crate) last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct LocalProxyMacStatus {
+    pub(crate) attachment_id: String,
+    pub(crate) mac: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,6 +110,7 @@ impl LocalStatus {
             inner: Arc::new(RwLock::new(StatusSnapshot {
                 started_at_ms: now_ms(),
                 local_peers: Vec::new(),
+                local_proxy_macs: Vec::new(),
                 upstream_routes: Vec::new(),
                 managed_macs: Vec::new(),
                 circuits: Vec::new(),
@@ -158,6 +166,11 @@ impl LocalStatus {
 
     pub(crate) fn set_concentrator(&self, status: Option<ConcentratorStatus>) {
         self.update(|snapshot| snapshot.concentrator = status);
+    }
+
+    pub(crate) fn replace_local_proxy_macs(&self, mut entries: Vec<LocalProxyMacStatus>) {
+        entries.sort_by(|left, right| left.attachment_id.cmp(&right.attachment_id));
+        self.update(|snapshot| snapshot.local_proxy_macs = entries);
     }
 
     pub(crate) fn upsert_peer(&self, mut peer: LocalPeerStatus) {
