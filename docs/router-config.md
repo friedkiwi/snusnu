@@ -94,6 +94,86 @@ This gateway still requires `--mptn-ws-gateway-lab FILE
 because its native address selection and session lifecycle are specific to
 the QA fixture. See [the cross-NETID lab](cross-netid-lab.md).
 
+### Several destinations on one TCP62 listener
+
+An incoming TCP62 Connect names both `source_lu` and its destination LU. The
+gateway validates those names against the BIND and selects a `[[route]]` by
+the exact network-qualified destination. Different remote locations on one
+OS/400 peer may therefore resolve to the same gateway IP and TCP/UDP port 397.
+The `destination_lu` on each route selects a target behind that listener; if
+there is only one gateway route, it may be omitted and defaults to the
+gateway's `destination_lu`. For example, the same Bob listener can select two
+concentrator targets:
+
+```toml
+[[mptn]]
+profile = "gateway"
+id = "bob-v5"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+destination_lu = "QAALICE.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+
+[[concentrator]]
+id = "alice"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = "replace-with-bob-router-credential"
+target_cp = "QAALICE.SNAA"
+target_lu = "QAALICE.SNAA"
+
+[[concentrator]]
+id = "carol"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = "replace-with-bob-router-credential"
+target_cp = "QACAROL.SNAC"
+target_lu = "QACAROL.SNAC"
+
+[[route]]
+from = "bob-v5"
+to = "alice"
+converter = "mptn_lu62"
+destination_lu = "QAALICE.SNAA"
+
+[[route]]
+from = "bob-v5"
+to = "carol"
+converter = "mptn_lu62"
+destination_lu = "QACAROL.SNAC"
+```
+
+The gateway publishes `QABOB.SNAB` once and uses separate circuit state for
+each destination. The URLs and tokens on these concentrator entries must
+match, and destination LUs must be unique on the listener. This remains an
+opt-in QA gateway configuration: the ordinary runtime does not yet provide
+general native session addressing, lifecycle, or reverse initiation. The
+`peer_cp` and gateway `destination_lu` describe the original single-target
+profile; each additional route supplies its own exact target LU and CP.
+
+### Initiating toward a local MPTN peer
+
+In the reverse direction, a native LLC or concentrator session opens with a
+BIND for an LU hosted by the local MPTN peer. For this example that target is
+`QABOB.SNAB`, the gateway's `source_lu`. The router would resolve the target
+LU to `bob-v5`, dial `10.99.4.3:397` from `10.99.4.11`, complete the peer's
+MPTN management/CNOS exchange, and send an outbound Connect whose source is
+the initiating LU (for example `QAALICE.SNAA`) and destination is
+`QABOB.SNAB`. The Connect correlator and native BIND result belong to that
+one session; normal, expedited, abort, and close traffic must use its own
+state and credit. The router has a validated outbound Connect builder and a
+TCP connector, but this complete reverse path is not wired into `--config`.
+
+An LLC guest still needs a local adapter address for the target CP. On a
+standalone route, that address belongs on `[[route]] proxy_mac`; when the
+target is advertised through the concentrator, the concentrator assigns and
+publishes the virtual CP MAC. The MPTN peer itself is addressed by IP and
+does not need an Ethernet MAC. A configured LLC-to-MPTN gateway route remains
+rejected until the reverse native session adapter is connected to the runtime.
+
 When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the concentrator route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
 
 An EE link can also be attached without any LLC peers. Each `[[ee]]` entry binds UDP ports 12000–12004 on its `local_ip`, accepts datagrams only from `peer_ip`, and preserves the EE priority port. To relay two EE links, configure two distinct local addresses and route the two IDs together:
@@ -176,13 +256,22 @@ The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the con
 
 ## LLC to MPTN gateway route intent
 
-The route syntax reserves an explicit converter for a future native LU6.2 to MPTN gateway:
+The route syntax reserves an explicit converter for a native LU6.2 to MPTN
+gateway. Here `mptn_lu62` is a `[[mptn]] profile = "gateway"` port, rather
+than a `relay` port:
 
 ```toml
 [[route]]
 from = "native_lu62"
 to = "mptn_lu62"
 converter = "mptn_lu62"
+proxy_mac = "02:53:4e:00:00:02"
 ```
 
-This route currently fails configuration loading with an `Unsupported` error. Native LLC2 information fields and TCP62 records require session-state translation, including BIND negotiation and the requested MPTN compensations. The router will enable this converter only when both protocol handlers are complete and tested against peers. A cross-profile route without a converter is rejected as an unsupported route.
+This route currently fails configuration loading because reverse native
+initiation is not connected to the ordinary runtime. The proxy MAC is the
+address configured on the initiating LLC guest for the MPTN-hosted CP; it is
+not the MPTN peer's physical MAC. Native LLC2 information fields and TCP62
+records require session-state translation, including BIND negotiation and
+the requested MPTN compensations. A cross-profile route without a converter
+is rejected as an unsupported route.
