@@ -128,7 +128,7 @@ fn user_fqpcid(data: &[u8], source: &[u8], destination: &[u8]) -> io::Result<Vec
         || user[3..11] != [0x40; 8]
         || user[11..14] != [9, 3, 1]
         || user[14] != 0x23
-        || user[19..21] != [0, 0]
+        || !matches!(user[19..21], [0, 0] | [0x80, 0])
         || user[21] as usize != source.len() + 1
         || user[22] != 4
         || user[23..23 + source.len()] != *source
@@ -434,6 +434,33 @@ mod tests {
         ingress.close();
         assert!(ingress.offer().is_none());
         assert_eq!(ingress.phase(), Phase::Closed);
+    }
+
+    #[test]
+    fn admits_captured_resumed_user_token_flag_and_rejects_other_flags() {
+        let source = name("SOLNET.SNAA").unwrap();
+        let mut data = variable_data("SOLNET.SNAA", "OTHNET.SNAB");
+        let user_start = 32 + 1 + source.len() + 1;
+        let first_flag = user_start + 19;
+        let repeated_flag = user_start + 27 + source.len() + 5;
+        data[first_flag] = 0x80;
+        data[repeated_flag] = 0x80;
+        let request = connect(data.clone());
+        assert!(matches!(
+            IngressSession::new(policy())
+                .unwrap()
+                .receive(&request.encode().unwrap())
+                .unwrap()
+                .kind(),
+            IngressKind::User { .. }
+        ));
+        data[first_flag] = 0x40;
+        data[repeated_flag] = 0x40;
+        let invalid = connect(data);
+        assert!(IngressSession::new(policy())
+            .unwrap()
+            .receive(&invalid.encode().unwrap())
+            .is_err());
     }
 
     #[test]
