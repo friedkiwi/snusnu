@@ -160,10 +160,10 @@ impl<P: RoutePort> WsNativeResponder<P> {
                 Egress::UserData => self.events.push_back(NativeEvent::EgressAck(1)),
             }
         }
+        if let Some(piu) = self.management.take_early_attach() {
+            self.process_information(piu)?;
+        }
         if self.management.phase() == ManagementPhase::BisComplete {
-            if let Some(piu) = self.management.take_early_attach() {
-                self.process_information(piu)?;
-            }
             if self.user_offer.is_some() && !self.user_bind_emitted {
                 self.events.push_back(NativeEvent::UserBind(
                     self.user_offer.as_ref().unwrap().request().to_vec(),
