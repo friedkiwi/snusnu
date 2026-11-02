@@ -90,6 +90,9 @@ func run() (runErr error) {
 	if err := app.InitializeRouterPolicy(ctx); err != nil {
 		return err
 	}
+	if err := app.StartLocalSNA(ctx); err != nil {
+		return err
+	}
 	app.StartMaintenance(ctx)
 	app.StartInstanceHeartbeat(ctx, instanceID)
 	srv := server.New(*addr)

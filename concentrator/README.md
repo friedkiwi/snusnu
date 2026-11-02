@@ -48,6 +48,8 @@ The default listener binds all network interfaces on port 8080. Use `-listen 127
 
 The concentrator is deliberately single-instance. At startup it acquires and continuously heartbeats an exclusive database lease; a second process using the same database refuses to start. Multi-instance operation is not supported. Startup clears stale live connection epochs and route advertisements only after acquiring that lease.
 
+At startup the concentrator publishes its reserved `SNUSNU.SVC` control point and `SNUSNU.PING` LU 6.2 service. An authenticated router can route APINGD traffic to that LU. The service responds to APING version, echo, no-echo, and orderly deallocation within the concentrator process. The managed CP address is `02:53:4e:ff:ff:ff`; user accounts cannot claim the `SNUSNU` NETID. Current APING support accepts complete mapped data in one SNA PIU, up to 1496 bytes including the nine-byte TH/RH header. Larger APING packets and chained RUs are not yet supported.
+
 The database is a required runtime dependency. Brief asynchronous write failures are retried, but exhausted router-log or SNA-circuit-history writes, sustained heartbeat failure, or loss of the singleton lease make the process unready and trigger its bounded graceful shutdown. The process exits nonzero so its service supervisor can restart it. Production supervisors should use restart-on-failure with backoff while PostgreSQL is unavailable. Unpersisted operational records may be discarded when the shutdown deadline expires; the concentrator does not maintain a separate local durability spool.
 
 ## Roles and current records

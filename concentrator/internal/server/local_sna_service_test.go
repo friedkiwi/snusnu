@@ -71,8 +71,7 @@ func TestLocalSNAAdapterActivatesStampedPeer(t *testing.T) {
 	a := testApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	service := newLocalSNAService(a.hub)
-	if err := a.hub.registerLocalService(ctx, service.handle); err != nil {
+	if err := a.StartLocalSNA(ctx); err != nil {
 		t.Fatal(err)
 	}
 	owner := store.RandomUUID()
@@ -205,7 +204,7 @@ func TestLocalSNAAdapterActivatesStampedPeer(t *testing.T) {
 	versionGrant := expectTestBody(t, conn, "event").GetCircuitEvent().GetSnaInformation()
 	versionReply := expectTestBody(t, conn, "event").GetCircuitEvent().GetSnaInformation()
 	wantVersion, _ := hex.DecodeString("000e12ff01022b024f532f343030")
-	if !bytes.Equal(versionGrant, attachGrant) || !bytes.Equal(versionReply[:9], []byte{0x2e, 0, 2, 2, 0, 1, 3, 0x91, 0x20}) || !bytes.Equal(versionReply[9:], wantVersion) {
+	if !bytes.Equal(versionGrant, attachGrant) || len(versionReply) < 9 || !bytes.Equal(versionReply[:9], []byte{0x2e, 0, 2, 2, 0, 1, 3, 0x91, 0x20}) || !bytes.Equal(versionReply[9:], wantVersion) {
 		t.Fatalf("APINGD version: %x %x", versionGrant, versionReply)
 	}
 	expectTestBody(t, conn, "credit")
@@ -216,10 +215,60 @@ func TestLocalSNAAdapterActivatesStampedPeer(t *testing.T) {
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SnaInformation{SnaInformation: echoRequest}}})
 	echoGrant := expectTestBody(t, conn, "event").GetCircuitEvent().GetSnaInformation()
 	echoReply := expectTestBody(t, conn, "event").GetCircuitEvent().GetSnaInformation()
-	if !bytes.Equal(echoGrant, attachGrant) || !bytes.Equal(echoReply[:9], []byte{0x2e, 0, 2, 2, 0, 2, 3, 0x90, 0x20}) || !bytes.Equal(echoReply[9:], packet) {
+	if !bytes.Equal(echoGrant, attachGrant) || len(echoReply) < 9 || !bytes.Equal(echoReply[:9], []byte{0x2e, 0, 2, 2, 0, 2, 3, 0x90, 0x20}) || !bytes.Equal(echoReply[9:], packet) {
 		t.Fatalf("APINGD echo: %x %x", echoGrant, echoReply)
 	}
 	expectTestBody(t, conn, "credit")
+	outbound += len(echoGrant) + len(echoReply)
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
+	userFQ, err := lu62.RequestFQPCID(userBind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendInfo := func(data []byte) {
+		sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SnaInformation{SnaInformation: data}}})
+	}
+	readInfo := func() []byte {
+		event := expectTestBody(t, conn, "event").GetCircuitEvent()
+		if event == nil {
+			t.Fatal("missing SNA event")
+		}
+		return event.GetSnaInformation()
+	}
+	noEcho, _ := hex.DecodeString("000812ff00000000000812ff00000000")
+	sendInfo(append([]byte{0x2e, 0, 2, 2, 0, 4, 3, 0xa1, 0}, noEcho...))
+	noEchoGrant := readInfo()
+	if !bytes.Equal(noEchoGrant, attachGrant) {
+		t.Fatalf("no-echo grant: %x", noEchoGrant)
+	}
+	expectTestBody(t, conn, "credit")
+	outbound += len(noEchoGrant)
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
+	sendInfo([]byte{0x2e, 0, 2, 2, 0, 5, 0x4b, 0xa0, 1, 4, 0, 6})
+	confirmReply := readInfo()
+	if !bytes.Equal(confirmReply, []byte{0x2e, 0, 2, 2, 0x80, 0, 0xcb, 0xa0, 0, 4}) {
+		t.Fatalf("CONFIRM reply: %x", confirmReply)
+	}
+	expectTestBody(t, conn, "credit")
+	outbound += len(confirmReply)
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
+	sendInfo([]byte{0x2e, 0, 2, 2, 0, 6, 0x4b, 0x91, 0, 0x70})
+	userBISGrant, userBISReply := readInfo(), readInfo()
+	if !bytes.Equal(userBISGrant, attachGrant) || !bytes.Equal(userBISReply, []byte{0x2e, 0, 2, 2, 0, 3, 0x4b, 0xb0, 0, 0x70}) {
+		t.Fatalf("user BIS replies: %x %x", userBISGrant, userBISReply)
+	}
+	expectTestBody(t, conn, "credit")
+	outbound += len(userBISGrant) + len(userBISReply)
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
+	userUnbind := append([]byte{0x2f, 0, 2, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}, userFQ...)
+	sendInfo(userUnbind)
+	userUnbindReply := readInfo()
+	if !bytes.Equal(userUnbindReply, []byte{0x2f, 0, 2, 2, 0, 0, 0xeb, 0x80, 0, 0x32}) {
+		t.Fatalf("user UNBIND reply: %x", userUnbindReply)
+	}
+	expectTestBody(t, conn, "credit")
+	outbound += len(userUnbindReply)
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitCredit{CircuitCredit: &wire.CircuitCredit{CircuitId: result.CircuitId, AllowanceBytes: 1500 + uint64(outbound)}})
 	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: result.CircuitId, Event: &wire.CircuitEvent_SnaInformation{SnaInformation: []byte{1, 2, 3}}}})
 	if reset := readTestEnvelope(t, conn).GetCircuitReset(); reset == nil || reset.Reason != wire.ResetReason_RESET_REASON_PROTOCOL {
 		t.Fatalf("malformed SNA PIU did not reset circuit: %+v", reset)

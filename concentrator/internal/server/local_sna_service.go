@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
@@ -45,6 +46,12 @@ type localSNAService struct {
 
 func newLocalSNAService(h *routerHub) *localSNAService {
 	return &localSNAService{hub: h, circuits: make(map[string]*localSNACircuit)}
+}
+
+// StartLocalSNA publishes the concentrator's CP and APING LU for the lifetime
+// of ctx. Call it before accepting router connections.
+func (a *App) StartLocalSNA(ctx context.Context) error {
+	return a.hub.registerLocalService(ctx, newLocalSNAService(a.hub).handle)
 }
 
 func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {

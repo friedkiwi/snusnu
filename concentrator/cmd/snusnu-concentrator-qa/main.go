@@ -47,6 +47,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := app.InitializeRouterPolicy(ctx); err != nil {
+		log.Fatal(err)
+	}
+	if err := app.StartLocalSNA(ctx); err != nil {
+		log.Fatal(err)
+	}
 	log.Printf("QA database: %s", path)
 	log.Printf("QA accounts and router tokens: see concentrator/QA.md")
 	srv := server.New(*addr)
