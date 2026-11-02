@@ -718,6 +718,15 @@ impl RouterConfig {
                         }
                     })
                     .expect("remote has one gateway route");
+                let selected_name = parse_cp(selected_lu)?;
+                let target_cp_name =
+                    parse_cp(remote.target_cp.as_deref().unwrap_or(&gateway.peer_cp))?;
+                if selected_name.netid != target_cp_name.netid {
+                    return Err(invalid(format!(
+                        "TCP62 gateway destination LU {selected_lu} has a different NETID from concentrator {} target CP",
+                        remote.id
+                    )));
+                }
                 if remote.target_cp.as_deref().is_some_and(|cp| {
                     cp != gateway.peer_cp && selected_lu == gateway.destination_lu
                 }) || remote
@@ -1334,6 +1343,21 @@ destination_lu = "QACAROL.SNAC"
         .unwrap_err()
         .to_string()
         .contains("duplicate TCP62 gateway destination"));
+        assert!(parse(
+            &config
+                .replace(
+                    "target_cp = \"QACAROL.SNAC\"",
+                    "target_cp = \"QAALICE.SNAC\""
+                )
+                .replace(
+                    "target_lu = \"QACAROL.SNAC\"",
+                    "target_lu = \"QAALICE.OTHER\""
+                )
+        )
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("different NETID from concentrator carol target CP"));
         assert!(parse(&config.replace(
             "from = \"bob\"\nto = \"carol\"",
             "from = \"bob\"\nto = \"carol\"\nbidirectional = false"
