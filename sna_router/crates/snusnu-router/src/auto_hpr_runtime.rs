@@ -7,7 +7,7 @@
 //! temporarily cannot send cannot lose an event popped from the fabric.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     sync::atomic::Ordering,
     thread,
@@ -24,6 +24,7 @@ use crate::{
 };
 use router_core::{
     hpr_control_bootstrap::HprControlBootstrap,
+    hpr_cp_management::CpManagementResponder,
     hpr_ip_activation::Phase,
     hpr_route_setup::{RouteSetupGds, RouteSetupKind},
     hpr_route_setup_reply::ReverseLinkMetrics,
@@ -42,6 +43,8 @@ const IDLE_POLL: Duration = Duration::from_micros(200);
 const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PENDING_RTP_MESSAGES: usize = 64;
 const MAX_PENDING_RTP_BYTES: usize = 128 * 1024;
+const MAX_PENDING_CP_REPLIES: usize = 16;
+const MAX_PENDING_CP_REPLY_BYTES: usize = 64 * 1024;
 
 fn protocol(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
@@ -85,6 +88,9 @@ struct DirectHprRuntime {
     rtp: HprRtpPort,
     route_setup: Option<DirectRouteSetupService>,
     route_reply: Option<PreparedRouteSetupReply>,
+    cp_management: CpManagementResponder,
+    pending_cp_replies: VecDeque<Vec<u8>>,
+    pending_cp_reply_bytes: usize,
     switch: SessionSwitch,
     session: Option<ActiveHprSession>,
     pending_rtp: std::collections::VecDeque<RtpIngress>,
@@ -100,9 +106,12 @@ impl DirectHprRuntime {
         switch.register(WS_ADAPTER);
         Self {
             rtp: HprRtpPort::new(bootstrap.clone()),
+            cp_management: CpManagementResponder::new(bootstrap.clone()),
             bootstrap,
             route_setup: None,
             route_reply: None,
+            pending_cp_replies: VecDeque::new(),
+            pending_cp_reply_bytes: 0,
             switch,
             session: None,
             pending_rtp: std::collections::VecDeque::new(),
@@ -127,13 +136,12 @@ impl DirectHprRuntime {
 
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
         self.try_route_reply(link, now_us)?;
+        self.try_cp_replies(link, now_us)?;
         while let Some(message) = self.pending_rtp.front().cloned() {
             let result = match message.kind {
                 RtpIngressKind::RouteSetup => self.route_message(link, hub, &message, now_us),
                 RtpIngressKind::User => self.user_message(hub, &message),
-                RtpIngressKind::CpSvcMg => {
-                    Err(protocol("HPR CP management topic is not established"))
-                }
+                RtpIngressKind::CpSvcMg => self.cp_message(&message),
             };
             if result
                 .as_ref()
@@ -145,8 +153,50 @@ impl DirectHprRuntime {
             self.pending_rtp.pop_front();
             self.pending_rtp_bytes -= message.bytes.len();
             self.try_route_reply(link, now_us)?;
+            self.try_cp_replies(link, now_us)?;
         }
         self.pump_session(link, hub, now_us)
+    }
+
+    fn cp_message(&mut self, message: &RtpIngress) -> io::Result<()> {
+        // A response remains queued until RTP accepts it. Withhold the next
+        // management BIU while that response is pending so protocol state
+        // cannot advance ahead of its wire delivery.
+        if !self.pending_cp_replies.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "HPR CP management response pending",
+            ));
+        }
+        let mut candidate = self.cp_management.clone();
+        let replies = candidate
+            .ingest(message.observation, &message.bytes)
+            .map_err(|error| protocol(format!("HPR CP management BIU rejected: {error}")))?;
+        let reply_bytes = replies.iter().try_fold(0usize, |used, reply| {
+            used.checked_add(reply.len())
+                .ok_or_else(|| protocol("HPR CP management reply size overflow"))
+        })?;
+        if replies.len() > MAX_PENDING_CP_REPLIES || reply_bytes > MAX_PENDING_CP_REPLY_BYTES {
+            return Err(protocol("HPR CP management response exceeds queue limits"));
+        }
+        self.cp_management = candidate;
+        self.pending_cp_reply_bytes = reply_bytes;
+        self.pending_cp_replies.extend(replies);
+        Ok(())
+    }
+
+    fn try_cp_replies(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        while let Some(reply) = self.pending_cp_replies.front() {
+            if !self
+                .rtp
+                .send(link, RtpIngressKind::CpSvcMg, reply, now_us)?
+            {
+                break;
+            }
+            self.pending_cp_reply_bytes -= reply.len();
+            self.pending_cp_replies.pop_front();
+        }
+        Ok(())
     }
 
     fn route_message(
@@ -886,6 +936,12 @@ pub(crate) fn from_session_wire(value: wire::SessionEvent) -> io::Result<Session
 mod tests {
     use super::*;
     use router_core::session::{Flow, QualifiedName};
+    use router_core::{
+        hpr_control_bootstrap::ControlAdvertisement,
+        hpr_cv61::{ArbMode, ControlFlowsTower},
+        hpr_session_address::RtpObservation,
+        ConnectionGeneration,
+    };
 
     fn q(value: &str) -> QualifiedName {
         value.parse().unwrap()
@@ -899,6 +955,56 @@ mod tests {
 
     fn unit(opcode: u8) -> SessionUnit {
         SessionUnit::from_reduced(&[0x80, 1, 0x6b, 0x80, 0, opcode]).unwrap()
+    }
+
+    fn advertisement(cp: &str, id: u8) -> ControlAdvertisement {
+        ControlAdvertisement {
+            cp: q(cp),
+            node_id: [0, 0, 0, id],
+            hpr_sap: 4,
+            link_label: vec![0x80, id],
+            tower: ControlFlowsTower {
+                max_send_packet_size: 1461,
+                path_switch_time_ms: 0,
+                mobile: false,
+                multilink_tg: false,
+                arb_mode: ArbMode::Base,
+                cp_nce_instance: [0, 0, 0, id],
+                route_setup_nce_instance: [0, 0, 0, id],
+                cp_nce_label: vec![0xa0, id],
+                route_setup_nce_label: vec![0xa4, id],
+            },
+        }
+    }
+
+    #[test]
+    fn cp_reply_backpressure_keeps_setup_ingress_and_route_setup_unopened() {
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let bootstrap = HprControlBootstrap::new(
+            generation,
+            advertisement("SNUSNU.SVC", 1),
+            advertisement("SOLNET.SNAB", 2),
+        )
+        .unwrap();
+        let mut runtime = DirectHprRuntime::new(bootstrap);
+        runtime.pending_cp_replies.push_back(vec![0x5d, 0]);
+        runtime.pending_cp_reply_bytes = 2;
+        let bind = RtpIngress {
+            kind: RtpIngressKind::CpSvcMg,
+            observation: RtpObservation {
+                generation,
+                tcid: 0x8000_0000_0000_0001,
+            },
+            bytes: vec![0x5d, 0],
+        };
+        assert_eq!(
+            runtime.cp_message(&bind).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(runtime.pending_cp_replies.len(), 1);
+        assert_eq!(runtime.pending_cp_reply_bytes, 2);
+        assert!(runtime.route_setup.is_none());
+        assert!(!runtime.user_route_authorized);
     }
 
     #[test]
