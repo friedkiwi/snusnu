@@ -164,8 +164,7 @@ the initiating LU (for example `QAALICE.SNAA`) and destination is
 `QABOB.SNAB`. The Connect correlator and native BIND result belong to that
 one session; normal, expedited, abort, and close traffic must use its own
 state and credit. The ordinary `--config` runtime supports one standalone
-LLC-to-MPTN route with a configured LU and TP; concentrator-to-MPTN initiation
-still needs its WebSocket native responder connected to the runtime.
+LLC-to-MPTN route or one concentrator-to-MPTN route with a configured LU and TP.
 
 An LLC guest still needs a local adapter address for the target CP. On a
 standalone route, that address belongs on `[[route]] proxy_mac`; when the
@@ -292,9 +291,50 @@ timeout_seconds = 600
 
 The proxy MAC is the address configured on the initiating LLC guest for the
 MPTN-hosted CP. `user_tp_hex` is the four-byte LU6.2 transaction program
-name in hexadecimal. The loader requires exactly one LLC peer, one gateway,
+name in hexadecimal. `timeout_seconds` bounds session setup; an established
+session remains open until a peer closes it or the router stops. The loader requires exactly one LLC peer, one gateway,
 one bidirectional route, one exported LLC LU, and matching CP/LU NETIDs.
 The converter runs one isolated circuit at a time and rearms after it closes.
-It handles TCP62 normal records and correlated UDP X'83' expedited delivery;
-UDP X'83' abort remains unsupported. The [Solstice lab](anynet-lab.md)
+It handles TCP62 normal records and correlated UDP X'83' expedited delivery
+and normal-end abort; unsupported termination RUs fail closed. The [Solstice lab](anynet-lab.md)
 records a V4R4-to-V5R4 Sign On through this ordinary config path.
+
+### Concentrator to a local MPTN peer
+
+The concentrator can also supply the native circuit. The local router
+publishes its MPTN-hosted LU once; an authenticated incoming circuit from the
+configured source CP opens an outbound TCP62 session to the peer. For example:
+
+```toml
+[[mptn]]
+profile = "gateway"
+id = "bob-v5"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+destination_lu = "QAALICE.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+
+[[concentrator]]
+id = "alice"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = "replace-with-bob-router-credential"
+target_cp = "QAALICE.SNAA"
+target_lu = "QAALICE.SNAA"
+
+[[route]]
+from = "alice"
+to = "bob-v5"
+converter = "mptn_lu62"
+destination_lu = "QAALICE.SNAA"
+user_tp_hex = "30f0f0f5"
+timeout_seconds = 300
+```
+
+This is one isolated reverse circuit at a time. The [cross-NETID lab](cross-netid-lab.md)
+records Alice V4R4 reaching Bob V5R4 Sign On through this route. Normal
+return-home teardown is still being validated.
