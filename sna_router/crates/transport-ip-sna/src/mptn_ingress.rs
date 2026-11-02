@@ -28,6 +28,44 @@ pub enum IngressKind {
     User { mode: String },
 }
 
+/// Route key extracted from a Connect before selecting an ingress policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectRoute {
+    pub source_lu: String,
+    pub destination_lu: String,
+}
+
+/// Validate an inbound Connect and its BIND names without a configured LU
+/// pair. The caller selects a route from this key, then uses `IngressSession`
+/// to apply the selected route's full admission policy.
+pub fn inspect_connect(bytes: &[u8]) -> io::Result<ConnectRoute> {
+    let record = TcpRecord::decode(bytes.to_vec())?;
+    if record.kind != TcpKind::Connect {
+        return Err(invalid("inbound TCP62 session must begin with Connect"));
+    }
+    let connect = Connect::decode(bytes)?;
+    if connect.direction != Direction::Request {
+        return Err(invalid("inbound TCP62 Connect must be a request"));
+    }
+    let source_lu = connect.source.qualified_lu()?;
+    let destination_lu = connect.destination.qualified_lu()?;
+    if source_lu == destination_lu {
+        return Err(invalid("ingress source and destination LU must differ"));
+    }
+    let mut piu = vec![0x2d, 0, 1, 2];
+    piu.extend_from_slice(connect.connection_data());
+    let bind = classify_bind(&piu)
+        .map_err(|_| invalid("inbound TCP62 BIND is invalid"))?
+        .ok_or_else(|| invalid("inbound Connect lacks a BIND request"))?;
+    if bind.plu != source_lu || bind.slu != destination_lu {
+        return Err(invalid("inbound BIND LU names disagree with Connect"));
+    }
+    Ok(ConnectRoute {
+        source_lu,
+        destination_lu,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngressOffer {
     connect: Connect,
@@ -551,5 +589,71 @@ mod tests {
             .unwrap()
             .receive(&request.encode().unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn inspects_multiple_targets_before_fixed_route_admission() {
+        for (source, destination) in [
+            ("SOLNET.SNAA", "OTHNET.SNAB"),
+            ("QAALICE.SNAA", "QABOB.SNAB"),
+            ("A.LU1", "B.LU2"),
+        ] {
+            let mut request = connect(variable_data(source, destination));
+            request.source.node = name(source).unwrap();
+            request.destination.node = name(destination).unwrap();
+            let encoded = request.encode().unwrap();
+            assert_eq!(
+                inspect_connect(&encoded).unwrap(),
+                ConnectRoute {
+                    source_lu: source.into(),
+                    destination_lu: destination.into(),
+                }
+            );
+            let mut selected = policy();
+            selected.source_lu = source.into();
+            selected.destination_lu = destination.into();
+            assert!(IngressSession::new(selected)
+                .unwrap()
+                .receive(&encoded)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_invalid_names_mismatched_bind_and_response() {
+        let request = connect(request_data());
+        let mut invalid_name = request.clone();
+        invalid_name.destination.node[0] = 0x40;
+        assert!(inspect_connect(&invalid_name.encode().unwrap()).is_err());
+        invalid_name.destination.node = vec![0xc1, 0x4b, 0xc2, 0x4b, 0xc3];
+        assert!(inspect_connect(&invalid_name.encode().unwrap()).is_err());
+        let mut mismatch = request.clone();
+        mismatch.destination.node = name("OTHER.SNAB").unwrap();
+        assert!(inspect_connect(&mismatch.encode().unwrap()).is_err());
+        let mut response = request;
+        response.direction = Direction::PositiveResponse;
+        response.processing = 0x8a;
+        assert!(inspect_connect(&response.encode().unwrap()).is_err());
+        assert!(inspect_connect(&[0, 0, 0, 10, 0, 0, 1, 3, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn inspection_accepts_management_bind_for_route_selection() {
+        let mut data = request_data();
+        data[5..32].copy_from_slice(&[
+            0x31, 0, 0x13, 7, 0xb0, 0xb0, 0x51, 0x33, 7, 0x87, 0x86, 0x86, 0x87, 7, 6, 2, 0, 0, 0,
+            0, 0, 0, 0, 0x94, 0x43, 0, 0,
+        ]);
+        data[48..56].copy_from_slice(&[0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]);
+        data[64] = 0x80;
+        data[88] = 0x80;
+        data[127] = 4;
+        assert_eq!(
+            inspect_connect(&connect(data).encode().unwrap()).unwrap(),
+            ConnectRoute {
+                source_lu: "SOLNET.SNAA".into(),
+                destination_lu: "OTHNET.SNAB".into(),
+            }
+        );
     }
 }

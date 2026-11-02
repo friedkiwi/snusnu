@@ -27,6 +27,32 @@ pub struct Address {
     pub node: Vec<u8>,
 }
 
+impl Address {
+    /// Decode a network-qualified LU used as a route key. Reject bytes that
+    /// cannot round-trip through the supported NETID.LU wire alphabet.
+    pub fn qualified_lu(&self) -> io::Result<String> {
+        let mut name = String::with_capacity(self.node.len());
+        for &byte in &self.node {
+            name.push(match byte {
+                0xc1..=0xc9 => char::from(b'A' + (byte - 0xc1)),
+                0xd1..=0xd9 => char::from(b'J' + (byte - 0xd1)),
+                0xe2..=0xe9 => char::from(b'S' + (byte - 0xe2)),
+                0xf0..=0xf9 => char::from(b'0' + (byte - 0xf0)),
+                0x4b => '.',
+                _ => return Err(invalid("invalid MPTN network-qualified LU character")),
+            });
+        }
+        let (netid, lu) = name
+            .split_once('.')
+            .ok_or_else(|| invalid("MPTN LU must be NETID.LU"))?;
+        if netid.is_empty() || lu.is_empty() || netid.len() > 8 || lu.len() > 8 || lu.contains('.')
+        {
+            return Err(invalid("invalid MPTN network-qualified LU"));
+        }
+        Ok(name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportRequirements {
     pub max_record: u32,
