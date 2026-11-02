@@ -139,7 +139,10 @@ pub(crate) struct MptnGatewayConfig {
     pub(crate) id: String,
     pub(crate) local_ip: IpAddr,
     pub(crate) peer_ip: IpAddr,
+    /// In automatic mode these identities are learned from admitted sessions.
+    #[serde(default)]
     pub(crate) local_cp: String,
+    #[serde(default)]
     pub(crate) peer_cp: String,
     #[serde(default)]
     pub(crate) source_lu: String,
@@ -147,6 +150,7 @@ pub(crate) struct MptnGatewayConfig {
     pub(crate) destination_lu: String,
     #[serde(default)]
     pub(crate) local_station: String,
+    #[serde(default)]
     pub(crate) local_node_id: String,
     #[serde(default = "default_tg_number")]
     pub(crate) tg_number: u8,
@@ -290,6 +294,11 @@ impl RemoteConfig {
 }
 
 impl RouterConfig {
+    /// An empty route table selects destination based routing at runtime.
+    pub(crate) fn automatic(&self) -> bool {
+        self.route.is_empty()
+    }
+
     /// Routes served by one TCP62 listener. The returned LU is the exact
     /// destination in an incoming Connect.
     pub(crate) fn gateway_routes<'a>(&'a self, id: &str) -> Vec<(&'a RouteConfig, &'a str)> {
@@ -730,25 +739,79 @@ impl RouterConfig {
                     peer.id
                 )));
             }
-            let local_cp = parse_cp(&peer.local_cp)?;
-            let peer_cp = parse_cp(&peer.peer_cp)?;
-            let source_lu = parse_cp(&peer.source_lu)?;
-            let destination_lu = parse_cp(&peer.destination_lu)?;
-            if local_cp.netid != source_lu.netid
-                || peer_cp.netid != destination_lu.netid
-                || source_lu == destination_lu
-                || !valid_sna_name(&peer.local_station)
-                || peer.local_node_id.len() != 8
-                || !peer
-                    .local_node_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
-                || peer.tg_number == 0
-            {
-                return Err(invalid(format!(
-                    "invalid TCP62 gateway identity for {}",
-                    peer.id
-                )));
+            if self.automatic() {
+                let local_cp = peer.local_cp.as_str();
+                let peer_cp = peer.peer_cp.as_str();
+                let source_lu = peer.source_lu.as_str();
+                let destination_lu = peer.destination_lu.as_str();
+                for name in [local_cp, peer_cp, source_lu, destination_lu] {
+                    if !name.is_empty() {
+                        parse_cp(name)?;
+                    }
+                }
+                if !peer.local_station.is_empty() && !valid_sna_name(&peer.local_station) {
+                    return Err(invalid(format!(
+                        "invalid TCP62 gateway local station for {}",
+                        peer.id
+                    )));
+                }
+                if !peer.local_node_id.is_empty()
+                    && (peer.local_node_id.len() != 8
+                        || !peer
+                            .local_node_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit()))
+                {
+                    return Err(invalid(format!(
+                        "invalid TCP62 gateway local node ID for {}",
+                        peer.id
+                    )));
+                }
+                if peer.tg_number == 0 {
+                    return Err(invalid(format!(
+                        "invalid TCP62 gateway TG number for {}",
+                        peer.id
+                    )));
+                }
+                if !local_cp.is_empty()
+                    && !source_lu.is_empty()
+                    && parse_cp(local_cp)?.netid != parse_cp(source_lu)?.netid
+                {
+                    return Err(invalid(format!(
+                        "TCP62 gateway {} source LU differs from local CP NETID",
+                        peer.id
+                    )));
+                }
+                if !peer_cp.is_empty()
+                    && !destination_lu.is_empty()
+                    && parse_cp(peer_cp)?.netid != parse_cp(destination_lu)?.netid
+                {
+                    return Err(invalid(format!(
+                        "TCP62 gateway {} destination LU differs from peer CP NETID",
+                        peer.id
+                    )));
+                }
+            } else {
+                let local_cp = parse_cp(&peer.local_cp)?;
+                let peer_cp = parse_cp(&peer.peer_cp)?;
+                let source_lu = parse_cp(&peer.source_lu)?;
+                let destination_lu = parse_cp(&peer.destination_lu)?;
+                if local_cp.netid != source_lu.netid
+                    || peer_cp.netid != destination_lu.netid
+                    || source_lu == destination_lu
+                    || !valid_sna_name(&peer.local_station)
+                    || peer.local_node_id.len() != 8
+                    || !peer
+                        .local_node_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || peer.tg_number == 0
+                {
+                    return Err(invalid(format!(
+                        "invalid TCP62 gateway identity for {}",
+                        peer.id
+                    )));
+                }
             }
         }
         for remote in &self.remote {
@@ -799,6 +862,9 @@ impl RouterConfig {
             return Err(invalid(
                 "all concentrator circuits on one WebSocket must use the same protocol version",
             ));
+        }
+        if self.automatic() {
+            return self.validate_automatic();
         }
         let mut directed = HashMap::<&str, &str>::new();
         let mut gateway_destinations = HashMap::<(&str, &str), &str>::new();
@@ -1122,6 +1188,42 @@ impl RouterConfig {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "HPR LAN to EE is experimental and awaits cross-medium XID3/TG validation before SETMODE",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_automatic(&self) -> io::Result<()> {
+        // A concentrator is one shared directory connection in automatic mode,
+        // not one statically selected circuit per destination.
+        if self.remote.len() > 1 {
+            return Err(invalid(
+                "automatic routing supports one [[concentrator]] connection",
+            ));
+        }
+        if self
+            .remote
+            .iter()
+            .any(|remote| remote.target_cp.is_some() || remote.target_lu.is_some())
+        {
+            return Err(invalid(
+                "automatic routing selects concentrator destinations from the received directory; omit target_cp and target_lu",
+            ));
+        }
+        let mut llc_peers = HashSet::new();
+        for peer in &self.llc {
+            let key = (peer.interface.as_str(), parse_mac(&peer.guest_mac)?);
+            if !llc_peers.insert(key) {
+                return Err(invalid(format!(
+                    "duplicate automatic LLC association on {} for {}",
+                    peer.interface, peer.guest_mac
+                )));
+            }
+        }
+        if !self.hpr_lan.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "HPR LAN attachment is experimental and cannot join automatic routing yet",
             ));
         }
         Ok(())
@@ -1820,10 +1922,9 @@ to = "west"
         assert!(
             toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[mptn_gateway]]")).is_err()
         );
-        assert!(toml::from_str::<RouterConfig>(
-            &relay.replace("profile = \"relay\"", "profile = \"gateway\"")
-        )
-        .is_err());
+        assert!(parse(&relay.replace("profile = \"relay\"", "profile = \"gateway\""))
+            .validate()
+            .is_err());
         assert!(toml::from_str::<RouterConfig>(&relay.replace(
             "peer_ip = \"127.0.0.3\"",
             "peer_ip = \"127.0.0.3\"\nlocal_cp = \"SOLNET.SNAA\""
@@ -1989,5 +2090,74 @@ timeout_seconds = 600
         ] {
             assert!(parse(&bad).validate().is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn route_free_config_selects_automatic_mode_with_minimal_attachments() {
+        let config = parse(
+            r#"
+[web]
+listen = "127.0.0.1:8082"
+password = "secret"
+[[llc]]
+id = "v4"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+[[mptn]]
+profile = "gateway"
+id = "v5"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+[[concentrator]]
+id = "upstream"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+token = "router-token"
+"#,
+        );
+        assert!(config.automatic());
+        config.validate().unwrap();
+        assert_eq!(config.mptn_gateway[0].local_cp, "");
+        assert_eq!(config.mptn_gateway[0].local_node_id, "");
+        assert!(config.remote[0].target_cp.is_none());
+    }
+
+    #[test]
+    fn automatic_mode_rejects_ambiguous_or_fixed_destinations() {
+        let base = r#"
+[[llc]]
+id = "v4"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+[[concentrator]]
+id = "upstream"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+"#;
+        assert!(parse(base).validate().is_ok());
+        let fixed = base.replace(
+            "id = \"upstream\"",
+            "id = \"upstream\"\ntarget_cp = \"OTHERNET.CP\"",
+        );
+        assert!(parse(&fixed)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("omit target_cp"));
+        let duplicate = base.replace(
+            "[[concentrator]]",
+            "[[llc]]\nid = \"v4b\"\ninterface = \"sol5\"\nguest_mac = \"02:00:35:27:23:01\"\n[[concentrator]]",
+        );
+        assert!(parse(&duplicate)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate automatic LLC"));
+        let second = format!(
+            "{base}\n[[concentrator]]\nid = \"second\"\nurl = \"ws://127.0.0.1:8081/router/v1/ws\"\n"
+        );
+        assert!(parse(&second)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("one [[concentrator]]"));
     }
 }
