@@ -48,6 +48,7 @@ pub(crate) struct NativePeerPort {
     first_user_attach: Option<Vec<u8>>,
     converter_policy: Option<(String, String)>,
     converter_expected_cp: Option<String>,
+    converter_dynamic: bool,
     converter_events: VecDeque<NativeLlcEvent>,
     converter_offer: Option<UserBindOffer>,
     converter_bind_waits_for_bis_ack: bool,
@@ -116,6 +117,7 @@ impl NativePeerPort {
             first_user_attach: None,
             converter_policy: None,
             converter_expected_cp: None,
+            converter_dynamic: false,
             converter_events: VecDeque::new(),
             converter_offer: None,
             converter_bind_waits_for_bis_ack: false,
@@ -203,6 +205,23 @@ impl NativePeerPort {
         port.management = Some(ManagementSession::new(remote_cp.clone(), local_cp));
         port.converter_policy = Some((user_plu, user_slu));
         port.converter_expected_cp = Some(remote_cp);
+        port.process(first_events)?;
+        Ok(port)
+    }
+
+    /// Learn the native CP from XID3 after a null-XID offer. The virtual CP
+    /// comes from the route target's local XID profile, while the management
+    /// and user LU pair are validated against the peer's subsequent BINDs.
+    pub(crate) fn open_dynamic_converter_from_endpoint(
+        endpoint: Endpoint,
+        first_events: Vec<Event>,
+        interface: &str,
+        local_xid: Xid3,
+        observed_cp: Option<String>,
+    ) -> io::Result<Self> {
+        let mut port = Self::open_with_endpoint(endpoint, interface, local_xid)?;
+        port.converter_dynamic = true;
+        port.converter_expected_cp = observed_cp;
         port.process(first_events)?;
         Ok(port)
     }
@@ -363,6 +382,17 @@ impl NativePeerPort {
                                         "native XID3 CP differs from converter peer policy",
                                     ));
                                 }
+                            }
+                            if self.converter_dynamic && self.management.is_none() {
+                                let peer_cp = self.type1.peer_name().ok_or_else(|| {
+                                    io::Error::new(io::ErrorKind::InvalidData, "native XID3 CP missing")
+                                })?.to_owned();
+                                let local_cp = self.local_xid.cp_name().map_err(management_error)?;
+                                self.management = Some(ManagementSession::new(
+                                    peer_cp.clone(), local_cp,
+                                ));
+                                self.converter_policy = Some((peer_cp.clone(), self.local_xid.cp_name().map_err(management_error)?));
+                                self.converter_expected_cp = Some(peer_cp);
                             }
                             self.endpoint.set_connect_allowed(true)?;
                             if self.type1.local_role() == Role::Primary {

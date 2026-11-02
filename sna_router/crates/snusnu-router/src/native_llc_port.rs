@@ -22,6 +22,23 @@ pub(crate) struct NativeLlcPort {
 }
 
 impl NativeLlcPort {
+    pub(crate) fn open_dynamic_from_offer(
+        offer: LlcIngressOffer,
+        local_xid: Xid3,
+    ) -> io::Result<Self> {
+        let interface = offer.interface.clone();
+        let (endpoint, first_events, observed_cp) = offer.into_endpoint()?;
+        Ok(Self {
+            inner: NativePeerPort::open_dynamic_converter_from_endpoint(
+                endpoint,
+                first_events,
+                &interface,
+                local_xid,
+                observed_cp,
+            )?,
+        })
+    }
+
     pub(crate) fn open_from_offer(
         offer: LlcIngressOffer,
         local_xid: Xid3,
