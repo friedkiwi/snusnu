@@ -252,3 +252,41 @@ second selector was not exercised by a live OS/400 Connect. Repeated
 sessions on one target and native-initiated LLC-to-MPTN routing remain
 unverified here. Both Rust routers and the QA concentrator were stopped
 after the run; the isolated Solstice guests remain booted.
+
+## Concentrator to local MPTN peer on 2026-11-02
+
+Alice V4R4 on `sol8` initiated `STRPASTHR RMTLOCNAME(SNAB)
+RMTNETID(QABOB) LCLLOCNAME(SNAA)` through its LLC2 router and the QA
+concentrator. Bob's router used ordinary `--config` with a directed
+`[[route]]` from the concentrator to its local `[[mptn]] profile = "gateway"`
+peer at `10.99.4.3:397`. Its hosted LU was `QABOB.SNAB`; the source LU was
+`QAALICE.SNAA`. Both routers published their CP/LU exports under separate
+QA bearer tokens and NETIDs. Alice's `SNAB` controller was temporarily
+changed from `INLCNN(*ANS)` to `*DIAL`, retaining Bob's managed MAC
+`02:53:4e:00:00:02`.
+
+The fifth live attempt reached V5R4 Bob's remote **Sign On** on Alice's
+TN5250 display: system `S1054504`, subsystem `QBASE`, virtual device
+`QPADEV0001`. The operator log records the Sign On at guest time 11:11:58.
+Bob's router log is `/tmp/snusnu-cross-netid/ws-reverse-bob4.log`; Alice's
+is `ws-reverse-alice4.log`. The log records authenticated WebSocket Open,
+XID3/LLC2, native SNASVCMG/CNOS and UNBIND, outbound TCP62 management,
+user BIND, first FMH-5 Attach, and a 524-byte display PIU. TCP
+`10.99.4.11:39515 → 10.99.4.3:397` remained established while the Sign On
+screen was visible for over a minute. No credentials were entered.
+
+The first live run exposed a one-slot assumption in the WebSocket native
+CNOS response queue; a focused fix allowed the pair of responses. A later
+run exposed management UNBIND being mistaken for a user BIND; the next
+focused fix recognized and acknowledged that UNBIND. Guest controller
+status also needed attention: when `SNAB` and `SNAB00` were `VARY ON
+PENDING`, Alice sent no LLC frames. Varying the controller off and on with
+both routers available made them `ACTIVE`.
+
+The return-home SysReq action did **not** complete normally. Bob's router
+exited with `TCP62 normal data is not an FM request` after a native FM
+response, and Alice reported a communications failure for `SNAB00`.
+Normal teardown in this direction remains unverified. After the test,
+Alice's controller was restored to `INLCNN(*ANS)` and varied on; both Rust
+routers and QA concentrator were stopped. Ports 397 and 8081 had no
+listeners. The isolated Solstice guests remain booted.
