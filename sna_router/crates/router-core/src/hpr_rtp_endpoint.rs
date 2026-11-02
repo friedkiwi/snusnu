@@ -14,7 +14,7 @@ use crate::{
         encode_setup_reply_from_snapshot, ReplyEncodeError, ReplyPath, StatusExchange,
     },
     hpr_rtp_send::{parse_peer_status, ReliableSendWindow, SendError, StatusEffect},
-    hpr_rtp_setup::{RtpInboundSetup, RtpLocalTarget, RtpSetupTopic, SetupError},
+    hpr_rtp_setup::{RtpInboundSetup, RtpLocalTarget, RtpSetupTopic, SetupError, SetupPhase},
     ConnectionGeneration,
 };
 
@@ -217,6 +217,7 @@ pub struct RtpInboundEndpoint {
     pending_status: Option<Vec<u8>>,
     pending_retransmission: Option<Vec<u8>>,
     pending_messages: Vec<Vec<u8>>,
+    pre_status_messages: Vec<Vec<u8>>,
     receive: Option<ReliableReceiveWindow>,
     send: Option<ReliableSendWindow>,
     assembly: OrderedMessageAssembler,
@@ -270,6 +271,7 @@ impl RtpInboundEndpoint {
             pending_status: None,
             pending_retransmission: None,
             pending_messages: Vec::new(),
+            pre_status_messages: Vec::new(),
             receive: None,
             send: None,
             assembly,
@@ -462,10 +464,10 @@ impl RtpInboundEndpoint {
     }
 
     /// Process one unqualified NLP. The first packet must both use the
-    /// CIE-assigned TCID and echo our setup STATUS. The initial qualified
-    /// message was already released after the CIE send; the peer can receive
-    /// our application reply before sending this STATUS. STATUS and data may
-    /// share an NLP.
+    /// CIE-assigned TCID. ARB and data can arrive before the peer's STATUS
+    /// echo; hold complete messages until that proof arrives. The initial
+    /// qualified message was already released after our CIE send, allowing
+    /// the application reply to precede this STATUS.
     pub fn receive(&mut self, nlp: &[u8]) -> Result<EndpointReceive, EndpointError> {
         if !matches!(
             self.phase,
@@ -495,11 +497,9 @@ impl RtpInboundEndpoint {
             return Err(EndpointError::InvalidArb);
         }
         let has_status = segments.iter().any(|s| s.key == 0x0e);
-        if self.phase == EndpointPhase::AwaitPeerStatus && !has_status {
-            return Err(EndpointError::MissingStatus);
-        }
         let mut setup = self.setup.clone();
-        if self.phase == EndpointPhase::AwaitPeerStatus {
+        if self.phase == EndpointPhase::AwaitPeerStatus && setup.phase() == SetupPhase::AwaitPeerUse
+        {
             setup
                 .observe_inbound_peer_use(self.config.generation, packet)
                 .map_err(EndpointError::Setup)?;
@@ -525,13 +525,33 @@ impl RtpInboundEndpoint {
             ReceiveResult::Duplicate => false,
         };
         let mut assembly = self.assembly.clone();
-        let messages = match delivered {
+        let mut messages = match delivered {
             ReceiveResult::Delivered(fragments) => assembly
                 .observe(&fragments)
                 .map_err(EndpointError::Assembly)?,
             ReceiveResult::Buffered | ReceiveResult::Duplicate => Vec::new(),
         };
-        if self.phase == EndpointPhase::AwaitPeerStatus {
+        let peer_sync = if has_status {
+            Some(parse_peer_status(packet).map_err(EndpointError::Send)?.sync)
+        } else {
+            None
+        };
+        if self.phase == EndpointPhase::AwaitPeerStatus && !has_status {
+            let retained = self.pre_status_messages.iter().map(Vec::len).sum::<usize>();
+            let additional = messages.iter().map(Vec::len).sum::<usize>();
+            if retained
+                .checked_add(additional)
+                .is_none_or(|size| size > self.config.max_window_bytes)
+            {
+                return Err(EndpointError::TooLarge);
+            }
+            self.pre_status_messages
+                .extend(std::mem::take(&mut messages));
+        }
+        if self.phase == EndpointPhase::AwaitPeerStatus && has_status {
+            let mut held = std::mem::take(&mut self.pre_status_messages);
+            held.append(&mut messages);
+            messages = held;
             self.phase = EndpointPhase::Active;
         }
         self.setup = setup;
@@ -545,7 +565,7 @@ impl RtpInboundEndpoint {
             self.pending_retransmission = None;
         }
         if let Some(status) = &status {
-            self.last_peer_sync = parse_peer_status(packet).map_err(EndpointError::Send)?.sync;
+            self.last_peer_sync = peer_sync.unwrap();
             return Ok(EndpointReceive {
                 generation: self.config.generation,
                 inbound_tcid: packet.tcid,
@@ -755,6 +775,7 @@ impl RtpInboundEndpoint {
         self.phase = EndpointPhase::Closed;
         self.setup.close();
         self.pending_messages.clear();
+        self.pre_status_messages.clear();
         self.pending_setup_reply = None;
         self.initial_setup_nlp = None;
         self.sent_setup_reply = None;
@@ -1092,6 +1113,46 @@ mod tests {
             .unwrap();
         assert_eq!(endpoint.pending_retransmission_nlp(), None);
         assert_eq!(endpoint.send.as_ref().unwrap().retained_packets(), 1);
+    }
+
+    #[test]
+    fn live_cp_order_buffers_arb_and_data_until_later_status_echo() {
+        let cfg = config();
+        let mut endpoint = RtpInboundEndpoint::new(cfg.clone()).unwrap();
+        let reply = endpoint.prepare_inbound_setup(&setup_packet(&cfg)).unwrap();
+        assert_eq!(
+            endpoint.confirm_setup_reply_sent(&reply).unwrap(),
+            vec![b"RSETUP".to_vec()]
+        );
+        let bind_result = endpoint.prepare_message(b"+RSP(BIND)", 10_000).unwrap();
+        endpoint.confirm_message_sent(&bind_result, 10_000).unwrap();
+
+        // Live V5R4 EE at 16:49:26 sent an assigned-TCID ARB-only NLP,
+        // then a complete CP FMH5 NLP, then STATUS about 200 ms later.
+        let mut arb_only = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], None);
+        arb_only[1] = 8;
+        arb_only[15] = 4;
+        arb_only[16..18].copy_from_slice(&8u16.to_be_bytes());
+        arb_only.extend_from_slice(&[3, 0x22, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(endpoint.receive(&arb_only).unwrap().messages.is_empty());
+        assert_eq!(endpoint.phase(), EndpointPhase::AwaitPeerStatus);
+        let early_packet = peer_packet(ASSIGNED & !ASSIGNOR, 107, b"CP-FMH5", None);
+        let early = endpoint.receive(&early_packet).unwrap();
+        assert!(early.messages.is_empty());
+        assert!(early.status_due);
+        assert!(endpoint.receive(&early_packet).unwrap().messages.is_empty());
+        assert_eq!(endpoint.phase(), EndpointPhase::AwaitPeerStatus);
+
+        let confirmed = endpoint
+            .receive(&peer_packet(
+                ASSIGNED & !ASSIGNOR,
+                115,
+                &[],
+                Some((1, 1, 211)),
+            ))
+            .unwrap();
+        assert_eq!(confirmed.messages, vec![b"CP-FMH5".to_vec()]);
+        assert_eq!(endpoint.phase(), EndpointPhase::Active);
     }
 
     #[test]

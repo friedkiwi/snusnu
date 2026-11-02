@@ -93,11 +93,22 @@ impl HprRtpPort {
 
     pub(crate) fn user_scope(&self) -> Option<RtpAssociationScope> {
         let user = self.user.as_ref()?;
-        let origin = user.origin_tcid()?;
+        self.scope_for(user)
+    }
+
+    /// Directional identifiers for the validated CP management RTP topic.
+    /// The first qualified BIND uses the origin TCID; subsequent peer BIUs
+    /// use our CIE-assigned TCID after the link generation is pinned.
+    pub(crate) fn cp_scope(&self) -> Option<RtpAssociationScope> {
+        self.scope_for(self.cp_svc_mg.as_ref()?)
+    }
+
+    fn scope_for(&self, endpoint: &RtpInboundEndpoint) -> Option<RtpAssociationScope> {
+        let origin = endpoint.origin_tcid()?;
         Some(RtpAssociationScope {
             generation: self.bootstrap.generation,
             initial_plu_tcid: origin,
-            subsequent_plu_tcid: user.assigned_tcid()?,
+            subsequent_plu_tcid: endpoint.assigned_tcid()?,
             slu_tcid: origin & !ASSIGNOR,
         })
     }
