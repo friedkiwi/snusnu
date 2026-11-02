@@ -42,6 +42,9 @@ struct PendingOob {
     packet: Vec<u8>,
     response: Vec<u8>,
     source: SocketAddr,
+    compensation: Compensation,
+    reduced: Vec<u8>,
+    submitted: bool,
 }
 
 /// Session-local UDP/397 correlation for an outbound MPTN Connect. The
@@ -116,7 +119,15 @@ impl OutboundUdp {
                 }
                 if let Some(pending) = &self.pending {
                     if pending.sequence == oob.sequence && pending.packet == packet {
-                        return Ok(OutboundUdpAction::PendingDuplicate);
+                        return if pending.submitted {
+                            Ok(OutboundUdpAction::PendingDuplicate)
+                        } else {
+                            Ok(OutboundUdpAction::Deliver {
+                                sequence: pending.sequence,
+                                compensation: pending.compensation,
+                                reduced: pending.reduced.clone(),
+                            })
+                        };
                     }
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
@@ -147,6 +158,9 @@ impl OutboundUdp {
                     packet: packet.to_vec(),
                     response,
                     source,
+                    compensation: oob.compensation.expect("validated X'83' request"),
+                    reduced: oob.user_data.to_vec(),
+                    submitted: false,
                 });
                 Ok(action)
             }
@@ -164,7 +178,7 @@ impl OutboundUdp {
         if self
             .pending
             .as_ref()
-            .is_none_or(|pending| pending.sequence != sequence)
+            .is_none_or(|pending| pending.sequence != sequence || !pending.submitted)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -184,6 +198,33 @@ impl OutboundUdp {
 
     pub(crate) fn pending_sequence(&self) -> Option<u16> {
         self.pending.as_ref().map(|pending| pending.sequence)
+    }
+
+    /// Re-offer a request when the native edge previously returned Busy.
+    pub(crate) fn unsubmitted_delivery(&self) -> Option<OutboundUdpAction> {
+        self.pending
+            .as_ref()
+            .filter(|pending| !pending.submitted)
+            .map(|pending| OutboundUdpAction::Deliver {
+                sequence: pending.sequence,
+                compensation: pending.compensation,
+                reduced: pending.reduced.clone(),
+            })
+    }
+
+    pub(crate) fn mark_native_submitted(&mut self, sequence: u16) -> io::Result<()> {
+        let pending = self
+            .pending
+            .as_mut()
+            .filter(|pending| pending.sequence == sequence && !pending.submitted)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP X'83' native submission is not pending",
+                )
+            })?;
+        pending.submitted = true;
+        Ok(())
     }
 }
 
@@ -499,6 +540,12 @@ mod tests {
                 reduced: vec![0, 0, 0, 0, 0, 0xc9],
             }
         );
+        assert!(matches!(
+            state.receive(&packet, source).unwrap(),
+            OutboundUdpAction::Deliver { sequence: 0, .. }
+        ));
+        assert!(state.unsubmitted_delivery().is_some());
+        state.mark_native_submitted(0).unwrap();
         assert_eq!(
             state.receive(&packet, source).unwrap(),
             OutboundUdpAction::PendingDuplicate
@@ -536,6 +583,7 @@ mod tests {
             state.receive(&packet, source).unwrap(),
             OutboundUdpAction::Deliver { .. }
         ));
+        state.mark_native_submitted(4).unwrap();
         state.complete_native_delivery(4).unwrap();
         let changed = build_request(&connect, 4, Compensation::Abort, &[0, 0, 0, 0, 1]).unwrap();
         assert_eq!(

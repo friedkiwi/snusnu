@@ -135,6 +135,17 @@ pub fn connect_template_for_native_bind(
     if info.plu != source_lu || info.slu != destination_lu {
         return Err(invalid("native BIND LU pair differs from outbound route"));
     }
+    connect_template_for_route(source_lu, destination_lu, correlator)
+}
+
+/// Construct an outbound Connect envelope before the native user BIND
+/// arrives. `GatewaySession::begin_native_bind` later validates that BIND
+/// and installs its reduced image into this envelope.
+pub fn connect_template_for_route(
+    source_lu: &str,
+    destination_lu: &str,
+    correlator: [u8; 8],
+) -> io::Result<Connect> {
     if correlator == [0; 8] {
         return Err(state_error("TCP62 correlator must be freshly allocated"));
     }
@@ -706,6 +717,24 @@ mod tests {
             [1; 8]
         )
         .is_err());
+    }
+
+    #[test]
+    fn route_template_can_be_created_before_native_bind() {
+        let template = connect_template_for_route("SOLNET.SNAA", "SOLNET.SNAB", [0x42; 8]).unwrap();
+        assert_eq!(template.source.qualified_lu().unwrap(), "SOLNET.SNAA");
+        assert_eq!(template.destination.qualified_lu().unwrap(), "SOLNET.SNAB");
+        assert_eq!(template.correlator, [0x42; 8]);
+        assert!(connect_template_for_route("SOLNET.SNAA", "SOLNET.SNAB", [0; 8]).is_err());
+        assert!(connect_template_for_route("SOLNET.SNAA", "bad.lu", [1; 8]).is_err());
+        let mut session = GatewaySession::new(test_policy(), full_capabilities()).unwrap();
+        let request = session
+            .begin_native_bind(&captured_user_bind(), template)
+            .unwrap();
+        assert_eq!(
+            Connect::decode(&request.bytes).unwrap().correlator,
+            [0x42; 8]
+        );
     }
 
     #[test]

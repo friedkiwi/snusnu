@@ -433,6 +433,20 @@ fn observe_outbound_udp(
     oob: &mut OutboundUdp,
     edge: &mut GatewayEdge<NativeLlcPort>,
 ) -> io::Result<()> {
+    if let Some(OutboundUdpAction::Deliver {
+        sequence,
+        compensation,
+        reduced,
+    }) = oob.unsubmitted_delivery()
+    {
+        if compensation == transport_ip_sna::mptn_oob::Compensation::Expedited {
+            match edge.submit_udp_expedited(&reduced) {
+                Ok(()) => oob.mark_native_submitted(sequence)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     let mut packet = [0u8; MAX_RECORD];
     match socket.recv_from(&mut packet) {
         Ok((length, source)) => match oob.receive(&packet[..length], source)? {
@@ -449,7 +463,11 @@ fn observe_outbound_udp(
                 reduced,
             } => match compensation {
                 transport_ip_sna::mptn_oob::Compensation::Expedited => {
-                    edge.submit_udp_expedited(&reduced)?;
+                    match edge.submit_udp_expedited(&reduced) {
+                        Ok(()) => oob.mark_native_submitted(sequence)?,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
                     tracing::debug!(source = %source, sequence, "outbound UDP X'83' expedited queued to native LLC");
                     Ok(())
                 }
