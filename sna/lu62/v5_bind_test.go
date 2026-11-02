@@ -51,6 +51,35 @@ func TestSanitizedV5R4EEBindNegotiatesFixedPacing(t *testing.T) {
 	}
 }
 
+// Captured from the V5R4 EE APING BIND following RouteSetup. This guest
+// advertises X'40' in the BIND profile where the earlier fixture used zero.
+func TestLiveV5R4EEBlankModePingBind(t *testing.T) {
+	encoded, err := os.ReadFile("testdata/v5r4_ee_blank_ping_bind.hex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reduced, err := hex.DecodeString(strings.TrimSpace(string(encoded)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := append([]byte{0x2f, 0, 1, 2}, reduced...)
+	bind, err := ParseBind(request)
+	if err != nil || bind == nil || bind.Management || bind.Mode != "" || bind.PLU != "SOLNET.SNAB" || bind.SLU != "SNUSNU.PING" {
+		t.Fatalf("live V5R4 APING BIND identity: %+v, %v", bind, err)
+	}
+	user, err := NewStandaloneUserSession(bind.PLU, bind.SLU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := user.PrepareBind(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response[6] != 0xeb || response[9+25] != 0x40 || response[9+8] != 3 || response[9+13] != 3 {
+		t.Fatalf("live V5R4 APING BIND response: %x", response)
+	}
+}
+
 func TestLiveV5R4EESNASVCMGPingBindIsStandaloneOnly(t *testing.T) {
 	encoded, err := os.ReadFile("testdata/v5r4_ee_snasvcmg_ping_bind.hex")
 	if err != nil {

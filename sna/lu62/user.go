@@ -93,7 +93,11 @@ func candidateUserResponse(request []byte, expectedPLU, expectedSLU string, mana
 	// fields in RSP(BIND). Keep the older V4R4 profile strict and distinct.
 	v5UserFixed := append([]byte(nil), v4UserFixed...)
 	v5UserFixed[10], v5UserFixed[11], v5UserFixed[25] = 0x8c, 0x8c, 0
-	if !bytes.Equal(ru[:27], v4UserFixed) && !(allowV5 && bytes.Equal(ru[:27], v5UserFixed)) {
+	// Live V5R4 EE APING also offers X'40' at byte 25. Keep this
+	// additional profile on the standalone V5 path only.
+	v5UserFixed40 := append([]byte(nil), v5UserFixed...)
+	v5UserFixed40[25] = 0x40
+	if !bytes.Equal(ru[:27], v4UserFixed) && !(allowV5 && (bytes.Equal(ru[:27], v5UserFixed) || bytes.Equal(ru[:27], v5UserFixed40))) {
 		return nil, ErrUserBind
 	}
 	plu, err := encodeLUName(expectedPLU)
