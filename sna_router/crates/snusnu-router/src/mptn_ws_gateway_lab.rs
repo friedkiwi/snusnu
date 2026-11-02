@@ -24,8 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 use transport_ip_sna::{
-    anynet::TcpRecord, mptn_compensations::CompensationSet, mptn_management_responder::V5Options,
-    mptn_reverse_user_bind::NativeAddress,
+    anynet::TcpRecord, mptn_compensations::CompensationSet, mptn_ingress::IngressOffer,
+    mptn_management_responder::V5Options, mptn_reverse_user_bind::NativeAddress,
 };
 use transport_ws::wire;
 
@@ -154,24 +154,6 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
     )
     .map_err(|error| invalid(format!("native management: {error}")))?;
     virtual_port.attach_management(management)?;
-    let deadline = Instant::now() + TIMEOUT;
-    while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
-        pump_virtual(&mut virtual_port)?;
-        if virtual_port.management_complete() {
-            break;
-        }
-        thread::sleep(Duration::from_micros(200));
-    }
-    if STOP.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    if !virtual_port.management_complete() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "native management timed out",
-        ));
-    }
-    tracing::info!(local_cp=%gateway.local_cp, peer_cp=%gateway.peer_cp, "native management ready; opening TCP62");
     let required =
         CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83]).map_err(io::Error::other)?;
     let mut tcp = MptnGatewayPort::bind(GatewayConfig {
@@ -186,12 +168,74 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         },
         cnos_mode: String::new(),
         cnos_limit: 8,
-        // Bob may retain its successfully negotiated TCP62 CNOS state from
-        // a prior association. This explicit lab starts only after the
-        // matching native management exchange has completed.
+        // Bob may retain prior TCP62 CNOS state. An early user offer is
+        // strictly validated and held until native management completes.
         allow_resumed_user: true,
     })?;
     tracing::info!(local_ip=%gateway.local_ip, peer_ip=%gateway.peer_ip, "experimental TCP62 gateway listening");
+    let deadline = Instant::now() + TIMEOUT;
+    let mut pending_offer: Option<IngressOffer> = None;
+    let mut offer_deadline: Option<Instant> = None;
+    while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+        pump_virtual(&mut virtual_port)?;
+        if virtual_port.management_complete() {
+            break;
+        }
+        if let Some(event) = tcp.poll_once(false)? {
+            match event {
+                GatewayEvent::ManagementReady => {
+                    tracing::info!("TCP62 management ready before native management")
+                }
+                GatewayEvent::UserBind(offer) if pending_offer.is_none() => {
+                    pending_offer = Some(offer);
+                    offer_deadline = Some(Instant::now() + Duration::from_secs(30));
+                    tracing::info!("TCP62 user BIND held until native management is ready");
+                }
+                GatewayEvent::Rejected(reason) => {
+                    return Err(invalid(format!("early TCP62 peer rejected: {reason}")))
+                }
+                GatewayEvent::Closed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "early TCP62 peer closed",
+                    ))
+                }
+                _ => {
+                    return Err(invalid(
+                        "unexpected TCP62 user record before native management",
+                    ))
+                }
+            }
+        }
+        if offer_deadline.is_some_and(|until| Instant::now() >= until) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "early TCP62 user BIND offer timed out",
+            ));
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+    if STOP.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if !virtual_port.management_complete() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "native management timed out",
+        ));
+    }
+    tracing::info!(local_cp=%gateway.local_cp, peer_cp=%gateway.peer_cp, "native management ready");
+    if let Some(offer) = pending_offer.take() {
+        virtual_port.begin_user_bind(
+            &offer,
+            NativeAddress {
+                daf: 2,
+                oaf: 2,
+                odai: true,
+            },
+        )?;
+        tracing::info!("held TCP62 user BIND offered to virtual native link");
+    }
     let mut pending_user_input: Option<TcpRecord> = None;
     while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
         pump_virtual(&mut virtual_port)?;
