@@ -20,6 +20,7 @@ pub mod hpr_route_setup_service;
 pub mod hpr_rtp;
 pub mod hpr_rtp_endpoint;
 pub mod hpr_rtp_message;
+pub mod hpr_rtp_outbound;
 pub mod hpr_rtp_outbound_setup;
 pub mod hpr_rtp_receive;
 pub mod hpr_rtp_reply;

@@ -17,6 +17,7 @@ use router_core::{
     hpr_rtp_endpoint::{
         EndpointError, EndpointPath, EndpointPeer, InboundEndpointConfig, RtpInboundEndpoint,
     },
+    hpr_rtp_outbound::{OutboundPhase, RtpOutboundEndpoint},
     hpr_rtp_setup::{classify_setup_topic, RtpLocalTarget, RtpSetupTopic},
     hpr_session_address::{RtpAssociationScope, RtpObservation},
     hpr_switching_path::{validate_inbound_switching_path, AuthorizedUserRoute, TrustedReturnPath},
@@ -44,6 +45,7 @@ fn endpoint_error(error: EndpointError) -> io::Error {
 pub(crate) enum RtpIngressKind {
     RouteSetup,
     CpSvcMg,
+    CpSvcMgOut,
     User,
 }
 
@@ -58,6 +60,7 @@ pub(crate) struct HprRtpPort {
     bootstrap: HprControlBootstrap,
     route_setup: Option<RtpInboundEndpoint>,
     cp_svc_mg: Option<RtpInboundEndpoint>,
+    cp_svc_mg_out: Option<RtpOutboundEndpoint>,
     user: Option<RtpInboundEndpoint>,
     authorized_user_route: Option<AuthorizedUserRoute>,
 }
@@ -68,6 +71,7 @@ impl HprRtpPort {
             bootstrap,
             route_setup: None,
             cp_svc_mg: None,
+            cp_svc_mg_out: None,
             user: None,
             authorized_user_route: None,
         }
@@ -103,6 +107,96 @@ impl HprRtpPort {
         self.scope_for(self.cp_svc_mg.as_ref()?)
     }
 
+    pub(crate) fn cp_out_scope(&self) -> Option<RtpAssociationScope> {
+        let endpoint = self.cp_svc_mg_out.as_ref()?;
+        if endpoint.phase() != OutboundPhase::Active {
+            return None;
+        }
+        let origin = endpoint.origin_tcid();
+        Some(RtpAssociationScope {
+            generation: endpoint.generation(),
+            initial_plu_tcid: origin,
+            subsequent_plu_tcid: endpoint.peer_assigned_tcid()?,
+            slu_tcid: origin & !ASSIGNOR,
+        })
+    }
+
+    pub(crate) fn cp_out_ready(&self) -> bool {
+        self.cp_out_scope().is_some()
+    }
+
+    /// Originate the reciprocal CPSVCMG RTP connection on the same EE TG.
+    /// A false result means transient UDP backpressure; the caller retries
+    /// the same first BIU without allocating a second TCID.
+    pub(crate) fn open_cp(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        first_biu: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.check_link(ee)?;
+        if self.cp_svc_mg_out.is_none() {
+            let tg = ee.tg_number().ok_or_else(|| invalid("EE TG not active"))?;
+            let id = allocate_tcid(self.bootstrap.generation.get())?;
+            let mut endpoint =
+                RtpOutboundEndpoint::new(self.bootstrap.clone(), tg, id).map_err(endpoint_error)?;
+            endpoint.prepare_setup(first_biu).map_err(endpoint_error)?;
+            self.cp_svc_mg_out = Some(endpoint);
+        }
+        let endpoint = self.cp_svc_mg_out.as_mut().unwrap();
+        let Some(packet) = endpoint.pending_setup_nlp().map(ToOwned::to_owned) else {
+            return Ok(true);
+        };
+        match ee.send_nlp(12001, &packet) {
+            Ok(()) => endpoint
+                .confirm_setup_sent(&packet, now_us)
+                .map_err(endpoint_error)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn send_cp(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        message: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.check_link(ee)?;
+        let endpoint = self
+            .cp_svc_mg_out
+            .as_mut()
+            .ok_or_else(|| invalid("outbound CP RTP not started"))?;
+        if endpoint.phase() != OutboundPhase::Active {
+            return Ok(false);
+        }
+        let packet = match endpoint.prepare_message(message, now_us) {
+            Ok(packet) => packet,
+            Err(
+                EndpointError::RateLimited
+                | EndpointError::Send(
+                    router_core::hpr_rtp_send::SendError::BufferFull
+                    | router_core::hpr_rtp_send::SendError::TooManyPackets,
+                ),
+            ) => return Ok(false),
+            Err(error) => return Err(endpoint_error(error)),
+        };
+        match ee.send_nlp(12001, &packet) {
+            Ok(()) => endpoint
+                .confirm_message_sent(&packet, now_us)
+                .map_err(endpoint_error)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                endpoint
+                    .cancel_unsent_message(&packet)
+                    .map_err(endpoint_error)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(true)
+    }
+
     fn scope_for(&self, endpoint: &RtpInboundEndpoint) -> Option<RtpAssociationScope> {
         let origin = endpoint.origin_tcid()?;
         Some(RtpAssociationScope {
@@ -128,6 +222,13 @@ impl HprRtpPort {
             .map_err(|error| invalid(format!("invalid RTP NLP: {error:?}")))?;
         if packet.tcid & ASSIGNOR != 0 {
             return self.on_setup(ee, datagram, packet);
+        }
+        if self
+            .cp_svc_mg_out
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.origin_tcid() & !ASSIGNOR == packet.tcid)
+        {
+            return self.on_outbound_cp(ee, datagram, packet);
         }
         self.on_established_packet(ee, datagram, packet)
     }
@@ -207,7 +308,138 @@ impl HprRtpPort {
                 .confirm_retransmission_sent(&packet, now_us)
                 .map_err(endpoint_error)?;
         }
+        self.tick_outbound_cp(ee, now_us)?;
         Ok(())
+    }
+
+    fn tick_outbound_cp(&mut self, ee: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        let Some(endpoint) = self.cp_svc_mg_out.as_mut() else {
+            return Ok(());
+        };
+        if let Some(packet) = endpoint
+            .setup_retransmit_due(now_us)
+            .map_err(endpoint_error)?
+        {
+            let packet = packet.to_vec();
+            match ee.send_nlp(12001, &packet) {
+                Ok(()) => endpoint
+                    .confirm_setup_retransmitted(&packet, now_us)
+                    .map_err(endpoint_error)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(packet) = endpoint.pending_status_nlp() {
+            let packet = packet.to_vec();
+            match ee.send_nlp(12001, &packet) {
+                Ok(()) => endpoint
+                    .confirm_status_sent(&packet)
+                    .map_err(endpoint_error)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        if endpoint.phase() != OutboundPhase::Active {
+            return Ok(());
+        }
+        let packet = if let Some(pending) = endpoint.pending_retransmission_nlp() {
+            pending.to_vec()
+        } else if let Some(due) = endpoint.retransmit_due(now_us).map_err(endpoint_error)? {
+            due
+        } else {
+            return Ok(());
+        };
+        match ee.send_nlp(12001, &packet) {
+            Ok(()) => endpoint
+                .confirm_retransmission_sent(&packet, now_us)
+                .map_err(endpoint_error)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    fn on_outbound_cp(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        datagram: &Datagram,
+        packet: RtpPacket<'_>,
+    ) -> io::Result<Vec<RtpIngress>> {
+        if datagram.port != 12001 || (packet.nhdr[0] >> 1) & 3 != 3 {
+            return Err(invalid("outbound CP RTP on wrong EE priority port"));
+        }
+        let endpoint = self.cp_svc_mg_out.as_mut().unwrap();
+        if endpoint.phase() == OutboundPhase::AwaitReply
+            || endpoint.phase() == OutboundPhase::AwaitStatusSent
+        {
+            if endpoint.phase() == OutboundPhase::AwaitReply
+                && packet
+                    .connection_identifier_exchange()
+                    .map_err(|error| invalid(format!("invalid outbound CP CIE: {error:?}")))?
+                    .is_none()
+            {
+                endpoint
+                    .buffer_before_reply(&datagram.payload[3..])
+                    .map_err(endpoint_error)?;
+                return Ok(Vec::new());
+            }
+            let reply = endpoint
+                .prepare_reply_status(&datagram.payload[3..])
+                .map_err(endpoint_error)?;
+            match ee.send_nlp(12001, &reply) {
+                Ok(()) => endpoint
+                    .confirm_status_sent(&reply)
+                    .map_err(endpoint_error)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            let mut ingress = Vec::new();
+            for held in endpoint.take_pre_status_nlps() {
+                let received = endpoint.receive(&held).map_err(endpoint_error)?;
+                ingress.extend(received.messages.into_iter().map(|bytes| RtpIngress {
+                    kind: RtpIngressKind::CpSvcMgOut,
+                    observation: RtpObservation {
+                        generation: received.generation,
+                        tcid: received.inbound_tcid,
+                    },
+                    bytes,
+                }));
+            }
+            return Ok(ingress);
+        }
+        if let Some(reply) = endpoint.reply_to_duplicate_cie(&datagram.payload[3..]) {
+            ee.send_nlp(12001, reply)?;
+            return Ok(Vec::new());
+        }
+        let received = endpoint
+            .receive(&datagram.payload[3..])
+            .map_err(endpoint_error)?;
+        if received.status_due {
+            let reply = if let Some(pending) = endpoint.pending_status_nlp() {
+                pending.to_vec()
+            } else {
+                endpoint.prepare_status().map_err(endpoint_error)?
+            };
+            match ee.send_nlp(12001, &reply) {
+                Ok(()) => endpoint
+                    .confirm_status_sent(&reply)
+                    .map_err(endpoint_error)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(received
+            .messages
+            .into_iter()
+            .map(|bytes| RtpIngress {
+                kind: RtpIngressKind::CpSvcMgOut,
+                observation: RtpObservation {
+                    generation: received.generation,
+                    tcid: received.inbound_tcid,
+                },
+                bytes,
+            })
+            .collect())
     }
 
     fn on_setup(
@@ -336,6 +568,9 @@ impl HprRtpPort {
         let local_nce_instance = match kind {
             RtpIngressKind::RouteSetup => self.bootstrap.local.tower.route_setup_nce_instance,
             RtpIngressKind::CpSvcMg => self.bootstrap.local.tower.cp_nce_instance,
+            RtpIngressKind::CpSvcMgOut => {
+                return Err(invalid("outbound CP RTP has separate setup"))
+            }
             RtpIngressKind::User => {
                 self.authorized_user_route
                     .as_ref()
@@ -348,18 +583,10 @@ impl HprRtpPort {
                 Some(self.bootstrap.peer.tower.route_setup_nce_label.clone())
             }
             RtpIngressKind::CpSvcMg => Some(self.bootstrap.peer.tower.cp_nce_label.clone()),
+            RtpIngressKind::CpSvcMgOut => return Err(invalid("outbound CP RTP has separate peer")),
             RtpIngressKind::User => None,
         };
-        let serial = NEXT_TCID.fetch_add(1, Ordering::Relaxed);
-        if serial > u64::from(u32::MAX) {
-            return Err(invalid("HPR RTP identifier space exhausted"));
-        }
-        let id = ASSIGNOR
-            | ((self.bootstrap.generation.get() & 0x3fff_ffff) << 32)
-            | (serial & 0xffff_ffff);
-        if id & RESERVED != 0 {
-            return Err(invalid("invalid allocated RTP identifier"));
-        }
+        let id = allocate_tcid(self.bootstrap.generation.get())?;
         Ok(InboundEndpointConfig {
             generation: self.bootstrap.generation,
             local_target: RtpLocalTarget {
@@ -398,21 +625,38 @@ impl HprRtpPort {
         match kind {
             RtpIngressKind::RouteSetup => self.route_setup.as_ref(),
             RtpIngressKind::CpSvcMg => self.cp_svc_mg.as_ref(),
+            RtpIngressKind::CpSvcMgOut => None,
             RtpIngressKind::User => self.user.as_ref(),
         }
     }
 
     fn endpoint_mut(&mut self, kind: RtpIngressKind) -> Option<&mut RtpInboundEndpoint> {
-        self.slot_mut(kind).as_mut()
+        match kind {
+            RtpIngressKind::CpSvcMgOut => None,
+            _ => self.slot_mut(kind).as_mut(),
+        }
     }
 
     fn slot_mut(&mut self, kind: RtpIngressKind) -> &mut Option<RtpInboundEndpoint> {
         match kind {
             RtpIngressKind::RouteSetup => &mut self.route_setup,
             RtpIngressKind::CpSvcMg => &mut self.cp_svc_mg,
+            RtpIngressKind::CpSvcMgOut => panic!("outbound CP RTP has its own slot"),
             RtpIngressKind::User => &mut self.user,
         }
     }
+}
+
+fn allocate_tcid(generation: u64) -> io::Result<u64> {
+    let serial = NEXT_TCID.fetch_add(1, Ordering::Relaxed);
+    if serial > u64::from(u32::MAX) {
+        return Err(invalid("HPR RTP identifier space exhausted"));
+    }
+    let id = ASSIGNOR | ((generation & 0x3fff_ffff) << 32) | (serial & 0xffff_ffff);
+    if id & RESERVED != 0 {
+        return Err(invalid("invalid allocated RTP identifier"));
+    }
+    Ok(id)
 }
 
 fn kind_for(topic: &RtpSetupTopic) -> RtpIngressKind {

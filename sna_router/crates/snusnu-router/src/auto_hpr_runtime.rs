@@ -9,9 +9,12 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    sync::atomic::Ordering,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -24,6 +27,7 @@ use crate::{
 };
 use router_core::{
     hpr_control_bootstrap::HprControlBootstrap,
+    hpr_cp_initiator::{CpInitiatorPhase, ReciprocalCpSession},
     hpr_cp_management::CpManagementResponder,
     hpr_ip_activation::Phase,
     hpr_route_setup::{RouteSetupGds, RouteSetupKind},
@@ -45,6 +49,8 @@ const MAX_PENDING_RTP_MESSAGES: usize = 64;
 const MAX_PENDING_RTP_BYTES: usize = 128 * 1024;
 const MAX_PENDING_CP_REPLIES: usize = 16;
 const MAX_PENDING_CP_REPLY_BYTES: usize = 64 * 1024;
+static NEXT_CP_NONCE: AtomicU64 = AtomicU64::new(1);
+static CP_NONCE_SEED: OnceLock<u64> = OnceLock::new();
 
 fn protocol(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
@@ -55,6 +61,19 @@ fn as_wire_name(value: &router_core::session::QualifiedName) -> wire::SnaName {
         netid: value.netid.clone(),
         name: value.name.clone(),
     }
+}
+
+fn reciprocal_nonce() -> u64 {
+    let seed = *CP_NONCE_SEED.get_or_init(|| {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        time ^ u64::from(std::process::id()).rotate_left(32)
+    });
+    let serial = NEXT_CP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let span = (1u64 << 62) - 1;
+    ((u128::from(seed) + u128::from(serial)) % u128::from(span)) as u64 + 1
 }
 
 fn user_nce_label(control: &[u8]) -> io::Result<Vec<u8>> {
@@ -91,6 +110,9 @@ struct DirectHprRuntime {
     cp_management: Option<CpManagementResponder>,
     pending_cp_replies: VecDeque<Vec<u8>>,
     pending_cp_reply_bytes: usize,
+    reciprocal_cp: Option<ReciprocalCpSession>,
+    pending_reciprocal_replies: VecDeque<Vec<u8>>,
+    pending_reciprocal_reply_bytes: usize,
     switch: SessionSwitch,
     session: Option<ActiveHprSession>,
     pending_rtp: std::collections::VecDeque<RtpIngress>,
@@ -112,6 +134,9 @@ impl DirectHprRuntime {
             route_reply: None,
             pending_cp_replies: VecDeque::new(),
             pending_cp_reply_bytes: 0,
+            reciprocal_cp: None,
+            pending_reciprocal_replies: VecDeque::new(),
+            pending_reciprocal_reply_bytes: 0,
             switch,
             session: None,
             pending_rtp: std::collections::VecDeque::new(),
@@ -135,13 +160,16 @@ impl DirectHprRuntime {
     }
 
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
+        self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
         self.try_cp_replies(link, now_us)?;
+        self.try_reciprocal_replies(link, now_us)?;
         while let Some(message) = self.pending_rtp.front().cloned() {
             let result = match message.kind {
                 RtpIngressKind::RouteSetup => self.route_message(link, hub, &message, now_us),
                 RtpIngressKind::User => self.user_message(hub, &message),
                 RtpIngressKind::CpSvcMg => self.cp_message(&message),
+                RtpIngressKind::CpSvcMgOut => self.reciprocal_cp_message(&message),
             };
             if result
                 .as_ref()
@@ -154,8 +182,113 @@ impl DirectHprRuntime {
             self.pending_rtp_bytes -= message.bytes.len();
             self.try_route_reply(link, now_us)?;
             self.try_cp_replies(link, now_us)?;
+            self.try_reciprocal_replies(link, now_us)?;
         }
         self.pump_session(link, hub, now_us)
+    }
+
+    fn try_open_reciprocal_cp(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        if self.reciprocal_cp.is_none() {
+            let nonce = reciprocal_nonce();
+            self.reciprocal_cp = Some(
+                ReciprocalCpSession::new(self.bootstrap.clone(), nonce)
+                    .map_err(|error| protocol(format!("HPR reciprocal CP BIND: {error}")))?,
+            );
+        }
+        let session = self.reciprocal_cp.as_mut().unwrap();
+        if session.phase() != CpInitiatorPhase::BindPrepared {
+            return Ok(());
+        }
+        let bind = session
+            .prepare_bind()
+            .map_err(|error| protocol(format!("HPR reciprocal CP BIND: {error}")))?;
+        if self.rtp.open_cp(link, bind, now_us)? {
+            session
+                .mark_bind_sent()
+                .map_err(|error| protocol(format!("HPR reciprocal CP BIND send: {error}")))?;
+            tracing::info!(local_cp = %self.bootstrap.local.cp,
+                peer_cp = %self.bootstrap.peer.cp,
+                generation = self.bootstrap.generation.get(),
+                "HPR reciprocal CP BIND transmitted");
+        }
+        Ok(())
+    }
+
+    fn reciprocal_cp_message(&mut self, message: &RtpIngress) -> io::Result<()> {
+        if !self.pending_reciprocal_replies.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "HPR reciprocal CP response pending",
+            ));
+        }
+        let scope = self
+            .rtp
+            .cp_out_scope()
+            .ok_or_else(|| protocol("HPR reciprocal CP RTP scope missing"))?;
+        let mut candidate = self
+            .reciprocal_cp
+            .as_ref()
+            .ok_or_else(|| protocol("HPR reciprocal CP session missing"))?
+            .clone();
+        let replies = candidate
+            .ingest(scope, message.observation, &message.bytes)
+            .map_err(|error| protocol(format!("HPR reciprocal CP BIU rejected: {error}")))?;
+        let reply_bytes = replies.iter().try_fold(0usize, |used, reply| {
+            used.checked_add(reply.len())
+                .ok_or_else(|| protocol("HPR reciprocal CP reply size overflow"))
+        })?;
+        if replies.len() > MAX_PENDING_CP_REPLIES || reply_bytes > MAX_PENDING_CP_REPLY_BYTES {
+            return Err(protocol("HPR reciprocal CP response exceeds queue limits"));
+        }
+        if candidate.phase() == CpInitiatorPhase::Active {
+            tracing::info!(local_cp = %self.bootstrap.local.cp,
+                peer_cp = %self.bootstrap.peer.cp,
+                generation = self.bootstrap.generation.get(),
+                "HPR reciprocal CP session active");
+        }
+        self.reciprocal_cp = Some(candidate);
+        self.pending_reciprocal_reply_bytes = reply_bytes;
+        self.pending_reciprocal_replies.extend(replies);
+        Ok(())
+    }
+
+    fn try_reciprocal_replies(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        while let Some(reply) = self.pending_reciprocal_replies.front() {
+            let marks_capabilities = self
+                .reciprocal_cp
+                .as_ref()
+                .is_some_and(|session| session.phase() == CpInitiatorPhase::CapabilitiesPrepared);
+            if marks_capabilities {
+                let prepared = self
+                    .reciprocal_cp
+                    .as_ref()
+                    .unwrap()
+                    .prepare_capabilities()
+                    .map_err(|error| {
+                        protocol(format!("HPR reciprocal CP capabilities: {error}"))
+                    })?;
+                if prepared != reply {
+                    return Err(protocol(
+                        "HPR reciprocal CP reply differs from prepared capabilities",
+                    ));
+                }
+            }
+            if !self.rtp.send_cp(link, reply, now_us)? {
+                break;
+            }
+            self.pending_reciprocal_reply_bytes -= reply.len();
+            self.pending_reciprocal_replies.pop_front();
+            if marks_capabilities {
+                self.reciprocal_cp
+                    .as_mut()
+                    .unwrap()
+                    .mark_capabilities_sent()
+                    .map_err(|error| {
+                        protocol(format!("HPR reciprocal CP capabilities send: {error}"))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     fn cp_message(&mut self, message: &RtpIngress) -> io::Result<()> {
@@ -1015,6 +1148,16 @@ mod tests {
         assert_eq!(runtime.pending_cp_reply_bytes, 2);
         assert!(runtime.route_setup.is_none());
         assert!(!runtime.user_route_authorized);
+    }
+
+    #[test]
+    fn reciprocal_cp_nonce_is_distinct_and_valid_for_bind_address() {
+        let first = reciprocal_nonce();
+        let second = reciprocal_nonce();
+        assert_ne!(first, second);
+        assert_ne!(first, 0);
+        assert_eq!(first >> 62, 0);
+        assert_eq!(second >> 62, 0);
     }
 
     #[test]

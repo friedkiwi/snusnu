@@ -90,7 +90,7 @@ pub enum EndpointError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BaseArb {
+pub(crate) struct BaseArb {
     /// Conservative interval derived from the peer's Base setup operating
     /// range, in microseconds. Rate replies can lengthen it.
     interval_us: u64,
@@ -103,7 +103,9 @@ struct BaseArb {
 }
 
 impl BaseArb {
-    fn from_setup(segment: crate::hpr_rtp::RtpOptionalSegment<'_>) -> Result<Self, EndpointError> {
+    pub(crate) fn from_setup(
+        segment: crate::hpr_rtp::RtpOptionalSegment<'_>,
+    ) -> Result<Self, EndpointError> {
         let data = segment.data;
         if data.len() != 18 || data[0] != 0 || data[1] != 0 {
             return Err(EndpointError::InvalidArb);
@@ -123,7 +125,7 @@ impl BaseArb {
         })
     }
 
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         segment: crate::hpr_rtp::RtpOptionalSegment<'_>,
     ) -> Result<(), EndpointError> {
@@ -170,7 +172,7 @@ impl BaseArb {
         Ok(())
     }
 
-    fn check_send_time(&self, now_us: u64) -> Result<(), EndpointError> {
+    pub(crate) fn check_send_time(&self, now_us: u64) -> Result<(), EndpointError> {
         if self.last_sent_us.is_some_and(|last| now_us < last) {
             return Err(EndpointError::ClockMovedBackwards);
         }
@@ -180,7 +182,7 @@ impl BaseArb {
         Ok(())
     }
 
-    fn sent(&mut self, now_us: u64, nlp_bytes: usize) -> Result<(), EndpointError> {
+    pub(crate) fn sent(&mut self, now_us: u64, nlp_bytes: usize) -> Result<(), EndpointError> {
         self.check_send_time(now_us)?;
         self.last_sent_us = Some(now_us);
         let capacity_interval_us = (nlp_bytes as u64)
@@ -189,6 +191,16 @@ impl BaseArb {
         self.next_send_not_before_us =
             now_us.saturating_add(self.interval_us.max(capacity_interval_us));
         Ok(())
+    }
+
+    pub(crate) fn measurement_us(&self, now_us: u64) -> u32 {
+        self.last_sent_us
+            .map_or(self.interval_us, |last| now_us.saturating_sub(last).max(1))
+            .min(u64::from(u32::MAX)) as u32
+    }
+
+    pub(crate) fn last_sent_us(&self) -> u64 {
+        self.last_sent_us.unwrap_or(0)
     }
 }
 
@@ -795,7 +807,7 @@ impl RtpInboundEndpoint {
     }
 }
 
-fn encode_data_nlp(
+pub(crate) fn encode_data_nlp(
     tcid: u64,
     path: &EndpointPath,
     bsn: u32,
@@ -829,7 +841,7 @@ fn encode_data_nlp(
     Ok(nlp)
 }
 
-fn encode_status_nlp(
+pub(crate) fn encode_status_nlp(
     tcid: u64,
     path: &EndpointPath,
     sync: u16,
