@@ -10,7 +10,6 @@ use crate::{
     virtual_native_cp::VirtualNativeCp,
 };
 use router_core::{
-    fixed_pacing::is_canonical_ipr,
     native_management::{ManagementSession, Phase as ResponderPhase},
     native_management_initiator::{NativeManagementInitiator, Phase as ManagementPhase},
     xid3::Xid3,
@@ -80,6 +79,7 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     tcp_user_output_kind: Option<TcpUserOutputKind>,
     tcp_user_output_queued: bool,
     expedited_ack: Option<TcpRecord>,
+    expedited_native_completed: bool,
     user_teardown: Option<ReverseUserTeardown>,
     native_user_close: Option<NativeUserClose>,
     tcp_user_writes: VecDeque<TcpUserOutputKind>,
@@ -124,6 +124,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             tcp_user_output_kind: None,
             tcp_user_output_queued: false,
             expedited_ack: None,
+            expedited_native_completed: false,
             user_teardown: None,
             native_user_close: None,
             tcp_user_writes: VecDeque::new(),
@@ -280,6 +281,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.udp_user_completion.take()
     }
 
+    pub(crate) fn take_expedited_native_completed(&mut self) -> bool {
+        std::mem::take(&mut self.expedited_native_completed)
+    }
+
     /// The gateway calls this only after the final byte of each queued user
     /// TCP record was written, in queue order.
     pub(crate) fn complete_tcp_user_records(&mut self, completed: usize) -> io::Result<()> {
@@ -363,6 +368,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.tcp_user_output_queued = false;
         self.tcp_user_output_kind = None;
         self.expedited_ack = None;
+        self.expedited_native_completed = false;
         self.user_teardown = None;
         self.native_user_close = None;
         self.tcp_user_writes.clear();
@@ -503,6 +509,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 NativeUserOutputKind::Grant => flow.mark_native_grant_enqueued(&piu)?,
                 NativeUserOutputKind::Expedited => {
                     flow.mark_expedited_native_enqueued(&piu)?;
+                    if self.expedited_native_completed {
+                        return Err(protocol("unclaimed TCP62 expedited native completion"));
+                    }
+                    self.expedited_native_completed = true;
                     self.tcp_user_output = self.expedited_ack.take();
                     self.tcp_user_output_kind = Some(TcpUserOutputKind::ExpeditedAck);
                 }
@@ -697,10 +707,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     );
                     self.tcp_user_output_kind = Some(TcpUserOutputKind::NativeAbort);
                     flow.close();
-                } else if piu.len() >= 9
-                    && piu[0] & 1 != 0
-                    && !(piu.len() == 9 && is_canonical_ipr(&piu[6..9], &piu[9..]))
-                {
+                } else if piu.len() >= 9 && piu[0] & 1 != 0 && piu[6..9] != [0x83, 1, 0] {
                     self.tcp_user_output = Some(flow.prepare_native_expedited(&piu)?.clone());
                     self.tcp_user_output_kind = Some(TcpUserOutputKind::Expedited);
                 } else {
@@ -1336,6 +1343,13 @@ mod tests {
         port.inner
             .incoming
             .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(
+                "2d0001020000830100000003",
+            ))));
+        port.poll(false).unwrap();
+        assert!(port.tcp_user_record().is_none()); // Adaptive IPR is local pacing.
+        port.inner
+            .incoming
+            .push_back(RouterEvent::Unit(RoutedUnit::SnaInformation(hex(
                 "2c000102800083a000",
             ))));
         port.poll(false).unwrap();
@@ -1369,6 +1383,8 @@ mod tests {
         assert!(port.tcp_user_record().is_none());
         port.inner.completed = 1;
         port.poll(false).unwrap();
+        assert!(port.take_expedited_native_completed());
+        assert!(!port.take_expedited_native_completed());
         let expedited_ack = port.tcp_user_record().unwrap().clone();
         assert_eq!(expedited_ack.bytes, hex("0000000503"));
         port.mark_tcp_user_record_enqueued(&expedited_ack).unwrap();
