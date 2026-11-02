@@ -254,6 +254,34 @@ fn pure_bridge_waits_for_remote_bind_and_native_ack_before_attach() {
 }
 
 #[test]
+fn route_free_bridge_learns_tp_only_from_validated_first_attach() {
+    let mut bridge = Bridge::new_dynamic_tp(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        1,
+    )
+    .unwrap();
+    let connect_record = bridge.begin_native_bind(&user_bind(), template()).unwrap();
+    let connect = Connect::decode(&connect_record.bytes).unwrap();
+    let response = bridge
+        .accept_connect_response(&positive_response(&connect))
+        .unwrap();
+    bridge.mark_native_bind_enqueued(&response).unwrap();
+    bridge.acknowledge_native_bind(1).unwrap();
+
+    let mut bad = first_user_attach();
+    bad[9 + 4] ^= 1;
+    assert!(bridge.first_attach(&bad).is_err());
+    assert_eq!(bridge.phase(), BridgePhase::Active);
+
+    let mut attach = first_user_attach();
+    attach[9 + 10..9 + 14].copy_from_slice(&[0xc1, 0xc2, 0xc3, 0xc4]);
+    let (_, route) = bridge.first_attach(&attach).unwrap();
+    assert_eq!(route.transaction_program, [0xc1, 0xc2, 0xc3, 0xc4]);
+}
+
+#[test]
 fn pure_bridge_reuses_management_address_only_after_teardown() {
     let mut bind = user_bind();
     bind[2..4].copy_from_slice(&[3, 4]);

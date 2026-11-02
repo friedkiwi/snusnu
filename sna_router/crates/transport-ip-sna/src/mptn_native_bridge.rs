@@ -33,7 +33,7 @@ pub struct Bridge {
     gateway: GatewaySession,
     management: ManagementBind,
     mode: String,
-    tp: [u8; 4],
+    tp: Option<[u8; 4]>,
     window: u8,
     offer: Option<UserBindOffer>,
     pacing: Option<UserPacingSession>,
@@ -66,6 +66,28 @@ impl Bridge {
         available: CompensationSet,
         management: ManagementBind,
         tp: [u8; 4],
+        window: u8,
+    ) -> io::Result<Self> {
+        Self::new_with_tp(policy, available, management, Some(tp), window)
+    }
+
+    /// Select the transaction program from the first validated FMH-5 Attach.
+    /// A route-free gateway cannot know the application's TP before the
+    /// native session arrives. Fixed-TP routes continue to use `new`.
+    pub fn new_dynamic_tp(
+        policy: BindPolicy,
+        available: CompensationSet,
+        management: ManagementBind,
+        window: u8,
+    ) -> io::Result<Self> {
+        Self::new_with_tp(policy, available, management, None, window)
+    }
+
+    fn new_with_tp(
+        policy: BindPolicy,
+        available: CompensationSet,
+        management: ManagementBind,
+        tp: Option<[u8; 4]>,
         window: u8,
     ) -> io::Result<Self> {
         if policy.plu != management.plu()
@@ -204,9 +226,23 @@ impl Bridge {
             self.gateway.complete_tcp_delivery(record.bytes.len())?;
             return Err(invalid("first user Attach lacks pacing indication"));
         }
+        let offer = self.offer.as_ref().unwrap();
+        let tp = match self.tp {
+            Some(tp) => tp,
+            None => {
+                // The FMH-5 parser validates the length and session before
+                // the TP field is read. The full route and PIP checks below
+                // still apply to this dynamically selected TP.
+                if router_core::user_fmh5::parse_first_user_attach(piu, offer).is_err() {
+                    self.gateway.complete_tcp_delivery(record.bytes.len())?;
+                    return Err(invalid("first user Attach is invalid"));
+                }
+                piu[19..23].try_into().expect("validated FMH-5 TP field")
+            }
+        };
         let route = match self.pacing.as_mut().unwrap().observe_first_attach(
-            self.offer.as_ref().unwrap(),
-            &self.tp,
+            offer,
+            &tp,
             piu,
         ) {
             Ok(route) => route,
@@ -216,6 +252,7 @@ impl Bridge {
                 return Err(invalid("first user Attach does not match TP route"));
             }
         };
+        self.tp = Some(tp);
         self.attach = Some(record.clone());
         self.phase = Phase::AttachPrepared;
         Ok((record, route))
