@@ -3,7 +3,7 @@
 
 use crate::{
     mptn_llc_reverse::ReverseLlcConfig, mptn_outbound_port::OutboundEndpoint,
-    native_probe::parse_tp,
+    mptn_ws_reverse::ReverseWsConfig, native_probe::parse_tp, remote::Config as WsConfig,
 };
 use router_core::xid3::Role;
 use serde::{Deserialize, Deserializer};
@@ -149,7 +149,7 @@ pub(crate) struct RouteConfig {
     /// Selects a TCP62 gateway circuit by the network-qualified destination
     /// LU in an incoming Connect. Omit for a gateway with one destination.
     pub(crate) destination_lu: Option<String>,
-    /// Required for a native LLC initiated MPTN session.
+    /// Required for a native LLC or concentrator initiated MPTN session.
     pub(crate) user_tp_hex: Option<String>,
     /// Bounded lifetime for one native LLC initiated MPTN circuit.
     pub(crate) timeout_seconds: Option<u64>,
@@ -380,6 +380,87 @@ impl RouterConfig {
             role: Role::Secondary,
             source_lu: source_lu.clone(),
             destination_lu: gateway.source_lu.clone(),
+            user_tp: parse_tp(user_tp_hex)?,
+            endpoint: OutboundEndpoint {
+                local_ip: gateway.local_ip,
+                peer_ip: gateway.peer_ip,
+            },
+            timeout: Duration::from_secs(timeout),
+        };
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    /// Resolve the one supported concentrator initiated MPTN circuit. The
+    /// explicit route direction distinguishes it from MPTN ingress through
+    /// the same gateway profile.
+    pub(crate) fn reverse_ws_config(&self) -> io::Result<Option<ReverseWsConfig>> {
+        let Some(route) = self.route.iter().find(|route| {
+            self.remote.iter().any(|remote| remote.id == route.from)
+                && self
+                    .mptn_gateway
+                    .iter()
+                    .any(|gateway| gateway.id == route.to)
+        }) else {
+            return Ok(None);
+        };
+        if !self.llc.is_empty()
+            || !self.ee.is_empty()
+            || !self.anynet.is_empty()
+            || !self.hpr_lan.is_empty()
+            || self.remote.len() != 1
+            || self.mptn_gateway.len() != 1
+            || self.route.len() != 1
+            || !route.bidirectional
+            || !matches!(route.converter, Some(RouteConverter::MptnLu62))
+            || route.proxy_mac.is_some()
+        {
+            return Err(invalid("concentrator to MPTN requires one concentrator, one gateway and one bidirectional route"));
+        }
+        let remote = &self.remote[0];
+        let gateway = &self.mptn_gateway[0];
+        let source_cp = remote
+            .target_cp
+            .as_deref()
+            .ok_or_else(|| invalid("concentrator to MPTN requires target_cp"))?;
+        let source_lu = remote
+            .target_lu
+            .as_deref()
+            .ok_or_else(|| invalid("concentrator to MPTN requires target_lu"))?;
+        let selected = route
+            .destination_lu
+            .as_deref()
+            .unwrap_or(&gateway.destination_lu);
+        if source_cp != gateway.peer_cp || source_lu != selected {
+            return Err(invalid("concentrator source CP/LU must match TCP62 gateway peer CP and route destination LU"));
+        }
+        let user_tp_hex = route
+            .user_tp_hex
+            .as_deref()
+            .ok_or_else(|| invalid("concentrator to MPTN requires route user_tp_hex"))?;
+        let timeout = route.timeout_seconds.unwrap_or(600);
+        if !(1..=600).contains(&timeout) {
+            return Err(invalid(
+                "concentrator to MPTN timeout_seconds must be 1..=600",
+            ));
+        }
+        let config = ReverseWsConfig {
+            remote: WsConfig {
+                url: remote.url.clone(),
+                bearer: remote.bearer_token()?,
+                local_cp: parse_cp(&gateway.local_cp)?,
+                target_cp: parse_cp(source_cp)?,
+                target_lu: Some(parse_cp(source_lu)?),
+            },
+            hosted_cp: gateway.local_cp.clone(),
+            hosted_lu: gateway.source_lu.clone(),
+            source_cp: source_cp.to_owned(),
+            source_lu: source_lu.to_owned(),
+            local_station: gateway.local_station.clone(),
+            local_node_id: u32::from_str_radix(&gateway.local_node_id, 16)
+                .map_err(|_| invalid("invalid TCP62 gateway local_node_id"))?
+                .to_be_bytes(),
+            tg_number: gateway.tg_number,
             user_tp: parse_tp(user_tp_hex)?,
             endpoint: OutboundEndpoint {
                 local_ip: gateway.local_ip,
@@ -701,10 +782,13 @@ impl RouterConfig {
                 )));
             }
             if (route.user_tp_hex.is_some() || route.timeout_seconds.is_some())
-                && !matches!((source_kind, target_kind), ("llc", "mptn_gateway"))
+                && !matches!(
+                    (source_kind, target_kind),
+                    ("llc", "mptn_gateway") | ("remote", "mptn_gateway")
+                )
             {
                 return Err(invalid(format!(
-                    "route {} -> {} user_tp_hex and timeout_seconds require LLC to TCP62 gateway",
+                    "route {} -> {} user_tp_hex and timeout_seconds require a native source to TCP62 gateway",
                     route.from, route.to
                 )));
             }
@@ -736,6 +820,9 @@ impl RouterConfig {
                     ("mptn_gateway", "remote") | ("remote", "mptn_gateway")
                 ) && matches!(converter, RouteConverter::MptnLu62)
                 {
+                    if source_kind == "remote" {
+                        self.reverse_ws_config()?;
+                    }
                     if source_kind != "mptn_gateway" {
                         add_directed(&mut directed, &route.from, &route.to)?;
                     }
@@ -1393,6 +1480,59 @@ converter = "mptn_lu62"
                 .to_string()
                 .contains("does not match")
         );
+    }
+
+    #[test]
+    fn concentrator_to_mptn_reverse_requires_exact_explicit_source() {
+        let config = r#"
+[[mptn]]
+profile = "gateway"
+id = "bob"
+local_ip = "10.99.4.11"
+peer_ip = "10.99.4.3"
+local_cp = "QABOB.SNAB"
+peer_cp = "QAALICE.SNAA"
+source_lu = "QABOB.SNAB"
+destination_lu = "QAALICE.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+[[concentrator]]
+id = "upstream"
+url = "ws://127.0.0.1:8081/router/v1/ws"
+target_cp = "QAALICE.SNAA"
+target_lu = "QAALICE.SNAA"
+token = ""
+[[route]]
+from = "upstream"
+to = "bob"
+converter = "mptn_lu62"
+destination_lu = "QAALICE.SNAA"
+user_tp_hex = "D7C1E2E3"
+timeout_seconds = 120
+"#;
+        let parsed = parse(config);
+        parsed.validate().unwrap();
+        let reverse = parsed.reverse_ws_config().unwrap().unwrap();
+        assert_eq!(reverse.hosted_lu, "QABOB.SNAB");
+        assert_eq!(reverse.source_lu, "QAALICE.SNAA");
+        assert_eq!(reverse.timeout, Duration::from_secs(120));
+        assert_eq!(reverse.endpoint.peer_ip.to_string(), "10.99.4.3");
+        let inbound = parse(&config.replace(
+            "from = \"upstream\"\nto = \"bob\"",
+            "from = \"bob\"\nto = \"upstream\"",
+        ));
+        inbound.validate().unwrap_err();
+        assert!(inbound.reverse_ws_config().unwrap().is_none());
+        assert!(parse(&config.replace(
+            "target_lu = \"QAALICE.SNAA\"",
+            "target_lu = \"QAALICE.OTHER\""
+        ))
+        .validate()
+        .is_err());
+        assert!(parse(&config.replace("user_tp_hex = \"D7C1E2E3\"", ""))
+            .validate()
+            .is_err());
     }
 
     #[test]
