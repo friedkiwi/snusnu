@@ -20,8 +20,8 @@ var versionRequestPrefix = []byte{0x12, 0xff, 0x01, 0x02, 0x2b, 0x02}
 // the local six-byte system type. The request system type is opaque; accepting
 // it does not authenticate the source LU.
 func VersionResponse(request []byte, systemType string) ([]byte, error) {
-	if err := validateRecord(request); err != nil || len(request) != 15 ||
-		!bytes.Equal(request[2:8], versionRequestPrefix) || request[14] != 0 {
+	if err := validateRecord(request); err != nil || (len(request) != 14 && len(request) != 15) ||
+		!bytes.Equal(request[2:8], versionRequestPrefix) || (len(request) == 15 && request[14] != 0) {
 		return nil, ErrRecord
 	}
 	if len(systemType) != 6 {

@@ -191,7 +191,7 @@ func (s *localSNAService) dispatchSession(c *localSNACircuit, event *wire.Sessio
 			}
 			return c.management.ReceiveIPR([]byte{0x2e, 0, virtualFID2DAF, virtualFID2OAF, 0, 0, 0x83, 1, 0})
 		}
-		if c.user == nil || value.PacingCredit.Normal != 1 {
+		if c.user == nil || value.PacingCredit.Normal != 3 {
 			return errLocalSNA
 		}
 		return c.user.ReceiveIPR([]byte{0x2f, 0, virtualFID2DAF, virtualFID2OAF, 0, 0, 0x83, 1, 0})
@@ -322,6 +322,11 @@ func (s *localSNAService) sessionInformation(c *localSNACircuit, request []byte)
 			}
 			return nil
 		}
+		if len(request) < 10 || !((request[6] == 1 && request[7] == 0x94 && request[8] == 0x20) ||
+			(request[6] == 3 && ((request[7] == 0x90 && request[8] == 0x20) || (request[7] == 0xa0 && request[8] == 0)))) {
+			return errLocalSNA
+		}
+		request[7] |= 1
 		var responseRU []byte
 		var err error
 		if !c.appVersioned {
@@ -359,6 +364,10 @@ func (s *localSNAService) sessionInformation(c *localSNACircuit, request []byte)
 		return nil
 	}
 	if c.user.Phase() == lu62.UserConfirmed {
+		if len(request) != 10 || request[6] != 0x4b || request[7] != 0x90 || request[8] != 0 || request[9] != 0x70 {
+			return errLocalSNA
+		}
+		request[7] |= 1
 		grant, reply, err := c.user.PrepareBIS(request)
 		if err != nil {
 			return err

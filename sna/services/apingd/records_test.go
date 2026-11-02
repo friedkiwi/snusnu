@@ -25,6 +25,16 @@ func TestV4R4APINGVersionAndEcho(t *testing.T) {
 	}
 }
 
+func TestLiveV5R4APINGVersionRecord(t *testing.T) {
+	// V5R4 EE omits the trailing reserved zero from the V4R4 request.
+	request, _ := hex.DecodeString("000e12ff01022b0289f561d6e200")
+	want, _ := hex.DecodeString("000e12ff01022b024f532f343030")
+	got, err := VersionResponse(request, "OS/400")
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("live V5R4 version: %x, %v", got, err)
+	}
+}
+
 func TestRejectMalformedRecords(t *testing.T) {
 	for _, input := range [][]byte{{}, {0}, {0, 4, 1}, {0, 2, 0}} {
 		if _, err := Echo([][]byte{input}); !errors.Is(err, ErrRecord) {

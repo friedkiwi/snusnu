@@ -77,8 +77,8 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 		t.Fatalf("Attach grant: %+v", grant)
 	}
 	expectTestBody(t, conn, "credit")
-	version, _ := hex.DecodeString("000f12ff01022b02d6e261f4f0f000")
-	request := append([]byte{0, 2, 1, 0x95, 0x20}, version...)
+	version, _ := hex.DecodeString("000e12ff01022b0289f561d6e200")
+	request := append([]byte{0, 2, 1, 0x94, 0x20}, version...)
 	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: request}}})
 	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 {
 		t.Fatalf("version grant: %+v", grant)
@@ -91,9 +91,9 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 	expectTestBody(t, conn, "credit")
 	outbound += uint64(len(reply.ReducedUnit))
 	ack(outbound)
-	send(&wire.SessionEvent{Event: &wire.SessionEvent_PacingCredit{PacingCredit: &wire.SessionPacingCredit{Normal: 1}}})
+	send(&wire.SessionEvent{Event: &wire.SessionEvent_PacingCredit{PacingCredit: &wire.SessionPacingCredit{Normal: 3}}})
 	packet, _ := hex.DecodeString("001412ff00000000000000000000000000000000")
-	request = append([]byte{0, 3, 3, 0x91, 0x20}, packet...)
+	request = append([]byte{0, 3, 3, 0x90, 0x20}, packet...)
 	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: request}}})
 	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 {
 		t.Fatalf("echo grant: %+v", grant)
@@ -106,7 +106,7 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 	outbound += uint64(len(reply.ReducedUnit))
 	ack(outbound)
 	noEcho, _ := hex.DecodeString("000812ff00000000000812ff00000000")
-	request = append([]byte{0, 4, 3, 0xa1, 0}, noEcho...)
+	request = append([]byte{0, 4, 3, 0xa0, 0}, noEcho...)
 	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: request}}})
 	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 {
 		t.Fatalf("no-echo grant: %+v", grant)
@@ -126,7 +126,7 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 	expectTestBody(t, conn, "credit")
 	outbound += uint64(len(reply.ReducedUnit))
 	ack(outbound)
-	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: []byte{0, 6, 0x4b, 0x91, 0, 0x70}}}})
+	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: []byte{0, 6, 0x4b, 0x90, 0, 0x70}}}})
 	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 {
 		t.Fatalf("BIS grant: %+v", grant)
 	}
