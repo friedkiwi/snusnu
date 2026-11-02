@@ -279,7 +279,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8, schemaV9, schemaV10} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8, schemaV9, schemaV10, schemaV11} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -384,6 +384,15 @@ var schemaV9 = []string{
 
 var schemaV10 = []string{
 	`CREATE TABLE concentrator_instance (id INTEGER PRIMARY KEY CHECK(id=1),instance_id TEXT NOT NULL,heartbeat_at BIGINT NOT NULL)`,
+}
+
+var schemaV11 = []string{
+	`CREATE INDEX idx_sna_circuit_history_closed_id ON sna_circuit_history(closed_at,id)`,
+	`CREATE INDEX idx_sna_circuit_history_state_closed_id ON sna_circuit_history(state,closed_at,id)`,
+	`CREATE INDEX idx_sna_circuit_history_source_closed_id ON sna_circuit_history(source_owner_id,closed_at,id)`,
+	`CREATE INDEX idx_sna_circuit_history_target_closed_id ON sna_circuit_history(target_owner_id,closed_at,id)`,
+	`CREATE INDEX idx_sna_circuit_history_source_router ON sna_circuit_history(source_router_id)`,
+	`CREATE INDEX idx_sna_circuit_history_target_router ON sna_circuit_history(target_router_id)`,
 }
 
 var ErrNotFound = errors.New("not found")

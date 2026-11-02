@@ -15,6 +15,7 @@ import (
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
+	"github.com/google/uuid"
 )
 
 const snaCircuitProfile = "Native DLC/PIU"
@@ -47,7 +48,9 @@ type circuitView struct {
 type circuitHistoryPage struct {
 	Items, Pending                  []circuitView
 	Search, State, Reason, From, To string
-	Page, PageSize, Total, Pages    int
+	CursorID, Direction             string
+	CursorClosed                    int64
+	PageSize                        int
 	PrevURL, NextURL                string
 }
 
@@ -156,10 +159,6 @@ func (h *routerHub) liveCircuits(ownerID string, all bool) []circuitView {
 }
 
 func circuitHistoryFilter(r *http.Request) circuitHistoryPage {
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
 	size, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
 	if size < 10 {
 		size = 50
@@ -171,7 +170,16 @@ func circuitHistoryFilter(r *http.Request) circuitHistoryPage {
 	if state != "closed" && state != "reset" {
 		state = ""
 	}
-	return circuitHistoryPage{Search: strings.TrimSpace(r.URL.Query().Get("q")), State: state, Reason: strings.TrimSpace(r.URL.Query().Get("reason")), From: r.URL.Query().Get("from"), To: r.URL.Query().Get("to"), Page: page, PageSize: size}
+	direction := r.URL.Query().Get("direction")
+	if direction != "older" && direction != "newer" {
+		direction = ""
+	}
+	cursorClosed, _ := strconv.ParseInt(r.URL.Query().Get("cursor_closed"), 10, 64)
+	cursorID := r.URL.Query().Get("cursor_id")
+	if cursorClosed <= 0 || len(cursorID) > 64 || cursorID == "" {
+		cursorClosed, cursorID, direction = 0, "", ""
+	}
+	return circuitHistoryPage{Search: strings.TrimSpace(r.URL.Query().Get("q")), State: state, Reason: strings.TrimSpace(r.URL.Query().Get("reason")), From: r.URL.Query().Get("from"), To: r.URL.Query().Get("to"), CursorClosed: cursorClosed, CursorID: cursorID, Direction: direction, PageSize: size}
 }
 
 func historyWhere(filter circuitHistoryPage, ownerID string, all bool) (string, []any) {
@@ -190,10 +198,17 @@ func historyWhere(filter circuitHistoryPage, ownerID string, all bool) (string, 
 		args = append(args, "%"+strings.ToLower(filter.Reason)+"%")
 	}
 	if filter.Search != "" {
-		like := "%" + strings.ToLower(filter.Search) + "%"
-		clauses = append(clauses, `(LOWER(h.id) LIKE ? OR LOWER(h.source_router_id) LIKE ? OR LOWER(h.source_router_name) LIKE ? OR LOWER(h.source_owner_id) LIKE ? OR LOWER(h.target_router_id) LIKE ? OR LOWER(h.target_router_name) LIKE ? OR LOWER(h.target_owner_id) LIKE ? OR LOWER(h.close_reason) LIKE ? OR LOWER(h.actor_id) LIKE ? OR LOWER(COALESCE(su.email,'')) LIKE ? OR LOWER(COALESCE(tu.email,'')) LIKE ?)`)
-		for i := 0; i < 11; i++ {
-			args = append(args, like)
+		if _, err := uuid.Parse(filter.Search); err == nil {
+			clauses = append(clauses, `(h.id=? OR h.source_router_id=? OR h.source_owner_id=? OR h.target_router_id=? OR h.target_owner_id=?)`)
+			for i := 0; i < 5; i++ {
+				args = append(args, filter.Search)
+			}
+		} else {
+			like := "%" + strings.ToLower(filter.Search) + "%"
+			clauses = append(clauses, `(LOWER(h.id) LIKE ? OR LOWER(h.source_router_id) LIKE ? OR LOWER(h.source_router_name) LIKE ? OR LOWER(h.source_owner_id) LIKE ? OR LOWER(h.target_router_id) LIKE ? OR LOWER(h.target_router_name) LIKE ? OR LOWER(h.target_owner_id) LIKE ? OR LOWER(h.close_reason) LIKE ? OR LOWER(h.actor_id) LIKE ? OR LOWER(COALESCE(su.email,'')) LIKE ? OR LOWER(COALESCE(tu.email,'')) LIKE ?)`)
+			for i := 0; i < 11; i++ {
+				args = append(args, like)
+			}
 		}
 	}
 	if value, err := time.Parse("2006-01-02", filter.From); err == nil {
@@ -213,18 +228,25 @@ func historyWhere(filter circuitHistoryPage, ownerID string, all bool) (string, 
 func (a *App) circuitHistoryRows(ctx context.Context, ownerID string, all bool, page *circuitHistoryPage) error {
 	from := " FROM sna_circuit_history h LEFT JOIN users su ON su.id=h.source_owner_id LEFT JOIN users tu ON tu.id=h.target_owner_id"
 	where, args := historyWhere(*page, ownerID, all)
-	if err := a.DB.Row(ctx, "SELECT COUNT(*)"+from+where, args...).Scan(&page.Total); err != nil {
-		return err
+	if page.CursorID != "" {
+		operator := "<"
+		if page.Direction == "newer" {
+			operator = ">"
+		}
+		clause := fmt.Sprintf("(h.closed_at%s? OR (h.closed_at=? AND h.id%s?))", operator, operator)
+		if where == "" {
+			where = " WHERE " + clause
+		} else {
+			where += " AND " + clause
+		}
+		args = append(args, page.CursorClosed, page.CursorClosed, page.CursorID)
 	}
-	page.Pages = (page.Total + page.PageSize - 1) / page.PageSize
-	if page.Pages == 0 {
-		page.Pages = 1
+	order := "DESC"
+	if page.Direction == "newer" {
+		order = "ASC"
 	}
-	if page.Page > page.Pages {
-		page.Page = page.Pages
-	}
-	query := "SELECT h.id,h.source_router_id,h.source_router_name,h.source_owner_id,h.target_router_id,h.target_router_name,h.target_owner_id,h.profile,h.opened_at,h.activated_at,h.closed_at,h.state,h.close_reason,h.source_bytes,h.target_bytes,h.source_events,h.target_events,h.peak_queued_bytes,h.actor_type,h.actor_id" + from + where + " ORDER BY h.closed_at DESC,h.id DESC LIMIT ? OFFSET ?"
-	queryArgs := append(append([]any{}, args...), page.PageSize, (page.Page-1)*page.PageSize)
+	query := "SELECT h.id,h.source_router_id,h.source_router_name,h.source_owner_id,h.target_router_id,h.target_router_name,h.target_owner_id,h.profile,h.opened_at,h.activated_at,h.closed_at,h.state,h.close_reason,h.source_bytes,h.target_bytes,h.source_events,h.target_events,h.peak_queued_bytes,h.actor_type,h.actor_id" + from + where + " ORDER BY h.closed_at " + order + ",h.id " + order + " LIMIT ?"
+	queryArgs := append(append([]any{}, args...), page.PageSize+1)
 	rows, err := a.DB.Query(ctx, query, queryArgs...)
 	if err != nil {
 		return err
@@ -242,13 +264,26 @@ func (a *App) circuitHistoryRows(ctx context.Context, ownerID string, all bool, 
 	if err = rows.Err(); err != nil {
 		return err
 	}
+	hasMore := len(page.Items) > page.PageSize
+	if hasMore {
+		page.Items = page.Items[:page.PageSize]
+	}
+	if page.Direction == "newer" {
+		for left, right := 0, len(page.Items)-1; left < right; left, right = left+1, right-1 {
+			page.Items[left], page.Items[right] = page.Items[right], page.Items[left]
+		}
+	}
 	values := rValues(*page)
-	if page.Page > 1 {
-		values.Set("page", strconv.Itoa(page.Page-1))
+	if len(page.Items) != 0 && ((page.Direction == "older" && page.CursorID != "") || (page.Direction == "newer" && hasMore)) {
+		values.Set("direction", "newer")
+		values.Set("cursor_closed", strconv.FormatInt(page.Items[0].ClosedAt, 10))
+		values.Set("cursor_id", page.Items[0].ID)
 		page.PrevURL = "?" + values.Encode()
 	}
-	if page.Page < page.Pages {
-		values.Set("page", strconv.Itoa(page.Page+1))
+	if len(page.Items) != 0 && ((page.Direction == "newer" && page.CursorID != "") || (page.Direction != "newer" && hasMore)) {
+		values.Set("direction", "older")
+		values.Set("cursor_closed", strconv.FormatInt(page.Items[len(page.Items)-1].ClosedAt, 10))
+		values.Set("cursor_id", page.Items[len(page.Items)-1].ID)
 		page.NextURL = "?" + values.Encode()
 	}
 	return nil

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -136,6 +137,8 @@ type LogEntry struct {
 	OccurredAt                                                                                                      int64
 }
 
+var ErrLogTargetGone = errors.New("router log target no longer exists")
+
 func (s *Store) AppendRouterLog(ctx context.Context, x LogEntry) error {
 	if x.Direction != "inbound" && x.Direction != "outbound" && x.Direction != "system" {
 		return errors.New("invalid log direction")
@@ -152,19 +155,34 @@ func (s *Store) AppendRouterLog(ctx context.Context, x LogEntry) error {
 	if x.DetailsJSON != "" && !json.Valid([]byte(x.DetailsJSON)) {
 		return errors.New("invalid decoded JSON")
 	}
-	r, err := s.RouterByID(ctx, x.RouterID)
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if x.OwnerID != "" && x.OwnerID != r.OwnerID {
+	defer tx.Rollback()
+	var ownerID string
+	if err = tx.QueryRowContext(ctx, s.Q("SELECT owner_id FROM routers WHERE id=?"), x.RouterID).Scan(&ownerID); errors.Is(err, sql.ErrNoRows) {
+		return ErrLogTargetGone
+	} else if err != nil {
+		return err
+	}
+	if x.OwnerID != "" && x.OwnerID != ownerID {
 		return errors.New("log owner mismatch")
 	}
 	var peer any
 	if x.PeerUserID != "" {
-		peer = x.PeerUserID
+		var exists int
+		if err = tx.QueryRowContext(ctx, s.Q("SELECT 1 FROM users WHERE id=?"), x.PeerUserID).Scan(&exists); err == nil {
+			peer = x.PeerUserID
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 	}
-	_, err = s.Exec(ctx, "INSERT INTO router_logs(id,router_id,owner_id,peer_user_id,direction,level,event_type,netid,node_name,source_ip,summary,details_json,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", RandomUUID(), x.RouterID, r.OwnerID, peer, x.Direction, x.Level, x.EventType, x.NetID, x.NodeName, x.SourceIP, x.Summary, x.DetailsJSON, Now())
-	return err
+	_, err = tx.ExecContext(ctx, s.Q("INSERT INTO router_logs(id,router_id,owner_id,peer_user_id,direction,level,event_type,netid,node_name,source_ip,summary,details_json,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"), RandomUUID(), x.RouterID, ownerID, peer, x.Direction, x.Level, x.EventType, x.NetID, x.NodeName, x.SourceIP, x.Summary, x.DetailsJSON, Now())
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) SearchRouterLogs(ctx context.Context, routerID, q string) ([]LogEntry, error) {
 	return s.searchLogs(ctx, "l.router_id=?", []any{routerID}, q)

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -41,16 +42,37 @@ func TestCircuitHistoryWriteFailureTriggersFatalDrain(t *testing.T) {
 func TestCircuitHistorySearchPagingAndOwnerScope(t *testing.T) {
 	a := testApp(t)
 	owner, other := store.RandomUUID(), store.RandomUUID()
+	var inserted []string
 	for i := 0; i < 3; i++ {
-		insertCircuitHistory(t, a, circuitHistoryRecord{ID: store.RandomUUID(), SourceRouterID: store.RandomUUID(), SourceRouterName: fmt.Sprintf("Needle router %d", i), SourceOwnerID: owner, TargetRouterID: store.RandomUUID(), TargetRouterName: "Peer", TargetOwnerID: other, Profile: snaCircuitProfile, OpenedAt: 10, ActivatedAt: 11, ClosedAt: int64(20 + i), State: "reset", CloseReason: "operator reset", ActorType: "admin", ActorID: "admin@example.com"})
+		id := fmt.Sprintf("00000000-0000-0000-0000-00000000000%d", i+1)
+		inserted = append(inserted, id)
+		insertCircuitHistory(t, a, circuitHistoryRecord{ID: id, SourceRouterID: store.RandomUUID(), SourceRouterName: fmt.Sprintf("Needle router %d", i), SourceOwnerID: owner, TargetRouterID: store.RandomUUID(), TargetRouterName: "Peer", TargetOwnerID: other, Profile: snaCircuitProfile, OpenedAt: 10, ActivatedAt: 11, ClosedAt: 20, State: "reset", CloseReason: "operator reset", ActorType: "admin", ActorID: "admin@example.com"})
 	}
 	insertCircuitHistory(t, a, circuitHistoryRecord{ID: store.RandomUUID(), SourceRouterID: store.RandomUUID(), SourceRouterName: "Unrelated", SourceOwnerID: other, TargetRouterID: store.RandomUUID(), TargetRouterName: "Peer", TargetOwnerID: other, Profile: snaCircuitProfile, OpenedAt: 10, ClosedAt: 30, State: "closed", CloseReason: "normal close"})
-	page := circuitHistoryPage{Search: "needle", State: "reset", Page: 2, PageSize: 2}
+	page := circuitHistoryPage{Search: "needle", State: "reset", PageSize: 2}
 	if err := a.circuitHistoryRows(context.Background(), owner, false, &page); err != nil {
 		t.Fatal(err)
 	}
-	if page.Total != 3 || page.Pages != 2 || page.Page != 2 || len(page.Items) != 1 || page.PrevURL == "" || page.NextURL != "" {
+	if len(page.Items) != 2 || page.Items[0].ID != inserted[2] || page.Items[1].ID != inserted[1] || page.PrevURL != "" || page.NextURL == "" {
 		t.Fatalf("unexpected page: %+v", page)
+	}
+
+	request := httptest.NewRequest("GET", "/circuits"+page.NextURL, nil)
+	next := circuitHistoryFilter(request)
+	if err := a.circuitHistoryRows(context.Background(), owner, false, &next); err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Items) != 1 || next.Items[0].ID != inserted[0] || next.PrevURL == "" || next.NextURL != "" {
+		t.Fatalf("unexpected next page: %+v", next)
+	}
+
+	request = httptest.NewRequest("GET", "/circuits"+next.PrevURL, nil)
+	previous := circuitHistoryFilter(request)
+	if err := a.circuitHistoryRows(context.Background(), owner, false, &previous); err != nil {
+		t.Fatal(err)
+	}
+	if len(previous.Items) != 2 || previous.Items[0].ID != inserted[2] || previous.Items[1].ID != inserted[1] || previous.PrevURL != "" || previous.NextURL == "" {
+		t.Fatalf("unexpected previous page: %+v", previous)
 	}
 }
 

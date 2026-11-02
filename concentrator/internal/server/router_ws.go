@@ -25,6 +25,10 @@ const wsPingInterval = 5 * time.Second
 const wsReadTimeout = 15 * time.Second
 const wsWriteTimeout = 10 * time.Second
 
+// Policy mutations call routerPolicyChanged immediately. This slower poll is
+// only a safety net for expiry and changes made outside the application.
+const policyFallbackInterval = 30 * time.Second
+
 type outboundMessage struct {
 	data    []byte
 	circuit string
@@ -42,6 +46,7 @@ type routerSession struct {
 	binding                        *wire.ManagedCpBindingSnapshot
 	bindingRevision                uint64
 	queued                         map[string]int
+	pendingRequests                map[uint64]struct{}
 	history                        map[uint64]routeSignature
 	rateWindow                     time.Time
 	rateCount                      int
@@ -183,22 +188,31 @@ func (a *App) routerWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.read(c)
 }
 func (h *routerHub) tick() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		h.expireCircuits(time.Now())
-		if h.sessionCount() == 0 {
-			h.running.Store(false)
-			if h.sessionCount() != 0 && h.running.CompareAndSwap(false, true) {
+	expiryTicker := time.NewTicker(time.Second)
+	policyTicker := time.NewTicker(policyFallbackInterval)
+	defer expiryTicker.Stop()
+	defer policyTicker.Stop()
+	for {
+		select {
+		case now := <-expiryTicker.C:
+			h.expireCircuits(now)
+			if h.sessionCount() == 0 {
+				h.running.Store(false)
+				if h.sessionCount() != 0 && h.running.CompareAndSwap(false, true) {
+					continue
+				}
+				return
+			}
+		case <-policyTicker.C:
+			if h.sessionCount() == 0 {
 				continue
 			}
-			return
-		}
-		refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := h.refreshPolicyAndRoutes(refreshCtx)
-		cancel()
-		if err != nil {
-			log.Printf("router policy refresh: %v", err)
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := h.refreshPolicyAndRoutes(refreshCtx)
+			cancel()
+			if err != nil {
+				log.Printf("router policy fallback refresh: %v", err)
+			}
 		}
 	}
 }

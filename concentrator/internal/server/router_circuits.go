@@ -70,6 +70,35 @@ func (h *routerHub) circuitCount(c *routerSession) int {
 	return int(c.circuitCount.Load())
 }
 
+func reservePendingRequest(c *routerSession, requestID uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingRequests == nil {
+		c.pendingRequests = make(map[uint64]struct{})
+	}
+	if _, exists := c.pendingRequests[requestID]; exists {
+		return false
+	}
+	c.pendingRequests[requestID] = struct{}{}
+	return true
+}
+
+func releasePendingRequest(c *routerSession, requestID uint64) {
+	c.mu.Lock()
+	delete(c.pendingRequests, requestID)
+	c.mu.Unlock()
+}
+
+// releaseCircuitRequest requires c.mu. Pending circuits own their source
+// request reservation from insertion until their opening resolves or teardown.
+func releaseCircuitRequest(c *wsCircuit) {
+	if !c.pending {
+		return
+	}
+	c.pending = false
+	releasePendingRequest(c.source, c.requestID)
+}
+
 func reserveCircuit(source, target *routerSession) bool {
 	if source.circuitCount.Add(1) > maxWSCircuits {
 		source.circuitCount.Add(-1)
@@ -85,6 +114,7 @@ func reserveCircuit(source, target *routerSession) bool {
 
 // releaseCircuitValue requires c.mu and releases each reservation once.
 func releaseCircuitValue(c *wsCircuit) {
+	releaseCircuitRequest(c)
 	if !c.counted {
 		return
 	}
@@ -129,19 +159,15 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
 		return errors.New("invalid open request")
 	}
-	duplicate := false
-	h.circuits.Range(func(_, value any) bool {
-		v := value.(*wsCircuit)
-		v.mu.Lock()
-		if v.source == source && v.pending && v.requestID == req.RequestId {
-			duplicate = true
-		}
-		v.mu.Unlock()
-		return !duplicate
-	})
-	if duplicate {
+	if !reservePendingRequest(source, req.RequestId) {
 		return errors.New("duplicate outstanding request ID")
 	}
+	requestOwnedByCircuit := false
+	defer func() {
+		if !requestOwnedByCircuit {
+			releasePendingRequest(source, req.RequestId)
+		}
+	}()
 	ref := req.Target
 	if source.subprotocol == "snusnu.v1" && req.SourceRoute != nil {
 		return errors.New("source route requires snusnu.v2")
@@ -181,6 +207,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 					candidate.pending = true
 					candidate.allowance[1] = req.ReceiveAllowanceBytes
 					h.circuits.Store(id, candidate)
+					requestOwnedByCircuit = true
 					if h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef}}}, "", 0) {
 						return nil
 					}
@@ -228,7 +255,7 @@ func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision)
 		return errors.New("invalid accepted open")
 	}
 	if accepted {
-		c.pending = false
+		releaseCircuitRequest(c)
 		c.activatedAt = time.Now()
 		c.lastActivityAt = c.activatedAt
 		c.allowance[0] = decision.ReceiveAllowanceBytes

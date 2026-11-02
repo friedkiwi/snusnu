@@ -47,8 +47,10 @@ type App struct {
 	workersOnce       sync.Once
 	workersWG         sync.WaitGroup
 	workerCancel      context.CancelFunc
+	schedulerCancel   context.CancelFunc
 	workersRunning    atomic.Bool
 	writeFailures     atomic.Uint64
+	routerLogStale    atomic.Uint64
 	leaseHealthy      atomic.Bool
 	heartbeatFailures atomic.Uint64
 	lastHeartbeat     atomic.Int64

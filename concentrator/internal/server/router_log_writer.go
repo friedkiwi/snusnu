@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -36,6 +37,11 @@ func (a *App) persistRouterLog(entry store.LogEntry) {
 		err = a.DB.AppendRouterLog(writeCtx, entry)
 		cancel()
 		if err == nil {
+			return
+		}
+		if errors.Is(err, store.ErrLogTargetGone) {
+			a.routerLogStale.Add(1)
+			log.Printf("discarding stale router log for removed router %s", entry.RouterID)
 			return
 		}
 		time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)

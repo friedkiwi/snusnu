@@ -1,6 +1,8 @@
 package server
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,52 @@ func cachedTestSession(id, owner, token, epoch string) *routerSession {
 	return &routerSession{
 		router: store.Router{ID: id, OwnerID: owner, DisplayName: id}, token: token, epoch: epoch, allowedNetID: "SOLNET",
 		out: newDynamicQueue[outboundMessage](4096, 32<<20, func(x outboundMessage) int { return len(x.data) }), done: make(chan struct{}), sent: map[string]routeVersion{}, queued: map[string]int{}, history: map[uint64]routeSignature{},
+	}
+}
+
+func TestPendingRequestReservationIsPerSessionAndConcurrent(t *testing.T) {
+	session := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "source-token", store.RandomUUID())
+	var won atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if reservePendingRequest(session, 42) {
+				won.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := won.Load(); got != 1 {
+		t.Fatalf("reservation winners: %d", got)
+	}
+	other := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "other-token", store.RandomUUID())
+	if !reservePendingRequest(other, 42) {
+		t.Fatal("request IDs should be scoped to one router session")
+	}
+	releasePendingRequest(session, 42)
+	if !reservePendingRequest(session, 42) {
+		t.Fatal("released request ID could not be reused")
+	}
+}
+
+func TestCircuitTeardownReleasesPendingRequestOnce(t *testing.T) {
+	source := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "source-token", store.RandomUUID())
+	target := cachedTestSession(store.RandomUUID(), store.RandomUUID(), "target-token", store.RandomUUID())
+	if !reservePendingRequest(source, 7) {
+		t.Fatal("initial reservation failed")
+	}
+	circuit := &wsCircuit{source: source, target: target, requestID: 7, pending: true, counted: true}
+	source.circuitCount.Store(1)
+	target.circuitCount.Store(1)
+	releaseCircuitValue(circuit)
+	releaseCircuitValue(circuit)
+	if !reservePendingRequest(source, 7) {
+		t.Fatal("circuit teardown retained request reservation")
+	}
+	if source.circuitCount.Load() != 0 || target.circuitCount.Load() != 0 {
+		t.Fatalf("circuit reservations were released more than once: %d %d", source.circuitCount.Load(), target.circuitCount.Load())
 	}
 }
 

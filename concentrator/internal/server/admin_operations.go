@@ -67,7 +67,8 @@ func (a *App) StartMaintenance(ctx context.Context) {
 		a.workersRunning.Store(true)
 		workerCtx, cancel := context.WithCancel(context.Background())
 		a.workerCancel = cancel
-		context.AfterFunc(ctx, cancel)
+		schedulerCtx, schedulerCancel := context.WithCancel(ctx)
+		a.schedulerCancel = schedulerCancel
 		a.startCircuitHistoryWriter(workerCtx)
 		a.startRouterLogWriter(workerCtx)
 		a.workersWG.Add(1)
@@ -77,11 +78,11 @@ func (a *App) StartMaintenance(ctx context.Context) {
 			defer ticker.Stop()
 			for {
 				select {
-				case <-workerCtx.Done():
+				case <-schedulerCtx.Done():
 					return
 				case <-ticker.C:
 					for name := range a.maintenance.tasks {
-						runCtx, cancel := context.WithTimeout(workerCtx, 10*time.Minute)
+						runCtx, cancel := context.WithTimeout(schedulerCtx, 10*time.Minute)
 						_, _ = a.maintenance.run(runCtx, name, "scheduled", "")
 						cancel()
 					}
@@ -94,6 +95,9 @@ func (a *App) StartMaintenance(ctx context.Context) {
 // ShutdownBackground fences producers before waiting for both persistence
 // queues and the maintenance scheduler to stop.
 func (a *App) ShutdownBackground(ctx context.Context) error {
+	if a.schedulerCancel != nil {
+		a.schedulerCancel()
+	}
 	a.routerLogs.close(false)
 	a.circuitHistory.close(false)
 	done := make(chan struct{})
@@ -262,7 +266,7 @@ func (a *App) adminOperations(w http.ResponseWriter, r *http.Request, u store.Us
 	a.historyMu.Lock()
 	pendingHistory := len(a.historyPending)
 	a.historyMu.Unlock()
-	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "HistoryPending": pendingHistory, "HistoryArchived": a.historyArchived.Load(), "HistoryPersisted": a.historyPersisted.Load(), "HistoryRetries": a.historyRetries.Load(), "HistoryFailed": a.historyFailed.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
+	a.render(w, "admin_operations", map[string]any{"User": u, "CSRF": s.CSRF, "Tasks": tasks, "Routers": routers, "Circuits": circuits, "PolicyVersion": policyVersion, "PolicyRouters": policyRouters, "PolicyBlocks": policyBlocks, "RouterLogQueue": logs, "HistoryQueue": history, "WriteFailures": a.writeFailures.Load(), "RouterLogStale": a.routerLogStale.Load(), "HistoryPending": pendingHistory, "HistoryArchived": a.historyArchived.Load(), "HistoryPersisted": a.historyPersisted.Load(), "HistoryRetries": a.historyRetries.Load(), "HistoryFailed": a.historyFailed.Load(), "HeartbeatFailures": a.heartbeatFailures.Load(), "LastHeartbeat": a.lastHeartbeat.Load(), "Draining": a.hub.draining.Load()})
 }
 
 func (a *App) runMaintenanceTask(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
