@@ -28,10 +28,10 @@ trap 'rm -rf "$check_dir"' EXIT
 # CI checks the committed tree. Build the staged tree so concurrent or
 # unrelated worktree edits cannot make a commit appear to pass or fail.
 git diff --cached --binary "$base_commit" > "$check_dir/staged.patch"
-git clone --quiet --local --shared --no-checkout "$repo_root" "$check_dir/tree"
-git -C "$check_dir/tree" checkout --quiet "$base_commit"
+env -u GIT_INDEX_FILE git clone --quiet --local --shared --no-checkout "$repo_root" "$check_dir/tree"
+env -u GIT_INDEX_FILE git -C "$check_dir/tree" checkout --quiet "$base_commit"
 if [[ -s "$check_dir/staged.patch" ]]; then
-  git -C "$check_dir/tree" apply --index "$check_dir/staged.patch"
+  env -u GIT_INDEX_FILE git -C "$check_dir/tree" apply --index "$check_dir/staged.patch"
 fi
 
 check_go_module() {

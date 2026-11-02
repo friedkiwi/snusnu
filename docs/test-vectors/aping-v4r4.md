@@ -21,7 +21,9 @@ two-byte big-endian length that includes the LL field itself.
 
 The no-echo turn received a positive SNA response with no data record. The
 requester then sent its normal close sequence. The captured exchange also
-included management BIND, CNOS, user BIND, FMH-5 Attach, pacing, and UNBIND;
-those stages must be implemented and verified before `apingd` is connected to
-the concentrator route. The record vectors alone do not prove that a local
-SNA endpoint can interoperate with either guest.
+included management BIND, CNOS, user BIND, FMH-5 Attach, pacing, and UNBIND.
+The Go packages and concentrator adapter implement these stages and cover
+them with a complete synthetic WebSocket circuit test. That test also checks
+the V4R4 extended pacing response and the no-echo positive response. The
+record vectors and synthetic test do not establish live guest interoperability
+with the embedded `SNUSNU.PING` LU.
