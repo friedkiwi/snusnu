@@ -132,6 +132,26 @@ impl<P: RoutePort> WsNativeResponder<P> {
         Ok(())
     }
 
+    /// WebSocket circuit credit is counted in bytes. A RoutePort exposes at
+    /// most one `available_receive_slots()` even when its allowance can carry
+    /// both short management replies. Require a full 1500-byte allowance and
+    /// bound the pair before enqueueing either reply.
+    fn send_management_pair(
+        &mut self,
+        first: Vec<u8>,
+        second: Vec<u8>,
+        tag: Egress,
+    ) -> io::Result<()> {
+        if !self.inner.has_capacity() || first.len() + second.len() > 1500 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native management reply pair has insufficient byte credit",
+            ));
+        }
+        self.send_information(first, tag)?;
+        self.send_information(second, tag)
+    }
+
     fn complete_egress(&mut self) -> io::Result<()> {
         let completed = self.inner.take_completed_information_count();
         for _ in 0..completed {
@@ -243,25 +263,18 @@ impl<P: RoutePort> WsNativeResponder<P> {
                 .buffer_early_attach(&piu)
                 .map_err(protocol)?,
             ManagementPhase::AwaitAttach => {
-                if self.inner.available_receive_slots() < 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "native CNOS needs two egress slots",
-                    ));
-                }
                 let (ipr, cnos) = self.management.observe_attach(&piu).map_err(protocol)?;
                 let (ipr, cnos) = (ipr.to_vec(), cnos.to_vec());
-                self.send_information(ipr.clone(), Egress::ManagementAttach)?;
-                self.send_information(cnos.clone(), Egress::ManagementAttach)?;
+                self.send_management_pair(ipr.clone(), cnos.clone(), Egress::ManagementAttach)?;
                 self.management
                     .mark_attach_replies_enqueued(&ipr, &cnos)
                     .map_err(protocol)?;
             }
             ManagementPhase::CnosComplete => {
-                if self.inner.available_receive_slots() < 2 {
+                if !self.inner.has_capacity() {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "native BIS needs two egress slots",
+                        "native BIS has insufficient byte credit",
                     ));
                 }
                 let ipr = self
@@ -278,6 +291,9 @@ impl<P: RoutePort> WsNativeResponder<P> {
                     .prepare_local_bis(true)
                     .map_err(protocol)?
                     .to_vec();
+                if ipr.len() + local_bis.len() > 1500 {
+                    return Err(invalid("native BIS reply pair exceeds byte allowance"));
+                }
                 self.send_information(local_bis.clone(), Egress::ManagementBis)?;
                 self.management
                     .mark_local_bis_enqueued(&local_bis)
@@ -645,5 +661,19 @@ mod tests {
         state.borrow_mut().completed = 1;
         leg.complete_egress().unwrap();
         assert_eq!(leg.management.phase(), ManagementPhase::AwaitAttach);
+        // RoutePort's default slot API reports one boolean slot, while the
+        // WebSocket byte allowance carries both short CNOS replies.
+        assert_eq!(leg.inner.available_receive_slots(), 1);
+        let attach = vec![
+            0x2c, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20, 0x0c, 0x05, 0x02, 0xff, 0, 3, 0xd0, 0, 0, 2,
+            0x06, 0xf1, 0, 25, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 8, 0, 4, 0, 4, 0, 8, 0x40, 0x40, 0x40,
+            0x40, 0x40, 0x40, 0x40, 0x40,
+        ];
+        leg.process_information(attach).unwrap();
+        assert_eq!(state.borrow().information.len(), 3);
+        assert_eq!(leg.management.phase(), ManagementPhase::AwaitCnosAck);
+        state.borrow_mut().completed = 2;
+        leg.complete_egress().unwrap();
+        assert_eq!(leg.management.phase(), ManagementPhase::CnosComplete);
     }
 }
