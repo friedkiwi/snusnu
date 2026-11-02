@@ -165,7 +165,8 @@ fn user_fqpcid(data: &[u8], source: &[u8], destination: &[u8]) -> io::Result<Vec
     if user[..3] != [0, 9, 2]
         || user[3..11] != [0x40; 8]
         || user[11..14] != [9, 3, 1]
-        || user[14] != 0x23
+        // X'03' carries a PLU-generated type-G session instance. All byte
+        // values are valid; the X'13' copy below must match it exactly.
         || !matches!(user[19..21], [0, 0] | [0x80, 0])
         || user[21] as usize != source.len() + 1
         || user[22] != 4
@@ -498,6 +499,41 @@ mod tests {
         assert!(IngressSession::new(policy())
             .unwrap()
             .receive(&invalid.encode().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn admits_plu_generated_session_instance_and_rejects_mismatched_copy() {
+        // Bob's later autonomous V5R4 Connect used X'24' instead of the
+        // earlier X'23' as the first generated session-instance byte.
+        let source = "QABOB.SNAB";
+        let destination = "QAALICE.SNAA";
+        let mut data = variable_data(source, destination);
+        let user_start = 32 + 1 + name(source).unwrap().len() + 1;
+        data[user_start + 14] = 0x24;
+        let repeated_instance = user_start + 27 + name(source).unwrap().len();
+        data[repeated_instance] = 0x24;
+        let mut request = connect(data.clone());
+        request.source.node = name(source).unwrap();
+        request.destination.node = name(destination).unwrap();
+        let encoded = request.encode().unwrap();
+        assert_eq!(inspect_connect(&encoded).unwrap().source_lu, source);
+        let mut selected = policy();
+        selected.source_lu = source.into();
+        selected.destination_lu = destination.into();
+        assert!(IngressSession::new(selected)
+            .unwrap()
+            .receive(&encoded)
+            .is_ok());
+
+        data[repeated_instance] = 0x23;
+        request.options[1].value = data;
+        let mut selected = policy();
+        selected.source_lu = source.into();
+        selected.destination_lu = destination.into();
+        assert!(IngressSession::new(selected)
+            .unwrap()
+            .receive(&request.encode().unwrap())
             .is_err());
     }
 
