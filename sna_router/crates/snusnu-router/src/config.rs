@@ -1,12 +1,18 @@
 //! Declarative local router configuration. Each LLC entry is one independent
 //! association, even when several entries share an Ethernet interface.
 
+use crate::{
+    mptn_llc_reverse::ReverseLlcConfig, mptn_outbound_port::OutboundEndpoint,
+    native_probe::parse_tp,
+};
+use router_core::xid3::Role;
 use serde::{Deserialize, Deserializer};
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     net::IpAddr,
     path::Path,
+    time::Duration,
 };
 use transport_ws::wire;
 
@@ -143,6 +149,10 @@ pub(crate) struct RouteConfig {
     /// Selects a TCP62 gateway circuit by the network-qualified destination
     /// LU in an incoming Connect. Omit for a gateway with one destination.
     pub(crate) destination_lu: Option<String>,
+    /// Required for a native LLC initiated MPTN session.
+    pub(crate) user_tp_hex: Option<String>,
+    /// Bounded lifetime for one native LLC initiated MPTN circuit.
+    pub(crate) timeout_seconds: Option<u64>,
 }
 
 /// A route names a converter explicitly before two different session
@@ -291,6 +301,94 @@ impl RouterConfig {
                 }
             })
             .ok_or_else(|| invalid(format!("concentrator {} has no local route", entry.id)))
+    }
+
+    /// Resolve the one supported standalone native LLC to MPTN circuit.
+    /// Other gateway topologies use the separate inbound WebSocket gateway.
+    pub(crate) fn reverse_llc_config(&self) -> io::Result<Option<ReverseLlcConfig>> {
+        let Some(route) = self.route.iter().find(|route| {
+            self.llc.iter().any(|llc| llc.id == route.from)
+                && self
+                    .mptn_gateway
+                    .iter()
+                    .any(|gateway| gateway.id == route.to)
+        }) else {
+            return Ok(None);
+        };
+        if self.llc.len() != 1
+            || self.mptn_gateway.len() != 1
+            || self.route.len() != 1
+            || !self.remote.is_empty()
+            || !self.ee.is_empty()
+            || !self.anynet.is_empty()
+            || !self.hpr_lan.is_empty()
+            || !route.bidirectional
+            || !matches!(route.converter, Some(RouteConverter::MptnLu62))
+        {
+            return Err(invalid(
+                "native LLC to MPTN requires one LLC peer, one gateway and one bidirectional route",
+            ));
+        }
+        let llc = &self.llc[0];
+        let gateway = &self.mptn_gateway[0];
+        let guest_cp = llc
+            .local_cp
+            .as_deref()
+            .ok_or_else(|| invalid("native LLC to MPTN requires LLC local_cp"))?;
+        if guest_cp != gateway.peer_cp {
+            return Err(invalid("native LLC CP must match TCP62 gateway peer_cp"));
+        }
+        let [source_lu] = llc.lus.as_slice() else {
+            return Err(invalid(
+                "native LLC to MPTN requires exactly one LLC source LU",
+            ));
+        };
+        let selector = route
+            .destination_lu
+            .as_deref()
+            .unwrap_or(&gateway.destination_lu);
+        if selector != source_lu {
+            return Err(invalid(
+                "native LLC source LU must match TCP62 gateway route destination_lu",
+            ));
+        }
+        let proxy_mac = route
+            .proxy_mac
+            .as_deref()
+            .ok_or_else(|| invalid("native LLC to MPTN requires route proxy_mac"))?;
+        let user_tp_hex = route
+            .user_tp_hex
+            .as_deref()
+            .ok_or_else(|| invalid("native LLC to MPTN requires route user_tp_hex"))?;
+        let timeout = route.timeout_seconds.unwrap_or(600);
+        if !(1..=600).contains(&timeout) {
+            return Err(invalid(
+                "native LLC to MPTN timeout_seconds must be 1..=600",
+            ));
+        }
+        let config = ReverseLlcConfig {
+            interface: llc.interface.clone(),
+            guest_mac: parse_mac(&llc.guest_mac)?,
+            proxy_mac: parse_mac(proxy_mac)?,
+            local_cp: gateway.local_cp.clone(),
+            guest_cp: guest_cp.to_owned(),
+            local_station: gateway.local_station.clone(),
+            local_node_id: u32::from_str_radix(&gateway.local_node_id, 16)
+                .map_err(|_| invalid("invalid TCP62 gateway local_node_id"))?
+                .to_be_bytes(),
+            tg_number: gateway.tg_number,
+            role: Role::Secondary,
+            source_lu: source_lu.clone(),
+            destination_lu: gateway.source_lu.clone(),
+            user_tp: parse_tp(user_tp_hex)?,
+            endpoint: OutboundEndpoint {
+                local_ip: gateway.local_ip,
+                peer_ip: gateway.peer_ip,
+            },
+            timeout: Duration::from_secs(timeout),
+        };
+        config.validate()?;
+        Ok(Some(config))
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
@@ -602,6 +700,14 @@ impl RouterConfig {
                     route.from, route.to
                 )));
             }
+            if (route.user_tp_hex.is_some() || route.timeout_seconds.is_some())
+                && !matches!((source_kind, target_kind), ("llc", "mptn_gateway"))
+            {
+                return Err(invalid(format!(
+                    "route {} -> {} user_tp_hex and timeout_seconds require LLC to TCP62 gateway",
+                    route.from, route.to
+                )));
+            }
             if let Some(mac) = &route.proxy_mac {
                 parse_mac(mac)?;
                 if source_kind != "llc" && target_kind != "llc" {
@@ -618,6 +724,13 @@ impl RouterConfig {
                 }
             }
             if let Some(converter) = route.converter {
+                if matches!((source_kind, target_kind), ("llc", "mptn_gateway"))
+                    && matches!(converter, RouteConverter::MptnLu62)
+                {
+                    self.reverse_llc_config()?;
+                    add_directed(&mut directed, &route.from, &route.to)?;
+                    continue;
+                }
                 if matches!(
                     (source_kind, target_kind),
                     ("mptn_gateway", "remote") | ("remote", "mptn_gateway")
@@ -1551,5 +1664,57 @@ converter = "mptn_lu62"
             &gateway.replace("converter = \"mptn_lu62\"", "converter = \"unknown\"")
         )
         .is_err());
+    }
+
+    #[test]
+    fn standalone_llc_to_mptn_resolves_one_exact_reverse_circuit() {
+        let config = r#"
+[[llc]]
+id = "alice"
+interface = "sol5"
+guest_mac = "02:00:35:27:23:01"
+local_cp = "SOLNET.SNAA"
+lus = ["SOLNET.SNAA"]
+[[mptn]]
+profile = "gateway"
+id = "bob"
+local_ip = "10.99.4.10"
+peer_ip = "10.99.4.3"
+local_cp = "SOLNET.SNAB"
+peer_cp = "SOLNET.SNAA"
+source_lu = "SOLNET.SNAB"
+destination_lu = "SOLNET.SNAA"
+local_station = "BOB"
+local_node_id = "FFF12345"
+tg_number = 1
+[[route]]
+from = "alice"
+to = "bob"
+converter = "mptn_lu62"
+proxy_mac = "02:53:4e:00:00:02"
+user_tp_hex = "30f0f0f5"
+timeout_seconds = 600
+"#;
+        let parsed = parse(config);
+        parsed.validate().unwrap();
+        let reverse = parsed.reverse_llc_config().unwrap().unwrap();
+        assert_eq!(reverse.source_lu, "SOLNET.SNAA");
+        assert_eq!(reverse.destination_lu, "SOLNET.SNAB");
+        assert_eq!(reverse.user_tp, [0x30, 0xf0, 0xf0, 0xf5]);
+        assert_eq!(reverse.proxy_mac, [0x02, 0x53, 0x4e, 0, 0, 2]);
+        assert_eq!(reverse.timeout, Duration::from_secs(600));
+        for bad in [
+            config.replace("user_tp_hex = \"30f0f0f5\"", ""),
+            config.replace("lus = [\"SOLNET.SNAA\"]", "lus = []"),
+            config.replace(
+                "destination_lu = \"SOLNET.SNAA\"",
+                "destination_lu = \"SOLNET.SNAC\"",
+            ),
+            config.replace("timeout_seconds = 600", "timeout_seconds = 601"),
+            config.replace("proxy_mac = \"02:53:4e:00:00:02\"", ""),
+            config.replace("to = \"bob\"", "to = \"bob\"\nbidirectional = false"),
+        ] {
+            assert!(parse(&bad).validate().is_err(), "accepted {bad}");
+        }
     }
 }
