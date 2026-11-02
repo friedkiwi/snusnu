@@ -2447,6 +2447,10 @@ mod tests {
                     snapshot: Some(wire::RouteSnapshot {
                         epoch: vec![10; 16], revision: 1,
                         routes: vec![wire::RouteExport {
+                            id: 30, generation: 1,
+                            resource: Some(wire::route_export::Resource::ControlPoint(
+                                name("TARGET", "CPB"))),
+                        }, wire::RouteExport {
                             id: 31, generation: 1,
                             resource: Some(wire::route_export::Resource::LogicalUnit(
                                 wire::LuReachability {
@@ -2456,6 +2460,18 @@ mod tests {
                                 })),
                         }],
                     }),
+                })).encode_to_vec().into())).unwrap();
+            socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::ManagedCpBindings(
+                wire::ManagedCpBindingSnapshot {
+                    schema_version: 1, recipient_epoch: vec![8; 16], revision: 1,
+                    bindings: vec![wire::ManagedCpBinding {
+                        address_id: vec![11; 16], control_point: Some(name("TARGET", "CPB")),
+                        virtual_mac: vec![0x02, 0x53, 0x4e, 0, 0, 1],
+                        candidates: vec![wire::RouteReference {
+                            router_id: vec![9; 16], epoch: vec![10; 16],
+                            route_id: 30, route_generation: 1,
+                        }],
+                    }],
                 })).encode_to_vec().into())).unwrap();
             thread::sleep(Duration::from_millis(100));
         });
@@ -2474,6 +2490,18 @@ mod tests {
         assert_eq!(hub.resolve_lu(&target).unwrap().unwrap().1,
             Some(name("TARGET", "CPB")));
         assert!(hub.open_lu(&target, &source).unwrap().is_some());
+        let mac = [0x02, 0x53, 0x4e, 0, 0, 1];
+        for _ in 0..1000 {
+            hub.poll_incoming().unwrap();
+            if hub.resolve_mac(&mac).unwrap().is_some() { break; }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(hub.managed_mac_for_cp(&name("TARGET", "CPB")).unwrap(), Some(mac));
+        let advertised = hub.advertised_addresses();
+        assert!(advertised.contains(&RouteAddress::Mac(mac)));
+        assert!(advertised.contains(&RouteAddress::LogicalUnit {
+            netid: "TARGET".into(), cp: Some("CPB".into()), name: "LUB".into(),
+        }));
         server.join().unwrap();
     }
 
