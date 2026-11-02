@@ -232,6 +232,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.deferred_user_normal
             || self.udp_abort_input.is_some()
             || self.udp_abort_pending.is_some()
+            || self
+                .user_teardown
+                .as_ref()
+                .is_some_and(|teardown| teardown.phase() != TeardownPhase::Active)
             || self.expedited_ack.is_some()
             || self.udp_user_input.is_some()
         {
@@ -279,6 +283,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.deferred_user_normal
             || self.udp_abort_input.is_some()
             || self.udp_abort_pending.is_some()
+            || self
+                .user_teardown
+                .as_ref()
+                .is_some_and(|teardown| teardown.phase() != TeardownPhase::Active)
         {
             return Ok(false);
         }
@@ -305,8 +313,14 @@ impl<P: RoutePort> VirtualWsPort<P> {
             || self.native_user_output.is_some()
             || self.native_user_input.is_some()
             || self.tcp_user_output.is_some()
+            || self.deferred_user_normal
+            || self.expedited_ack.is_some()
             || self.udp_user_input.is_some()
             || self.udp_user_completion.is_some()
+            || self
+                .user_teardown
+                .as_ref()
+                .is_none_or(|teardown| teardown.phase() != TeardownPhase::Active)
         {
             return Ok(false);
         }
@@ -1372,6 +1386,12 @@ mod tests {
         port.inner.completed = 1;
         port.complete_management_egress().unwrap();
         assert_eq!(port.take_completed_udp_abort(), None);
+        assert!(!port
+            .submit_udp_expedited(10, &hex("80004b8000c900010001"))
+            .unwrap());
+        assert!(!port
+            .submit_tcp_user_record(&TcpRecord::decode(hex("0000000503")).unwrap())
+            .unwrap());
         port.native_user_input = Some(hex("2f0002020000eb800032"));
         port.drive_user_flow().unwrap();
         assert_eq!(port.inner.inbound_completed, 1);
