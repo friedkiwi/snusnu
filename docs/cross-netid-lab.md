@@ -320,3 +320,38 @@ Alice's `SNAB` was restored to `INLCNN(*ANS)` and `ADPTADR(02534E000002)`,
 verified by `DSPCTLD`. Both Rust routers and the QA concentrator were
 stopped, with no listeners on ports 397 or 8081. The isolated Solstice
 guests remain booted. No remote sign-on credentials were entered.
+
+## One configured Bob gateway, both initiation directions
+
+On 2026-11-02, Bob's V5R4 router used one `[[mptn]] profile = "gateway"`,
+one `[[concentrator]]`, and one bidirectional `mptn_lu62` route with
+`user_tp_hex = "30f0f0f5"`. The QA concentrator listened on
+`0.0.0.0:8081`, with Alice's V4R4 router attached over LLC2. A fresh QA
+directory assigned Bob the managed MAC `02:53:4e:00:00:01`.
+
+Bob first initiated `STRPASTHR RMTLOCNAME(SNAA) RMTNETID(QAALICE)
+LCLLOCNAME(SNAB)` and reached Alice's remote Sign On (`S1012345`,
+`QPADEV0001`) through TCP62, Bob's shared WebSocket, the concentrator,
+and Alice's LLC2 link. Alice then initiated `STRPASTHR RMTLOCNAME(SNAB)
+RMTNETID(QABOB) LCLLOCNAME(SNAA)` and reached Bob's remote Sign On
+(`S1054504`, `QPADEV0001`) through the reverse path. After Alice ended
+that request, Bob initiated again and reached Alice's Sign On **without
+restarting Bob's router**. The latter two sessions and the intervening
+router recovery are recorded in
+`/tmp/snusnu-cross-netid/bob-duplex-reverse.log`.
+
+The reverse session's native teardown still raises `later native PIU is not
+an FM request`; Bob's router logs the session error, recreates its circuit,
+and remains available. Alice's dial controller briefly reopened an idle
+native link before it was varied off. The earlier Bob-initiated session
+also remained attached after the local return-home action; varying Bob's
+`ANYTOA` controller off closed TCP62 and exposed an unsupported TCP62
+UNBIND shape. The router now treats that peer protocol failure as a
+circuit failure and retries, rather than exiting. These are teardown gaps,
+so this run proves sequential initiation in both directions and Sign On,
+not clean protocol shutdown or concurrent opposite-direction sessions.
+
+Alice's `SNAB` controller was restored to `INLCNN(*ANS)` and its original
+`ADPTADR(02534E000002)`, then varied on. Bob's `ANYTOA` was varied on.
+Both Rust routers and the QA concentrator were stopped; ports 397 and 8081
+had no listeners. No remote sign-on credentials were entered.

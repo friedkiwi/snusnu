@@ -89,9 +89,11 @@ to = "upstream"
 converter = "mptn_lu62"
 ```
 
-The MPTN-to-concentrator gateway still requires `--mptn-ws-gateway-lab FILE
---acknowledge-experimental-x83`; its native address selection is specific to
-the QA fixture. See [the cross-NETID lab](cross-netid-lab.md).
+For a single MPTN peer and concentrator target, add the reverse target's
+`user_tp_hex` and use one bidirectional route. This runs with ordinary
+`--config` and accepts initiation from either side. The current native user
+address allocation is specific to the QA fixture, and the gateway serves one
+active user session at a time. See [the cross-NETID lab](cross-netid-lab.md).
 
 ### Several destinations on one TCP62 listener
 
@@ -147,19 +149,42 @@ destination_lu = "QACAROL.SNAC"
 
 The gateway publishes `QABOB.SNAB` once and uses separate circuit state for
 each destination. The URLs and tokens on these concentrator entries must
-match, and destination LUs must be unique on the listener. This remains an
-opt-in QA gateway configuration: the ordinary runtime does not yet provide
-general MPTN-to-concentrator native session addressing or lifecycle. The
+match, and destination LUs must be unique on the listener. This multiple
+destination configuration remains an opt-in QA gateway configuration. The
 `peer_cp` and gateway `destination_lu` describe the original single-target
 profile; each additional route supplies its own exact target LU and CP.
+
+### One gateway with initiation from either side
+
+The following route completes the preceding single-target example and runs
+with `snusnu-router --config bob.toml`:
+
+```toml
+[[route]]
+from = "bob-v5"
+to = "upstream"
+bidirectional = true
+converter = "mptn_lu62"
+destination_lu = "QAALICE.SNAA"
+user_tp_hex = "30f0f0f5"
+timeout_seconds = 300
+```
+
+`user_tp_hex` is the four-byte transaction program sent to the local MPTN
+peer when the concentrator initiates. The route also lets the MPTN peer
+initiate toward the configured concentrator target. The router advertises
+the hosted LU once on a shared WebSocket connection. One user session can
+be active at a time; after it closes, the router creates fresh circuit state
+for either direction. Simultaneous opposite-direction sessions are not yet
+served by this adapter.
 
 ### Initiating toward a local MPTN peer
 
 In the reverse direction, a native LLC or concentrator session opens with a
 BIND for an LU hosted by the local MPTN peer. For this example that target is
-`QABOB.SNAB`, the gateway's `source_lu`. The router would resolve the target
-LU to `bob-v5`, dial `10.99.4.3:397` from `10.99.4.11`, complete the peer's
-MPTN management/CNOS exchange, and send an outbound Connect whose source is
+`QABOB.SNAB`, the gateway's `source_lu`. The router resolves the target
+LU to `bob-v5`, dials `10.99.4.3:397` from `10.99.4.11`, completes the peer's
+MPTN management/CNOS exchange, and sends an outbound Connect whose source is
 the initiating LU (for example `QAALICE.SNAA`) and destination is
 `QABOB.SNAB`. The Connect correlator and native BIND result belong to that
 one session; normal, expedited, abort, and close traffic must use its own
