@@ -394,7 +394,7 @@ mod tests {
         value.parse().unwrap()
     }
     fn unit() -> SessionUnit {
-        SessionUnit::from_reduced(&[0x31, 0, 0, 0x31]).unwrap()
+        SessionUnit::from_reduced(&[0, 0, 0x31, 0, 0, 0x31]).unwrap()
     }
     fn identity() -> SessionIdentity {
         SessionIdentity::new(q("SRC.LUA"), q("DST.LUB"))

@@ -145,11 +145,7 @@ fn invalid(reason: &'static str) -> io::Error {
 fn reduced_connect_unit(data: &[u8]) -> io::Result<SessionUnit> {
     // TCP62 Connect connection data starts with the two-byte SNF. The
     // following three bytes are RH, then RU. Ingress validates this BIND.
-    SessionUnit::from_reduced(
-        data.get(2..)
-            .ok_or_else(|| invalid("short TCP62 connection data"))?,
-    )
-    .map_err(io::Error::other)
+    SessionUnit::from_reduced(data).map_err(io::Error::other)
 }
 
 fn remember_completed(recent: &mut VecDeque<u16>, sequence: u16) {
@@ -2119,12 +2115,11 @@ mod tests {
         );
         assert_eq!(session.identity.source_lu.to_string(), "QABOB.SNAB");
         assert_eq!(session.identity.target_lu.to_string(), "QAALICE.SNAA");
-        assert_eq!(
-            reduced_connect_unit(offer.connect().connection_data())
-                .unwrap()
-                .ru()[0],
-            0x31
-        );
+        let connection_data = offer.connect().connection_data();
+        let unit = reduced_connect_unit(connection_data).unwrap();
+        assert_eq!(unit.as_reduced(), connection_data);
+        assert_eq!(unit.snf(), &connection_data[..2]);
+        assert_eq!(unit.ru()[0], 0x31);
         peer.set_nonblocking(true).unwrap();
         assert_eq!(
             peer.read(&mut [0; 1]).unwrap_err().kind(),

@@ -3,7 +3,9 @@
 //! A link adapter must remove LLC, MPTN, or HPR framing before emitting these
 //! events. It must not feed an unparsed transport record into `Information`.
 //! Carrier-specific negotiation, FID2 addresses, and pacing translation stay
-//! with the adapter; this contract only fixes the ordering and bounded data
+//! with the adapter. The two-byte SNA sequence field (SNF) stays with the
+//! session unit so forwarding preserves request/response correlation.
+//! This contract fixes the ordering and bounded data
 //! presented to the router's session selector.
 
 use std::{fmt, str::FromStr};
@@ -113,7 +115,7 @@ pub enum Flow {
     Expedited,
 }
 
-/// One complete reduced SNA session unit: three-byte RH followed by RU.
+/// One complete reduced SNA session unit: two-byte SNF, three-byte RH, then RU.
 /// FID2 addressing or HPR framing belongs to the carrier adapter. An empty
 /// RU is valid for some control units; BIND and UNBIND require a nonempty RU.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,18 +123,22 @@ pub struct SessionUnit(Vec<u8>);
 
 impl SessionUnit {
     pub fn from_reduced(bytes: &[u8]) -> Result<Self, SessionError> {
-        if !(3..=MAX_SESSION_UNIT).contains(&bytes.len()) {
+        if !(5..=MAX_SESSION_UNIT).contains(&bytes.len()) {
             return Err(SessionError::InvalidUnit);
         }
         Ok(Self(bytes.to_vec()))
     }
 
+    pub fn snf(&self) -> &[u8] {
+        &self.0[..2]
+    }
+
     pub fn rh(&self) -> &[u8] {
-        &self.0[..3]
+        &self.0[2..5]
     }
 
     pub fn ru(&self) -> &[u8] {
-        &self.0[3..]
+        &self.0[5..]
     }
 
     pub fn as_reduced(&self) -> &[u8] {
@@ -244,7 +250,7 @@ mod tests {
     }
 
     fn unit(bytes: &[u8]) -> SessionUnit {
-        SessionUnit::from_reduced(bytes).unwrap()
+        SessionUnit::from_reduced(&[&[0, 0][..], bytes].concat()).unwrap()
     }
 
     #[test]
@@ -273,11 +279,16 @@ mod tests {
     #[test]
     fn reduced_unit_has_one_consistent_boundary() {
         let bind = unit(&[0x31, 0, 0, 0x31]);
+        assert_eq!(bind.snf(), &[0, 0]);
         assert_eq!(bind.rh(), &[0x31, 0, 0]);
         assert_eq!(bind.ru(), &[0x31]);
-        assert_eq!(bind.as_reduced(), &[0x31, 0, 0, 0x31]);
+        assert_eq!(bind.as_reduced(), &[0, 0, 0x31, 0, 0, 0x31]);
+        let request = SessionUnit::from_reduced(&[0, 2, 0x03, 0x91, 0x20, 0xc1]).unwrap();
+        assert_eq!(request.snf(), &[0, 2]);
+        assert_eq!(request.rh(), &[0x03, 0x91, 0x20]);
+        assert_eq!(request.ru(), &[0xc1]);
         assert_eq!(
-            SessionUnit::from_reduced(&[1, 2]),
+            SessionUnit::from_reduced(&[0, 0, 1, 2]),
             Err(SessionError::InvalidUnit)
         );
         assert_eq!(
