@@ -149,6 +149,7 @@ pub(crate) struct AutomaticFabric {
     directory: AutomaticDirectory,
     sessions: HashMap<u64, (PortId, PortId)>,
     closed_sessions: Vec<u64>,
+    observations: Vec<SessionObservation>,
 }
 
 impl AutomaticFabric {
@@ -158,6 +159,7 @@ impl AutomaticFabric {
             directory: AutomaticDirectory::default(),
             sessions: HashMap::new(),
             closed_sessions: Vec::new(),
+            observations: Vec::new(),
         }
     }
 
@@ -208,6 +210,24 @@ impl AutomaticFabric {
 
     pub(crate) fn poll_once(&mut self) -> io::Result<bool> {
         let received = self.router.poll_once()?;
+        for (session_id, (ingress, egress)) in &self.sessions {
+            for (side, port) in [
+                (SessionSide::Ingress, ingress),
+                (SessionSide::Egress, egress),
+            ] {
+                self.observations.extend(
+                    self.router
+                        .port_mut(port)?
+                        .take_identity_observations()
+                        .into_iter()
+                        .map(|identity| SessionObservation {
+                            session_id: *session_id,
+                            side,
+                            identity,
+                        }),
+                );
+            }
+        }
         let retired = self.router.take_retired_ports();
         if !retired.is_empty() {
             let closed = self
@@ -231,6 +251,10 @@ impl AutomaticFabric {
     /// the last call. The attachment runtime can release its listener state.
     pub(crate) fn take_closed_sessions(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.closed_sessions)
+    }
+
+    pub(crate) fn take_identity_observations(&mut self) -> Vec<SessionObservation> {
+        std::mem::take(&mut self.observations)
     }
 
     pub(crate) fn close_pair(&mut self, session_id: u64) -> io::Result<()> {
@@ -266,6 +290,25 @@ pub(crate) enum RouterEvent {
     TimedOut,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum IdentityObservation {
+    ControlPoint(String),
+    LogicalUnit(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionSide {
+    Ingress,
+    Egress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionObservation {
+    pub(crate) session_id: u64,
+    pub(crate) side: SessionSide,
+    pub(crate) identity: IdentityObservation,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FailureScope {
     /// Reset and retry only the connected route component.
@@ -296,6 +339,9 @@ pub(crate) trait RoutePort {
     /// this port since the last call. LLC ports count peer acknowledgements.
     fn take_completed_information_count(&mut self) -> usize {
         0
+    }
+    fn take_identity_observations(&mut self) -> Vec<IdentityObservation> {
+        Vec::new()
     }
     fn on_downstream_completed(&mut self, _count: usize) -> io::Result<()> {
         Ok(())
@@ -843,6 +889,7 @@ mod tests {
         next_event: Option<RouterEvent>,
         send_failures_remaining: usize,
         shared_failure: bool,
+        observations: Vec<IdentityObservation>,
     }
 
     struct FakePort(Rc<RefCell<State>>);
@@ -882,6 +929,9 @@ mod tests {
         }
         fn take_completed_information_count(&mut self) -> usize {
             std::mem::take(&mut self.0.borrow_mut().completions)
+        }
+        fn take_identity_observations(&mut self) -> Vec<IdentityObservation> {
+            std::mem::take(&mut self.0.borrow_mut().observations)
         }
         fn on_downstream_completed(&mut self, count: usize) -> io::Result<()> {
             self.0.borrow_mut().credited += count;
@@ -1603,5 +1653,47 @@ mod tests {
         let count = live.borrow().poll_count;
         fabric.poll_once().unwrap();
         assert_eq!(live.borrow().poll_count, count + 1);
+    }
+
+    #[test]
+    fn automatic_fabric_reports_identity_for_the_correct_session_side() {
+        let mut fabric = AutomaticFabric::new();
+        let ingress = PortId::new("llc-a");
+        let egress = PortId::new("ws");
+        let destination = RouteAddress::ControlPoint {
+            netid: "NETB".into(),
+            name: "CPB".into(),
+        };
+        fabric
+            .directory_mut()
+            .replace(egress.clone(), [destination.clone()]);
+        let source = Rc::new(RefCell::new(State {
+            free_slots: 1,
+            observations: vec![IdentityObservation::ControlPoint("NETA.CPA".into())],
+            ..State::default()
+        }));
+        fabric
+            .open_pair(
+                41,
+                &ingress,
+                &destination,
+                &egress,
+                Box::new(FakePort(source)),
+                Box::new(FakePort(Rc::new(RefCell::new(State {
+                    free_slots: 1,
+                    ..State::default()
+                })))),
+            )
+            .unwrap();
+        fabric.poll_once().unwrap();
+        assert_eq!(
+            fabric.take_identity_observations(),
+            vec![SessionObservation {
+                session_id: 41,
+                side: SessionSide::Ingress,
+                identity: IdentityObservation::ControlPoint("NETA.CPA".into()),
+            }]
+        );
+        assert!(fabric.take_identity_observations().is_empty());
     }
 }
