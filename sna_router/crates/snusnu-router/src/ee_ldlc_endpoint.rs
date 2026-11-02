@@ -6,13 +6,14 @@
 //! active here is not an RTP connection or an admitted LU route.
 
 use router_core::{
-    hpr_cv61::ControlFlowsTower,
+    hpr_cv61::{ArbMode, ControlFlowsTower},
     hpr_ip_activation::{HprIpActivation, Observation, Phase},
     hpr_lan::{HprMedium, DEFAULT_BASE_SAP},
     hpr_setmode::XidDone,
     hpr_xid_evidence::HprXidEvidence,
-    hpr_xid_leg::Side,
-    xid3::{ExchangeState, Role, Xid3},
+    hpr_xid_leg::{local_ee_tg_descriptor, Side},
+    session::QualifiedName,
+    xid3::{ControlVector, ExchangeState, Role, Xid3},
 };
 use std::{
     io,
@@ -36,6 +37,101 @@ pub(crate) struct LocalEeXids {
 }
 
 impl LocalEeXids {
+    /// Build the local secondary side of one regular EE TG. `local_cp` and
+    /// `node_id` are stable identities supplied by configuration or persisted
+    /// router state. For a guest served by the concentrator's APING endpoint,
+    /// the server must authorize a proxy CP such as SNUSNU.SVC. The guest's
+    /// NETID may differ, so only CP equality is rejected here.
+    ///
+    /// `tower` and `link_label` are allocated by the local APPN control
+    /// bootstrap. Until path switching and Responsive ARB are implemented,
+    /// the tower must advertise zero path-switch time and Base ARB. The
+    /// caller must have a working RTP/CP tower before using this builder in
+    /// production; it advertises those capabilities in CV61.
+    pub(crate) fn build(
+        local_cp: &QualifiedName,
+        peer_cp: &QualifiedName,
+        node_id: [u8; 4],
+        tg_number: u8,
+        link_label: [u8; 2],
+        tower: &ControlFlowsTower,
+        network_node: bool,
+    ) -> io::Result<Self> {
+        let id = u32::from_be_bytes(node_id);
+        let block = id >> 20;
+        if local_cp == peer_cp
+            || !matches!(block, 0x000 | 0xfff)
+            || id & 0x000f_ffff == 0
+            || tg_number == 0
+            || link_label[0] != 0x80
+            || link_label[1] == 0xff
+            || !(768..=1461).contains(&tower.max_send_packet_size)
+            || tower.path_switch_time_ms != 0
+            || tower.arb_mode != ArbMode::Base
+            || tower.mobile
+            || tower.multilink_tg
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid local EE identity, TG, label or packet size",
+            ));
+        }
+        let mut cv61 = vec![0xf8, 0, 2, link_label[0], link_label[1], 3, 0x80, 4];
+        cv61.extend_from_slice(
+            &tower
+                .encode()
+                .map_err(|_| invalid("invalid EE control tower"))?,
+        );
+        let product = vec![
+            0, 0x0b, 0x11, 0x0c, 0x08, 0x06, 0xe2, 0xd5, 0xe4, 0xe2, 0xd5, 0xe4,
+        ]; // Non-IBM SNUSNU product ID.
+        let vectors = vec![
+            ControlVector {
+                key: 0x0e,
+                data: vec![0xf4, 0xc1, 0x4b, 0xc1],
+            },
+            ControlVector {
+                key: 0x10,
+                data: product,
+            },
+            local_ee_tg_descriptor(tg_number),
+        ];
+        let mut pre_fixed = [0u8; 29];
+        pre_fixed[2..6].copy_from_slice(&node_id);
+        pre_fixed[9] = 0x88 | if network_node { 0x40 } else { 0 };
+        pre_fixed[10] = 0xc0;
+        pre_fixed[12] = 0x80;
+        pre_fixed[15] = 0x80;
+        pre_fixed[16] = tg_number;
+        pre_fixed[17] = 0x01; // Native IP DLC in the V5R4 EE XID profile.
+        pre_fixed[18] = 0x0b;
+        pre_fixed[19] = 0x40; // ABM and local secondary station.
+        pre_fixed[21..23].copy_from_slice(&tower.max_send_packet_size.to_be_bytes());
+        pre_fixed[27] = 7;
+        let mut pre = Xid3::from_parts(pre_fixed, vectors.clone())
+            .map_err(|_| invalid("invalid local EE prenegotiation XID"))?;
+        pre.set_cp_name(&local_cp.to_string())
+            .map_err(|_| invalid("invalid local EE CP name"))?;
+        let mut np_fixed = pre_fixed;
+        np_fixed[9] = 0xb4 | if network_node { 0x40 } else { 0 };
+        np_fixed[12] = 0xc0; // Secondary enhanced-XID negotiation complete.
+        let mut np_vectors = vectors;
+        np_vectors.push(ControlVector {
+            key: 0x61,
+            data: cv61,
+        });
+        let mut np = Xid3::from_parts(np_fixed, np_vectors)
+            .map_err(|_| invalid("invalid local EE negotiation XID"))?;
+        np.set_cp_name(&local_cp.to_string())
+            .map_err(|_| invalid("invalid local EE CP name"))?;
+        Self::new(
+            pre.encode()
+                .map_err(|_| invalid("invalid local EE XID encoding"))?,
+            np.encode()
+                .map_err(|_| invalid("invalid local EE XID encoding"))?,
+        )
+    }
+
     /// Accept only a consistent, locally secondary EE profile. Constructing
     /// this does not authorize starting it: the caller must implement every
     /// capability advertised in CV61 before binding the endpoint.
@@ -50,7 +146,7 @@ impl LocalEeXids {
         if pre.exchange_state() != ExchangeState::Prenegotiation
             || np.exchange_state() != ExchangeState::NegotiationProceeding
             || pre.cp_name().ok() != np.cp_name().ok()
-            || pre.node_id() != np.node_id()
+            || (pre.node_id() != [0; 4] && pre.node_id() != np.node_id())
             || prenegotiation[16] != negotiation[16]
             || evidence.role != Role::Secondary
             || evidence.negotiation_byte & 0xc0 != 0xc0
@@ -378,6 +474,99 @@ mod tests {
     };
     use std::{net::UdpSocket, thread};
 
+    fn tower() -> ControlFlowsTower {
+        let mut tower = ControlFlowsTower::decode(&[
+            0x17, 0x81, 0x05, 0xb5, 0, 0, 0xea, 0x60, 0x10, 0, 0, 0, 4, 0, 0, 0, 4, 2, 0xa4, 0, 2,
+            0xa5, 0,
+        ])
+        .unwrap();
+        tower.path_switch_time_ms = 0;
+        tower.arb_mode = ArbMode::Base;
+        tower
+    }
+
+    #[test]
+    fn builds_stable_local_nn_xids_for_foreign_netid_end_node() {
+        let local: QualifiedName = "SNUSNU.SVC".parse().unwrap();
+        let peer: QualifiedName = "SOLNET.SNAB".parse().unwrap();
+        let xids = LocalEeXids::build(
+            &local,
+            &peer,
+            [0xff, 0xf1, 0x23, 0x45],
+            1,
+            [0x80, 2],
+            &tower(),
+            true,
+        )
+        .unwrap();
+        let pre = Xid3::decode(&xids.prenegotiation).unwrap();
+        let np = Xid3::decode(&xids.negotiation).unwrap();
+        assert_eq!(pre.cp_name().unwrap(), "SNUSNU.SVC");
+        assert_eq!(np.cp_name().unwrap(), "SNUSNU.SVC");
+        assert_eq!(pre.node_id(), [0xff, 0xf1, 0x23, 0x45]);
+        assert_eq!(np.node_id(), pre.node_id());
+        assert_eq!(pre.exchange_state(), ExchangeState::Prenegotiation);
+        assert_eq!(np.exchange_state(), ExchangeState::NegotiationProceeding);
+        assert_eq!(np.role(), Ok(Role::Secondary));
+        assert_eq!(xids.prenegotiation[9] & 0x40, 0x40); // NN assertion.
+        assert_eq!(xids.negotiation[9] & 0x40, 0x40);
+        assert_eq!(
+            HprXidEvidence::parse(&xids.negotiation, HprMedium::EnterpriseExtender)
+                .unwrap()
+                .advertised_sap,
+            4
+        );
+        let again = LocalEeXids::build(
+            &local,
+            &peer,
+            [0xff, 0xf1, 0x23, 0x45],
+            1,
+            [0x80, 2],
+            &tower(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(xids.prenegotiation, again.prenegotiation);
+        assert_eq!(xids.negotiation, again.negotiation);
+        assert!(LocalEeXids::build(
+            &local,
+            &local,
+            [0xff, 0xf1, 0x23, 0x45],
+            1,
+            [0x80, 2],
+            &tower(),
+            true
+        )
+        .is_err());
+        assert!(
+            LocalEeXids::build(&local, &peer, [0, 0, 0, 0], 1, [0x80, 2], &tower(), true).is_err()
+        );
+        let mut unsupported = tower();
+        unsupported.arb_mode = ArbMode::Responsive;
+        assert!(LocalEeXids::build(
+            &local,
+            &peer,
+            [0xff, 0xf1, 0x23, 0x45],
+            1,
+            [0x80, 2],
+            &unsupported,
+            true
+        )
+        .is_err());
+        unsupported.arb_mode = ArbMode::Base;
+        unsupported.path_switch_time_ms = 60_000;
+        assert!(LocalEeXids::build(
+            &local,
+            &peer,
+            [0xff, 0xf1, 0x23, 0x45],
+            1,
+            [0x80, 2],
+            &unsupported,
+            true
+        )
+        .is_err());
+    }
+
     fn xid(local: bool, negotiation: bool) -> Vec<u8> {
         let mut fixed = [0u8; 29];
         fixed[2..6].copy_from_slice(if local {
@@ -457,8 +646,10 @@ mod tests {
         peer.set_nonblocking(true).unwrap();
         let now = Instant::now();
         assert_eq!(exchange(&mut endpoint, &peer, &[], now), [4, 5, 0xaf]);
+        let mut remote_pre = xid(false, false);
+        remote_pre[2..6].fill(0); // V5R4 assigns its node ID in a later NP XID.
         assert_eq!(
-            exchange(&mut endpoint, &peer, &xid(false, false), now),
+            exchange(&mut endpoint, &peer, &remote_pre, now),
             [vec![4, 5, 0xaf], xid(true, false)].concat()
         );
         assert_eq!(

@@ -138,7 +138,16 @@ impl HprXidLeg {
             Side::Remote => (&self.remote_pre, &mut self.remote_np),
         };
         let pre = pre.as_ref().ok_or(LegError::MissingPrenegotiation)?;
-        if evidence.cp_name != pre.cp_name || evidence.node_id != pre.node_id {
+        // An EE peer can leave the node-identification field zero during
+        // prenegotiation and assign its FFF/000-block identifier in NP. The
+        // direct V5R4 capture does this. Once NP has supplied an identifier,
+        // later NP retries may not switch it to a different value.
+        if evidence.cp_name != pre.cp_name
+            || (pre.node_id != [0; 4] && evidence.node_id != pre.node_id)
+            || slot.as_ref().is_some_and(|previous| {
+                previous.node_id != [0; 4] && evidence.node_id != previous.node_id
+            })
+        {
             return Err(LegError::IdentityChanged);
         }
         if evidence.tg_number != pre.tg_number {
@@ -341,5 +350,36 @@ mod tests {
         assert_eq!(local_ee_tg_descriptor(1).data, [5, 0x80, 1, 0, 0]);
         let fixture = fixture(HprMedium::EnterpriseExtender, Side::Local, false, false);
         assert_eq!(tg_identifier(&fixture), Ok(Some(1)));
+    }
+
+    #[test]
+    fn ee_zero_prenegotiation_id_can_be_assigned_once_in_np() {
+        let medium = HprMedium::EnterpriseExtender;
+        let mut leg = HprXidLeg::new(medium, Side::Local);
+        leg.observe_prenegotiation(Side::Local, &fixture(medium, Side::Local, false, false))
+            .unwrap();
+        let mut remote_pre = fixture(medium, Side::Remote, false, false);
+        remote_pre[2..6].fill(0); // Preserved V5R4 EE prenegotiation shape.
+        leg.observe_prenegotiation(Side::Remote, &remote_pre)
+            .unwrap();
+        leg.observe_negotiation(Side::Local, &fixture(medium, Side::Local, true, false))
+            .unwrap();
+        let mut remote_np = fixture(medium, Side::Remote, true, true);
+        remote_np[2..6].copy_from_slice(&[0xff, 0xf6, 0x01, 0x00]);
+        leg.observe_negotiation(Side::Remote, &remote_np).unwrap();
+        assert_eq!(
+            leg.xid_agreement().unwrap().remote.node_id,
+            [0xff, 0xf6, 1, 0]
+        );
+
+        remote_np[2..6].copy_from_slice(&[0xff, 0xf6, 0x01, 0x01]);
+        assert_eq!(
+            leg.observe_negotiation(Side::Remote, &remote_np),
+            Err(LegError::IdentityChanged)
+        );
+        assert_eq!(
+            leg.xid_agreement().unwrap().remote.node_id,
+            [0xff, 0xf6, 1, 0]
+        );
     }
 }
