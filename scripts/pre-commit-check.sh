@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
 base_commit=$(git rev-parse HEAD)
+staged_tree=$(git write-tree)
 staged_paths=$(git diff --cached --name-only --diff-filter=ACDMR)
 if [[ -z "$staged_paths" ]]; then
   exit 0
@@ -77,6 +78,14 @@ if $check_protocol; then
   test -f "$check_dir/tree/docs/test-vectors/README.md"
   grep -q '## Implemented invariants' "$check_dir/tree/docs/protocol.md"
   grep -q '## Captured vectors' "$check_dir/tree/docs/test-vectors/README.md"
+fi
+
+# Another worker can stage files while this hook runs. Git commits the index
+# as it exists after the hook, so reject a changed index rather than approving
+# a different tree from the one tested above.
+if [[ $(git rev-parse HEAD) != "$base_commit" || $(git write-tree) != "$staged_tree" ]]; then
+  echo "pre-commit: HEAD or staged tree changed during checks; retry the commit" >&2
+  exit 1
 fi
 
 echo "pre-commit: all CI checks passed"
