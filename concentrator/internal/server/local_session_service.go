@@ -322,7 +322,7 @@ func (s *localSNAService) sessionInformation(c *localSNACircuit, request []byte)
 			}
 			return nil
 		}
-		if len(request) < 10 || !((request[6] == 1 && request[7] == 0x94 && request[8] == 0x20) ||
+		if len(request) < 10 || !((request[6] == 1 && (request[7] == 0x90 || request[7] == 0x94) && request[8] == 0x20) ||
 			(request[6] == 3 && ((request[7] == 0x90 && request[8] == 0x20) || (request[7] == 0xa0 && request[8] == 0)))) {
 			return errLocalSNA
 		}

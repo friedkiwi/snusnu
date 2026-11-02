@@ -78,7 +78,7 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 	}
 	expectTestBody(t, conn, "credit")
 	version, _ := hex.DecodeString("000e12ff01022b0289f561d6e200")
-	request := append([]byte{0, 2, 1, 0x94, 0x20}, version...)
+	request := append([]byte{0, 2, 1, 0x90, 0x20}, version...)
 	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: request}}})
 	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 {
 		t.Fatalf("version grant: %+v", grant)
