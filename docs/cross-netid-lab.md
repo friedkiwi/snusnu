@@ -53,8 +53,11 @@ Configure only the copied OS/400 guests after they reach Main Menu:
 The end-to-end route reached the remote V4R4 Sign On twice; the eighth run
 remained active past the former 180-second lab deadline. It currently uses
 the opt-in `--mptn-ws-gateway-lab` path. The ordinary `--config` runtime
-keeps `[[mptn_gateway]]` gated while X'83' UDP completion and teardown are
-finished. The `SOLNET` regression guests remain separate from this lab.
+keeps `[[mptn_gateway]]` gated because native session addressing still uses
+the QA fixture's address and the gateway handles one user session per run.
+The X'83' UDP completion and teardown handlers are implemented and covered
+by focused tests, but have not been exercised against a live OS/400 UDP
+exchange. The `SOLNET` regression guests remain separate from this lab.
 
 ## Prepared clone state
 
