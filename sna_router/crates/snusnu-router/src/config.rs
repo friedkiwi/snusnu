@@ -35,7 +35,7 @@ struct RawRouterConfig {
     #[serde(default)]
     llc: Vec<LlcConfig>,
     #[serde(default)]
-    ee: Vec<EeConfig>,
+    hpr_ip: Vec<EeConfig>,
     #[serde(default)]
     mptn: Vec<MptnConfig>,
     #[serde(default)]
@@ -85,7 +85,7 @@ impl<'de> Deserialize<'de> for RouterConfig {
         Ok(Self {
             web: raw.web,
             llc: raw.llc,
-            ee: raw.ee,
+            ee: raw.hpr_ip,
             anynet,
             mptn_gateway,
             hpr_lan: raw.hpr_lan,
@@ -565,7 +565,7 @@ impl RouterConfig {
             && self.hpr_lan.is_empty()
         {
             return Err(invalid(
-                "at least one [[llc]], [[ee]], [[mptn]] or [[hpr_lan]] peer is required",
+                "at least one [[llc]], [[hpr_ip]], [[mptn]] or [[hpr_lan]] peer is required",
             ));
         }
         let mut peers = HashSet::new();
@@ -665,17 +665,20 @@ impl RouterConfig {
             if !ids.insert(peer.id.as_str()) {
                 return Err(invalid(format!("duplicate port ID {}", peer.id)));
             }
-            kinds.insert(&peer.id, "ee");
+            kinds.insert(&peer.id, "hpr_ip");
             if peer.local_ip == peer.peer_ip
                 || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
                 || peer.local_ip.is_unspecified()
                 || peer.peer_ip.is_unspecified()
             {
-                return Err(invalid(format!("invalid EE IP pair for {}", peer.id)));
+                return Err(invalid(format!(
+                    "invalid HPR/IP address pair for {}",
+                    peer.id
+                )));
             }
             if !ee_listeners.insert(peer.local_ip) {
                 return Err(invalid(format!(
-                    "duplicate EE UDP listener IP {}",
+                    "duplicate HPR/IP UDP listener IP {}",
                     peer.local_ip
                 )));
             }
@@ -999,9 +1002,9 @@ impl RouterConfig {
                 ("llc", "llc")
                     | ("llc", "remote")
                     | ("remote", "llc")
-                    | ("ee", "ee")
-                    | ("hpr_lan", "ee")
-                    | ("ee", "hpr_lan")
+                    | ("hpr_ip", "hpr_ip")
+                    | ("hpr_lan", "hpr_ip")
+                    | ("hpr_ip", "hpr_lan")
                     | ("mptn_relay", "mptn_relay")
             ) {
                 return Err(invalid(format!(
@@ -1185,7 +1188,7 @@ impl RouterConfig {
         if !self.hpr_lan.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "HPR LAN to EE is experimental and awaits cross-medium XID3/TG validation before SETMODE",
+                "HPR LAN to HPR/IP is experimental and awaits cross-medium XID3/TG validation before SETMODE",
             ));
         }
         Ok(())
@@ -1227,7 +1230,7 @@ impl RouterConfig {
         if !self.ee.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "EE attachments cannot join automatic routing yet",
+                "HPR/IP attachments cannot join automatic routing yet",
             ));
         }
         if !self.anynet.is_empty() {
@@ -1481,11 +1484,11 @@ proxy_mac = "02:53:4e:00:00:04"
     #[test]
     fn ee_only_route_is_valid_and_llc_to_ee_is_rejected() {
         let ee = r#"
-[[ee]]
+[[hpr_ip]]
 id = "east"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
-[[ee]]
+[[hpr_ip]]
 id = "west"
 local_ip = "127.0.0.4"
 peer_ip = "127.0.0.5"
@@ -1499,7 +1502,7 @@ to = "west"
 id = "a"
 interface = "sol5"
 guest_mac = "02:00:35:27:23:01"
-[[ee]]
+[[hpr_ip]]
 id = "east"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
@@ -1512,6 +1515,10 @@ to = "east"
             .unwrap_err()
             .to_string()
             .contains("unsupported route"));
+        assert!(toml::from_str::<RouterConfig>(
+            "[[ee]]\nid='old'\nlocal_ip='127.0.0.2'\npeer_ip='127.0.0.3'\n"
+        )
+        .is_err());
     }
 
     #[test]
@@ -1892,7 +1899,7 @@ profile = "relay"
 id = "mptn"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
-[[ee]]
+[[hpr_ip]]
 id = "hpr"
 local_ip = "127.0.0.4"
 peer_ip = "127.0.0.5"
@@ -1990,7 +1997,7 @@ interface = "sol6"
 guest_mac = "02:04:ac:05:45:04"
 proxy_mac = "02:53:4e:00:00:04"
 experimental = true
-[[ee]]
+[[hpr_ip]]
 id = "ip"
 local_ip = "127.0.0.2"
 peer_ip = "127.0.0.3"
@@ -2013,7 +2020,7 @@ to = "ip"
             .validate()
             .is_err());
         assert!(
-            parse(&mixed.replace("[[ee]]", "[[mptn]]\nprofile = \"relay\""))
+            parse(&mixed.replace("[[hpr_ip]]", "[[mptn]]\nprofile = \"relay\""))
                 .validate()
                 .is_err()
         );
@@ -2175,10 +2182,10 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
 
     #[test]
     fn automatic_mode_rejects_media_without_session_adapters() {
-        let ee = parse("[[ee]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n");
+        let ee = parse("[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n");
         let error = ee.validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("EE attachments"));
+        assert!(error.to_string().contains("HPR/IP attachments"));
 
         let relay = parse(
             "[[mptn]]\nprofile='relay'\nid='relay'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\n",

@@ -1,6 +1,6 @@
 # Enterprise Extender V5R4 lab
 
-On 2026-11-01, two emulated V5R4 OS/400 guests completed `STRPASTHR`, remote sign-on, and `ENDPASTHR` through the Rust router's configured EE↔EE UDP relay. The relay carried XID3 activation on UDP 12000 and HPR UI traffic on UDP 12000, 12001, and 12003. This tests EE media forwarding between two HPRIP links. It does not test conversion to native LLC2 APPN.
+On 2026-11-01, two emulated V5R4 OS/400 guests completed `STRPASTHR`, remote sign-on, and `ENDPASTHR` through the Rust router's configured EE↔EE UDP relay. The router now labels this attachment `hpr_ip`, for the HPR/IP link that implements the Enterprise Extender IP side. The relay carried XID3 activation on UDP 12000 and HPR UI traffic on UDP 12000, 12001, and 12003. This tests EE media forwarding between two HPRIP links. It does not test conversion to native LLC2 APPN.
 
 ## Guests and links
 
@@ -33,15 +33,15 @@ sudo ip route add 10.99.4.2/32 dev sol6 src 10.99.4.10
 sudo ip route add 10.99.4.3/32 dev sol7 src 10.99.4.11
 ```
 
-The router configuration was:
+The equivalent router configuration with the current `hpr_ip` label is:
 
 ```toml
-[[ee]]
+[[hpr_ip]]
 id = "ee_a"
 local_ip = "10.99.4.10"
 peer_ip = "10.99.4.2"
 
-[[ee]]
+[[hpr_ip]]
 id = "ee_b"
 local_ip = "10.99.4.11"
 peer_ip = "10.99.4.3"

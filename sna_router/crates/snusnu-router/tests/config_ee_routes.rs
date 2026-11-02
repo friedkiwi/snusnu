@@ -35,8 +35,8 @@ impl RouterProcess {
         fs::write(
             &config,
             format!(
-                "[[ee]]\nid='first'\nlocal_ip='{first}'\npeer_ip='{first_peer}'\n\
-                 [[ee]]\nid='second'\nlocal_ip='{second}'\npeer_ip='{second_peer}'\n\
+                "[[hpr_ip]]\nid='first'\nlocal_ip='{first}'\npeer_ip='{first_peer}'\n\
+                 [[hpr_ip]]\nid='second'\nlocal_ip='{second}'\npeer_ip='{second_peer}'\n\
                  [[route]]\nfrom='first'\nto='second'\n"
             ),
         )

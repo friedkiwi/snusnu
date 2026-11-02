@@ -190,15 +190,17 @@ route-owned proxy MAC.
 
 When `[[llc]] local_cp` is set, the LLC port checks the guest's format-3 XID CP name against it and blocks LLC2 contact until a matching XID3 arrives. A mismatched or malformed XID3 closes that route; the gate resets after disconnect. The router still publishes configured reachability on WebSocket connection before seeing the guest XID: a passive OS/400 peer may need the concentrator route to receive the XID that elicits its own. Publication therefore asserts configured ownership, while live XID verification gates session activation. LU names remain configuration declarations; XID3 identifies the CP, not individual LUs.
 
-An EE link can also be attached without any LLC peers. Each `[[ee]]` entry binds UDP ports 12000–12004 on its `local_ip`, accepts datagrams only from `peer_ip`, and preserves the EE priority port. To relay two EE links, configure two distinct local addresses and route the two IDs together:
+## HPR/IP support for Enterprise Extender peers
+
+`[[hpr_ip]]` is the router's HPR over IP attachment. It implements the Enterprise Extender (EE) IP-side link format; EE is the familiar name for this APPN/HPR transport over UDP, while HPR/IP names the protocol used by the attachment. Each entry binds UDP ports 12000–12004 on its `local_ip`, accepts datagrams only from `peer_ip`, and preserves the EE priority port. An HPR/IP link can be attached without any LLC peers. To relay two links, configure two distinct local addresses and route the two IDs together:
 
 ```toml
-[[ee]]
+[[hpr_ip]]
 id = "ee_a"
 local_ip = "192.0.2.1"
 peer_ip = "192.0.2.11"
 
-[[ee]]
+[[hpr_ip]]
 id = "ee_b"
 local_ip = "192.0.2.2"
 peer_ip = "192.0.2.12"
@@ -208,13 +210,13 @@ from = "ee_a"
 to = "ee_b"
 ```
 
-EE↔EE relays EE datagrams. The loader rejects LLC↔EE routes and does not translate LLC2 PIUs into AnyNet MPTN or HPR records. Those profiles require explicit protocol converters.
+HPR/IP↔HPR/IP relays EE datagrams. The loader rejects LLC↔HPR/IP routes and does not translate LLC2 PIUs into AnyNet MPTN or HPR records. Those profiles require explicit protocol converters.
 
-The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this EE configuration on two isolated TAPs.
+The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this HPR/IP configuration on two isolated TAPs.
 
-## Experimental HPR LAN to EE media route
+## Experimental HPR LAN to HPR/IP media route
 
-`[[hpr_lan]]` describes one HPR-capable OS/400 Ethernet peer through AF_PACKET. Its `proxy_mac` is the remote adapter address configured on that guest. Pair it with one `[[ee]]` port on an IP address assigned to the host. The media adapter code translates HPR LAN UI framing and EE UDP framing while preserving HPR NLP bytes. **The runtime currently rejects this configuration as unsupported** until it can validate XID3 transmission-group agreement across both media before SETMODE. The example records the intended configuration shape for that integration test.
+`[[hpr_lan]]` describes one HPR-capable OS/400 Ethernet peer through AF_PACKET. Its `proxy_mac` is the remote adapter address configured on that guest. Pair it with one `[[hpr_ip]]` port on an IP address assigned to the host. The media adapter code translates HPR LAN UI framing and EE UDP framing while preserving HPR NLP bytes. **The runtime currently rejects this configuration as unsupported** until it can validate XID3 transmission-group agreement across both media before SETMODE. The example records the intended configuration shape for that integration test.
 
 ```toml
 [[hpr_lan]]
@@ -224,7 +226,7 @@ guest_mac = "02:04:ac:05:45:04"
 proxy_mac = "02:04:ac:05:45:05"
 experimental = true
 
-[[ee]]
+[[hpr_ip]]
 id = "ee_b"
 local_ip = "192.0.2.2"
 peer_ip = "192.0.2.12"
@@ -234,7 +236,7 @@ from = "lan_a"
 to = "ee_b"
 ```
 
-The loader requires `experimental = true` and rejects HPR LAN routes to LLC, AnyNet, WebSocket or another HPR LAN port. It still returns an explicit unsupported error for the HPR LAN to EE pair. The HPR LAN adapter negotiates its HPR SAP from XID3; no fixed `0xC8` SAP is configured. The [direct V5R4 HPR LAN baseline](hpr-lan-lab.md) documents the guest configuration used to validate the adapter.
+The loader requires `experimental = true` and rejects HPR LAN routes to LLC, AnyNet, WebSocket or another HPR LAN port. It still returns an explicit unsupported error for the HPR LAN to HPR/IP pair. The HPR LAN adapter negotiates its HPR SAP from XID3; no fixed `0xC8` SAP is configured. The [direct V5R4 HPR LAN baseline](hpr-lan-lab.md) documents the guest configuration used to validate the adapter.
 
 ## MPTN support for IBM AnyNet peers
 
@@ -264,7 +266,7 @@ from = "mptn_a"
 to = "mptn_b"
 ```
 
-Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 397 requires root or `CAP_NET_BIND_SERVICE`. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate MPTN listener IPs and routes between a relay profile and LLC, EE or WebSocket profiles until a session converter is implemented. IBM AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
+Each `local_ip` must already be assigned on the host. Binding TCP and UDP port 397 requires root or `CAP_NET_BIND_SERVICE`. `local_lu` identifies the LU reached through this port's `peer_ip`; `remote_lu` is the LU at the other end of the route. Set both names or omit both, and use the reciprocal pair on the opposite port. With names present, the adapter validates MPTN Connect LU identities and correlator before forwarding the session. The loader rejects duplicate MPTN listener IPs and routes between a relay profile and LLC, HPR/IP or WebSocket profiles until a session converter is implemented. IBM AnyNet addressing may embed provider IP addresses, so successful use still depends on paired peer configuration and trace validation.
 
 The [V5R4 AnyNet lab](anynet-lab.md) records an OS/400 pass-through over the configured TCP relay.
 
