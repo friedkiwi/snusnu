@@ -204,6 +204,7 @@ pub(crate) struct RouteConfig {
 pub(crate) struct BidirectionalGatewayConfig<'a> {
     pub(crate) gateway: &'a MptnGatewayConfig,
     pub(crate) concentrator: &'a RemoteConfig,
+    #[allow(dead_code)] // Retained for the configured gateway's route metadata and tests.
     pub(crate) route: &'a RouteConfig,
     pub(crate) reverse: ReverseWsConfig,
 }
@@ -973,10 +974,8 @@ impl RouterConfig {
                     if source_kind != "mptn_gateway" {
                         add_directed(&mut directed, &route.from, &route.to)?;
                     }
-                    if route.bidirectional {
-                        if target_kind != "mptn_gateway" {
-                            add_directed(&mut directed, &route.to, &route.from)?;
-                        }
+                    if route.bidirectional && target_kind != "mptn_gateway" {
+                        add_directed(&mut directed, &route.to, &route.from)?;
                     }
                     continue;
                 }
@@ -1088,12 +1087,11 @@ impl RouterConfig {
                 }
                 let local_cp = parse_cp(&gateway.local_cp)?;
                 let source_lu = parse_cp(&gateway.source_lu)?;
-                if exported_gateways.insert(&gateway.id) {
-                    if !exported_cps.insert((local_cp.netid, local_cp.name))
-                        || !exported_lus.insert((source_lu.netid, source_lu.name))
-                    {
-                        return Err(invalid("duplicate local CP or LU export"));
-                    }
+                if exported_gateways.insert(&gateway.id)
+                    && (!exported_cps.insert((local_cp.netid, local_cp.name))
+                        || !exported_lus.insert((source_lu.netid, source_lu.name)))
+                {
+                    return Err(invalid("duplicate local CP or LU export"));
                 }
                 continue;
             }
@@ -1224,6 +1222,18 @@ impl RouterConfig {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "HPR LAN attachment is experimental and cannot join automatic routing yet",
+            ));
+        }
+        if !self.ee.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "EE attachments cannot join automatic routing yet",
+            ));
+        }
+        if !self.anynet.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "MPTN relay attachments cannot join automatic routing yet; use a gateway profile or explicit relay route",
             ));
         }
         Ok(())
@@ -1922,9 +1932,11 @@ to = "west"
         assert!(
             toml::from_str::<RouterConfig>(&relay.replace("[[mptn]]", "[[mptn_gateway]]")).is_err()
         );
-        assert!(parse(&relay.replace("profile = \"relay\"", "profile = \"gateway\""))
-            .validate()
-            .is_err());
+        assert!(
+            parse(&relay.replace("profile = \"relay\"", "profile = \"gateway\""))
+                .validate()
+                .is_err()
+        );
         assert!(toml::from_str::<RouterConfig>(&relay.replace(
             "peer_ip = \"127.0.0.3\"",
             "peer_ip = \"127.0.0.3\"\nlocal_cp = \"SOLNET.SNAA\""
@@ -2159,5 +2171,20 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
             .unwrap_err()
             .to_string()
             .contains("one [[concentrator]]"));
+    }
+
+    #[test]
+    fn automatic_mode_rejects_media_without_session_adapters() {
+        let ee = parse("[[ee]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n");
+        let error = ee.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("EE attachments"));
+
+        let relay = parse(
+            "[[mptn]]\nprofile='relay'\nid='relay'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\n",
+        );
+        let error = relay.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("MPTN relay attachments"));
     }
 }

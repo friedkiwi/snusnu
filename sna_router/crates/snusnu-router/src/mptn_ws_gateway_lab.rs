@@ -113,7 +113,7 @@ pub(crate) fn run_config(config: &config::RouterConfig, experimental: bool) -> i
             return run_multi_target(config);
         }
     }
-    check_shape(&config)?;
+    check_shape(config)?;
     let gateway = &config.mptn_gateway[0];
     let remote = &config.remote[0];
     let bearer = remote.bearer_token()?;

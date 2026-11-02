@@ -1,6 +1,9 @@
 //! A loopback concentrator script exercises the wire contract across two
 //! authenticated router connections without requiring TAPs or OS/400.
 
+// The tungstenite handshake callback fixes the large Err response type.
+#![allow(clippy::result_large_err)]
+
 use prost::Message as _;
 use std::{
     net::{TcpListener, TcpStream},

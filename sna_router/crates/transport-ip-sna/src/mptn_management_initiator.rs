@@ -120,7 +120,7 @@ impl ManagementInitiator {
             || bind_token[1..5].iter().all(|&byte| byte == 0)
             || bind_token[5..] != [0x80, 0]
             || !(2..=8).contains(&session_limit)
-            || session_limit % 2 != 0
+            || !session_limit.is_multiple_of(2)
         {
             return Err(invalid(
                 "unsupported V5R4 management identity or session policy",

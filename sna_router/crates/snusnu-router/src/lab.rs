@@ -71,7 +71,7 @@ fn handle(
                     return Err(io::Error::other("LLC relay capacity changed"));
                 }
                 delivered[side] += 1;
-                if delivered[side] == 1 || delivered[side] % 10 == 0 {
+                if delivered[side] == 1 || delivered[side].is_multiple_of(10) {
                     tracing::debug!(
                         source_leg = side,
                         target_leg = 1 - side,

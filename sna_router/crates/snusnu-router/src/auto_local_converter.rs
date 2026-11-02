@@ -5,41 +5,25 @@
 //! UDP/397 lease, keeping native pacing and TCP62 credit within this session.
 
 use crate::{
-    auto_gateway_runtime::{virtual_cp_for_source, virtual_xid},
-    auto_llc::LlcIngressOffer,
-    config, mptn_llc_reverse,
-    mptn_outbound_port::OutboundEndpoint,
-    native_llc_port::NativeLlcPort,
+    auto_gateway_runtime::virtual_xid, auto_llc::LlcIngressOffer, config, mptn_llc_reverse,
+    mptn_outbound_port::OutboundEndpoint, native_llc_port::NativeLlcPort,
 };
 use router_core::xid3::Xid3;
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 use transport_ws::wire;
 
-/// Generate the router's virtual APPN identity only after the LLC guest has
-/// supplied XID3. A null XID contains no NETID, so callers must use the
-/// native listener's completed bootstrap offer or a previously verified CP.
-pub(crate) fn virtual_xid_for_offer(offer: &LlcIngressOffer, seed: &[u8]) -> io::Result<Xid3> {
-    virtual_xid_for_observed_cp(offer.peer_cp.as_deref(), seed)
-}
-
-fn virtual_xid_for_observed_cp(guest_cp: Option<&str>, seed: &[u8]) -> io::Result<Xid3> {
-    let guest_cp = guest_cp.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "LLC peer CP is not known before XID3",
-        )
-    })?;
-    let guest = config::parse_cp(guest_cp)?;
-    let wire_guest = wire::SnaName {
-        netid: guest.netid,
-        name: guest.name,
-    };
-    let local_cp = virtual_cp_for_source(&wire_guest, seed, None)?;
-    virtual_xid(&local_cp, seed, None, None, 1)
+/// Build the router's native XID from the selected MPTN target's trusted CP.
+/// The LLC guest CP is never used as the router's CP: the two can have
+/// different NETIDs. When no target CP is known, routing must wait for an
+/// advertised hosting CP or an explicit attachment hint.
+pub(crate) fn virtual_xid_for_target(target_cp: &wire::SnaName, seed: &[u8]) -> io::Result<Xid3> {
+    config::parse_cp(&format!("{}.{}", target_cp.netid, target_cp.name))?;
+    virtual_xid(target_cp, seed, None, None, 1)
 }
 
 /// The virtual XID CP and target MPTN attachment must already be selected by
@@ -51,11 +35,12 @@ pub(crate) fn run_llc_to_mptn(
     udp: UdpSocket,
     target: OutboundEndpoint,
     timeout: Duration,
+    cancel: &AtomicBool,
 ) -> io::Result<()> {
     validate_target(&udp, target)?;
     let interface = offer.interface.clone();
     let native = NativeLlcPort::open_dynamic_from_offer(offer, virtual_xid)?;
-    mptn_llc_reverse::run_with_native(native, udp, target, &interface, timeout)
+    mptn_llc_reverse::run_with_native(native, udp, target, &interface, timeout, cancel)
 }
 
 fn validate_target(udp: &UdpSocket, target: OutboundEndpoint) -> io::Result<()> {
@@ -91,14 +76,12 @@ mod tests {
     }
 
     #[test]
-    fn virtual_identity_requires_observed_xid3_cp() {
-        assert_eq!(
-            virtual_xid_for_observed_cp(None, b"router")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        let xid = virtual_xid_for_observed_cp(Some("SOLNET.SNAA"), b"router").unwrap();
-        assert!(xid.cp_name().unwrap().starts_with("SOLNET.R"));
+    fn virtual_identity_uses_selected_target_cp_even_across_netids() {
+        let cp = wire::SnaName {
+            netid: "QABOB".into(),
+            name: "SNAB".into(),
+        };
+        let xid = virtual_xid_for_target(&cp, b"router").unwrap();
+        assert_eq!(xid.cp_name().unwrap(), "QABOB.SNAB");
     }
 }

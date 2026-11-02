@@ -201,14 +201,14 @@ pub(crate) struct AutoReverseWsSession {
 
 enum AutoReversePhase {
     Management {
-        native: WsNativeResponder<WsRoutePort>,
+        native: Box<WsNativeResponder<WsRoutePort>>,
         socket: UdpSocket,
         deadline: Instant,
     },
     Active {
-        edge: GatewayEdge<WsNativeResponder<WsRoutePort>>,
+        edge: Box<GatewayEdge<WsNativeResponder<WsRoutePort>>>,
         socket: UdpSocket,
-        oob: OutboundUdp,
+        oob: Box<OutboundUdp>,
         first_attach_seen: bool,
     },
 }
@@ -228,27 +228,46 @@ impl AutoReverseWsSession {
         native.arm_inbound()?;
         Ok(Self {
             config,
-            phase: Some(AutoReversePhase::Management { native, socket, deadline }),
+            phase: Some(AutoReversePhase::Management {
+                native: Box::new(native),
+                socket,
+                deadline,
+            }),
         })
     }
 
     /// Returns false after the circuit ends; the caller may then remove it.
     pub(crate) fn poll_once(&mut self) -> io::Result<bool> {
-        let phase = self.phase.take().ok_or_else(|| invalid("reverse circuit already closed"))?;
+        let phase = self
+            .phase
+            .take()
+            .ok_or_else(|| invalid("reverse circuit already closed"))?;
         match phase {
-            AutoReversePhase::Management { mut native, socket, deadline } => {
+            AutoReversePhase::Management {
+                mut native,
+                socket,
+                deadline,
+            } => {
                 if Instant::now() >= deadline {
                     native.close()?;
-                    return Err(io::Error::new(io::ErrorKind::TimedOut,
-                        "automatic native management timed out"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "automatic native management timed out",
+                    ));
                 }
                 native.poll_management_once()?;
                 if !native.management_ready() {
-                    self.phase = Some(AutoReversePhase::Management { native, socket, deadline });
+                    self.phase = Some(AutoReversePhase::Management {
+                        native,
+                        socket,
+                        deadline,
+                    });
                     return Ok(true);
                 }
-                let management = native.management_bind()
-                    .ok_or_else(|| invalid("native management BIND absent"))?.clone();
+                let management = native
+                    .management_bind()
+                    .ok_or_else(|| invalid("native management BIND absent"))?
+                    .clone();
                 self.config.endpoint.establish_v5_management(
                     self.config.timeout.min(Duration::from_secs(5)),
                     &self.config.source_lu,
@@ -268,27 +287,48 @@ impl AutoReverseWsSession {
                     1,
                 )?;
                 let connect = connect_template_for_route(
-                    &self.config.source_lu, &self.config.hosted_lu, new_correlator()?)?;
+                    &self.config.source_lu,
+                    &self.config.hosted_lu,
+                    new_correlator()?,
+                )?;
                 let oob = OutboundUdp::new(self.config.endpoint, connect.clone())?;
                 let edge = self.config.endpoint.open_edge(
-                    Duration::from_secs(5), native, bridge, connect)?;
+                    Duration::from_secs(5),
+                    *native,
+                    bridge,
+                    connect,
+                )?;
                 self.phase = Some(AutoReversePhase::Active {
-                    edge, socket, oob, first_attach_seen: false,
+                    edge: Box::new(edge),
+                    socket,
+                    oob: Box::new(oob),
+                    first_attach_seen: false,
                 });
                 Ok(true)
             }
-            AutoReversePhase::Active { mut edge, socket, mut oob, mut first_attach_seen } => {
+            AutoReversePhase::Active {
+                mut edge,
+                socket,
+                mut oob,
+                mut first_attach_seen,
+            } => {
                 let result = (|| -> io::Result<bool> {
                     poll_udp(&socket, &mut oob, &mut edge)?;
                     edge.poll_native_once()?;
-                    if edge.is_closed() { return Ok(false); }
+                    if edge.is_closed() {
+                        return Ok(false);
+                    }
                     edge.flush_tcp()?;
                     first_attach_seen |= edge.first_attach_delivery_complete();
                     if first_attach_seen || !edge.ipr_ack_outstanding() {
                         match edge.poll_tcp_once() {
                             Ok(()) => {}
-                            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof
-                                && first_attach_seen => return Ok(false),
+                            Err(error)
+                                if error.kind() == io::ErrorKind::UnexpectedEof
+                                    && first_attach_seen =>
+                            {
+                                return Ok(false)
+                            }
                             Err(error) => return Err(error),
                         }
                     }
@@ -298,16 +338,23 @@ impl AutoReverseWsSession {
                 match result {
                     Ok(true) => {
                         self.phase = Some(AutoReversePhase::Active {
-                            edge, socket, oob, first_attach_seen,
+                            edge,
+                            socket,
+                            oob,
+                            first_attach_seen,
                         });
                         Ok(true)
                     }
                     Ok(false) => {
                         edge.close()?;
                         if !first_attach_seen {
-                            Err(io::Error::new(io::ErrorKind::ConnectionAborted,
-                                "MPTN session ended before first Attach"))
-                        } else { Ok(false) }
+                            Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "MPTN session ended before first Attach",
+                            ))
+                        } else {
+                            Ok(false)
+                        }
                     }
                     Err(error) => {
                         let _ = edge.close();
@@ -366,33 +413,10 @@ pub(crate) fn run_once(config: &ReverseWsConfig) -> io::Result<()> {
 /// socket is a clone of that gateway's sole bound UDP/397 socket.
 pub(crate) fn run_from_open(
     config: &ReverseWsConfig,
-    native: WsNativeResponder<WsRoutePort>,
-    socket: UdpSocket,
-    open: InboundOpen,
-    setup_deadline: Instant,
-) -> io::Result<()> {
-    run_from_open_with_tp(config, native, socket, open, setup_deadline, false)
-}
-
-/// Automatic routes learn the transaction program from the first validated
-/// native FMH-5 Attach, so no QA-specific TP has to appear in router config.
-pub(crate) fn run_from_open_dynamic_tp(
-    config: &ReverseWsConfig,
-    native: WsNativeResponder<WsRoutePort>,
-    socket: UdpSocket,
-    open: InboundOpen,
-    setup_deadline: Instant,
-) -> io::Result<()> {
-    run_from_open_with_tp(config, native, socket, open, setup_deadline, true)
-}
-
-fn run_from_open_with_tp(
-    config: &ReverseWsConfig,
     mut native: WsNativeResponder<WsRoutePort>,
     socket: UdpSocket,
     open: InboundOpen,
     setup_deadline: Instant,
-    dynamic_tp: bool,
 ) -> io::Result<()> {
     tracing::info!(
         circuit_id = ?open.circuit_id,
@@ -435,13 +459,9 @@ fn run_from_open_with_tp(
         allow_blank_mode: true,
         max_pending_bytes: MAX_RECORD,
     };
-    let available = CompensationSet::from_codes(&TCP62_REQUIRED)
-        .map_err(|error| invalid(error.to_string()))?;
-    let bridge = if dynamic_tp {
-        Bridge::new_dynamic_tp(policy, available, management, 1)?
-    } else {
-        Bridge::new(policy, available, management, config.user_tp, 1)?
-    };
+    let available =
+        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?;
+    let bridge = Bridge::new(policy, available, management, config.user_tp, 1)?;
     let connect =
         connect_template_for_route(&config.source_lu, &config.hosted_lu, new_correlator()?)?;
     let mut oob = OutboundUdp::new(config.endpoint, connect.clone())?;

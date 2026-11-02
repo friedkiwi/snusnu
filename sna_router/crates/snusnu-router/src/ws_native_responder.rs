@@ -184,10 +184,9 @@ impl<P: RoutePort> WsNativeResponder<P> {
             self.process_information(piu)?;
         }
         if self.management.phase() == ManagementPhase::BisComplete {
-            if self.user_offer.is_some() && !self.user_bind_emitted {
-                self.events.push_back(NativeEvent::UserBind(
-                    self.user_offer.as_ref().unwrap().request().to_vec(),
-                ));
+            if let Some(offer) = self.user_offer.as_ref().filter(|_| !self.user_bind_emitted) {
+                self.events
+                    .push_back(NativeEvent::UserBind(offer.request().to_vec()));
                 self.user_bind_emitted = true;
             }
         }
@@ -238,10 +237,9 @@ impl<P: RoutePort> WsNativeResponder<P> {
                 .map_err(protocol)?;
             return Ok(());
         }
-        if self.user_offer.is_some() && self.user_bind_acked {
+        if let Some(offer) = self.user_offer.as_ref().filter(|_| self.user_bind_acked) {
             if !self.first_attach_seen {
-                parse_first_user_attach(&piu, self.user_offer.as_ref().unwrap())
-                    .map_err(protocol)?;
+                parse_first_user_attach(&piu, offer).map_err(protocol)?;
                 self.first_attach_seen = true;
                 self.events.push_back(NativeEvent::FirstAttach(piu));
             } else {
@@ -324,13 +322,15 @@ impl<P: RoutePort> WsNativeResponder<P> {
                 self.user_offer = Some(self.validate_user_bind(&piu)?);
             }
             ManagementPhase::BisComplete => {
-                if self.user_offer.is_none() {
-                    if let Ok(offer) = self.validate_user_bind(&piu) {
-                        self.user_offer = Some(offer);
-                        self.events.push_back(NativeEvent::UserBind(piu));
-                        self.user_bind_emitted = true;
-                        return Ok(());
-                    }
+                let candidate = self
+                    .user_offer
+                    .is_none()
+                    .then(|| self.validate_user_bind(&piu));
+                if let Some(Ok(offer)) = candidate {
+                    self.user_offer = Some(offer);
+                    self.events.push_back(NativeEvent::UserBind(piu));
+                    self.user_bind_emitted = true;
+                    return Ok(());
                 }
                 let response = self
                     .management

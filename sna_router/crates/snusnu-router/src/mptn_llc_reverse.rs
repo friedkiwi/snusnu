@@ -19,7 +19,7 @@ use std::{
     io::{self, Read},
     net::{IpAddr, SocketAddr, UdpSocket},
     path::Path,
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -33,6 +33,16 @@ use transport_ip_sna::{
 };
 
 const IDLE_POLL: Duration = Duration::from_micros(200);
+
+struct BridgeRun<'a> {
+    endpoint: OutboundEndpoint,
+    interface: &'a str,
+    source_lu: &'a str,
+    destination_lu: &'a str,
+    user_tp: Option<[u8; 4]>,
+    management: ManagementBind,
+    cancel: Option<&'a AtomicBool>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReverseLlcConfig {
@@ -246,47 +256,50 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
     run_bridge(
         native,
         socket,
-        config.endpoint,
-        &config.interface,
-        &config.source_lu,
-        &config.destination_lu,
-        Some(config.user_tp),
-        management,
+        BridgeRun {
+            endpoint: config.endpoint,
+            interface: &config.interface,
+            source_lu: &config.source_lu,
+            destination_lu: &config.destination_lu,
+            user_tp: Some(config.user_tp),
+            management,
+            cancel: None,
+        },
     )
 }
 
-fn run_bridge(
-    native: NativeLlcPort,
-    socket: UdpSocket,
-    endpoint: OutboundEndpoint,
-    interface: &str,
-    source_lu: &str,
-    destination_lu: &str,
-    user_tp: Option<[u8; 4]>,
-    management: ManagementBind,
-) -> io::Result<()> {
-    let policy =
-        BindPolicy {
-            plu: source_lu.to_owned(),
-            slu: destination_lu.to_owned(),
-            mode: None,
-            allow_blank_mode: true,
-            max_pending_bytes: MAX_RECORD,
-        };
-    let available = CompensationSet::from_codes(&TCP62_REQUIRED)
-        .map_err(|error| invalid(error.to_string()))?;
+fn run_bridge(native: NativeLlcPort, socket: UdpSocket, settings: BridgeRun<'_>) -> io::Result<()> {
+    let BridgeRun {
+        endpoint,
+        interface,
+        source_lu,
+        destination_lu,
+        user_tp,
+        management,
+        cancel,
+    } = settings;
+    let policy = BindPolicy {
+        plu: source_lu.to_owned(),
+        slu: destination_lu.to_owned(),
+        mode: None,
+        allow_blank_mode: true,
+        max_pending_bytes: MAX_RECORD,
+    };
+    let available =
+        CompensationSet::from_codes(&TCP62_REQUIRED).map_err(|error| invalid(error.to_string()))?;
     let bridge = match user_tp {
         Some(tp) => Bridge::new(policy, available, management, tp, 1)?,
         None => Bridge::new_dynamic_tp(policy, available, management, 1)?,
     };
     let connect = connect_template_for_route(source_lu, destination_lu, new_correlator()?)?;
     let mut oob = OutboundUdp::new(endpoint, connect.clone())?;
-    let mut edge = endpoint
-        .open_edge(Duration::from_secs(5), native, bridge, connect)?;
+    let mut edge = endpoint.open_edge(Duration::from_secs(5), native, bridge, connect)?;
     let mut first_attach_seen = false;
     let result = (|| -> io::Result<()> {
         loop {
-            if STOP.load(Ordering::Relaxed) {
+            if STOP.load(Ordering::Relaxed)
+                || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            {
                 return Ok(());
             }
             poll_udp(&socket, &mut oob, &mut edge)?;
@@ -317,7 +330,10 @@ fn run_bridge(
     let close = edge.close();
     result?;
     close?;
-    if !first_attach_seen && !STOP.load(Ordering::Relaxed) {
+    if !first_attach_seen
+        && !STOP.load(Ordering::Relaxed)
+        && !cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "MPTN session ended before first Attach",
@@ -337,6 +353,7 @@ pub(crate) fn run_with_native(
     endpoint: OutboundEndpoint,
     interface: &str,
     timeout: Duration,
+    cancel: &AtomicBool,
 ) -> io::Result<()> {
     if timeout.is_zero() || timeout > Duration::from_secs(600) {
         return Err(invalid("automatic LLC to MPTN setup timeout is invalid"));
@@ -345,6 +362,7 @@ pub(crate) fn run_with_native(
     let deadline = Instant::now() + timeout;
     while native.management_bind().is_none()
         && !STOP.load(Ordering::Relaxed)
+        && !cancel.load(Ordering::Relaxed)
         && Instant::now() < deadline
     {
         match native.receive_once()? {
@@ -357,6 +375,12 @@ pub(crate) fn run_with_native(
             }
             Some(_) => return Err(invalid("native user event before management BIND")),
         }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "automatic local circuit cancelled",
+        ));
     }
     let management = native
         .management_bind()
@@ -375,12 +399,15 @@ pub(crate) fn run_with_native(
     run_bridge(
         native,
         socket,
-        endpoint,
-        interface,
-        &source_lu,
-        &destination_lu,
-        None,
-        management,
+        BridgeRun {
+            endpoint,
+            interface,
+            source_lu: &source_lu,
+            destination_lu: &destination_lu,
+            user_tp: None,
+            management,
+            cancel: Some(cancel),
+        },
     )
 }
 

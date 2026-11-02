@@ -345,9 +345,8 @@ mod tests {
     fn wrong_native_address_or_fqpcid_retires_attempt() {
         for mutation in [2, 3, 4 + 5 + 27 + 1] {
             let mut bridge = ReverseUserBind::after_management(&offer(), address()).unwrap();
-            bridge
-                .mark_native_bind_enqueued(&bridge.native_bind().to_vec())
-                .unwrap();
+            let expected_bind = bridge.native_bind().to_vec();
+            bridge.mark_native_bind_enqueued(&expected_bind).unwrap();
             let mut response = native_response();
             response[mutation] ^= 1;
             assert!(bridge.accept_native_response(&response).is_err());

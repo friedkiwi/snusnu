@@ -14,6 +14,7 @@ use std::io;
 
 pub(crate) struct VirtualNativeCp {
     type1: NativeType1,
+    #[allow(dead_code)] // Inspectable identity in the virtual-CP tests.
     local_cp: String,
     expected_peer_cp: String,
     pending: Option<OutboundType1>,
@@ -42,14 +43,17 @@ impl VirtualNativeCp {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn local_cp(&self) -> &str {
         &self.local_cp
     }
 
+    #[cfg(test)]
     pub(crate) fn peer_cp(&self) -> Option<&str> {
         self.type1.peer_name()
     }
 
+    #[cfg(test)]
     pub(crate) fn xid_ready(&self) -> bool {
         self.pending.is_none() && self.type1.phase() == Phase::ReadyForSabme
     }

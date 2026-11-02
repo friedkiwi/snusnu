@@ -4,6 +4,9 @@
 //! Router A uses token `lab-a`; router B uses token `lab-b`. This intentionally
 //! omits production authentication, policy, persistence, and multi-circuit routing.
 
+// The tungstenite handshake callback fixes the large Err response type.
+#![allow(clippy::result_large_err)]
+
 use prost::Message as _;
 use std::{
     env, io,

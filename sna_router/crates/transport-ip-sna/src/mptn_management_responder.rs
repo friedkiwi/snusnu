@@ -111,7 +111,7 @@ impl ManagementResponder {
             || !matches!(response_token[5], 0 | 0x80)
             || response_token[6] != 0
             || !(2..=8).contains(&session_limit)
-            || session_limit % 2 != 0
+            || !session_limit.is_multiple_of(2)
         {
             return Err(invalid(
                 "management response capability or token unsupported",

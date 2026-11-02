@@ -104,10 +104,10 @@ pub fn advertised_hpr_sap(xid: &[u8], medium: HprMedium) -> Result<u8, Negotiati
             .checked_add(2 + header[1] as usize)
             .filter(|end| *end <= xid.len())
             .ok_or(NegotiationError::InvalidXid3)?;
-        if header[0] == HPR_CAPABILITIES_KEY {
-            if capabilities.replace(&xid[cursor + 2..end]).is_some() {
-                return Err(NegotiationError::DuplicateHprCapabilities);
-            }
+        if header[0] == HPR_CAPABILITIES_KEY
+            && capabilities.replace(&xid[cursor + 2..end]).is_some()
+        {
+            return Err(NegotiationError::DuplicateHprCapabilities);
         }
         cursor = end;
     }

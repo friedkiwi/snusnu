@@ -240,11 +240,12 @@ impl Bridge {
                 piu[19..23].try_into().expect("validated FMH-5 TP field")
             }
         };
-        let route = match self.pacing.as_mut().unwrap().observe_first_attach(
-            offer,
-            &tp,
-            piu,
-        ) {
+        let route = match self
+            .pacing
+            .as_mut()
+            .unwrap()
+            .observe_first_attach(offer, &tp, piu)
+        {
             Ok(route) => route,
             Err(_) => {
                 // Prepared record was never queued; return reserved credit.

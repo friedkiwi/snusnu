@@ -1,6 +1,9 @@
 use std::{
     env, io, process,
-    sync::{atomic::{AtomicBool, Ordering}, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
     thread,
     time::Duration,
 };
@@ -156,7 +159,10 @@ fn run() -> io::Result<()> {
             }));
         }
         LOCAL_STATUS.set(status.clone()).map_err(|_| {
-            io::Error::new(io::ErrorKind::AlreadyExists, "local status already initialized")
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "local status already initialized",
+            )
         })?;
         if let Some(web) = &config.web {
             let _web_thread = local_web::start(web, status)?;

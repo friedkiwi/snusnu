@@ -190,6 +190,7 @@ impl LocalStatus {
         self.persist_or_warn();
     }
 
+    #[allow(dead_code)] // Reserved for a future local peer cache reset action.
     pub(crate) fn remove_peer(&self, key: &str) {
         self.update(|snapshot| snapshot.local_peers.retain(|peer| peer.key != key));
         self.persist_or_warn();

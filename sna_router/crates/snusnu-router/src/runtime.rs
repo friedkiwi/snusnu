@@ -3,10 +3,10 @@
 use crate::{
     anynet_port::AnyNetPort,
     config::{self, BidirectionalGatewayConfig, RouterConfig},
-    endpoint::{Endpoint, EndpointRegistry, Event, format_mac},
+    endpoint::{format_mac, Endpoint, EndpointRegistry, Event},
     hpr_lan_port::HprLanPort,
     ip_ports::EePort,
-    local_status::{LocalPeerStatus, now_ms},
+    local_status::{now_ms, LocalPeerStatus},
     mptn_bidirectional_gateway,
     mptn_llc_reverse::{self, ReverseLlcConfig},
     mptn_ws_reverse::{self, ReverseWsConfig},
@@ -855,11 +855,9 @@ to = "upstream"
         };
         let error = wrong_netid.observe(&pdu).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(
-            error
-                .to_string()
-                .contains("NETID SOLNET differs from configured OTHNET")
-        );
+        assert!(error
+            .to_string()
+            .contains("NETID SOLNET differs from configured OTHNET"));
         assert!(!wrong_netid.verified);
         let mut malformed = pdu;
         malformed[4] = 0x2e; // Declared XID length no longer matches.

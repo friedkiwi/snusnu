@@ -101,6 +101,8 @@ struct PendingOutboundOob {
 struct Association {
     tcp: TcpSession,
     state: SessionState,
+    /// Network-qualified identities admitted from this association's Connect.
+    selected_lus: Option<(String, String)>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
     writes: VecDeque<(usize, Completion)>,
@@ -128,6 +130,7 @@ pub(crate) struct MptnGatewayPort {
     allowed_routes: Vec<(String, String)>,
     completed_by_association: BTreeMap<u64, usize>,
     management_ready: bool,
+    completed_management_lus: Option<(String, String)>,
     completed_user_records: usize,
 }
 
@@ -181,7 +184,15 @@ impl MptnGatewayPort {
                 }
                 "offered"
             }
-            Some(GatewayEvent::ManagementReady) => "management-ready",
+            Some(GatewayEvent::ManagementReady) => {
+                if let Some((source_lu, _)) = &self.completed_management_lus {
+                    if !lus.contains(source_lu) {
+                        lus.push(source_lu.clone());
+                        lus.sort();
+                    }
+                }
+                "management-ready"
+            }
             Some(GatewayEvent::Closed | GatewayEvent::Rejected(_))
                 if existing.is_some() && self.association_ids().is_empty() =>
             {
@@ -260,12 +271,21 @@ impl MptnGatewayPort {
             allowed_routes: Vec::new(),
             completed_by_association: BTreeMap::new(),
             management_ready: false,
+            completed_management_lus: None,
             completed_user_records: 0,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn management_ready(&self) -> bool {
         self.management_ready
+    }
+
+    /// The last completed management exchange yields its validated LU pair
+    /// once. Call after `GatewayEvent::ManagementReady` to publish local
+    /// reachability before the peer opens a user session.
+    pub(crate) fn take_management_lus(&mut self) -> Option<(String, String)> {
+        self.completed_management_lus.take()
     }
 
     /// The duplex session manager owns UDP receive scheduling. A clone shares
@@ -392,6 +412,7 @@ impl MptnGatewayPort {
                 let association = Association {
                     tcp: TcpSession::new(stream)?,
                     state: SessionState::AwaitConnect,
+                    selected_lus: None,
                     incoming: VecDeque::new(),
                     incoming_bytes: 0,
                     writes: VecDeque::new(),
@@ -934,6 +955,8 @@ impl MptnGatewayPort {
                             self.config.cnos_limit,
                         )?;
                         let bytes = responder.connect_response().to_vec();
+                        association.selected_lus =
+                            Some((source_lu.to_string(), destination_lu.to_string()));
                         association.state = SessionState::Management(responder);
                         Self::queue(
                             association,
@@ -969,6 +992,7 @@ impl MptnGatewayPort {
                         responder.accept_unbind(&record.bytes)?;
                         responder.mark_close_sent()?;
                         self.management_ready = true;
+                        self.completed_management_lus = association.selected_lus.take();
                         return Ok((Some(GatewayEvent::ManagementReady), false));
                     }
                     _ => return Err(invalid("TCP62 management input before egress completion")),
@@ -1281,6 +1305,7 @@ impl MptnGatewayPort {
             .is_some_and(|association| matches!(association.state, SessionState::UserActive(_)))
     }
 
+    #[cfg(test)]
     pub(crate) fn live_association_ids(&self) -> Vec<u64> {
         self.association_ids()
     }
@@ -1516,6 +1541,71 @@ mod tests {
     }
 
     #[test]
+    fn management_lus_are_available_only_after_completed_exchange() {
+        fn read_record(peer: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).unwrap();
+            let length = u32::from_be_bytes(header) as usize;
+            assert!((5..=MAX_RECORD).contains(&length));
+            let mut bytes = vec![0; length];
+            bytes[..4].copy_from_slice(&header);
+            peer.read_exact(&mut bytes[4..]).unwrap();
+            bytes
+        }
+        fn pump(port: &mut MptnGatewayPort) -> Option<GatewayEvent> {
+            for _ in 0..20 {
+                if let Some(event) = port.poll_once(true).unwrap() {
+                    return Some(event);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            None
+        }
+        let mut port = MptnGatewayPort::bind_dynamic(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: String::new(),
+            destination_lu: String::new(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: true,
+                keepalive_handler: true,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        let mut initiator = request();
+        let mut peer = peer_socket(port.listener.local_addr().unwrap());
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        peer.write_all(initiator.connect_request()).unwrap();
+        assert!(pump(&mut port).is_none());
+        assert_eq!(port.take_management_lus(), None);
+        let positive = read_record(&mut peer);
+        let cnos = initiator.accept_connect_response(&positive).unwrap();
+        peer.write_all(&cnos).unwrap();
+        assert!(pump(&mut port).is_none());
+        let cnos_reply = read_record(&mut peer);
+        let bis = initiator.accept_cnos_reply(&cnos_reply).unwrap();
+        peer.write_all(&bis).unwrap();
+        assert!(pump(&mut port).is_none());
+        let bis_reply = read_record(&mut peer);
+        let unbind = initiator.accept_bis(&bis_reply).unwrap();
+        peer.write_all(&unbind).unwrap();
+        assert!(matches!(
+            pump(&mut port),
+            Some(GatewayEvent::ManagementReady)
+        ));
+        assert_eq!(
+            port.take_management_lus(),
+            Some(("QABOB.SNAB".into(), "QAALICE.SNAA".into()))
+        );
+        assert_eq!(port.take_management_lus(), None);
+    }
+
+    #[test]
     fn concurrent_peers_select_distinct_lu_routes_on_one_listener() {
         let mut port = MptnGatewayPort::bind(GatewayConfig {
             local: "127.0.0.1:0".parse().unwrap(),
@@ -1620,6 +1710,7 @@ mod tests {
             Association {
                 tcp: TcpSession::new(stream).unwrap(),
                 state: SessionState::UserActive(offer),
+                selected_lus: None,
                 incoming: VecDeque::new(),
                 incoming_bytes: 0,
                 writes: VecDeque::new(),
@@ -1753,6 +1844,7 @@ mod tests {
         port.active = Some(Association {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
+            selected_lus: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
@@ -2081,6 +2173,7 @@ mod tests {
         port.active = Some(Association {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
+            selected_lus: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
@@ -2192,6 +2285,7 @@ mod tests {
         port.active = Some(Association {
             tcp: TcpSession::new(stream).unwrap(),
             state: SessionState::UserActive(offer),
+            selected_lus: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),

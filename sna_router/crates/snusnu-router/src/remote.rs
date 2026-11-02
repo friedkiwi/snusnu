@@ -103,7 +103,11 @@ impl Drop for SharedWs {
     fn drop(&mut self) {
         if let Some(status) = crate::status() {
             let snapshot = status.snapshot();
-            for origin in snapshot.upstream_routes.iter().map(|route| &route.origin_router_id) {
+            for origin in snapshot
+                .upstream_routes
+                .iter()
+                .map(|route| &route.origin_router_id)
+            {
                 status.withdraw_origin(origin);
             }
             status.replace_managed_macs(Vec::new());
@@ -170,7 +174,10 @@ impl SharedWs {
         match &body {
             Body::OriginRoutes(origin) => {
                 if origin.router_id.len() != 16
-                    || origin.snapshot.as_ref().is_none_or(|snapshot| snapshot.epoch.len() != 16)
+                    || origin
+                        .snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| snapshot.epoch.len() != 16)
                 {
                     return Err(protocol("invalid origin route snapshot"));
                 }
@@ -210,19 +217,24 @@ impl SharedWs {
             }
             Body::IncomingOpen(open) => {
                 if self.auto_directory.is_some()
-                    && open.target.as_ref().is_some_and(|target|
-                        self.auto_local_route_ids.contains(&target.route_id))
+                    && open
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| self.auto_local_route_ids.contains(&target.route_id))
                 {
                     if self.auto_incoming.len() < MAX_PENDING_AUTO_OPENS {
                         self.auto_incoming.push_back(open.clone());
                     } else {
                         warn!(circuit_id = %format_uuid(&open.circuit_id),
                             "automatic incoming circuit queue is full");
-                        self.client.send(envelope(Body::OpenDecision(wire::OpenDecision {
-                            circuit_id: open.circuit_id.clone(), accept: false,
-                            receive_allowance_bytes: 0,
-                            reason: wire::OpenFailure::Busy as i32,
-                        }))).map_err(io_error)?;
+                        self.client
+                            .send(envelope(Body::OpenDecision(wire::OpenDecision {
+                                circuit_id: open.circuit_id.clone(),
+                                accept: false,
+                                receive_allowance_bytes: 0,
+                                reason: wire::OpenFailure::Busy as i32,
+                            })))
+                            .map_err(io_error)?;
                     }
                     return Ok(true);
                 }
@@ -868,6 +880,22 @@ impl WsRoutePort {
                 if snapshot.epoch.len() != 16 {
                     return Err(protocol("invalid route epoch"));
                 }
+                if self.auto_owned {
+                    let target_gone = self.target.as_ref().is_some_and(|target| {
+                        target.router_id == origin.router_id
+                            && target.epoch == snapshot.epoch
+                            && !snapshot.routes.iter().any(|route| {
+                                route.id == target.route_id
+                                    && route.generation == target.route_generation
+                            })
+                    });
+                    if target_gone {
+                        self.target = None;
+                        self.disconnect()?;
+                        return Ok(vec![RouterEvent::Closed]);
+                    }
+                    return Ok(Vec::new());
+                }
                 if self.target_lu.is_none()
                     && self.managed_binding_seen
                     && (self.require_managed_binding || self.managed_mac.is_some())
@@ -928,7 +956,8 @@ impl WsRoutePort {
                 }
             }
             Body::OriginWithdraw(withdraw) => {
-                if self.target_lu.is_none()
+                if !self.auto_owned
+                    && self.target_lu.is_none()
                     && self.managed_binding_seen
                     && (self.require_managed_binding || self.managed_mac.is_some())
                 {
@@ -969,6 +998,38 @@ impl WsRoutePort {
                     binding_count = bindings.bindings.len(),
                     "received managed CP bindings"
                 );
+                if self.auto_owned {
+                    if self.target_lu.is_some() {
+                        return Ok(Vec::new());
+                    }
+                    let binding = bindings
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.control_point.as_ref() == Some(&self.target_cp));
+                    let authorized = binding.is_some_and(|binding| {
+                        self.target.as_ref().is_some_and(|target| {
+                            binding
+                                .candidates
+                                .iter()
+                                .any(|candidate| candidate == target)
+                        })
+                    });
+                    if !authorized {
+                        self.managed_mac = None;
+                        self.disconnect()?;
+                        return Ok(vec![RouterEvent::Closed]);
+                    }
+                    let mac: [u8; 6] = binding
+                        .unwrap()
+                        .virtual_mac
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| protocol("invalid managed virtual MAC"))?;
+                    if self.managed_mac.replace(mac) != Some(mac) {
+                        return Ok(vec![RouterEvent::ManagedMac(mac)]);
+                    }
+                    return Ok(Vec::new());
+                }
                 if let Some(binding) = bindings
                     .bindings
                     .into_iter()
@@ -1697,7 +1758,10 @@ pub(crate) fn automatic_route_snapshot(
         });
     }
     for lu in logical_units {
-        let name = lu.lu.as_ref().ok_or_else(|| protocol("LU export missing name"))?;
+        let name = lu
+            .lu
+            .as_ref()
+            .ok_or_else(|| protocol("LU export missing name"))?;
         validate_name(name)?;
         if name.netid != allowed_netid {
             warn!(local_lu = %format_cp(name), assigned_netid = allowed_netid,
@@ -1746,15 +1810,21 @@ pub(crate) struct AutoDirectory {
 impl AutoDirectory {
     fn route_for_reference(&self, reference: &wire::RouteReference) -> Option<&wire::RouteExport> {
         let (epoch, _, routes) = self.origins.get(&reference.router_id)?;
-        if epoch != &reference.epoch { return None; }
-        routes.iter().find(|route|
-            route.id == reference.route_id && route.generation == reference.route_generation)
+        if epoch != &reference.epoch {
+            return None;
+        }
+        routes.iter().find(|route| {
+            route.id == reference.route_id && route.generation == reference.route_generation
+        })
     }
     pub(crate) fn replace_origin(&mut self, origin: &wire::OriginRouteSnapshot) -> io::Result<()> {
         if origin.router_id.len() != 16 {
             return Err(protocol("invalid origin ID"));
         }
-        let snapshot = origin.snapshot.as_ref().ok_or_else(|| protocol("missing route snapshot"))?;
+        let snapshot = origin
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| protocol("missing route snapshot"))?;
         if snapshot.epoch.len() != 16 || snapshot.revision == 0 {
             return Err(protocol("invalid origin route snapshot"));
         }
@@ -1766,19 +1836,35 @@ impl AutoDirectory {
             match route.resource.as_ref() {
                 Some(wire::route_export::Resource::ControlPoint(cp)) => validate_name(cp)?,
                 Some(wire::route_export::Resource::LogicalUnit(lu)) => {
-                    validate_name(lu.lu.as_ref().ok_or_else(|| protocol("LU route missing name"))?)?;
-                    if let Some(host) = &lu.hosting_cp { validate_name(host)?; }
+                    validate_name(
+                        lu.lu
+                            .as_ref()
+                            .ok_or_else(|| protocol("LU route missing name"))?,
+                    )?;
+                    if let Some(host) = &lu.hosting_cp {
+                        validate_name(host)?;
+                    }
                 }
                 None => return Err(protocol("origin route missing resource")),
             }
         }
-        if self.origins.get(&origin.router_id).is_some_and(|(epoch, revision, _)|
-            epoch == &snapshot.epoch && snapshot.revision <= *revision)
+        if self
+            .origins
+            .get(&origin.router_id)
+            .is_some_and(|(epoch, revision, _)| {
+                epoch == &snapshot.epoch && snapshot.revision <= *revision
+            })
         {
             return Err(protocol("origin route revision is not increasing"));
         }
-        self.origins.insert(origin.router_id.clone(),
-            (snapshot.epoch.clone(), snapshot.revision, snapshot.routes.clone()));
+        self.origins.insert(
+            origin.router_id.clone(),
+            (
+                snapshot.epoch.clone(),
+                snapshot.revision,
+                snapshot.routes.clone(),
+            ),
+        );
         Ok(())
     }
 
@@ -1786,7 +1872,9 @@ impl AutoDirectory {
         if withdraw.router_id.len() != 16 || withdraw.epoch.len() != 16 {
             return Err(protocol("invalid origin withdrawal"));
         }
-        if self.origins.get(&withdraw.router_id)
+        if self
+            .origins
+            .get(&withdraw.router_id)
             .is_some_and(|(epoch, _, _)| epoch == &withdraw.epoch)
         {
             self.origins.remove(&withdraw.router_id);
@@ -1794,41 +1882,57 @@ impl AutoDirectory {
         Ok(())
     }
 
-    pub(crate) fn replace_managed(&mut self, bindings: &wire::ManagedCpBindingSnapshot) -> io::Result<()> {
+    pub(crate) fn replace_managed(
+        &mut self,
+        bindings: &wire::ManagedCpBindingSnapshot,
+    ) -> io::Result<()> {
         validate_managed_bindings(&bindings.bindings)?;
         let mut next = HashMap::new();
         for binding in &bindings.bindings {
-            let mac: [u8; 6] = binding.virtual_mac.as_slice().try_into()
+            let mac: [u8; 6] = binding
+                .virtual_mac
+                .as_slice()
+                .try_into()
                 .map_err(|_| protocol("invalid managed virtual MAC"))?;
-            let cp = binding.control_point.clone().ok_or_else(|| protocol("managed CP missing name"))?;
+            let cp = binding
+                .control_point
+                .clone()
+                .ok_or_else(|| protocol("managed CP missing name"))?;
             next.insert(mac, (cp, binding.candidates.clone()));
         }
         self.managed = next;
         Ok(())
     }
 
-    pub(crate) fn resolve_cp(&self, name: &wire::SnaName) -> io::Result<Option<wire::RouteReference>> {
-        self.resolve(|resource| matches!(resource,
-            wire::route_export::Resource::ControlPoint(cp) if cp == name))
-    }
-
-    pub(crate) fn resolve_lu(&self, name: &wire::SnaName) -> io::Result<Option<wire::RouteReference>> {
-        self.resolve(|resource| matches!(resource,
-            wire::route_export::Resource::LogicalUnit(lu) if lu.lu.as_ref() == Some(name)))
+    pub(crate) fn resolve_lu(
+        &self,
+        name: &wire::SnaName,
+    ) -> io::Result<Option<wire::RouteReference>> {
+        self.resolve(|resource| {
+            matches!(resource,
+            wire::route_export::Resource::LogicalUnit(lu) if lu.lu.as_ref() == Some(name))
+        })
     }
 
     pub(crate) fn resolve_mac(&self, mac: &[u8; 6]) -> io::Result<Option<wire::RouteReference>> {
-        let Some((name, candidates)) = self.managed.get(mac) else { return Ok(None) };
+        let Some((name, candidates)) = self.managed.get(mac) else {
+            return Ok(None);
+        };
         let mut found = Vec::new();
         for candidate in candidates {
-            if self.origins.get(&candidate.router_id).is_some_and(|(epoch, _, routes)| {
-                epoch == &candidate.epoch && routes.iter().any(|route| {
-                    route.id == candidate.route_id
-                        && route.generation == candidate.route_generation
-                        && matches!(route.resource.as_ref(),
+            if self
+                .origins
+                .get(&candidate.router_id)
+                .is_some_and(|(epoch, _, routes)| {
+                    epoch == &candidate.epoch
+                        && routes.iter().any(|route| {
+                            route.id == candidate.route_id
+                                && route.generation == candidate.route_generation
+                                && matches!(route.resource.as_ref(),
                             Some(wire::route_export::Resource::ControlPoint(cp)) if cp == name)
+                        })
                 })
-            }) {
+            {
                 found.push(candidate.clone());
             }
         }
@@ -1839,14 +1943,19 @@ impl AutoDirectory {
         }
     }
 
+    // The automatic LLC bridge calls this once its runtime branch is wired.
+    #[allow(dead_code)]
     pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName) -> io::Result<Option<[u8; 6]>> {
         let mut found = None;
         for (mac, (name, candidates)) in &self.managed {
-            if name != cp || !candidates.iter().any(|candidate| matches!(
-                self.route_for_reference(candidate).and_then(|route| route.resource.as_ref()),
-                Some(wire::route_export::Resource::ControlPoint(route_cp)) if route_cp == cp
-            ))
-            { continue; }
+            if name != cp || !candidates.iter().any(|candidate| {
+                matches!(
+                    self.route_for_reference(candidate).and_then(|route| route.resource.as_ref()),
+                    Some(wire::route_export::Resource::ControlPoint(route_cp)) if route_cp == cp
+                )
+            }) {
+                continue;
+            }
             if found.replace(*mac).is_some() {
                 return Err(protocol("ambiguous managed MAC for CP"));
             }
@@ -1854,7 +1963,10 @@ impl AutoDirectory {
         Ok(found)
     }
 
-    fn resolve(&self, matches: impl Fn(&wire::route_export::Resource) -> bool) -> io::Result<Option<wire::RouteReference>> {
+    fn resolve(
+        &self,
+        matches: impl Fn(&wire::route_export::Resource) -> bool,
+    ) -> io::Result<Option<wire::RouteReference>> {
         let mut found = None;
         for (router_id, (epoch, _, routes)) in &self.origins {
             for route in routes {
@@ -1863,8 +1975,10 @@ impl AutoDirectory {
                         return Err(protocol("ambiguous upstream SNA destination"));
                     }
                     found = Some(wire::RouteReference {
-                        router_id: router_id.clone(), epoch: epoch.clone(),
-                        route_id: route.id, route_generation: route.generation,
+                        router_id: router_id.clone(),
+                        epoch: epoch.clone(),
+                        route_id: route.id,
+                        route_generation: route.generation,
                     });
                 }
             }
@@ -1922,35 +2036,65 @@ impl AutoWsHub {
                 last_error: None,
             }));
         }
-        let mut hub = Self { shared, directory, welcome, local_routes: HashMap::new(), revision: 0 };
+        let mut hub = Self {
+            shared,
+            directory,
+            welcome,
+            local_routes: HashMap::new(),
+            revision: 0,
+        };
         hub.publish_local(control_points, logical_units)?;
         Ok(hub)
     }
 
-    pub(crate) fn router_id(&self) -> &[u8] { &self.welcome.router_id }
-    pub(crate) fn allowed_netid(&self) -> &str { &self.welcome.allowed_netid }
+    pub(crate) fn router_id(&self) -> &[u8] {
+        &self.welcome.router_id
+    }
+    pub(crate) fn allowed_netid(&self) -> &str {
+        &self.welcome.allowed_netid
+    }
 
-    pub(crate) fn local_route(&self, reference: &wire::RouteReference) -> Option<&wire::RouteExport> {
+    pub(crate) fn local_route(
+        &self,
+        reference: &wire::RouteReference,
+    ) -> Option<&wire::RouteExport> {
         if reference.router_id != self.welcome.router_id
             || reference.epoch != self.welcome.connection_epoch
-        { return None; }
-        self.local_routes.get(&reference.route_id)
+        {
+            return None;
+        }
+        self.local_routes
+            .get(&reference.route_id)
             .filter(|route| route.generation == reference.route_generation)
     }
 
-    pub(crate) fn remote_route(&self, reference: &wire::RouteReference)
-        -> Option<wire::RouteExport>
-    {
-        self.directory.borrow().route_for_reference(reference).cloned()
+    pub(crate) fn remote_route(
+        &self,
+        reference: &wire::RouteReference,
+    ) -> Option<wire::RouteExport> {
+        self.directory
+            .borrow()
+            .route_for_reference(reference)
+            .cloned()
     }
 
-    pub(crate) fn reject_incoming(&mut self, open: &wire::IncomingOpen,
-        reason: wire::OpenFailure) -> io::Result<()> {
-        self.shared.borrow_mut().client.send(envelope(
-            wire::ws_envelope::Body::OpenDecision(wire::OpenDecision {
-                circuit_id: open.circuit_id.clone(), accept: false,
-                receive_allowance_bytes: 0, reason: reason as i32,
-            }))).map_err(io_error)
+    pub(crate) fn reject_incoming(
+        &mut self,
+        open: &wire::IncomingOpen,
+        reason: wire::OpenFailure,
+    ) -> io::Result<()> {
+        self.shared
+            .borrow_mut()
+            .client
+            .send(envelope(wire::ws_envelope::Body::OpenDecision(
+                wire::OpenDecision {
+                    circuit_id: open.circuit_id.clone(),
+                    accept: false,
+                    receive_allowance_bytes: 0,
+                    reason: reason as i32,
+                },
+            )))
+            .map_err(io_error)
     }
 
     pub(crate) fn publish_local(
@@ -1958,17 +2102,31 @@ impl AutoWsHub {
         control_points: &[wire::SnaName],
         logical_units: &[wire::LuReachability],
     ) -> io::Result<()> {
-        let revision = self.revision.checked_add(1)
+        let revision = self
+            .revision
+            .checked_add(1)
             .ok_or_else(|| protocol("route revision exhausted"))?;
         let snapshot = automatic_route_snapshot(
-            &self.welcome.connection_epoch, revision, &self.welcome.allowed_netid,
-            control_points, logical_units,
+            &self.welcome.connection_epoch,
+            revision,
+            &self.welcome.allowed_netid,
+            control_points,
+            logical_units,
         )?;
         let ids = snapshot.routes.iter().map(|route| route.id).collect();
-        self.shared.borrow_mut().client.send(envelope(
-            wire::ws_envelope::Body::PublishRoutes(snapshot.clone()))).map_err(io_error)?;
+        self.shared
+            .borrow_mut()
+            .client
+            .send(envelope(wire::ws_envelope::Body::PublishRoutes(
+                snapshot.clone(),
+            )))
+            .map_err(io_error)?;
         self.shared.borrow_mut().auto_local_route_ids = ids;
-        self.local_routes = snapshot.routes.into_iter().map(|route| (route.id, route)).collect();
+        self.local_routes = snapshot
+            .routes
+            .into_iter()
+            .map(|route| (route.id, route))
+            .collect();
         self.revision = revision;
         info!(revision, export_count = self.local_routes.len(), assigned_netid = %self.welcome.allowed_netid,
             "published automatic local reachability");
@@ -1976,60 +2134,89 @@ impl AutoWsHub {
     }
 
     pub(crate) fn local_reference_lu(&self, lu: &wire::SnaName) -> Option<wire::RouteReference> {
-        self.local_reference(|resource| matches!(resource,
+        self.local_reference(|resource| {
+            matches!(resource,
             wire::route_export::Resource::LogicalUnit(reachability)
-                if reachability.lu.as_ref() == Some(lu)))
+                if reachability.lu.as_ref() == Some(lu))
+        })
     }
 
+    // Used by the automatic LLC bridge after a verified XID3 CP is published.
+    #[allow(dead_code)]
     pub(crate) fn local_reference_cp(&self, cp: &wire::SnaName) -> Option<wire::RouteReference> {
-        self.local_reference(|resource| matches!(resource,
-            wire::route_export::Resource::ControlPoint(name) if name == cp))
+        self.local_reference(|resource| {
+            matches!(resource,
+            wire::route_export::Resource::ControlPoint(name) if name == cp)
+        })
     }
 
-    fn local_reference(&self, matches: impl Fn(&wire::route_export::Resource) -> bool)
-        -> Option<wire::RouteReference>
-    {
-        let route = self.local_routes.values().find(|route|
-            route.resource.as_ref().is_some_and(&matches))?;
+    fn local_reference(
+        &self,
+        matches: impl Fn(&wire::route_export::Resource) -> bool,
+    ) -> Option<wire::RouteReference> {
+        let route = self
+            .local_routes
+            .values()
+            .find(|route| route.resource.as_ref().is_some_and(&matches))?;
         Some(wire::RouteReference {
-            router_id: self.welcome.router_id.clone(), epoch: self.welcome.connection_epoch.clone(),
-            route_id: route.id, route_generation: route.generation,
+            router_id: self.welcome.router_id.clone(),
+            epoch: self.welcome.connection_epoch.clone(),
+            route_id: route.id,
+            route_generation: route.generation,
         })
     }
 
     pub(crate) fn poll_incoming(&mut self) -> io::Result<Option<wire::IncomingOpen>> {
         let mut shared = self.shared.borrow_mut();
-        if shared.auto_incoming.is_empty() { shared.receive_once()?; }
+        if shared.auto_incoming.is_empty() {
+            shared.receive_once()?;
+        }
         Ok(shared.auto_incoming.pop_front())
     }
 
-    pub(crate) fn resolve_lu(&self, lu: &wire::SnaName)
-        -> io::Result<Option<(wire::RouteReference, Option<wire::SnaName>)>>
-    {
+    pub(crate) fn resolve_lu(
+        &self,
+        lu: &wire::SnaName,
+    ) -> io::Result<Option<(wire::RouteReference, Option<wire::SnaName>)>> {
         let directory = self.directory.borrow();
-        let Some(reference) = directory.resolve_lu(lu)? else { return Ok(None) };
-        let host = match directory.route_for_reference(&reference).and_then(|route| route.resource.as_ref()) {
-            Some(wire::route_export::Resource::LogicalUnit(reachability)) => reachability.hosting_cp.clone(),
+        let Some(reference) = directory.resolve_lu(lu)? else {
+            return Ok(None);
+        };
+        let host = match directory
+            .route_for_reference(&reference)
+            .and_then(|route| route.resource.as_ref())
+        {
+            Some(wire::route_export::Resource::LogicalUnit(reachability)) => {
+                reachability.hosting_cp.clone()
+            }
             _ => None,
         };
         Ok(Some((reference, host)))
     }
 
-    pub(crate) fn resolve_mac(&self, mac: &[u8; 6])
-        -> io::Result<Option<(wire::RouteReference, wire::SnaName)>>
-    {
+    // Used by the automatic LLC bridge for concentrator-assigned proxy MACs.
+    #[allow(dead_code)]
+    pub(crate) fn resolve_mac(
+        &self,
+        mac: &[u8; 6],
+    ) -> io::Result<Option<(wire::RouteReference, wire::SnaName)>> {
         let directory = self.directory.borrow();
-        let Some(reference) = directory.resolve_mac(mac)? else { return Ok(None) };
-        let cp = match directory.route_for_reference(&reference).and_then(|route| route.resource.as_ref()) {
+        let Some(reference) = directory.resolve_mac(mac)? else {
+            return Ok(None);
+        };
+        let cp = match directory
+            .route_for_reference(&reference)
+            .and_then(|route| route.resource.as_ref())
+        {
             Some(wire::route_export::Resource::ControlPoint(cp)) => cp.clone(),
             _ => return Err(protocol("managed MAC points to missing CP route")),
         };
         Ok(Some((reference, cp)))
     }
 
-    pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName)
-        -> io::Result<Option<[u8; 6]>>
-    {
+    // Used by the automatic LLC bridge when an upstream CP initiates a circuit.
+    #[allow(dead_code)]
+    pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName) -> io::Result<Option<[u8; 6]>> {
         self.directory.borrow().managed_mac_for_cp(cp)
     }
 
@@ -2039,13 +2226,17 @@ impl AutoWsHub {
         let directory = self.directory.borrow();
         let mut addresses = Vec::new();
         for (router_id, (_, _, routes)) in &directory.origins {
-            if router_id == &self.welcome.router_id { continue; }
+            if router_id == &self.welcome.router_id {
+                continue;
+            }
             for route in routes {
                 match route.resource.as_ref() {
-                    Some(wire::route_export::Resource::ControlPoint(cp)) =>
+                    Some(wire::route_export::Resource::ControlPoint(cp)) => {
                         addresses.push(RouteAddress::ControlPoint {
-                            netid: cp.netid.clone(), name: cp.name.clone(),
-                        }),
+                            netid: cp.netid.clone(),
+                            name: cp.name.clone(),
+                        })
+                    }
                     Some(wire::route_export::Resource::LogicalUnit(lu)) => {
                         if let Some(name) = &lu.lu {
                             addresses.push(RouteAddress::LogicalUnit {
@@ -2067,19 +2258,38 @@ impl AutoWsHub {
         addresses
     }
 
-    pub(crate) fn open_lu(&mut self, target_lu: &wire::SnaName, source_lu: &wire::SnaName)
-        -> io::Result<Option<WsRoutePort>>
-    {
-        let Some((target, Some(target_cp))) = self.resolve_lu(target_lu)? else { return Ok(None) };
-        let Some(source) = self.local_reference_lu(source_lu) else { return Ok(None) };
+    pub(crate) fn open_lu(
+        &mut self,
+        target_lu: &wire::SnaName,
+        source_lu: &wire::SnaName,
+    ) -> io::Result<Option<WsRoutePort>> {
+        let Some((target, Some(target_cp))) = self.resolve_lu(target_lu)? else {
+            return Ok(None);
+        };
+        let Some(source) = self.local_reference_lu(source_lu) else {
+            return Ok(None);
+        };
         let local_cp = self.local_hosting_cp(&source)?;
-        self.open_ref(target, target_cp, Some(target_lu.clone()), Some(source), local_cp).map(Some)
+        self.open_ref(
+            target,
+            target_cp,
+            Some(target_lu.clone()),
+            Some(source),
+            local_cp,
+        )
+        .map(Some)
     }
 
     fn local_hosting_cp(&self, reference: &wire::RouteReference) -> io::Result<wire::SnaName> {
-        match self.local_routes.get(&reference.route_id).and_then(|route| route.resource.as_ref()) {
+        match self
+            .local_routes
+            .get(&reference.route_id)
+            .and_then(|route| route.resource.as_ref())
+        {
             Some(wire::route_export::Resource::ControlPoint(cp)) => Ok(cp.clone()),
-            Some(wire::route_export::Resource::LogicalUnit(lu)) => lu.hosting_cp.clone()
+            Some(wire::route_export::Resource::LogicalUnit(lu)) => lu
+                .hosting_cp
+                .clone()
                 .ok_or_else(|| protocol("local LU has no hosting CP")),
             None => Err(protocol("local source route unavailable")),
         }
@@ -2095,22 +2305,34 @@ impl AutoWsHub {
     ) -> io::Result<WsRoutePort> {
         let target_valid = {
             let directory = self.directory.borrow();
-            match directory.route_for_reference(&target).and_then(|route| route.resource.as_ref()) {
-                Some(wire::route_export::Resource::ControlPoint(cp)) =>
-                    target_lu.is_none() && cp == &target_cp,
-                Some(wire::route_export::Resource::LogicalUnit(lu)) =>
+            match directory
+                .route_for_reference(&target)
+                .and_then(|route| route.resource.as_ref())
+            {
+                Some(wire::route_export::Resource::ControlPoint(cp)) => {
+                    target_lu.is_none() && cp == &target_cp
+                }
+                Some(wire::route_export::Resource::LogicalUnit(lu)) => {
                     target_lu.as_ref() == lu.lu.as_ref()
-                        && lu.hosting_cp.as_ref() == Some(&target_cp),
+                        && lu.hosting_cp.as_ref() == Some(&target_cp)
+                }
                 None => false,
             }
         };
-        if !target_valid { return Err(protocol("target route is not in the current directory")); }
+        if !target_valid {
+            return Err(protocol("target route is not in the current directory"));
+        }
         if let Some(source) = &source_route {
             if source.router_id != self.welcome.router_id
                 || source.epoch != self.welcome.connection_epoch
                 || self.local_route(source).is_none()
-            { return Err(protocol("source route is not currently published")); }
-            let source_matches_profile = match self.local_route(source).and_then(|route| route.resource.as_ref()) {
+            {
+                return Err(protocol("source route is not currently published"));
+            }
+            let source_matches_profile = match self
+                .local_route(source)
+                .and_then(|route| route.resource.as_ref())
+            {
                 Some(wire::route_export::Resource::LogicalUnit(_)) => target_lu.is_some(),
                 Some(wire::route_export::Resource::ControlPoint(_)) => target_lu.is_none(),
                 None => false,
@@ -2119,40 +2341,62 @@ impl AutoWsHub {
                 return Err(protocol("source and target route profiles differ"));
             }
         } else {
-            return Err(protocol("automatic v2 circuit requires a published source route"));
+            return Err(protocol(
+                "automatic v2 circuit requires a published source route",
+            ));
         }
-        let mut port = self.new_port(local_cp, target_cp, target_lu, source_route, HashSet::new())?;
+        let mut port =
+            self.new_port(local_cp, target_cp, target_lu, source_route, HashSet::new())?;
         port.target = Some(target);
         Ok(port)
     }
 
-    pub(crate) fn accept_incoming(&mut self, open: wire::IncomingOpen)
-        -> io::Result<Option<WsRoutePort>>
-    {
-        let Some(local_ref) = open.target.as_ref() else { return Ok(None) };
+    pub(crate) fn accept_incoming(
+        &mut self,
+        open: wire::IncomingOpen,
+    ) -> io::Result<Option<WsRoutePort>> {
+        let Some(local_ref) = open.target.as_ref() else {
+            return Ok(None);
+        };
         if local_ref.router_id != self.welcome.router_id
             || local_ref.epoch != self.welcome.connection_epoch
             || self.local_route(local_ref).is_none()
-        { return Ok(None) }
+        {
+            return Ok(None);
+        }
         let local_cp = self.local_hosting_cp(local_ref)?;
-        let Some(source_ref) = open.source_route.as_ref() else { return Ok(None) };
+        let Some(source_ref) = open.source_route.as_ref() else {
+            return Ok(None);
+        };
         let (target_lu, target_cp) = {
             let directory = self.directory.borrow();
-            let Some(route) = directory.route_for_reference(source_ref) else { return Ok(None) };
+            let Some(route) = directory.route_for_reference(source_ref) else {
+                return Ok(None);
+            };
             match route.resource.as_ref() {
-                Some(wire::route_export::Resource::LogicalUnit(lu)) =>
-                    (lu.lu.clone(), lu.hosting_cp.clone()),
-                Some(wire::route_export::Resource::ControlPoint(cp)) =>
-                    (None, Some(cp.clone())),
+                Some(wire::route_export::Resource::LogicalUnit(lu)) => {
+                    (lu.lu.clone(), lu.hosting_cp.clone())
+                }
+                Some(wire::route_export::Resource::ControlPoint(cp)) => (None, Some(cp.clone())),
                 _ => return Ok(None),
             }
         };
-        let Some(target_cp) = target_cp else { return Ok(None) };
-        let local_is_lu = matches!(self.local_route(local_ref).and_then(|route| route.resource.as_ref()),
-            Some(wire::route_export::Resource::LogicalUnit(_)));
-        if local_is_lu != target_lu.is_some() { return Ok(None) }
+        let Some(target_cp) = target_cp else {
+            return Ok(None);
+        };
+        let local_is_lu = matches!(
+            self.local_route(local_ref)
+                .and_then(|route| route.resource.as_ref()),
+            Some(wire::route_export::Resource::LogicalUnit(_))
+        );
+        if local_is_lu != target_lu.is_some() {
+            return Ok(None);
+        }
         let mut port = match self.new_port(
-            local_cp, target_cp, target_lu, Some(local_ref.clone()),
+            local_cp,
+            target_cp,
+            target_lu,
+            Some(local_ref.clone()),
             HashSet::from([local_ref.route_id]),
         ) {
             Ok(port) => port,
@@ -2168,31 +2412,57 @@ impl AutoWsHub {
     }
 
     fn new_port(
-        &mut self, local_cp: wire::SnaName, target_cp: wire::SnaName,
-        target_lu: Option<wire::SnaName>, source_route: Option<wire::RouteReference>,
+        &mut self,
+        local_cp: wire::SnaName,
+        target_cp: wire::SnaName,
+        target_lu: Option<wire::SnaName>,
+        source_route: Option<wire::RouteReference>,
         local_route_ids: HashSet<u64>,
     ) -> io::Result<WsRoutePort> {
         let mut shared = self.shared.borrow_mut();
-        if shared.inbox.len().saturating_sub(shared.auto_free_indexes.len())
+        if shared
+            .inbox
+            .len()
+            .saturating_sub(shared.auto_free_indexes.len())
             >= self.welcome.max_circuits as usize
         {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "concentrator circuit limit reached"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "concentrator circuit limit reached",
+            ));
         }
-        let index = if let Some(index) = shared.auto_free_indexes.pop() { index } else {
+        let index = if let Some(index) = shared.auto_free_indexes.pop() {
+            index
+        } else {
             shared.inbox.push(VecDeque::new());
             shared.inbox.len() - 1
         };
         drop(shared);
         Ok(WsRoutePort {
-            shared: self.shared.clone(), index, welcome: self.welcome.clone(),
-            local_cp, local_route_ids, target_cp, target_lu, target: None, source_route,
-            require_managed_binding: false, managed_binding_seen: false, managed_mac: None,
-            circuit: None, opening: false, local_ready: false, request_id: 0,
-            retry_at: None, retry_delay: FIRST_OPEN_RETRY,
-            pending_type1: VecDeque::new(), pending_information: VecDeque::new(),
-            downstream_sizes: VecDeque::new(), outbound_completions: OutboundCompletions::default(),
-            inbound_open: None, auto_owned: true,
+            shared: self.shared.clone(),
+            index,
+            welcome: self.welcome.clone(),
+            local_cp,
+            local_route_ids,
+            target_cp,
+            target_lu,
+            target: None,
+            source_route,
+            require_managed_binding: false,
+            managed_binding_seen: false,
+            managed_mac: None,
+            circuit: None,
+            opening: false,
+            local_ready: false,
+            request_id: 0,
+            retry_at: None,
+            retry_delay: FIRST_OPEN_RETRY,
+            pending_type1: VecDeque::new(),
+            pending_information: VecDeque::new(),
+            downstream_sizes: VecDeque::new(),
+            outbound_completions: OutboundCompletions::default(),
+            inbound_open: None,
+            auto_owned: true,
         })
     }
 }
@@ -2295,13 +2565,16 @@ fn format_mac(mac: &[u8]) -> String {
 }
 
 pub(crate) fn server_authority(url: &str) -> &str {
-    let authority = url.split_once("://")
+    let authority = url
+        .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url)
         .split(['/', '?', '#'])
         .next()
         .unwrap_or("unknown");
-    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 fn protocol(message: &'static str) -> io::Error {
@@ -2312,6 +2585,9 @@ fn io_error(error: transport_ws::Error) -> io::Error {
 }
 
 #[cfg(test)]
+// Tungstenite's handshake callback has a large rejection response; these
+// mock servers only accept connections and never construct that error path.
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use prost::Message;
@@ -2331,14 +2607,17 @@ mod tests {
             supported_types: Vec::new(),
         };
         let snapshot = automatic_route_snapshot(
-            &[7; 16], 1, "OWNED",
+            &[7; 16],
+            1,
+            "OWNED",
             &[owned.clone(), foreign.clone()],
             &[
                 lu(name("OWNED", "LUA"), owned.clone()),
                 lu(name("OTHER", "LUB"), foreign.clone()),
                 lu(name("OWNED", "LUC"), foreign),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(snapshot.routes.len(), 2);
         assert!(snapshot.routes.iter().any(|route| matches!(
             route.resource.as_ref(),
@@ -2350,24 +2629,31 @@ mod tests {
                 if lu.lu.as_ref() == Some(&name("OWNED", "LUA"))
         )));
         assert!(automatic_route_snapshot(&[7; 16], 2, "OWNED", &[], &[])
-            .unwrap().routes.is_empty());
+            .unwrap()
+            .routes
+            .is_empty());
     }
 
     #[test]
     fn automatic_directory_resolves_unique_lu_and_fences_withdrawal_epoch() {
         let mut directory = AutoDirectory::default();
         let route = wire::RouteExport {
-            id: 41, generation: 2,
-            resource: Some(wire::route_export::Resource::LogicalUnit(wire::LuReachability {
-                lu: Some(name("TARGET", "LUA")),
-                hosting_cp: Some(name("TARGET", "CPA")),
-                supported_types: Vec::new(),
-            })),
+            id: 41,
+            generation: 2,
+            resource: Some(wire::route_export::Resource::LogicalUnit(
+                wire::LuReachability {
+                    lu: Some(name("TARGET", "LUA")),
+                    hosting_cp: Some(name("TARGET", "CPA")),
+                    supported_types: Vec::new(),
+                },
+            )),
         };
         let origin = wire::OriginRouteSnapshot {
             router_id: vec![1; 16],
             snapshot: Some(wire::RouteSnapshot {
-                epoch: vec![2; 16], revision: 1, routes: vec![route.clone()],
+                epoch: vec![2; 16],
+                revision: 1,
+                routes: vec![route.clone()],
             }),
         };
         directory.replace_origin(&origin).unwrap();
@@ -2375,23 +2661,44 @@ mod tests {
         let mut advanced = origin.clone();
         advanced.snapshot.as_mut().unwrap().revision = 2;
         directory.replace_origin(&advanced).unwrap();
-        assert_eq!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap()
-            .unwrap().route_id, 41);
-        directory.withdraw(&wire::OriginWithdraw {
-            router_id: vec![1; 16], epoch: vec![9; 16],
-        }).unwrap();
-        assert!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap().is_some());
+        assert_eq!(
+            directory
+                .resolve_lu(&name("TARGET", "LUA"))
+                .unwrap()
+                .unwrap()
+                .route_id,
+            41
+        );
+        directory
+            .withdraw(&wire::OriginWithdraw {
+                router_id: vec![1; 16],
+                epoch: vec![9; 16],
+            })
+            .unwrap();
+        assert!(directory
+            .resolve_lu(&name("TARGET", "LUA"))
+            .unwrap()
+            .is_some());
         let mut another = origin.clone();
         another.router_id = vec![3; 16];
         directory.replace_origin(&another).unwrap();
         assert!(directory.resolve_lu(&name("TARGET", "LUA")).is_err());
-        directory.withdraw(&wire::OriginWithdraw {
-            router_id: vec![3; 16], epoch: vec![2; 16],
-        }).unwrap();
-        directory.withdraw(&wire::OriginWithdraw {
-            router_id: vec![1; 16], epoch: vec![2; 16],
-        }).unwrap();
-        assert!(directory.resolve_lu(&name("TARGET", "LUA")).unwrap().is_none());
+        directory
+            .withdraw(&wire::OriginWithdraw {
+                router_id: vec![3; 16],
+                epoch: vec![2; 16],
+            })
+            .unwrap();
+        directory
+            .withdraw(&wire::OriginWithdraw {
+                router_id: vec![1; 16],
+                epoch: vec![2; 16],
+            })
+            .unwrap();
+        assert!(directory
+            .resolve_lu(&name("TARGET", "LUA"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2434,111 +2741,198 @@ mod tests {
                     );
                     Ok(response)
                 },
-            ).unwrap();
-            socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::Welcome(
-                wire::RouterWelcome {
-                    router_id: vec![7; 16], connection_epoch: vec![8; 16],
-                    max_message_bytes: 65536, max_circuits: 1,
-                    display_name: "auto router".into(), allowed_netid: "OWNED".into(),
-                })).encode_to_vec().into())).unwrap();
+            )
+            .unwrap();
+            socket
+                .send(WsMessage::Binary(
+                    envelope(wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                        router_id: vec![7; 16],
+                        connection_epoch: vec![8; 16],
+                        max_message_bytes: 65536,
+                        max_circuits: 1,
+                        display_name: "auto router".into(),
+                        allowed_netid: "OWNED".into(),
+                    }))
+                    .encode_to_vec()
+                    .into(),
+                ))
+                .unwrap();
             let mut local_cp_route = None;
             for expected_revision in 1..=2 {
-                let WsMessage::Binary(payload) = socket.read().unwrap() else { panic!("snapshot expected") };
+                let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                    panic!("snapshot expected")
+                };
                 let envelope = wire::WsEnvelope::decode(payload).unwrap();
                 let Some(wire::ws_envelope::Body::PublishRoutes(snapshot)) = envelope.body else {
                     panic!("publish expected")
                 };
                 assert_eq!(snapshot.revision, expected_revision);
-                assert!(snapshot.routes.iter().all(|route| match route.resource.as_ref().unwrap() {
-                    wire::route_export::Resource::ControlPoint(cp) => cp.netid == "OWNED",
-                    wire::route_export::Resource::LogicalUnit(lu) => lu.lu.as_ref().unwrap().netid == "OWNED",
+                assert!(snapshot.routes.iter().all(|route| {
+                    match route.resource.as_ref().unwrap() {
+                        wire::route_export::Resource::ControlPoint(cp) => cp.netid == "OWNED",
+                        wire::route_export::Resource::LogicalUnit(lu) => {
+                            lu.lu.as_ref().unwrap().netid == "OWNED"
+                        }
+                    }
                 }));
-                assert_eq!(snapshot.routes.len(), if expected_revision == 1 { 0 } else { 2 });
+                assert_eq!(
+                    snapshot.routes.len(),
+                    if expected_revision == 1 { 0 } else { 2 }
+                );
                 if expected_revision == 2 {
-                    local_cp_route = snapshot.routes.iter().find_map(|route| match route.resource.as_ref() {
-                        Some(wire::route_export::Resource::ControlPoint(cp))
-                            if cp == &name("OWNED", "CPA") => Some(route.id),
-                        _ => None,
-                    });
+                    local_cp_route =
+                        snapshot
+                            .routes
+                            .iter()
+                            .find_map(|route| match route.resource.as_ref() {
+                                Some(wire::route_export::Resource::ControlPoint(cp))
+                                    if cp == &name("OWNED", "CPA") =>
+                                {
+                                    Some(route.id)
+                                }
+                                _ => None,
+                            });
                 }
             }
-            socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::OriginRoutes(
-                wire::OriginRouteSnapshot {
-                    router_id: vec![9; 16],
-                    snapshot: Some(wire::RouteSnapshot {
-                        epoch: vec![10; 16], revision: 1,
-                        routes: vec![wire::RouteExport {
-                            id: 30, generation: 1,
-                            resource: Some(wire::route_export::Resource::ControlPoint(
-                                name("TARGET", "CPB"))),
-                        }, wire::RouteExport {
-                            id: 31, generation: 1,
-                            resource: Some(wire::route_export::Resource::LogicalUnit(
-                                wire::LuReachability {
-                                    lu: Some(name("TARGET", "LUB")),
-                                    hosting_cp: Some(name("TARGET", "CPB")),
-                                    supported_types: Vec::new(),
-                                })),
-                        }],
-                    }),
-                })).encode_to_vec().into())).unwrap();
-            socket.send(WsMessage::Binary(envelope(wire::ws_envelope::Body::ManagedCpBindings(
-                wire::ManagedCpBindingSnapshot {
-                    schema_version: 1, recipient_epoch: vec![8; 16], revision: 1,
-                    bindings: vec![wire::ManagedCpBinding {
-                        address_id: vec![11; 16], control_point: Some(name("TARGET", "CPB")),
-                        virtual_mac: vec![0x02, 0x53, 0x4e, 0, 0, 1],
-                        candidates: vec![wire::RouteReference {
-                            router_id: vec![9; 16], epoch: vec![10; 16],
-                            route_id: 30, route_generation: 1,
-                        }],
-                    }],
-                })).encode_to_vec().into())).unwrap();
-            let WsMessage::Binary(payload) = socket.read().unwrap() else { panic!("open expected") };
+            socket
+                .send(WsMessage::Binary(
+                    envelope(wire::ws_envelope::Body::OriginRoutes(
+                        wire::OriginRouteSnapshot {
+                            router_id: vec![9; 16],
+                            snapshot: Some(wire::RouteSnapshot {
+                                epoch: vec![10; 16],
+                                revision: 1,
+                                routes: vec![
+                                    wire::RouteExport {
+                                        id: 30,
+                                        generation: 1,
+                                        resource: Some(wire::route_export::Resource::ControlPoint(
+                                            name("TARGET", "CPB"),
+                                        )),
+                                    },
+                                    wire::RouteExport {
+                                        id: 31,
+                                        generation: 1,
+                                        resource: Some(wire::route_export::Resource::LogicalUnit(
+                                            wire::LuReachability {
+                                                lu: Some(name("TARGET", "LUB")),
+                                                hosting_cp: Some(name("TARGET", "CPB")),
+                                                supported_types: Vec::new(),
+                                            },
+                                        )),
+                                    },
+                                ],
+                            }),
+                        },
+                    ))
+                    .encode_to_vec()
+                    .into(),
+                ))
+                .unwrap();
+            socket
+                .send(WsMessage::Binary(
+                    envelope(wire::ws_envelope::Body::ManagedCpBindings(
+                        wire::ManagedCpBindingSnapshot {
+                            schema_version: 1,
+                            recipient_epoch: vec![8; 16],
+                            revision: 1,
+                            bindings: vec![wire::ManagedCpBinding {
+                                address_id: vec![11; 16],
+                                control_point: Some(name("TARGET", "CPB")),
+                                virtual_mac: vec![0x02, 0x53, 0x4e, 0, 0, 1],
+                                candidates: vec![wire::RouteReference {
+                                    router_id: vec![9; 16],
+                                    epoch: vec![10; 16],
+                                    route_id: 30,
+                                    route_generation: 1,
+                                }],
+                            }],
+                        },
+                    ))
+                    .encode_to_vec()
+                    .into(),
+                ))
+                .unwrap();
+            let WsMessage::Binary(payload) = socket.read().unwrap() else {
+                panic!("open expected")
+            };
             let message = wire::WsEnvelope::decode(payload).unwrap();
             let Some(wire::ws_envelope::Body::OpenRequest(open)) = message.body else {
                 panic!("open request expected")
             };
             assert_eq!(open.target.as_ref().unwrap().route_id, 30);
-            assert_eq!(open.source_route.as_ref().unwrap().route_id, local_cp_route.unwrap());
+            assert_eq!(
+                open.source_route.as_ref().unwrap().route_id,
+                local_cp_route.unwrap()
+            );
         });
         let mut hub = AutoWsHub::connect(&url, "", &[], &[]).unwrap();
         let source = name("OWNED", "LUA");
         let host = name("OWNED", "CPA");
-        hub.publish_local(&[host.clone(), name("FOREIGN", "CPX")],
-            &[wire::LuReachability { lu: Some(source.clone()),
-                hosting_cp: Some(host), supported_types: Vec::new() }]).unwrap();
+        hub.publish_local(
+            &[host.clone(), name("FOREIGN", "CPX")],
+            &[wire::LuReachability {
+                lu: Some(source.clone()),
+                hosting_cp: Some(host),
+                supported_types: Vec::new(),
+            }],
+        )
+        .unwrap();
         let target = name("TARGET", "LUB");
         for _ in 0..1000 {
             hub.poll_incoming().unwrap();
-            if hub.resolve_lu(&target).unwrap().is_some() { break; }
+            if hub.resolve_lu(&target).unwrap().is_some() {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(hub.resolve_lu(&target).unwrap().unwrap().1,
-            Some(name("TARGET", "CPB")));
+        assert_eq!(
+            hub.resolve_lu(&target).unwrap().unwrap().1,
+            Some(name("TARGET", "CPB"))
+        );
         let lu_port = hub.open_lu(&target, &source).unwrap().unwrap();
         let mac = [0x02, 0x53, 0x4e, 0, 0, 1];
         for _ in 0..1000 {
             hub.poll_incoming().unwrap();
-            if hub.resolve_mac(&mac).unwrap().is_some() { break; }
+            if hub.resolve_mac(&mac).unwrap().is_some() {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(hub.managed_mac_for_cp(&name("TARGET", "CPB")).unwrap(), Some(mac));
+        assert_eq!(
+            hub.managed_mac_for_cp(&name("TARGET", "CPB")).unwrap(),
+            Some(mac)
+        );
         let advertised = hub.advertised_addresses();
         assert!(advertised.contains(&RouteAddress::Mac(mac)));
         assert!(advertised.contains(&RouteAddress::LogicalUnit {
-            netid: "TARGET".into(), cp: Some("CPB".into()), name: "LUB".into(),
+            netid: "TARGET".into(),
+            cp: Some("CPB".into()),
+            name: "LUB".into(),
         }));
         let (target_ref, target_cp) = hub.resolve_mac(&mac).unwrap().unwrap();
         let local_cp = name("OWNED", "CPA");
         let source_ref = hub.local_reference_cp(&local_cp).unwrap();
-        assert_eq!(hub.open_ref(target_ref.clone(), target_cp.clone(), None,
-            Some(source_ref.clone()), local_cp.clone()).err().unwrap().kind(),
-            io::ErrorKind::WouldBlock);
+        assert_eq!(
+            hub.open_ref(
+                target_ref.clone(),
+                target_cp.clone(),
+                None,
+                Some(source_ref.clone()),
+                local_cp.clone()
+            )
+            .err()
+            .unwrap()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
         drop(lu_port);
-        let mut cp_port = hub.open_ref(target_ref, target_cp, None,
-            Some(source_ref), local_cp).unwrap();
-        cp_port.send(RoutedUnit::DlcType1(vec![4, 4, 0xaf])).unwrap();
+        let mut cp_port = hub
+            .open_ref(target_ref, target_cp, None, Some(source_ref), local_cp)
+            .unwrap();
+        cp_port
+            .send(RoutedUnit::DlcType1(vec![4, 4, 0xaf]))
+            .unwrap();
         server.join().unwrap();
     }
 
@@ -3580,7 +3974,7 @@ mod tests {
             candidates: vec![],
         };
         let valid = binding(&[0x02, 0x53, 0x4e, 0, 0, 1]);
-        assert!(validate_managed_bindings(&[valid.clone()]).is_ok());
+        assert!(validate_managed_bindings(std::slice::from_ref(&valid)).is_ok());
         assert!(validate_managed_bindings(&[valid.clone(), valid.clone()]).is_err());
         assert!(validate_managed_bindings(&[binding(&[0x02, 0x53, 0x4f, 0, 0, 1])]).is_err());
         let mut duplicate_cp = binding(&[0x02, 0x53, 0x4e, 0, 0, 2]);

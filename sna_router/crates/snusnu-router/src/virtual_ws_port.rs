@@ -95,6 +95,14 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
 }
 
 impl<P: RoutePort> VirtualWsPort<P> {
+    /// Preserve identities observed by a private native egress so the
+    /// automatic directory can learn an LLC peer reached through TCP62.
+    pub(crate) fn take_inner_identity_observations(
+        &mut self,
+    ) -> Vec<crate::routing::IdentityObservation> {
+        self.inner.take_identity_observations()
+    }
+
     pub(crate) fn new(
         inner: P,
         local_xid: Xid3,
@@ -243,6 +251,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn user_bind_response_ready(&self) -> bool {
         self.tcp_bind_response.is_some()
     }

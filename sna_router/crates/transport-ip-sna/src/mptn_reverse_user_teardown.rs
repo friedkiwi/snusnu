@@ -264,7 +264,9 @@ mod tests {
         assert_eq!(&native[4..], reduced);
         assert_eq!(teardown.phase(), Phase::NativeUnbindPrepared);
         assert!(teardown.prepare_udp_abort(reduced).is_err());
-        assert!(teardown.mark_native_unbind_enqueued(&native[..native.len() - 1]).is_err());
+        assert!(teardown
+            .mark_native_unbind_enqueued(&native[..native.len() - 1])
+            .is_err());
         assert_eq!(teardown.phase(), Phase::NativeUnbindPrepared);
         teardown.mark_native_unbind_enqueued(&native).unwrap();
         assert_eq!(teardown.phase(), Phase::AwaitNativeResponse);

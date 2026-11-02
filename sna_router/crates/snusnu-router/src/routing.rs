@@ -293,6 +293,9 @@ pub(crate) enum RouterEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IdentityObservation {
     ControlPoint(String),
+    /// Reserved for a parser that can establish the qualified LU from native
+    /// session control; a CP name must never be substituted for this value.
+    #[allow(dead_code)]
     LogicalUnit(String),
 }
 
@@ -833,10 +836,7 @@ impl Router {
                     tracing::trace!(source_port = %source.0, target_port = %target.0, kind, bytes, "unit routed");
                     if !self.port_mut(&target)?.send(unit)? {
                         tracing::warn!(source_port = %source.0, target_port = %target.0, kind, bytes, "route target rejected unit");
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "route capacity changed during dispatch",
-                        ));
+                        return Err(io::Error::other("route capacity changed during dispatch"));
                     }
                 }
                 RouterEvent::ManagedMac(mac) => {

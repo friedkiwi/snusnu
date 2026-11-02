@@ -7,9 +7,8 @@
 use crate::{
     config::parse_cp,
     remote::{AutoWsHub, WsRoutePort},
-    routing::PortId,
+    routing::{PortId, RouteAddress},
 };
-use router_core::xid3::Xid3;
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -41,6 +40,32 @@ pub(crate) struct IncomingLlcSelection {
 }
 
 impl AutoLlcWsBridge {
+    /// Local directory entries remain available even when their NETID is not
+    /// eligible for publication on this concentrator connection.
+    pub(crate) fn local_addresses(&self, id: &PortId) -> Vec<RouteAddress> {
+        let Some(local) = self.local.get(id) else {
+            return Vec::new();
+        };
+        let mut addresses = Vec::new();
+        if let Some(cp) = &local.cp {
+            addresses.push(RouteAddress::ControlPoint {
+                netid: cp.netid.clone(),
+                name: cp.name.clone(),
+            });
+            for (netid, name) in &local.lus {
+                addresses.push(RouteAddress::LogicalUnit {
+                    netid: netid.clone(),
+                    cp: Some(cp.name.clone()),
+                    name: name.clone(),
+                });
+            }
+        }
+        addresses
+    }
+
+    pub(crate) fn observed_cp(&self, id: &PortId) -> Option<&wire::SnaName> {
+        self.local.get(id)?.cp.as_ref()
+    }
     pub(crate) fn register(
         &mut self,
         id: PortId,
@@ -68,31 +93,6 @@ impl AutoLlcWsBridge {
             },
         );
         Ok(())
-    }
-
-    pub(crate) fn withdraw(&mut self, id: &PortId) {
-        self.local.remove(id);
-    }
-
-    /// Call only for Type1 units received through the private LLC endpoint
-    /// for this attachment. It has already checked the guest MAC and proxy.
-    pub(crate) fn observe_type1(&mut self, id: &PortId, pdu: &[u8]) -> io::Result<bool> {
-        if pdu.len() < 4 || pdu[2] & !0x10 != 0xaf || pdu[3] != 0x32 {
-            return Ok(false);
-        }
-        let xid = Xid3::decode(&pdu[3..]).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid guest XID3: {error}"),
-            )
-        })?;
-        let cp = xid.cp_name().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("guest XID3 has no valid CP: {error}"),
-            )
-        })?;
-        self.observe_cp(id, &cp)
     }
 
     /// An observed CP is accepted only from the registered local attachment.
@@ -195,16 +195,10 @@ impl AutoLlcWsBridge {
         Ok((cps, lus))
     }
 
-    /// Publish only identities actually observed on local LLC attachments.
-    /// The hub applies the server-assigned NETID boundary as a second check.
-    pub(crate) fn publish_verified(&self, hub: &mut AutoWsHub) -> io::Result<()> {
-        let (cps, lus) = self.advertisements(hub.allowed_netid())?;
-        hub.publish_local(&cps, &lus)
-    }
-
     /// Select one current upstream CP for the managed proxy MAC contacted by
     /// this LLC guest. The guest CP must have been seen in a valid XID3 and
     /// published in this concentrator epoch before a circuit can be opened.
+    #[allow(dead_code)] // The concentrator's v2 CP-to-CP OPEN case is pending.
     pub(crate) fn open_managed_cp(
         &self,
         hub: &mut AutoWsHub,
@@ -385,6 +379,7 @@ fn format_name(name: &wire::SnaName) -> String {
     format!("{}.{}", name.netid, name.name)
 }
 
+#[allow(dead_code)] // Used by the pending CP-scoped upstream OPEN path.
 fn format_mac(mac: [u8; 6]) -> String {
     mac.iter()
         .map(|byte| format!("{byte:02x}"))

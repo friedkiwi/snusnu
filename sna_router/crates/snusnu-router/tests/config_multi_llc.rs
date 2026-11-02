@@ -370,7 +370,7 @@ fn distinct_proxy_macs_on_one_interface_select_distinct_llc_routes() {
     while Instant::now() < deadline {
         first.extend(collect_markers(&capture_b1, PROXY_B1, GUEST_B1).unwrap());
         second.extend(collect_markers(&capture_b2, PROXY_B2, GUEST_B2).unwrap());
-        if first.len() >= 1 && second.len() >= 1 {
+        if !first.is_empty() && !second.is_empty() {
             break;
         }
         thread::sleep(Duration::from_millis(5));

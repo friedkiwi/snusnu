@@ -74,6 +74,7 @@ impl HprLanCodec {
 
     /// The caller must validate XID3 roles, HPR capabilities and TG agreement
     /// on both media before enabling SETMODE. SAP observation alone is not enough.
+    #[cfg(test)]
     fn arm_after_validated_xid(&mut self) -> io::Result<()> {
         self.saps.saps().map_err(negotiation_error)?;
         self.setmode

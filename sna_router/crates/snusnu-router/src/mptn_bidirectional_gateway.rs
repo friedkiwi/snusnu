@@ -35,7 +35,10 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-pub(crate) fn fresh_management(local_cp: &str, peer_cp: &str) -> io::Result<NativeManagementInitiator> {
+pub(crate) fn fresh_management(
+    local_cp: &str,
+    peer_cp: &str,
+) -> io::Result<NativeManagementInitiator> {
     let mut random = [0u8; 14];
     File::open("/dev/urandom")?.read_exact(&mut random)?;
     let mut token = [0u8; 7];

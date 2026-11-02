@@ -188,27 +188,6 @@ impl NativePeerPort {
         Ok(port)
     }
 
-    /// Construct the native state machine around an already selected LLC
-    /// association. The listener's first frame is applied exactly once, and
-    /// no second converter endpoint is opened for this circuit.
-    pub(crate) fn open_converter_from_endpoint(
-        endpoint: Endpoint,
-        first_events: Vec<Event>,
-        interface: &str,
-        local_xid: Xid3,
-        remote_cp: String,
-        local_cp: String,
-        user_plu: String,
-        user_slu: String,
-    ) -> io::Result<Self> {
-        let mut port = Self::open_with_endpoint(endpoint, interface, local_xid)?;
-        port.management = Some(ManagementSession::new(remote_cp.clone(), local_cp));
-        port.converter_policy = Some((user_plu, user_slu));
-        port.converter_expected_cp = Some(remote_cp);
-        port.process(first_events)?;
-        Ok(port)
-    }
-
     /// Learn the native CP from XID3 after a null-XID offer. The virtual CP
     /// comes from the route target's local XID profile, while the management
     /// and user LU pair are validated against the peer's subsequent BINDs.
@@ -262,7 +241,12 @@ impl NativePeerPort {
             if self.endpoint.buffered_information_count() != 0 {
                 return Ok(false);
             }
-            let offer = self.converter_offer.as_ref().unwrap();
+            let offer = self.converter_offer.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "converter user BIND offer missing",
+                )
+            })?;
             if piu != offer.build_fixed_response(1).map_err(management_error)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -384,14 +368,24 @@ impl NativePeerPort {
                                 }
                             }
                             if self.converter_dynamic && self.management.is_none() {
-                                let peer_cp = self.type1.peer_name().ok_or_else(|| {
-                                    io::Error::new(io::ErrorKind::InvalidData, "native XID3 CP missing")
-                                })?.to_owned();
-                                let local_cp = self.local_xid.cp_name().map_err(management_error)?;
-                                self.management = Some(ManagementSession::new(
-                                    peer_cp.clone(), local_cp,
+                                let peer_cp = self
+                                    .type1
+                                    .peer_name()
+                                    .ok_or_else(|| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "native XID3 CP missing",
+                                        )
+                                    })?
+                                    .to_owned();
+                                let local_cp =
+                                    self.local_xid.cp_name().map_err(management_error)?;
+                                self.management =
+                                    Some(ManagementSession::new(peer_cp.clone(), local_cp));
+                                self.converter_policy = Some((
+                                    peer_cp.clone(),
+                                    self.local_xid.cp_name().map_err(management_error)?,
                                 ));
-                                self.converter_policy = Some((peer_cp.clone(), self.local_xid.cp_name().map_err(management_error)?));
                                 self.converter_expected_cp = Some(peer_cp);
                             }
                             self.endpoint.set_connect_allowed(true)?;
@@ -484,7 +478,9 @@ impl NativePeerPort {
                 let bind = management.bind().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "management BIND missing")
                 })?;
-                let (plu, slu) = self.converter_policy.as_ref().unwrap();
+                let (plu, slu) = self.converter_policy.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "converter policy missing")
+                })?;
                 return queue_converter_bind(
                     management.phase(),
                     &piu,
@@ -526,7 +522,9 @@ impl NativePeerPort {
                     "user Attach before management teardown or duplicate Attach",
                 ));
             }
-            let policy = self.pacing_probe.as_ref().unwrap();
+            let policy = self.pacing_probe.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "pacing probe missing")
+            })?;
             let offer = self.user_offer.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "user BIND offer missing")
             })?;
@@ -819,6 +817,10 @@ fn validate_converter_bind(
     Ok(offer)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "BIND transition updates three independent session outputs"
+)]
 fn queue_converter_bind(
     phase: ManagementPhase,
     piu: &[u8],

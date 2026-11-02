@@ -258,11 +258,12 @@ impl OutboundEndpoint {
     /// Connect one circuit from the configured local interface to peer
     /// TCP/397. Each call returns a separate credit and correlator domain.
     pub(crate) fn dial(self, timeout: Duration) -> io::Result<TcpSession> {
-        Ok(TcpSession::new(self.dial_stream(397, timeout)?)?)
+        TcpSession::new(self.dial_stream(397, timeout)?)
     }
 
+    #[cfg(test)]
     fn dial_port(self, port: u16, timeout: Duration) -> io::Result<TcpSession> {
-        Ok(TcpSession::new(self.dial_stream(port, timeout)?)?)
+        TcpSession::new(self.dial_stream(port, timeout)?)
     }
 
     fn dial_stream(self, port: u16, timeout: Duration) -> io::Result<TcpStream> {

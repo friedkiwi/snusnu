@@ -3,6 +3,10 @@
 //! This is a blocking transport. A router with local packet ports should run
 //! it on a dedicated thread and exchange bounded events with that thread.
 
+// tungstenite's accept_hdr callback fixes a large HTTP response as its Err
+// type; callers cannot change that upstream callback signature.
+#![allow(clippy::result_large_err)]
+
 use prost::Message as ProstMessage;
 use std::fmt;
 use std::io::ErrorKind;
