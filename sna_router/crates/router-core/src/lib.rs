@@ -9,6 +9,7 @@ pub mod fixed_pacing;
 pub mod hpr_fid5;
 pub mod hpr_ip_activation;
 pub mod hpr_lan;
+pub mod hpr_ldlc_adjacency;
 pub mod hpr_route_setup;
 pub mod hpr_rtp;
 pub mod hpr_rtp_receive;
