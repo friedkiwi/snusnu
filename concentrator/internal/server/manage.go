@@ -309,7 +309,7 @@ func (a *App) adminVerifyUser(w http.ResponseWriter, r *http.Request, u store.Us
 	http.Redirect(w, r, "/admin/users", http.StatusSeeOther)
 }
 func (a *App) apiDirectory(w http.ResponseWriter, r *http.Request, u store.User) {
-	items, err := a.DB.ListExports(r.Context(), "")
+	items, err := a.liveDirectoryExports(r.Context())
 	if err != nil {
 		dbError(w, err)
 		return

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"image"
@@ -158,10 +159,18 @@ func (a *App) routerDelete(w http.ResponseWriter, r *http.Request, u store.User,
 	http.Redirect(w, r, "/dashboard", 303)
 }
 func (a *App) globalDirectory(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
-	exports, err := a.DB.ListExports(r.Context(), "")
+	exports, err := a.liveDirectoryExports(r.Context())
 	if err != nil {
 		dbError(w, err)
 		return
+	}
+	a.render(w, "global_directory", map[string]any{"User": u, "CSRF": s.CSRF, "Exports": exports})
+}
+
+func (a *App) liveDirectoryExports(ctx context.Context) ([]store.Export, error) {
+	exports, err := a.DB.ListExports(ctx, "")
+	if err != nil {
+		return nil, err
 	}
 	if a.hub.local != nil {
 		service := store.Export{RouterID: serviceRouterID, RouterName: "SNUSNU services", OwnerID: serviceOwnerID,
@@ -176,7 +185,7 @@ func (a *App) globalDirectory(w http.ResponseWriter, r *http.Request, u store.Us
 		lu.LUTypes = []string{"LU 6.2"}
 		exports = append(exports, cp, lu)
 	}
-	a.render(w, "global_directory", map[string]any{"User": u, "CSRF": s.CSRF, "Exports": exports})
+	return exports, nil
 }
 func (a *App) adminRouters(w http.ResponseWriter, r *http.Request, u store.User, s store.Session) {
 	items, err := a.DB.ListRouters(r.Context(), "")

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -40,6 +41,15 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 		t.Fatal("duplicate local origin")
 	}
 	ctx := context.Background()
+	api := httptest.NewRecorder()
+	a.apiDirectory(api, httptest.NewRequest("GET", "/api/v1/directory", nil), store.User{})
+	var directory []store.Export
+	if api.Code != 200 || json.Unmarshal(api.Body.Bytes(), &directory) != nil || len(directory) != 2 ||
+		directory[0].Kind != "CP" || directory[0].NetID != "SNUSNU" || directory[0].Name != "SVC" ||
+		directory[1].Kind != "LU" || directory[1].NetID != "SNUSNU" || directory[1].Name != "PING" ||
+		directory[1].HostingCPName != "SVC" {
+		t.Fatalf("local directory API: %d %+v", api.Code, directory)
+	}
 	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "local-peer@example.com", "unused", store.Now(), "PEERNET"); err != nil {
 		t.Fatal(err)
 	}
