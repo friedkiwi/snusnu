@@ -23,7 +23,7 @@ bidirectional = true
 
 Run `sudo sna_router/target/debug/snusnu-router --config router.toml` from the repository root. Each route selects a target association by its stable local ID. A source must have exactly one target while the current flow-control contract is per association. The loader rejects unknown IDs, ambiguous routes, duplicate associations, invalid MACs and ports without a route before opening any socket. `bidirectional` defaults to `true`.
 
-`proxy_mac` on `[[route]]` overrides an inferred target address for one LLC-facing direction. A bidirectional LLC-to-LLC route has two different local addresses, so it cannot use one route-level override; use the opposite guests' MACs as shown above. The old `[[llc]] proxy_mac` field remains a deprecated migration fallback. Do not set it together with `[[route]] proxy_mac`.
+`proxy_mac` on `[[route]]` overrides an inferred target address for one LLC-facing direction. A bidirectional LLC-to-LLC route has two different local addresses, so it cannot use one route-level override; use the opposite guests' MACs as shown above.
 
 An optional `[[concentrator]]` entry makes a WebSocket hop another named port. For example, use this as a separate configuration to route one LLC association to `upstream`:
 

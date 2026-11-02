@@ -91,10 +91,10 @@ from = "a"
 to = "b"
 ```
 
-An LLC route to a non-LLC destination can set `proxy_mac` on `[[route]]`.
-For an LLC route to the concentrator, the usual choice is to omit it and use
-the server-assigned CP virtual MAC. The native probe's separate `proxy_mac`
-setting below is not part of the declarative router schema.
+For declarative routing, an LLC route to a non-LLC destination can set
+`proxy_mac` on `[[route]]`. For an LLC route to the concentrator, the usual
+choice is to omit it and use the server-assigned CP virtual MAC. The native
+probe's separate `proxy_mac` setting below is specific to that probe.
 
 For one LLC endpoint routed through a concentrator, use a router credential
 in the environment rather than on the command line:
