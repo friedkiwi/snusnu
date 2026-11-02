@@ -11,19 +11,19 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
 };
 
-use crate::local_status::{LocalPeerStatus, now_ms};
+use crate::local_status::{now_ms, LocalPeerStatus};
 use std::time::Instant;
 use transport_ip_sna::{
-    anynet::{MAX_RECORD, TcpKind, TcpRecord, TcpSession, bind_udp, listen_tcp},
+    anynet::{bind_udp, listen_tcp, TcpKind, TcpRecord, TcpSession, MAX_RECORD},
     mptn_bind_negotiation::validate_positive_response,
     mptn_compensations::CompensationSet,
     mptn_connect::{Connect, Direction},
-    mptn_ingress::{IngressKind, IngressOffer, IngressPolicy, IngressSession, inspect_connect},
+    mptn_ingress::{inspect_connect, IngressKind, IngressOffer, IngressPolicy, IngressSession},
     mptn_keepalive::{Keepalive, Kind as KeepaliveKind},
     mptn_management_responder::{ManagementResponder, Phase as ManagementPhase, V5Options},
     mptn_oob::{
-        Compensation as OobCompensation, Datagram as OobDatagram, Kind as OobKind,
-        build_request as build_oob_request,
+        build_request as build_oob_request, Compensation as OobCompensation,
+        Datagram as OobDatagram, Kind as OobKind,
     },
     mptn_oob_fallback::{
         Action as FallbackAction, Completion as FallbackCompletion, Fallback, Purpose,
@@ -118,6 +118,7 @@ struct Association {
 
 pub(crate) struct MptnGatewayPort {
     config: GatewayConfig,
+    dynamic_lus: bool,
     listener: TcpListener,
     udp: UdpSocket,
     active: Option<Association>,
@@ -142,6 +143,16 @@ fn remember_completed(recent: &mut VecDeque<u16>, sequence: u16) {
 }
 
 impl MptnGatewayPort {
+    /// Return the network-qualified LU pair admitted for this association.
+    /// The caller uses the destination to select one circuit egress; the
+    /// source is the identity learned from the peer, not a configured alias.
+    pub(crate) fn offer_lus(offer: &IngressOffer) -> io::Result<(String, String)> {
+        Ok((
+            offer.connect().source.qualified_lu()?,
+            offer.connect().destination.qualified_lu()?,
+        ))
+    }
+
     fn observe_association(&self, id: u64, event: Option<&GatewayEvent>) {
         let Some(status) = crate::status() else {
             return;
@@ -209,15 +220,29 @@ impl MptnGatewayPort {
     }
 
     pub(crate) fn bind(config: GatewayConfig) -> io::Result<Self> {
+        Self::bind_with_mode(config, false)
+    }
+
+    /// Automatic routing admits a validated Connect LU pair before the
+    /// destination is selected. The caller must either bind that offer to a
+    /// private circuit or close its association; this does not acknowledge a
+    /// user Connect on its own.
+    pub(crate) fn bind_dynamic(config: GatewayConfig) -> io::Result<Self> {
+        Self::bind_with_mode(config, true)
+    }
+
+    fn bind_with_mode(config: GatewayConfig, dynamic_lus: bool) -> io::Result<Self> {
         // Check the configured LU policy before reserving TCP/UDP port 397.
-        IngressSession::new(IngressPolicy {
-            source_lu: config.source_lu.clone(),
-            destination_lu: config.destination_lu.clone(),
-            user_mode: None,
-            allow_blank_user_mode: true,
-            available_compensations: config.available_compensations,
-            forbidden_fqpcid: None,
-        })?;
+        if !dynamic_lus {
+            IngressSession::new(IngressPolicy {
+                source_lu: config.source_lu.clone(),
+                destination_lu: config.destination_lu.clone(),
+                user_mode: None,
+                allow_blank_user_mode: true,
+                available_compensations: config.available_compensations,
+                forbidden_fqpcid: None,
+            })?;
+        }
         if config.local.ip() == config.peer_ip || config.cnos_limit == 0 {
             return Err(invalid("TCP62 gateway peer or CNOS policy invalid"));
         }
@@ -225,6 +250,7 @@ impl MptnGatewayPort {
         let listener = listen_tcp(config.local)?;
         Ok(Self {
             config,
+            dynamic_lus,
             listener,
             udp,
             active: None,
@@ -434,6 +460,19 @@ impl MptnGatewayPort {
             self.completed_user_records = completed_before;
         }
         let event = result?;
+        if self.dynamic_lus {
+            if let Some(GatewayEvent::UserBind(offer)) = event.as_ref() {
+                let (source_lu, destination_lu) = Self::offer_lus(offer)?;
+                tracing::info!(
+                    association = id,
+                    local_ip = %self.config.local.ip(),
+                    peer_ip = %self.config.peer_ip,
+                    source_lu,
+                    destination_lu,
+                    "TCP62 session destination discovered"
+                );
+            }
+        }
         self.observe_association(id, event.as_ref());
         Ok(event.map(|event| (id, event)))
     }
@@ -824,36 +863,50 @@ impl MptnGatewayPort {
         association.incoming_bytes -= record.bytes.len();
         match &mut association.state {
             SessionState::AwaitConnect => {
-                let route = inspect_connect(&record.bytes).ok();
-                if let Some(route) = &route {
-                    let observed_netid = route.source_lu.split_once('.').map(|(netid, _)| netid);
-                    let configured_netid = self
-                        .config
-                        .source_lu
-                        .split_once('.')
-                        .map(|(netid, _)| netid);
-                    if observed_netid != configured_netid {
-                        tracing::warn!(
-                            local_ip = %self.config.local.ip(),
-                            peer_ip = %self.config.peer_ip,
-                            source_lu = %route.source_lu,
-                            destination_lu = %route.destination_lu,
-                            observed_netid = observed_netid.unwrap_or("<missing>"),
-                            configured_netid = configured_netid.unwrap_or("<missing>"),
-                            "TCP62 source NETID rejected"
-                        );
-                        return Err(invalid("TCP62 source NETID differs from configured NETID"));
+                let route = if self.dynamic_lus {
+                    Some(inspect_connect(&record.bytes)?)
+                } else {
+                    inspect_connect(&record.bytes).ok()
+                };
+                if !self.dynamic_lus {
+                    if let Some(route) = &route {
+                        let observed_netid =
+                            route.source_lu.split_once('.').map(|(netid, _)| netid);
+                        let configured_netid = self
+                            .config
+                            .source_lu
+                            .split_once('.')
+                            .map(|(netid, _)| netid);
+                        if observed_netid != configured_netid {
+                            tracing::warn!(
+                                local_ip = %self.config.local.ip(),
+                                peer_ip = %self.config.peer_ip,
+                                source_lu = %route.source_lu,
+                                destination_lu = %route.destination_lu,
+                                observed_netid = observed_netid.unwrap_or("<missing>"),
+                                configured_netid = configured_netid.unwrap_or("<missing>"),
+                                "TCP62 source NETID rejected"
+                            );
+                            return Err(invalid(
+                                "TCP62 source NETID differs from configured NETID",
+                            ));
+                        }
                     }
                 }
-                let (source_lu, destination_lu) = route
-                    .as_ref()
-                    .and_then(|route| {
-                        self.allowed_routes.iter().find(|pair| {
-                            pair.0 == route.source_lu && pair.1 == route.destination_lu
+                let (source_lu, destination_lu) = if self.dynamic_lus {
+                    let route = route.as_ref().expect("dynamic Connect was inspected");
+                    (route.source_lu.as_str(), route.destination_lu.as_str())
+                } else {
+                    route
+                        .as_ref()
+                        .and_then(|route| {
+                            self.allowed_routes.iter().find(|pair| {
+                                pair.0 == route.source_lu && pair.1 == route.destination_lu
+                            })
                         })
-                    })
-                    .map(|pair| (pair.0.as_str(), pair.1.as_str()))
-                    .unwrap_or((&self.config.source_lu, &self.config.destination_lu));
+                        .map(|pair| (pair.0.as_str(), pair.1.as_str()))
+                        .unwrap_or((&self.config.source_lu, &self.config.destination_lu))
+                };
                 let mut ingress = IngressSession::new(IngressPolicy {
                     source_lu: source_lu.to_string(),
                     destination_lu: destination_lu.to_string(),
@@ -1421,6 +1474,45 @@ mod tests {
             rejected.as_deref(),
             Some("TCP62 source NETID differs from configured NETID")
         );
+    }
+
+    #[test]
+    fn dynamic_listener_admits_inspected_lu_pair_without_configured_netid() {
+        let mut port = MptnGatewayPort::bind_dynamic(GatewayConfig {
+            local: "127.0.0.1:0".parse().unwrap(),
+            peer_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            source_lu: String::new(),
+            destination_lu: String::new(),
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            options: V5Options {
+                son_handler: false,
+                keepalive_handler: false,
+            },
+            cnos_mode: String::new(),
+            cnos_limit: 8,
+            allow_resumed_user: true,
+        })
+        .unwrap();
+        let mut peer = peer_socket(port.listener.local_addr().unwrap());
+        peer.write_all(request_to("OTHNET.SNAC", [0x33; 8]).connect_request())
+            .unwrap();
+        for _ in 0..40 {
+            if let Some((_, GatewayEvent::Rejected(reason))) =
+                port.poll_association_once(true).unwrap()
+            {
+                panic!("dynamic listener rejected a valid LU pair: {reason}");
+            }
+            if port
+                .active
+                .as_ref()
+                .is_some_and(|association| matches!(association.state, SessionState::Management(_)))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("dynamic listener did not admit the Connect");
     }
 
     #[test]
@@ -2112,18 +2204,16 @@ mod tests {
         // TCP X'10'. Its positive response releases only the Abort event.
         let abort = TcpRecord::decode(hex("0000003b1000006b8000320f080100006014cec37477b5dc29a10be2d6d3d5c5e34be2d5c1c13513080100000c000be2d6d3d5c5e34be2d5c1c200")).unwrap();
         let mut sent = Vec::new();
-        assert!(
-            MptnGatewayPort::queue_udp_abort_with(
-                port.active.as_mut().unwrap(),
-                port.config.peer_ip,
-                &abort,
-                |bytes, destination| {
-                    sent.push((bytes.to_vec(), destination));
-                    Ok(())
-                },
-            )
-            .unwrap()
-        );
+        assert!(MptnGatewayPort::queue_udp_abort_with(
+            port.active.as_mut().unwrap(),
+            port.config.peer_ip,
+            &abort,
+            |bytes, destination| {
+                sent.push((bytes.to_vec(), destination));
+                Ok(())
+            },
+        )
+        .unwrap());
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1, "127.0.0.2:397".parse().unwrap());
         let datagram = OobDatagram::decode(&sent[0].0).unwrap();
