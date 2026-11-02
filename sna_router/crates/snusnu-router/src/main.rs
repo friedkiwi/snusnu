@@ -29,6 +29,8 @@ mod mptn_outbound_port;
 #[cfg(target_os = "linux")]
 mod mptn_ws_gateway_lab;
 #[cfg(target_os = "linux")]
+mod mptn_ws_reverse;
+#[cfg(target_os = "linux")]
 mod native_converter_lab;
 #[cfg(target_os = "linux")]
 mod native_llc_port;
