@@ -104,8 +104,8 @@ impl WsClient {
         }
     }
 
-    /// Connect using an HTTP Authorization header. A plaintext `ws` URL is
-    /// accepted only for loopback development servers.
+    /// Connect using an HTTP Authorization header when a bearer is supplied.
+    /// A plaintext `ws` URL is accepted only for loopback development servers.
     pub fn connect(url: &str, bearer: &str) -> Result<(Self, wire::RouterWelcome), Error> {
         Self::connect_with_subprotocol(url, bearer, SUBPROTOCOL)
     }
@@ -126,13 +126,12 @@ impl WsClient {
         subprotocol: &'static str,
     ) -> Result<(Self, wire::RouterWelcome), Error> {
         validate_url(url)?;
-        if bearer.is_empty() {
-            return Err(Error::InvalidBearer);
-        }
-        let auth =
-            HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|_| Error::InvalidBearer)?;
         let mut request = url.into_client_request().map_err(|_| Error::InvalidUrl)?;
-        request.headers_mut().insert(AUTHORIZATION, auth);
+        if !bearer.is_empty() {
+            let auth = HeaderValue::from_str(&format!("Bearer {bearer}"))
+                .map_err(|_| Error::InvalidBearer)?;
+            request.headers_mut().insert(AUTHORIZATION, auth);
+        }
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static(subprotocol),
@@ -405,6 +404,45 @@ mod tests {
                 )),
             })
             .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn empty_bearer_omits_authorization_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept_hdr(
+                tcp,
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    assert!(!request.headers().contains_key(AUTHORIZATION));
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let welcome = wire::WsEnvelope {
+                body: Some(wire::ws_envelope::Body::Welcome(wire::RouterWelcome {
+                    router_id: vec![7; 16],
+                    connection_epoch: vec![8; 16],
+                    max_message_bytes: 1024,
+                    max_circuits: 16,
+                    display_name: "Unauthenticated test router".into(),
+                    allowed_netid: "SOLNET".into(),
+                })),
+            };
+            socket
+                .send(Message::Binary(welcome.encode_to_vec().into()))
+                .unwrap();
+        });
+        let url = format!("ws://{address}/router/v1/ws");
+        let (_, welcome) = WsClient::connect(&url, "").unwrap();
+        assert_eq!(welcome.display_name, "Unauthenticated test router");
         server.join().unwrap();
     }
 
