@@ -55,6 +55,27 @@ func Echo(records [][]byte) ([][]byte, error) {
 	return out, nil
 }
 
+// ParseMappedRecords splits one complete LU 6.2 mapped-data RU. A single
+// request can carry several records, including APING's ECHO(*NO) turn.
+func ParseMappedRecords(data []byte) ([][]byte, error) {
+	if len(data) == 0 || len(data) > 64*1024-9 {
+		return nil, ErrRecord
+	}
+	var records [][]byte
+	for len(data) != 0 {
+		if len(data) < 2 {
+			return nil, ErrRecord
+		}
+		n := int(binary.BigEndian.Uint16(data[:2]))
+		if n < 2 || n > MaxRecord || n > len(data) || len(records) == 32767 {
+			return nil, ErrRecord
+		}
+		records = append(records, append([]byte(nil), data[:n]...))
+		data = data[n:]
+	}
+	return records, nil
+}
+
 func validateRecord(record []byte) error {
 	if len(record) < 2 || len(record) > MaxRecord || int(binary.BigEndian.Uint16(record[:2])) != len(record) {
 		return ErrRecord

@@ -35,3 +35,20 @@ func TestRejectMalformedRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMappedRecordBoundaries(t *testing.T) {
+	data, _ := hex.DecodeString("000812ff00000000000812ff00000000")
+	records, err := ParseMappedRecords(data)
+	if err != nil || len(records) != 2 || !bytes.Equal(records[0], data[:8]) || !bytes.Equal(records[1], data[8:]) {
+		t.Fatalf("mapped records: %x, %v", records, err)
+	}
+	data[2] = 0
+	if records[0][2] != 0x12 {
+		t.Fatal("records alias input")
+	}
+	for _, invalid := range [][]byte{{0}, {0, 0}, {0, 8, 1}, {0, 2, 0}} {
+		if _, err := ParseMappedRecords(invalid); !errors.Is(err, ErrRecord) {
+			t.Fatalf("accepted %x: %v", invalid, err)
+		}
+	}
+}
