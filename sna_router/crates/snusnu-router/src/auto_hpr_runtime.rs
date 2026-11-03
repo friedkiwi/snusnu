@@ -18,7 +18,9 @@ use std::{
 };
 
 use crate::{
+    auto_address::AutoProxyMacs,
     auto_hpr_identity::AuthorizedEeIdentity,
+    auto_hpr_local_ingress::LocalToHprRuntime,
     auto_hpr_reverse_runtime::ReverseRuntime,
     config::RouterConfig,
     ee_ldlc_endpoint::EeLdlcEndpoint,
@@ -165,7 +167,10 @@ struct DirectHprRuntime<'a> {
     next_handle: u64,
     bound_user_scopes: Vec<router_core::hpr_session_address::RtpAssociationScope>,
     peer_lus: Option<EePeerLus>,
+    ee_attachment_id: Option<String>,
     reverse: Option<ReverseRuntime>,
+    local_ingress: Option<LocalToHprRuntime>,
+    reverse_local_reservation: Option<(String, [u8; 6])>,
 }
 
 impl<'a> DirectHprRuntime<'a> {
@@ -198,7 +203,10 @@ impl<'a> DirectHprRuntime<'a> {
             next_handle: 1,
             bound_user_scopes: Vec::new(),
             peer_lus: None,
+            ee_attachment_id: None,
             reverse: None,
+            local_ingress: None,
+            reverse_local_reservation: None,
         }
     }
 
@@ -206,7 +214,8 @@ impl<'a> DirectHprRuntime<'a> {
         let mut peer_lus = EePeerLus::from_attachment(attachment)?;
         peer_lus.activate(&self.bootstrap.peer.cp);
         self.peer_lus = Some(peer_lus);
-        Ok(())
+        self.ee_attachment_id = Some(attachment.id.clone());
+        self.refresh_ee_directory(&attachment.id)
     }
 
     fn configure_local_llc(&mut self, config: &RouterConfig) -> io::Result<()> {
@@ -218,6 +227,47 @@ impl<'a> DirectHprRuntime<'a> {
             )?);
         }
         Ok(())
+    }
+
+    fn configure_local_ingress(
+        &mut self,
+        config: &RouterConfig,
+        attachment: &crate::config::EeConfig,
+    ) -> io::Result<()> {
+        if !config.llc.is_empty() {
+            let proxy_mac = AutoProxyMacs::from_ids([attachment.id.as_str()])?
+                .get(&attachment.id)
+                .ok_or_else(|| protocol("EE local proxy MAC allocation missing"))?;
+            self.local_ingress = Some(LocalToHprRuntime::new(
+                &config.llc,
+                &attachment.id,
+                self.bootstrap.peer.cp.clone(),
+                proxy_mac,
+                &self.bootstrap.local.node_id,
+            )?);
+            tracing::info!(attachment = %attachment.id, proxy_mac = %crate::endpoint::format_mac(proxy_mac),
+                "LLC ingress for local EE destinations listening");
+        }
+        Ok(())
+    }
+
+    fn refresh_ee_directory(&mut self, attachment_id: &str) -> io::Result<()> {
+        let routes = self
+            .peer_lus
+            .as_ref()
+            .into_iter()
+            .flat_map(EePeerLus::advertised)
+            .map(|lu| {
+                (
+                    lu,
+                    Destination::Ee {
+                        hosting_cp: self.bootstrap.peer.cp.clone(),
+                        attachment_id: attachment_id.to_owned(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.local_directory.replace_owner("ee", routes)
     }
 
     fn configure_local_mptn(&mut self, config: &'a RouterConfig) -> io::Result<()> {
@@ -332,6 +382,7 @@ impl<'a> DirectHprRuntime<'a> {
         self.pump_local_llc()?;
         self.pump_local_mptn()?;
         self.refresh_local_exports(hub)?;
+        self.try_local_reverse(link)?;
         self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
         self.try_cp_replies(link, now_us)?;
@@ -366,8 +417,84 @@ impl<'a> DirectHprRuntime<'a> {
             reverse.pump(link, &mut self.rtp, &mut self.switch, now_us)?;
             if reverse.is_done() {
                 self.reverse = None;
+                if let Some((ingress_id, proxy_mac)) = self.reverse_local_reservation.take() {
+                    if let Some(local_ingress) = self.local_ingress.as_mut() {
+                        local_ingress.release(&ingress_id, proxy_mac)?;
+                    }
+                }
             }
         }
+        Ok(())
+    }
+
+    fn try_local_reverse(&mut self, link: &EeLdlcEndpoint) -> io::Result<()> {
+        if self.reverse.is_some()
+            || !self
+                .reciprocal_cp
+                .as_ref()
+                .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+        {
+            return Ok(());
+        }
+        let Some(local_ingress) = self.local_ingress.as_mut() else {
+            return Ok(());
+        };
+        let Some(mut ready) = local_ingress.poll_ready(&self.local_directory)? else {
+            return Ok(());
+        };
+        let result = (|| {
+            let tg = link
+                .tg_number()
+                .ok_or_else(|| protocol("active EE link has no TG"))?;
+            let (label, instance) = target_nce(
+                &self.bootstrap.local.tower.route_setup_nce_label,
+                self.bootstrap.local.tower.route_setup_nce_instance,
+                126,
+            )?;
+            self.switch
+                .replace_routes(
+                    HPR_ADAPTER,
+                    vec![Reachability {
+                        lu: Some(ready.identity.target_lu.clone()),
+                        cp: ready.identity.target_cp.clone(),
+                    }],
+                )
+                .map_err(|error| protocol(format!("local EE route admission: {error:?}")))?;
+            let handle = self.next_handle;
+            self.next_handle = self
+                .next_handle
+                .checked_add(1)
+                .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+            Ok((tg, label, instance, handle))
+        })();
+        let (tg, label, instance, handle) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                ready.source.close()?;
+                local_ingress.release(&ready.ingress_id, ready.proxy_mac)?;
+                return Err(error);
+            }
+        };
+        tracing::info!(ingress = %ready.ingress_id, target = %ready.target_ee_id,
+            source_lu = %ready.identity.source_lu, target_lu = %ready.identity.target_lu,
+            handle, "local LLC session admitted to EE peer");
+        self.reverse_local_reservation = Some((ready.ingress_id, ready.proxy_mac));
+        self.reverse = Some(ReverseRuntime::with_source(
+            ready.identity,
+            ready.source,
+            LOCAL_ADAPTER,
+            self.bootstrap.clone(),
+            handle,
+            tg,
+            reciprocal_nonce().to_be_bytes(),
+            label,
+            instance,
+            router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            },
+        ));
         Ok(())
     }
 
@@ -909,7 +1036,11 @@ impl<'a> DirectHprRuntime<'a> {
             ));
         }
         if let Some(peer_lus) = self.peer_lus.as_mut() {
-            peer_lus.observe(&identity);
+            if peer_lus.observe(&identity) {
+                if let Some(attachment_id) = self.ee_attachment_id.clone() {
+                    self.refresh_ee_directory(&attachment_id)?;
+                }
+            }
         }
         let source_lu = as_wire_name(&identity.source_lu);
         let target_lu = as_wire_name(&identity.target_lu);
@@ -1376,6 +1507,7 @@ fn run_connected(
                 runtime.configure_peer_lus(attachment)?;
                 runtime.configure_local_llc(config)?;
                 runtime.configure_local_mptn(config)?;
+                runtime.configure_local_ingress(config, attachment)?;
                 runtime.publish_reachability(hub, None)?;
                 active = Some(runtime);
                 tracing::info!(attachment = %attachment.id, generation = link.generation().get(),

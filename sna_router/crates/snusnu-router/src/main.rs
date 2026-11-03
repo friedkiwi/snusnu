@@ -25,6 +25,8 @@ mod auto_hpr_inbound;
 #[allow(dead_code)] // Prepared for HPR gateway integration; automatic config remains gated.
 mod auto_hpr_ip;
 #[cfg(target_os = "linux")]
+mod auto_hpr_local_ingress;
+#[cfg(target_os = "linux")]
 mod auto_hpr_reverse;
 #[cfg(target_os = "linux")]
 mod auto_hpr_reverse_runtime;
@@ -54,6 +56,8 @@ mod endpoint;
 #[allow(dead_code)] // Shared LU directory is used by the EE local carrier switch.
 mod hpr_destination_directory;
 #[cfg(target_os = "linux")]
+mod hpr_fid2_session;
+#[cfg(target_os = "linux")]
 mod hpr_lan_port;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // LLC XID/management probes feed verified local EE routes.
@@ -61,6 +65,8 @@ mod hpr_llc_attachments;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Native LLC user session adapter for the EE switch.
 mod hpr_local_llc;
+#[cfg(target_os = "linux")]
+mod hpr_local_llc_ingress;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Local MPTN user session adapter for the EE switch.
 mod hpr_local_mptn;

@@ -209,6 +209,26 @@ impl NativePeerPort {
         self.converter_events.pop_front()
     }
 
+    /// The CP from XID3 is usable for local route admission only after the
+    /// full Type1 role exchange has validated the peer and link activation.
+    pub(crate) fn converter_peer_cp(&self) -> Option<&str> {
+        (self.converter_dynamic && self.activation_announced)
+            .then(|| self.type1.peer_name())
+            .flatten()
+    }
+
+    /// The native BIND response must use the negotiated management profile;
+    /// a remote carrier's positive reduced response cannot be sent verbatim.
+    pub(crate) fn converter_positive_bind_response(&self) -> io::Result<Vec<u8>> {
+        self.converter_offer
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "native user BIND offer missing")
+            })?
+            .build_fixed_response(1)
+            .map_err(management_error)
+    }
+
     pub(crate) fn replay_converter_user_bind(&mut self, piu: Vec<u8>) -> io::Result<()> {
         if self
             .converter_offer
