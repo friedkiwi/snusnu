@@ -4,7 +4,13 @@
 //! private native converter proves the source CP and parses a user BIND
 //! before the shared HPR reverse runtime receives the SessionSource.
 
-use std::{collections::HashSet, io};
+use std::{
+    collections::HashSet,
+    io,
+    time::{Duration, Instant},
+};
+
+const PENDING_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
     auto_llc::{LlcAutoListener, LlcIngressOffer},
@@ -24,6 +30,7 @@ struct Pending {
     ingress_id: String,
     proxy_mac: [u8; 6],
     source: LocalLlcIngress,
+    accepted_at: Instant,
 }
 
 pub(crate) struct ReadyLocalLlc {
@@ -148,6 +155,7 @@ impl LocalToHprState {
                 ingress_id: ingress_id.to_owned(),
                 proxy_mac,
                 source,
+                accepted_at: Instant::now(),
             }),
             Err(error) => {
                 self.releases.push((ingress_id.to_owned(), proxy_mac));
@@ -164,6 +172,10 @@ impl LocalToHprState {
     ) -> io::Result<Option<ReadyLocalLlc>> {
         let mut index = 0;
         while index < self.pending.len() {
+            if self.pending[index].accepted_at.elapsed() >= PENDING_BIND_TIMEOUT {
+                self.reject(index, "LLC user BIND timed out")?;
+                continue;
+            }
             let result = self.pending[index].source.poll();
             match result {
                 Ok(Some(SourceUpdate::Event(SessionEvent::BindRequest(_)))) => {

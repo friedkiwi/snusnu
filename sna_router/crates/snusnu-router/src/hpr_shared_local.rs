@@ -27,6 +27,7 @@ pub(crate) struct HprSharedLocal {
     mptn: HashMap<String, HprMptnPeerState>,
     candidates: Vec<ConfiguredCandidate>,
     llc: Option<LocalToHprState>,
+    llc_proxy: Option<(Vec<String>, [u8; 6])>,
 }
 
 impl HprSharedLocal {
@@ -44,6 +45,7 @@ impl HprSharedLocal {
             mptn,
             candidates,
             llc: None,
+            llc_proxy: None,
         })
     }
 
@@ -58,13 +60,29 @@ impl HprSharedLocal {
         if config.llc.is_empty() {
             return Ok(());
         }
-        let proxy_mac = AutoProxyMacs::from_ids([attachment_id])?
-            .get(attachment_id)
-            .ok_or_else(|| io::Error::other("EE proxy MAC allocation failed"))?;
+        let proxy_mac = AutoProxyMacs::from_ids(
+            config
+                .llc
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .chain(config.mptn_gateway.iter().map(|entry| entry.id.as_str()))
+                .chain(std::iter::once(attachment_id)),
+        )?
+        .get(attachment_id)
+        .ok_or_else(|| io::Error::other("EE proxy MAC allocation failed"))?;
+        let state = LocalToHprState::new(attachment_id, peer_cp, proxy_mac)?;
+        let mut registered: Vec<String> = Vec::new();
         for entry in &config.llc {
-            runner.allow_llc_proxy_mac(&entry.id, proxy_mac)?;
+            if let Err(error) = runner.allow_llc_proxy_mac(&entry.id, proxy_mac) {
+                for id in registered {
+                    let _ = runner.withdraw_llc_proxy_mac(&id, proxy_mac);
+                }
+                return Err(error);
+            }
+            registered.push(entry.id.clone());
         }
-        self.llc = Some(LocalToHprState::new(attachment_id, peer_cp, proxy_mac)?);
+        self.llc = Some(state);
+        self.llc_proxy = Some((registered, proxy_mac));
         Ok(())
     }
 
@@ -123,8 +141,16 @@ impl HprSharedLocal {
             }
         }
         if let Some(state) = self.llc.as_mut() {
-            if can_accept_user && ready.is_none() {
-                ready = state.poll_ready(directory)?.map(ReadyLocalHpr::Llc);
+            if let Some(mut source) = state.poll_ready(directory)? {
+                if can_accept_user && ready.is_none() {
+                    ready = Some(ReadyLocalHpr::Llc(source));
+                } else {
+                    if let Err(error) = source.source.close() {
+                        tracing::warn!(attachment = %source.ingress_id, error = %error,
+                            "failed to close LLC session while EE slot is busy");
+                    }
+                    state.release(&source.ingress_id, source.proxy_mac)?;
+                }
             }
             release_llc(runner, state)?;
         }
@@ -196,6 +222,11 @@ impl HprSharedLocal {
         if let Some(mut state) = self.llc.take() {
             state.shutdown();
             release_llc(runner, &mut state)?;
+        }
+        if let Some((attachments, proxy_mac)) = self.llc_proxy.take() {
+            for id in attachments {
+                runner.withdraw_llc_proxy_mac(&id, proxy_mac)?;
+            }
         }
         for (id, state) in &mut self.mptn {
             runner.with_gateway(id, |gateway| {
