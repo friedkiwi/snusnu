@@ -315,7 +315,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 			return fmt.Errorf("printer probe management BIND identity mismatch: %s to %s", bind.PLU, bind.SLU)
 		}
 		mode, sessions := "", uint16(8)
-		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_SOURCE_BIND") == "1" {
+		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_QRMTWSC") == "1" || os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_SOURCE_BIND") == "1" {
 			mode, sessions = "QRMTWSC", 57
 		}
 		management, err := lu62.NewManagementSessionWithMode(bind.PLU, bind.SLU, mode, sessions)

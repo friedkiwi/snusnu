@@ -395,6 +395,26 @@ ACTLU following the rejected BIND. The source-CNOS option is gated by
 explicit once a source management session can be activated. The successful
 AnyNet source CNOS uses a separate router-to-guest management path.
 
+The guest has two LLC APPC devices attached to `LLCPRT`: `PRINTER00`
+identifies `SNUSNU.PRINTER`, while `SVC` identifies `SNUSNU.SVC`. The first
+mode-status check examined `PRINTER00` and showed only `SNASVCMG`; it was
+not evidence about the `SVC` route. With `SVC` varied on, an explicit
+`STRMOD` for remote location `SVC`, remote network `SNUSNU`, device `SVC`,
+and mode `QRMTWSC` completed successfully. `DSPMODSTS` then showed device
+`SVC` ACTIVE, mode `QRMTWSC` Started, and negotiated limits of 57 total,
+56 locally controlled, and one remotely controlled session. The LLC QA
+trace contains the matching guest management BIND and CNOS. A separate
+QA flag, `SNUSNU_PRINTER_PROBE_PASSIVE_QRMTWSC=1`, accepts that CNOS
+without injecting a controller BIND.
+
+Repeating the post-UNBIND `(2,2)` controller BIND in this confirmed `SVC`
+mode state changed the negative sense to `80040000` (unrecognized
+destination). This indicates that the host did not recognize the BIND's
+destination address after the management UNBIND. The 5494 source
+SNASVCMG/CNOS session must be
+activated separately; a successful target-side CNOS does not by itself
+allocate its FID2 address. The probe has still received no LU4 BIND or SCS.
+
 The [TCP62 transport draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00.txt)
 specifies LU 6.2 application conversion, whereas IBM's
 [management-services guide](https://public.dhe.ibm.com/software/network/commserver/publications/cslin_64/czx41100.pdf)
