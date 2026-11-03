@@ -121,6 +121,7 @@ mod mptn_gateway_port;
 mod mptn_ingress_lab;
 #[cfg(target_os = "linux")]
 mod mptn_llc_reverse;
+mod mptn_local_session;
 #[cfg(target_os = "linux")]
 mod mptn_outbound_port;
 #[cfg(target_os = "linux")]

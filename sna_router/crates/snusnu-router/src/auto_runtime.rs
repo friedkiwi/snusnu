@@ -16,6 +16,7 @@ use crate::{
     llc_session_ws::LlcSessionWs,
     llc_source_ws::LlcSourceWs,
     local_status::LocalProxyMacStatus,
+    mptn_local_session::MptnLocalSession,
     mptn_session_ws::MptnSessionWs,
     mptn_target_ws::MptnTargetWs,
     remote::AutoWsHub,
@@ -74,6 +75,56 @@ fn mptn_source_proof(
 
 fn mptn_proof_wait_allowed(now: Instant, deadline: Instant, gateway_available: bool) -> bool {
     gateway_available && now < deadline
+}
+
+fn unique_mptn_hosting_cp(
+    learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
+    gateway_id: &str,
+) -> io::Result<Option<wire::SnaName>> {
+    let mut cps = learned
+        .get(gateway_id)
+        .into_iter()
+        .flat_map(|routes| routes.values());
+    let Some(first) = cps.next() else {
+        return Ok(None);
+    };
+    if cps.any(|cp| cp != first) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MPTN attachment advertises multiple hosting CPs; target CP is ambiguous",
+        ));
+    }
+    Ok(Some(wire_name(first)))
+}
+
+fn local_mptn_identity(
+    learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
+    source_id: &str,
+    target_id: &str,
+    source_lu: QualifiedName,
+    target_lu: QualifiedName,
+) -> io::Result<SessionIdentity> {
+    let source_cp = learned
+        .get(source_id)
+        .and_then(|routes| routes.get(&source_lu))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "MPTN source LU has no management proof",
+            )
+        })?;
+    let target_cp = learned
+        .get(target_id)
+        .and_then(|routes| routes.get(&target_lu))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "MPTN target LU has no hosting CP proof",
+            )
+        })?;
+    SessionIdentity::new(source_lu, target_lu)
+        .with_control_points(Some(source_cp.clone()), Some(target_cp.clone()))
+        .map_err(io::Error::other)
 }
 
 fn require_session_v1_target(route: &wire::RouteExport) -> io::Result<()> {
@@ -240,6 +291,7 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     sessions: HashMap<u64, LlcSession>,
     next_id: u64,
     mptn_ws_sessions: HashMap<u64, MptnSessionWs>,
+    mptn_local_sessions: HashMap<u64, MptnLocalSession>,
     next_mptn_ws_id: u64,
     mptn_target_sessions: HashMap<u64, MptnTargetWs>,
     next_mptn_target_id: u64,
@@ -363,6 +415,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             sessions: HashMap::new(),
             next_id: 0,
             mptn_ws_sessions: HashMap::new(),
+            mptn_local_sessions: HashMap::new(),
             next_mptn_ws_id: 0,
             mptn_target_sessions: HashMap::new(),
             next_mptn_target_id: 0,
@@ -798,6 +851,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             local_dispatch,
             sessions,
             mptn_ws_sessions,
+            mptn_local_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
             pending_llc_upstream,
@@ -811,6 +865,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
         } = self;
         let mut next_id = self.next_id;
         let mut next_mptn_ws_id = self.next_mptn_ws_id;
+        let mut pending_local_mptn = Vec::new();
         let mut changed_proofs = HashSet::<PortId>::new();
         let mut exports_changed = false;
         for id in active_llc_upstream.keys().copied().collect::<Vec<_>>() {
@@ -1058,6 +1113,28 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 }
             }
         }
+        for id in mptn_local_sessions.keys().copied().collect::<Vec<_>>() {
+            let retired = match mptn_local_sessions.get_mut(&id).unwrap().pump() {
+                Ok(true) => false,
+                Ok(false) => true,
+                Err(error) => {
+                    tracing::warn!(session = id, error = %error,
+                        "automatic local TCP62 to TCP62 circuit failed");
+                    true
+                }
+            };
+            if retired {
+                let mut circuit = mptn_local_sessions.remove(&id).unwrap();
+                let (source_id, target_id) = circuit.gateways();
+                let (source_id, target_id) = (source_id.to_owned(), target_id.to_owned());
+                let _ = circuit.close();
+                for gateway in gateways.iter_mut() {
+                    if gateway.id() == source_id || gateway.id() == target_id {
+                        gateway.release_udp();
+                    }
+                }
+            }
+        }
         for id in mptn_target_sessions.keys().copied().collect::<Vec<_>>() {
             let result = mptn_target_sessions.get_mut(&id).unwrap().pump();
             let retired = match result {
@@ -1269,14 +1346,20 @@ impl<'a> AutoLocalSessionRunner<'a> {
                     observe_native_llc_peer(&offer, cp);
                 }
                 let seed = format!("{}:{}", ingress_id.0, gateway.id());
-                let target_cp = gateway.configured_local_cp().and_then(|cp| {
-                    cp.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "LLC to TCP62 target CP has not been configured or discovered",
-                        )
+                let target_cp = gateway
+                    .configured_local_cp()
+                    .and_then(|hint| match hint {
+                        Some(cp) => Ok(Some(cp)),
+                        None => unique_mptn_hosting_cp(learned_mptn_lus, gateway.id()),
                     })
-                });
+                    .and_then(|cp| {
+                        cp.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "LLC to TCP62 target CP has not been configured or discovered",
+                            )
+                        })
+                    });
                 let result = target_cp.and_then(|cp| {
                     local_dispatch.start(
                         &ingress_id.0,
@@ -1704,6 +1787,14 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 }
                 continue;
             }
+            if config
+                .mptn_gateway
+                .iter()
+                .any(|peer| peer.id == target_id.0)
+            {
+                pending_local_mptn.push((gateway.id().to_owned(), target_id.0, association, offer));
+                continue;
+            }
             let mut detached_for_session = false;
             let result = (|| -> io::Result<()> {
                 let (source, destination) = AutoMptnGateway::offer_lus(&offer)?;
@@ -1837,6 +1928,87 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 }
             }
         }
+        for (source_id, target_id, association, offer) in pending_local_mptn {
+            let source_index = gateways
+                .iter()
+                .position(|gateway| gateway.id() == source_id);
+            let target_index = gateways
+                .iter()
+                .position(|gateway| gateway.id() == target_id);
+            let (Some(source_index), Some(target_index)) = (source_index, target_index) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "local MPTN attachment disappeared",
+                ));
+            };
+            if source_index == target_index {
+                gateways[source_index].reject_offer(
+                    association,
+                    "TCP62 source and target use the same attachment",
+                )?;
+                continue;
+            }
+            let (source_gateway, target_gateway) = if source_index < target_index {
+                let (left, right) = gateways.split_at_mut(target_index);
+                (&mut left[source_index], &mut right[0])
+            } else {
+                let (left, right) = gateways.split_at_mut(source_index);
+                (&mut right[0], &mut left[target_index])
+            };
+            let mut detached = false;
+            let mut target_leased = false;
+            let result = (|| -> io::Result<MptnLocalSession> {
+                let (source_lu, target_lu) = AutoMptnGateway::offer_lus(&offer)?;
+                let source_lu: QualifiedName = source_lu.parse().map_err(io::Error::other)?;
+                let target_lu: QualifiedName = target_lu.parse().map_err(io::Error::other)?;
+                let identity = local_mptn_identity(
+                    learned_mptn_lus,
+                    &source_id,
+                    &target_id,
+                    source_lu,
+                    target_lu,
+                )?;
+                let target_udp = target_gateway.lease_udp()?;
+                target_leased = true;
+                let target_endpoint = target_gateway.outbound_endpoint();
+                let source_endpoint = source_gateway.outbound_endpoint();
+                let (detached_user, source_udp) =
+                    source_gateway.detach_user_for_hpr(association, &offer)?;
+                detached = true;
+                let source =
+                    MptnToHprSession::new(detached_user, source_udp, source_endpoint, offer)?;
+                Ok(MptnLocalSession::new(
+                    source,
+                    target_udp,
+                    target_endpoint,
+                    identity,
+                    source_id.clone(),
+                    target_id.clone(),
+                ))
+            })();
+            match result {
+                Ok(circuit) => {
+                    next_mptn_ws_id = next_mptn_ws_id.checked_add(1).ok_or_else(|| {
+                        io::Error::other("automatic local MPTN session ID exhausted")
+                    })?;
+                    tracing::info!(session = next_mptn_ws_id, ingress = %source_id, egress = %target_id,
+                        "automatic local TCP62 to TCP62 session bridge installed");
+                    mptn_local_sessions.insert(next_mptn_ws_id, circuit);
+                }
+                Err(error) => {
+                    if target_leased {
+                        target_gateway.release_udp();
+                    }
+                    if detached {
+                        source_gateway.release_udp();
+                    } else {
+                        source_gateway.reject_offer(association, &error.to_string())?;
+                    }
+                    tracing::warn!(ingress = %source_id, egress = %target_id, association,
+                        error = %error, "automatic local TCP62 to TCP62 session rejected");
+                }
+            }
+        }
         if let Some(connected) = hub {
             if refresh_mptn_exports(
                 learned_mptn_lus,
@@ -1867,6 +2039,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             listeners,
             sessions,
             mptn_ws_sessions,
+            mptn_local_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
             pending_llc_upstream,
@@ -1891,6 +2064,16 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 .find(|gateway| gateway.id() == gateway_id)
             {
                 gateway.release_udp();
+            }
+        }
+        for (_, mut circuit) in mptn_local_sessions.drain() {
+            let (source_id, target_id) = circuit.gateways();
+            let (source_id, target_id) = (source_id.to_owned(), target_id.to_owned());
+            let _ = circuit.close();
+            for gateway in gateways.iter_mut() {
+                if gateway.id() == source_id || gateway.id() == target_id {
+                    gateway.release_udp();
+                }
             }
         }
         for (_, mut target) in mptn_target_sessions.drain() {
@@ -2594,6 +2777,64 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn local_mptn_target_cp_comes_from_discovered_lu_host() {
+        let gateway = "mptn-b".to_owned();
+        let mut learned = HashMap::new();
+        let lu: QualifiedName = "QABOB.USERLU".parse().unwrap();
+        let cp: QualifiedName = "QABOB.HOSTCP".parse().unwrap();
+        learned.insert(gateway.clone(), HashMap::from([(lu, cp.clone())]));
+        assert_eq!(
+            unique_mptn_hosting_cp(&learned, &gateway).unwrap(),
+            Some(wire_name(&cp))
+        );
+        let second_lu: QualifiedName = "QABOB.OTHERLU".parse().unwrap();
+        learned.get_mut(&gateway).unwrap().insert(second_lu, cp);
+        assert!(unique_mptn_hosting_cp(&learned, &gateway)
+            .unwrap()
+            .is_some());
+        learned.get_mut(&gateway).unwrap().insert(
+            "QABOB.THIRDLU".parse().unwrap(),
+            "QABOB.OTHERCP".parse().unwrap(),
+        );
+        assert_eq!(
+            unique_mptn_hosting_cp(&learned, &gateway)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(unique_mptn_hosting_cp(&learned, "unknown").unwrap(), None);
+    }
+
+    #[test]
+    fn local_mptn_identity_requires_both_attachment_proofs() {
+        let source_lu: QualifiedName = "QAALICE.USERA".parse().unwrap();
+        let target_lu: QualifiedName = "QABOB.USERB".parse().unwrap();
+        let source_cp: QualifiedName = "QAALICE.SNAA".parse().unwrap();
+        let target_cp: QualifiedName = "QABOB.SNAB".parse().unwrap();
+        let mut learned = HashMap::from([
+            (
+                "a".to_owned(),
+                HashMap::from([(source_lu.clone(), source_cp.clone())]),
+            ),
+            (
+                "b".to_owned(),
+                HashMap::from([(target_lu.clone(), target_cp.clone())]),
+            ),
+        ]);
+        let identity =
+            local_mptn_identity(&learned, "a", "b", source_lu.clone(), target_lu.clone()).unwrap();
+        assert_eq!(identity.source_cp, Some(source_cp));
+        assert_eq!(identity.target_cp, Some(target_cp));
+        learned.get_mut("b").unwrap().clear();
+        assert_eq!(
+            local_mptn_identity(&learned, "a", "b", source_lu, target_lu)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn upstream_llc_bootstrap_requires_verified_cp_in_assigned_netid() {
