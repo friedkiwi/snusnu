@@ -31,7 +31,10 @@ needs both paths before a writer can send spool data.
 The transport-independent Go `sna/services/printer` package now parses the
 IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds
 candidate ACTLU and printer BIND responses, and renders common SCS fixed-pitch
-text. It also encodes the short, hardware-only NMVT Reply Product Set ID used
+text. Its LU 4 device state advances through ACTLU and BIND only after each
+prepared response is acknowledged by the transport. The outer device-session
+envelope remains outside that state machine. The package also encodes the
+short, hardware-only NMVT Reply Product Set ID used
 to announce a powered-on printer, with runtime SNA address and VPD supplied by
 the caller. These candidates have not been exercised against the guest. The
 NMVT has no LU 6.2 GDS envelope; its live FID2 TH/RH and the device session's
