@@ -83,10 +83,11 @@ impl PacketPort {
         Ok(Self { fd })
     }
 
-    /// Receive one frame, omitting locally transmitted frames. `WouldBlock`
-    /// means no frame is ready. `MSG_TRUNC` detects oversized packets.
+    /// Receive one frame, omitting locally transmitted and oversized frames.
+    /// `WouldBlock` means no frame is ready. Promiscuous sockets also receive
+    /// unrelated jumbo traffic, which must not fail an LLC route.
     pub fn receive_frame(&self, frame: &mut [u8; MAX_FRAME_LEN]) -> io::Result<usize> {
-        loop {
+        receive_frame_with(frame, |frame| {
             let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             let mut address_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
             let length = unsafe {
@@ -102,17 +103,8 @@ impl PacketPort {
             if length < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if address.sll_pkttype == libc::PACKET_OUTGOING {
-                continue;
-            }
-            if length as usize > frame.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Ethernet frame exceeds untagged maximum",
-                ));
-            }
-            return Ok(length as usize);
-        }
+            Ok((length as usize, address.sll_pkttype))
+        })
     }
 
     /// Transmit a complete untagged Ethernet frame excluding its FCS.
@@ -149,5 +141,44 @@ impl PacketPort {
             ));
         }
         Ok(())
+    }
+}
+
+fn receive_frame_with(
+    frame: &mut [u8; MAX_FRAME_LEN],
+    mut receive: impl FnMut(&mut [u8; MAX_FRAME_LEN]) -> io::Result<(usize, u8)>,
+) -> io::Result<usize> {
+    loop {
+        let (length, packet_type) = receive(frame)?;
+        if packet_type == libc::PACKET_OUTGOING || length > frame.len() {
+            continue;
+        }
+        return Ok(length);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_unrelated_jumbo_and_then_delivers_llc() {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let mut calls = 0;
+        let length = receive_frame_with(&mut frame, |buffer| {
+            calls += 1;
+            if calls == 1 {
+                buffer[..14].copy_from_slice(&[0xff; 14]);
+                Ok((MAX_FRAME_LEN + 1, libc::PACKET_OTHERHOST))
+            } else {
+                buffer[..17]
+                    .copy_from_slice(&[0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2, 0, 3, 4, 4, 0x6f]);
+                Ok((17, libc::PACKET_OTHERHOST))
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(length, 17);
+        assert_eq!(&frame[14..17], &[4, 4, 0x6f]);
     }
 }
