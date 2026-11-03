@@ -91,6 +91,9 @@ mod hpr_rtp_port;
 #[cfg(target_os = "linux")]
 mod hpr_session_source;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Used by the one-hub EE coordinator when wired.
+mod hpr_shared_local;
+#[cfg(target_os = "linux")]
 mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
