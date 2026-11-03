@@ -329,6 +329,14 @@ impl<'a> DirectHprRuntime<'a> {
         self.shared_publication = true;
     }
 
+    pub(crate) fn can_accept_local(&self) -> bool {
+        self.reverse.is_none()
+            && self
+                .reciprocal_cp
+                .as_ref()
+                .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+    }
+
     pub(crate) fn poll_shared_local(
         &mut self,
         link: &EeLdlcEndpoint,
@@ -336,21 +344,27 @@ impl<'a> DirectHprRuntime<'a> {
         runner: &mut AutoLocalSessionRunner<'_>,
         config: &RouterConfig,
     ) -> io::Result<()> {
-        self.refresh_shared_llc_routes(runner, config)?;
-        self.reconcile_pending_shared_llc(runner)?;
-        let routes = shared.trusted_mptn_routes(runner)?;
-        self.local_directory.replace_owner("mptn", routes)?;
+        self.refresh_shared_local(runner, shared, config)?;
         let can_accept = link.phase() == router_core::hpr_ip_activation::Phase::Active
-            && self.reverse.is_none()
-            && self
-                .reciprocal_cp
-                .as_ref()
-                .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active);
+            && self.can_accept_local();
         if let Some(ready) = shared.poll(runner, &self.local_directory, can_accept)? {
             if let Err(error) = self.accept_shared_source(ready, link, shared, runner) {
                 tracing::warn!(error = %error, "shared local source could not enter EE session");
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_shared_local(
+        &mut self,
+        runner: &mut AutoLocalSessionRunner<'_>,
+        shared: &mut HprSharedLocal,
+        config: &RouterConfig,
+    ) -> io::Result<()> {
+        self.refresh_shared_llc_routes(runner, config)?;
+        self.reconcile_pending_shared_llc(runner)?;
+        let routes = shared.trusted_mptn_routes(runner)?;
+        self.local_directory.replace_owner("mptn", routes)?;
         Ok(())
     }
 
