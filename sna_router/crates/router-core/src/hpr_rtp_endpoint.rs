@@ -509,6 +509,13 @@ impl RtpInboundEndpoint {
             return Err(EndpointError::InvalidArb);
         }
         let has_status = segments.iter().any(|s| s.key == 0x0e);
+        // An idle STATUS is the peer's RTP heartbeat. V5R4 sends it with a
+        // fresh SYNC and RASAPI but without SRI; echo that SYNC once so the
+        // peer does not mistake an otherwise idle connection for a failed
+        // path. Duplicate STATUS packets must not provoke an echo loop.
+        let idle_status = segments
+            .iter()
+            .any(|s| s.key == 0x0e && s.data.first().is_some_and(|flags| flags & 0x40 != 0));
         let mut setup = self.setup.clone();
         if self.phase == EndpointPhase::AwaitPeerStatus && setup.phase() == SetupPhase::AwaitPeerUse
         {
@@ -533,13 +540,14 @@ impl RtpInboundEndpoint {
         let delivered = receive
             .observe(self.config.generation, packet)
             .map_err(EndpointError::Receive)?;
-        let status_due = match &delivered {
-            ReceiveResult::Buffered => true,
-            ReceiveResult::Delivered(fragments) => fragments
-                .iter()
-                .any(|fragment| !fragment.data.is_empty() || fragment.end_of_message),
-            ReceiveResult::Duplicate => false,
-        };
+        let status_due = (idle_status && status.is_some())
+            || match &delivered {
+                ReceiveResult::Buffered => true,
+                ReceiveResult::Delivered(fragments) => fragments
+                    .iter()
+                    .any(|fragment| !fragment.data.is_empty() || fragment.end_of_message),
+                ReceiveResult::Duplicate => false,
+            };
         let mut assembly = self.assembly.clone();
         let mut messages = match delivered {
             ReceiveResult::Delivered(fragments) => assembly
@@ -1089,6 +1097,35 @@ mod tests {
         assert_eq!(endpoint.retransmit_due(600_000), Ok(None));
         endpoint.close();
         assert_eq!(endpoint.phase(), EndpointPhase::Closed);
+    }
+
+    #[test]
+    fn v5r4_idle_status_echoes_fresh_sync_once_without_status_loop() {
+        let cfg = config();
+        let mut endpoint = RtpInboundEndpoint::new(cfg.clone()).unwrap();
+        let reply = endpoint.prepare_inbound_setup(&setup_packet(&cfg)).unwrap();
+        endpoint.confirm_setup_reply_sent(&reply).unwrap();
+
+        // The final STATUS after the first APING session used SYNC=0. Nine
+        // seconds later V5R4 sent an idle heartbeat with a fresh SYNC=1,
+        // THDR RASAPI alone, and CV0E Idle=1. Without an echo it attempted
+        // a path switch five seconds later on the same live EE link.
+        let final_ack = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], Some((0, 1, 200)));
+        assert!(!endpoint.receive(&final_ack).unwrap().status_due);
+        let mut idle = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], Some((1, 1, 200)));
+        idle[6 + 8] = 0x04; // RASAPI without SRI, as observed from V5R4.
+        idle[6 + 20 + 2] = 0x40; // CV0E Idle heartbeat.
+        assert!(endpoint.receive(&idle).unwrap().status_due);
+        let response = endpoint.prepare_status().unwrap();
+        let parsed = parse_peer_status(RtpPacket::parse(&response).unwrap()).unwrap();
+        assert_eq!(parsed.echo, 1);
+        endpoint.confirm_status_sent(&response).unwrap();
+        assert!(!endpoint.receive(&idle).unwrap().status_due);
+
+        // A new ordinary STATUS only acknowledges bytes; answering it would
+        // create a STATUS exchange loop.
+        let plain = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], Some((2, 2, 200)));
+        assert!(!endpoint.receive(&plain).unwrap().status_due);
     }
 
     #[test]
