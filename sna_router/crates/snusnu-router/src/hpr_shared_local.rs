@@ -15,11 +15,17 @@ use crate::{
     },
     hpr_local_mptn::HprToMptnSession,
     hpr_mptn_attachments::{HprMptnPeerState, MptnIngressOffer, ReadyMptnSource},
+    hpr_session_source::SessionSource,
 };
 
 pub(crate) enum ReadyLocalHpr {
     Llc(ReadyLocalLlc),
     Mptn(ReadyMptnSource),
+    Ee {
+        target_ee_id: String,
+        identity: SessionIdentity,
+        source: Box<dyn SessionSource>,
+    },
 }
 
 /// Owns protocol proof and EE session state, but never binds LLC or TCP62.
