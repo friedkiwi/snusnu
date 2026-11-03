@@ -53,6 +53,21 @@ func TestLU4PrinterBindClassification(t *testing.T) {
 	if !IsPrinterBind(piu) {
 		t.Fatal("IBM 5494 LU4 printer BIND not classified")
 	}
+	response, err := CandidatePrinterBindResponseRU(piu, 0x86)
+	if err != nil || response[9] != 7 || response[10] != 0x85 || response[11] != 0x85 || response[25] != 0 {
+		t.Fatalf("printer BIND response: %x %v", response, err)
+	}
+	positive, err := PositiveLU4Response(piu, response)
+	if err != nil || !positive.Response || positive.RH != [3]byte{0xf3, 0x80, 0} || positive.Address != 1 {
+		t.Fatalf("positive BIND response: %+v %v", positive, err)
+	}
+	if _, err := positive.Encode(); err != nil {
+		t.Fatalf("encode positive BIND response: %v", err)
+	}
+	last := LU4PIU{Address: 1, Session: LU4PrintSession, RH: [3]byte{1, 0x80, 0x20}, RU: []byte{0xc8}}
+	if reply, err := PositiveLU4Response(last, nil); err != nil || reply.RH != [3]byte{0x83, 0x80, 0} {
+		t.Fatalf("last-of-chain response: %+v %v", reply, err)
+	}
 	piu.RU[14] = 7
 	if IsPrinterBind(piu) {
 		t.Fatal("display BIND classified as printer")

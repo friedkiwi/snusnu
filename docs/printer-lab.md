@@ -28,8 +28,9 @@ LU 6.2 device session. The service therefore needs both session directions
 and the controller notification before a writer can send spool data.
 
 The transport-independent Go `sna/services/printer` package now parses the
-IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds an
-available-printer ACTLU response RU, and renders common SCS fixed-pitch text.
+IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds
+candidate ACTLU and printer BIND responses, and renders common SCS fixed-pitch
+text. These response candidates have not been exercised against the guest.
 The enclosing LU 6.2 controller and device GDS envelopes remain unknown.
 The package does not perform APPC session management, store jobs, or produce a
 PDF. The concentrator now has owner-scoped durable raw SCS storage,
