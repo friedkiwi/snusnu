@@ -501,6 +501,10 @@ The real 5494's runtime header bytes and any host application response beyond
 the SNA response still need a live trace.
 The configured `3812` machine type would be `F3 F8 F1 F2` in EBCDIC, but that
 value was not observed in a populated firmware VPD table.
+IBM SNA Formats defines this Reply-PSID's `0A 04 01 00 00 00 00 00 00 01`
+Address List as one single local address: format `00`, five reserved zero
+bytes, then address `01`. The six zero bytes in QA's record are therefore
+architected for that address format, not a missing MAC or CP identifier.
 
 The November 3 LLC probe used the firmware-derived 5494 controller XID and
 sent a constructed address-01 Reply PSID after the controller Attach. With
@@ -562,13 +566,15 @@ The three station-56 LU7 fragments reassemble to 794 bytes: a `04 F3`
 Write Structured Field command followed by a 792-byte structured field.
 Its EBCDIC entries repeatedly name `3486` and `3487` display models and
 `AJLPY...` objects. This is display-side setup on address 56; it does not
-show that the address-01 3812 printer has started. The final fragment's
+show that the address-01 3812 printer has started, though the exchange may
+still gate controller readiness. The final fragment's
 inner RH is `01 90 20`. The IBM 5494 Functions Reference RH table defines
 `90` on a request as exception response, so a positive inner SNA response
 is not requested. A disposable QA trial attempted to prepare one; the
 library rejected it and the trial reset its circuit. That trial did not
-test printer activation. The next printer probe should focus on the
-NMVT/VPD to remote-device transition.
+test printer activation. The next printer probe should establish both
+the controller exchange completion and the NMVT/VPD to remote-device
+transition.
 
 A fresh LLC trial kept the controller job alive and deferred the corrected
 address-01 NMVT until after the final address-56 WSF fragment and the
