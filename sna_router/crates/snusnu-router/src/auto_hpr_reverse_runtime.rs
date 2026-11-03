@@ -221,6 +221,9 @@ impl ReverseRuntime {
                     reverse.accept_route_reply(message.observation.generation, &message.bytes)?;
                 self.user_config = Some(config);
                 self.phase = Phase::SendUser;
+                tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
+                    target_lu = %self.identity.target_lu, pcid = ?self.pcid,
+                    "reverse HPR RouteSetup reply accepted");
                 Ok(())
             }
             RtpIngressKind::UserOut if self.phase == Phase::AwaitUserCie => {
@@ -260,6 +263,9 @@ impl ReverseRuntime {
             if rtp.open_route_out(link, &request, now_us)? {
                 reverse.mark_route_sent(&request)?;
                 self.phase = Phase::AwaitRoute;
+                tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
+                    target_lu = %self.identity.target_lu, pcid = ?self.pcid,
+                    "reverse HPR RouteSetup sent to EE peer");
             }
         }
         if self.phase == Phase::SendUser {
@@ -267,6 +273,8 @@ impl ReverseRuntime {
             let route = self.user_config.as_ref().unwrap().clone();
             if rtp.open_user_out(link, reverse.initial_bind_fid5(), route, now_us)? {
                 self.phase = Phase::AwaitUserCie;
+                tracing::info!(handle = self.handle, target_lu = %self.identity.target_lu,
+                    "reverse HPR user BIND sent to EE peer");
             }
         }
         if self.phase == Phase::AwaitUserCie {
@@ -282,6 +290,8 @@ impl ReverseRuntime {
                     .mark_sent(HPR_ADAPTER, self.handle)
                     .map_err(|error| switch_error("reverse HPR first BIND completion", error))?;
                 self.phase = Phase::Active;
+                tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
+                    target_lu = %self.identity.target_lu, "reverse HPR user RTP active");
             }
         }
         while self.phase == Phase::Active {
@@ -388,6 +398,9 @@ impl ReverseRuntime {
             self.reverse = Some(reverse);
             self.phase = Phase::SendRoute;
             self.source.complete_received(charge)?;
+            tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
+                target_lu = %self.identity.target_lu,
+                "reverse HPR BIND received from session source");
             return Ok(());
         }
         match switch.submit(self.source_adapter, self.handle, event) {
