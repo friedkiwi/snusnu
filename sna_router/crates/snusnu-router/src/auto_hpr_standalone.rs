@@ -16,6 +16,7 @@ use crate::{
     auto_hpr_runtime::DirectHprRuntime,
     config::{EeConfig, RouterConfig},
     ee_ldlc_endpoint::EeLdlcEndpoint,
+    hpr_mptn_attachments::HprMptnAttachments,
     STOP,
 };
 use router_core::{
@@ -60,18 +61,26 @@ pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
 }
 
 fn run_link(config: &RouterConfig, attachment: &EeConfig) -> io::Result<()> {
+    // The TCP62 listener is an independent local attachment. It remains
+    // bound while the EE adjacency is absent or renegotiates.
+    let mut local_mptn = (!config.mptn_gateway.is_empty())
+        .then(|| HprMptnAttachments::new(config))
+        .transpose()?;
     let mut link = StandaloneEeLink::bind(attachment)?;
     let clock = Instant::now();
     let mut active: Option<DirectHprRuntime<'_>> = None;
     while !STOP.load(Ordering::Relaxed) {
         match link.poll(Instant::now())? {
             Some(StandaloneEvent::Activated(bootstrap)) => {
+                if let Some(mut previous) = active.take() {
+                    local_mptn = previous.detach_local_mptn();
+                }
                 let peer_cp = bootstrap.peer.cp.clone();
                 let generation = bootstrap.generation;
                 let mut runtime = DirectHprRuntime::new(*bootstrap);
                 runtime.configure_peer_lus(attachment)?;
                 runtime.configure_local_llc(config)?;
-                runtime.configure_local_mptn(config)?;
+                runtime.attach_local_mptn(local_mptn.take());
                 runtime.configure_local_ingress(config, attachment)?;
                 active = Some(runtime);
                 tracing::info!(attachment = %attachment.id, peer_cp = %peer_cp,
@@ -88,7 +97,9 @@ fn run_link(config: &RouterConfig, attachment: &EeConfig) -> io::Result<()> {
                 }
             }
             Some(StandaloneEvent::Deactivated) => {
-                active = None;
+                if let Some(mut runtime) = active.take() {
+                    local_mptn = runtime.detach_local_mptn();
+                }
                 tracing::warn!(attachment = %attachment.id,
                     "standalone EE peer deactivated; local sessions withdrawn");
             }
@@ -98,6 +109,8 @@ fn run_link(config: &RouterConfig, attachment: &EeConfig) -> io::Result<()> {
             let now_us = clock.elapsed().as_micros() as u64;
             runtime.tick(link.link(), now_us)?;
             runtime.pump(link.link(), None, now_us)?;
+        } else if let Some(mptn) = local_mptn.as_mut() {
+            mptn.poll_without_ee()?;
         }
         thread::sleep(IDLE_POLL);
     }

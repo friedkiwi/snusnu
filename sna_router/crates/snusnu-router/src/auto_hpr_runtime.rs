@@ -331,11 +331,14 @@ impl<'a> DirectHprRuntime<'a> {
         self.local_directory.replace_owner("ee", routes)
     }
 
-    pub(crate) fn configure_local_mptn(&mut self, config: &'a RouterConfig) -> io::Result<()> {
-        if !config.mptn_gateway.is_empty() {
-            self.mptn = Some(HprMptnAttachments::new(config)?);
-        }
-        Ok(())
+    pub(crate) fn attach_local_mptn(&mut self, mptn: Option<HprMptnAttachments<'a>>) {
+        self.mptn = mptn;
+    }
+
+    pub(crate) fn detach_local_mptn(&mut self) -> Option<HprMptnAttachments<'a>> {
+        let mut mptn = self.mptn.take()?;
+        mptn.release_all_users();
+        Some(mptn)
     }
 
     fn pump_local_llc(&mut self) -> io::Result<()> {
@@ -2137,11 +2140,19 @@ fn run_connected(
     attachment: &crate::config::EeConfig,
     hub: &mut AutoWsHub,
 ) -> io::Result<()> {
+    // The TCP62 listener and management discoveries belong to MPTN, not to
+    // an EE link generation. They exist even before EE authorization arrives.
+    let mut local_mptn = (!config.mptn_gateway.is_empty())
+        .then(|| HprMptnAttachments::new(config))
+        .transpose()?;
     let identity = loop {
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
         }
         poll_unsolicited(hub)?;
+        if let Some(mptn) = local_mptn.as_mut() {
+            mptn.poll_without_ee()?;
+        }
         if let Some(identity) = AuthorizedEeIdentity::resolve(hub, attachment)? {
             break identity;
         }
@@ -2163,6 +2174,9 @@ fn run_connected(
                 .as_ref()
                 .is_none_or(|runtime| runtime.bootstrap.generation != ee.link().generation())
             {
+                if let Some(mut previous) = active.take() {
+                    local_mptn = previous.detach_local_mptn();
+                }
                 let bootstrap = ee
                     .link()
                     .control_bootstrap()?
@@ -2170,7 +2184,7 @@ fn run_connected(
                 let mut runtime = DirectHprRuntime::new(bootstrap);
                 runtime.configure_peer_lus(attachment)?;
                 runtime.configure_local_llc(config)?;
-                runtime.configure_local_mptn(config)?;
+                runtime.attach_local_mptn(local_mptn.take());
                 runtime.configure_local_ingress(config, attachment)?;
                 runtime.publish_reachability(hub, None)?;
                 active = Some(runtime);
@@ -2181,8 +2195,12 @@ fn run_connected(
             if let Some(peer_lus) = runtime.peer_lus.as_mut() {
                 peer_lus.deactivate();
             }
+            local_mptn = runtime.detach_local_mptn();
             hub.publish_local(&[], &[])?;
             tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
+        }
+        if let Some(mptn) = local_mptn.as_mut() {
+            mptn.poll_without_ee()?;
         }
         if let Some(open) = hub.poll_incoming()? {
             let local_llc = active

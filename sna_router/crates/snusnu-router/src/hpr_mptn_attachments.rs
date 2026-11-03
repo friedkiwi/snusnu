@@ -148,6 +148,31 @@ impl<'a> HprMptnAttachments<'a> {
         Ok(offered)
     }
 
+    /// Keep the TCP62 listener and its peer evidence alive while no EE link
+    /// can carry a user session. An incoming user offer is rejected on this
+    /// attachment, without tearing down the other management associations.
+    pub(crate) fn poll_without_ee(&mut self) -> io::Result<()> {
+        for offered in self.poll_once()? {
+            self.reject_offer(
+                &offered.gateway_id,
+                offered.association,
+                "EE destination unavailable",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A disappearing EE generation drops its user sessions, but the MPTN
+    /// listener and independently observed management peers survive.
+    pub(crate) fn release_all_users(&mut self) {
+        for attachment in &mut self.attachments {
+            if attachment.active_user {
+                attachment.active_user = false;
+                attachment.gateway.release_udp();
+            }
+        }
+    }
+
     /// Only live management LU evidence plus an explicit operator CP
     /// assertion may create an EE RouteSetup destination. The CP is not
     /// claimed to have come from TCP62's wire format.
