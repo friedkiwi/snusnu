@@ -163,7 +163,10 @@ impl ReverseUserBind {
             ));
         }
         fixed[8..14].copy_from_slice(&[3, 3, 0x8c, 0x8c, 0x83, 3]);
-        fixed[25] = 0;
+        // This byte is a BIND capability selected by the initiator. The
+        // AnyNet sample uses zero, while the live EE-originated user BIND
+        // carries X'40'. Preserve the source value across the V4R4 hop.
+        fixed[25] = self.request.connection_data()[5 + 25];
         validate_positive_response(self.request.connection_data(), &tcp_bind_response)
             .map_err(|_| invalid("converted TCP62 BIND response failed correlation"))?;
         let mut response = self.request.clone();
@@ -230,6 +233,8 @@ mod tests {
     const LIVE_QA_CONNECT: &str = "000000e4800a00e02a0b010dd8c1c1d3c9c3c54be2d5c1c1010b010bd8c1c2d6c24be2d5c1c20109b023f700831e80000f00008005000000760000007620000508000601010a02008b00006b800031001307b0b0513303838c8c8303060200000000000000944300000ad8c1c2d6c24be2d5c1c22c000902404040404040404009030123f700801d00000b04d8c1c2d6c24be2d5c1c20a1300b023f700801d0000000cd8c1c1d3c9c3c54be2d5c1c16013e8e772dd2407024a0ad8c1c2d6c24be2d5c1c22c0a01087bc3d6d5d5c5c3e31800000501190a000a0020010310831a00000584";
     const LIVE_QA_NATIVE_BIND: &str = "2f00020200006b850031001307b0b051330383c7c78303060200000000000000944340000ad8c1c2d6c24be2d5c1c22c000902404040404040404009030123f700801d00000b04d8c1c2d6c24be2d5c1c20a1300b023f700801d0000000cd8c1c1d3c9c3c54be2d5c1c16013e8e772dd2407024a0ad8c1c2d6c24be2d5c1c22c0a01087bc3d6d5d5c5c3e3";
     const LIVE_QA_V4_RESPONSE: &str = "2f0002020000eb850031001307b0b051330080c7c7800006020000000000000094434000002700090240404040404040400203020d05d8c1c1d3c9c3c54be2d5c1c10a1300b023f70000a9000000006013e8e772dd2407024a0ad8c1c2d6c24be2d5c1c2";
+    const LIVE_EE_USER_BIND: &str = "00006b800031001307b0b0513303838c8c8303060200000000000000944340000be2d6d3d5c5e34be2d5c1c22d000902404040404040404009030125c514b15d80000c04e2d6d3d5c5e34be2d5c1c20a1300b025c514b15d8000000be2d6d3d5c5e34be2d5c1c16014cec370e7b283a3400be2d6d3d5c5e34be2d5c1c22c0a01087bc3d6d5d5c5c3e3";
+    const LIVE_EE_LLC_BIND_RESPONSE: &str = "2f0002020000eb850031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c10a1300b025c51370ab000000006014cec370e7b283a3400be2d6d3d5c5e34be2d5c1c2";
 
     fn connect() -> Connect {
         let source = hex("e2d6d3d5c5e34be2d5c1c1");
@@ -416,5 +421,46 @@ mod tests {
         assert_eq!(tcp.direction, Direction::PositiveResponse);
         assert_eq!(&tcp.connection_data()[..5], &[0, 0, 0xeb, 0x80, 0]);
         assert_eq!(bridge.native_flow_windows(), Some((3, 1)));
+    }
+
+    #[test]
+    fn live_ee_bind_retains_initiator_capability_through_llc_response() {
+        let mut connect = connect();
+        connect.source.node = hex("e2d6d3d5c5e34be2d5c1c2");
+        connect.destination.node = hex("e2d6d3d5c5e34be2d5c1c1");
+        connect
+            .options
+            .iter_mut()
+            .find(|option| option.kind == 0x0a)
+            .unwrap()
+            .value = hex(LIVE_EE_USER_BIND);
+        let mut ingress = IngressSession::new(IngressPolicy {
+            source_lu: "SOLNET.SNAB".into(),
+            destination_lu: "SOLNET.SNAA".into(),
+            user_mode: None,
+            allow_blank_user_mode: true,
+            available_compensations: CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83])
+                .unwrap(),
+            forbidden_fqpcid: None,
+        })
+        .unwrap();
+        let offer = ingress.receive(&connect.encode().unwrap()).unwrap();
+        let mut bridge = ReverseUserBind::after_management(
+            offer,
+            NativeAddress {
+                daf: 2,
+                oaf: 2,
+                odai: true,
+            },
+        )
+        .unwrap();
+        let native_bind = bridge.native_bind().to_vec();
+        assert_eq!(native_bind[4 + 5 + 25], 0x40);
+        bridge.mark_native_bind_enqueued(&native_bind).unwrap();
+        let response = bridge
+            .accept_native_response(&hex(LIVE_EE_LLC_BIND_RESPONSE))
+            .unwrap();
+        assert_eq!(response.connection_data()[5 + 25], 0x40);
+        assert_eq!(response.direction, Direction::PositiveResponse);
     }
 }
