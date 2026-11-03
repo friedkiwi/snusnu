@@ -48,7 +48,9 @@ controller BIND requests with dynamic LU names, CP name, and FQPCID. The 5494
 CNOS helper requests one source-controlled controller session and up to 56
 target-controlled device sessions, matching the firmware's count direction. Its
 CNOS reply validator checks the accepted-pending service, mode, session limits,
-and reversed FID2 addresses before the controller can proceed. Its
+and reversed FID2 addresses before the controller can proceed. Outbound CNOS
+uses the 15-byte FMH-5 Attach observed in the 5494 firmware; the parser also
+accepts the 12-byte form captured from V4R4. Its
 binary architecture-TP Attach parser can retain the controller TPN
 `30F0F6F6` without treating it as an EBCDIC application name. These requests
 have not been accepted by a live IBM i controller session. The library now

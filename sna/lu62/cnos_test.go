@@ -49,7 +49,8 @@ func TestOutboundQRMTWSCCNOSReply(t *testing.T) {
 	if err != nil || got.SessionLimit != 57 || got.SourceWinners != 1 || got.TargetWinners != 56 || got.Mode != "QRMTWSC" {
 		t.Fatalf("CNOS acceptance: %+v %v", got, err)
 	}
-	if got.Service != 0x0a || got.ModeWidth != 8 || !bytes.Equal(request[21:38], []byte{0, 0x19, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 57, 0, 1, 0, 56, 0, 8}) {
+	if got.Service != 0x0a || got.ModeWidth != 8 || !bytes.Equal(request[9:24], []byte{0x0f, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1, 0, 0, 0}) ||
+		!bytes.Equal(request[24:41], []byte{0, 0x19, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 57, 0, 1, 0, 56, 0, 8}) {
 		t.Fatalf("5494 source CNOS fields: %x %+v", request, got)
 	}
 	if _, err := New5494ControllerCNOS(57); err == nil {
@@ -59,6 +60,11 @@ func TestOutboundQRMTWSCCNOSReply(t *testing.T) {
 	badRoute[2] = 3
 	if _, err := ValidateCNOSReply(request, badRoute); err == nil {
 		t.Fatal("reply from a different session accepted")
+	}
+	badAttach := append([]byte(nil), request...)
+	badAttach[23] = 1
+	if _, err := ValidateCNOSReply(badAttach, reply); err == nil {
+		t.Fatal("malformed firmware Attach accepted")
 	}
 	badLimit := append([]byte(nil), reply...)
 	badLimit[9+9], badLimit[9+10] = 0, 58

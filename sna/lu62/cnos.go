@@ -106,8 +106,8 @@ func EncodeCNOS(c CNOS) ([]byte, error) {
 	return data, nil
 }
 
-// CandidateCNOSAttach wraps a source CNOS request in the observed LU 6.2
-// control-operator FMH-5 Attach. The caller must have an active management
+// CandidateCNOSAttach wraps a source CNOS request in the 15-byte LU 6.2
+// control-operator FMH-5 Attach observed in the 5494 firmware. The caller must have an active management
 // session and must handle pacing, CONFIRM, and the accepted-pending reply.
 func CandidateCNOSAttach(daf, oaf byte, sequence uint16, c CNOS) ([]byte, error) {
 	if daf == 0 || oaf == 0 || daf == oaf || sequence == 0 {
@@ -118,8 +118,21 @@ func CandidateCNOSAttach(daf, oaf byte, sequence uint16, c CNOS) ([]byte, error)
 		return nil, err
 	}
 	piu := []byte{0x2e, 0, daf, oaf, byte(sequence >> 8), byte(sequence), 0x0b, 0x91, 0x20,
-		0x0c, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}
+		0x0f, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1, 0, 0, 0}
 	return append(piu, gds...), nil
+}
+
+func cnosAttachLength(ru []byte) int {
+	if len(ru) < 12 || !bytes.Equal(ru[1:12], []byte{5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}) {
+		return 0
+	}
+	if ru[0] == 0x0c {
+		return 12 // captured V4R4 compact form
+	}
+	if ru[0] == 0x0f && len(ru) >= 15 && bytes.Equal(ru[12:15], []byte{0, 0, 0}) {
+		return 15 // 5494 Release 3.2 firmware form
+	}
+	return 0
 }
 
 // ValidateCNOSReply checks the accepted-pending GDS returned for an outbound
@@ -128,12 +141,11 @@ func CandidateCNOSAttach(daf, oaf byte, sequence uint16, c CNOS) ([]byte, error)
 func ValidateCNOSReply(request, reply []byte) (CNOS, error) {
 	var empty CNOS
 	req, err := piu.ParseFID2(request)
-	if err != nil || len(req.RU) < 12 ||
-		!bytes.Equal(req.RU[:12], []byte{0x0c, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}) ||
-		req.RH != [3]byte{0x0b, 0x91, 0x20} {
+	attachLength := cnosAttachLength(req.RU)
+	if err != nil || attachLength == 0 || req.RH != [3]byte{0x0b, 0x91, 0x20} {
 		return empty, ErrCNOS
 	}
-	requested, err := ParseCNOS(req.RU[12:])
+	requested, err := ParseCNOS(req.RU[attachLength:])
 	if err != nil || requested.Service != 2 {
 		return empty, ErrCNOS
 	}
@@ -181,18 +193,18 @@ func (r *CNOSResponder) AcceptAttach(data []byte) ([]byte, error) {
 		return nil, ErrCNOS
 	}
 	p, err := piu.ParseFID2(data)
-	if err != nil || len(p.RU) < 12 || (p.TH[0] != 0x2c && p.TH[0] != 0x2e) || p.TH[1] != 0 ||
+	attachLength := cnosAttachLength(p.RU)
+	if err != nil || attachLength == 0 || (p.TH[0] != 0x2c && p.TH[0] != 0x2e) || p.TH[1] != 0 ||
 		p.TH[2] == 0 || p.TH[3] == 0 || p.TH[2] == p.TH[3] ||
-		p.RH != [3]byte{0x0b, 0x91, 0x20} ||
-		!bytes.Equal(p.RU[:12], []byte{0x0c, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}) {
+		p.RH != [3]byte{0x0b, 0x91, 0x20} {
 		return nil, ErrCNOS
 	}
-	c, err := ParseCNOS(p.RU[12:])
+	c, err := ParseCNOS(p.RU[attachLength:])
 	if err != nil || c.Service != 2 || c.Mode != r.mode || c.SessionLimit == 0 || c.SessionLimit > r.maxSessions {
 		return nil, ErrCNOS
 	}
 	r.Negotiated = c
-	replyGDS := append([]byte(nil), p.RU[12:]...)
+	replyGDS := append([]byte(nil), p.RU[attachLength:]...)
 	replyGDS[4] = 0x0a
 	reply := []byte{p.TH[0], 0, p.TH[3], p.TH[2], 0, 1, 3, 0x91, 1}
 	reply = append(reply, replyGDS...)
