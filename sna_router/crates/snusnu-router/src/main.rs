@@ -141,6 +141,9 @@ mod remote;
 mod routing;
 #[cfg(target_os = "linux")]
 mod runtime;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Some switch operations are reserved for adapter withdrawal.
+mod session_switch;
 mod virtual_native_cp;
 #[cfg(target_os = "linux")]
 mod virtual_ws_management_lab;
