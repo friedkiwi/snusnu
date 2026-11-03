@@ -182,7 +182,10 @@ Reply PSID over its independent network-management FID2 path, then observing
 the host's printer-session BIND and private `D824` records. The current
 AnyNet reverse gateway completes and releases its separate SNASVCMG
 management association before the controller session, so it cannot yet carry
-that NMVT. An LLC route has not yet been verified.
+that NMVT. A lab-only attempt to send the PSID as a TCP62 normal record on
+this association after CNOS/BIS received no IBM i response and did not change
+the subsequent controller exchange; that experiment was removed from the
+router source. An LLC route has not yet been verified.
 
 The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
 provide a direct source for the missing controller sender code. In
