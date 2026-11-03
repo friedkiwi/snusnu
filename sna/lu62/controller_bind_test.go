@@ -19,6 +19,9 @@ func Test5494ControllerBindCandidate(t *testing.T) {
 		[]byte{0x31, 0, 0x13, 7, 0xb0, 0xb0, 0xd0, 0xb3, 0, 0, 0x87, 0x87, 0x80, 0, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0x23, 0, 0}...)) {
 		t.Fatalf("unexpected IBM 5494 fixed BIND profile: %x", request[:9+27])
 	}
+	if !bytes.Contains(request, []byte{0, 8, 2, 0xd8, 0xd9, 0xd4, 0xe3, 0xe6, 0xe2, 0xc3}) {
+		t.Fatalf("controller BIND lacks seven-byte QRMTWSC subfield: %x", request)
+	}
 	fq, err := RequestFQPCID(request)
 	if err != nil || len(fq) != 11+len("SNUSNU.SVC") || !bytes.Equal(fq[2:10], pcid[:]) {
 		t.Fatalf("FQPCID: %x %v", fq, err)
@@ -32,7 +35,10 @@ func Test5494ControllerBindCandidate(t *testing.T) {
 }
 
 func TestQRMTWSCCNOSRequest(t *testing.T) {
-	request := CNOS{Service: 2, SessionLimit: 57, SourceWinners: 56, TargetWinners: 1, Mode: "QRMTWSC", ModeWidth: 8}
+	request, err := New5494ControllerCNOS(56)
+	if err != nil {
+		t.Fatal(err)
+	}
 	encoded, err := EncodeCNOS(request)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +58,7 @@ func TestQRMTWSCCNOSRequest(t *testing.T) {
 	if _, err := responder.AcceptAttach(attach); err != nil {
 		t.Fatalf("CNOS Attach rejected by responder: %v", err)
 	}
-	request.TargetWinners = 2
+	request.TargetWinners = 57
 	if _, err := EncodeCNOS(request); err == nil {
 		t.Fatal("overcommitted session winners accepted")
 	}

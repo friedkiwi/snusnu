@@ -11,8 +11,8 @@ var qrmtwscMode = []byte{0xd8, 0xd9, 0xd4, 0xe3, 0xe6, 0xe2, 0xc3} // QRMTWSC
 
 // Candidate5494ControllerBind constructs the IBM-defined LU 6.2 controller
 // BIND with mode QRMTWSC. The 5494 controller application must first complete
-// CNOS and must use fresh PCID bytes. The private controller Attach and device
-// notification are outside this function and remain unverified.
+// CNOS and must use fresh PCID bytes. The controller Attach and the separate
+// network-management NMVT device announcement are outside this function.
 func Candidate5494ControllerBind(localLU, remoteLU, localCP string, daf, oaf, maxRU byte, pcid [8]byte) ([]byte, error) {
 	if daf == 0 || oaf == 0 || daf == oaf || maxRU < 0x85 || maxRU > 0x87 || pcid == [8]byte{} {
 		return nil, ErrControllerBind
@@ -37,6 +37,7 @@ func Candidate5494ControllerBind(localLU, remoteLU, localCP string, daf, oaf, ma
 		0, 0, 0, 0, 0, 0, 0, 0, 0x23, 0, 0}
 	ru = append(ru, byte(len(plu)))
 	ru = append(ru, plu...)
+	// VG10 uses the configured seven-byte mode length plus one key byte here.
 	user := []byte{0, 8, 2}
 	user = append(user, qrmtwscMode...)
 	user = append(user, byte(len(plu)+1), 4)
