@@ -30,6 +30,8 @@ const (
 // outbound PIUs have been accepted and then acknowledged by its link.
 type ManagementSession struct {
 	remoteCP, localCP string
+	mode              string
+	maxSessions       uint16
 	standalone        bool
 	primaryWindow     byte
 	phase             ManagementPhase
@@ -49,13 +51,23 @@ type ManagementSession struct {
 }
 
 func NewManagementSession(remoteCP, localCP string) (*ManagementSession, error) {
+	return NewManagementSessionWithMode(remoteCP, localCP, "", 8)
+}
+
+// NewManagementSessionWithMode serves a specifically configured CNOS mode.
+// The 5494 controller uses QRMTWSC with 57 sessions; ordinary management
+// sessions retain the blank-mode default through NewManagementSession.
+func NewManagementSessionWithMode(remoteCP, localCP, mode string, maxSessions uint16) (*ManagementSession, error) {
 	if _, err := encodeLUName(remoteCP); err != nil {
 		return nil, err
 	}
 	if _, err := encodeLUName(localCP); err != nil || remoteCP == localCP {
 		return nil, ErrManagementState
 	}
-	return &ManagementSession{remoteCP: remoteCP, localCP: localCP, primaryWindow: 7}, nil
+	if _, err := NewCNOSResponder(mode, maxSessions); err != nil {
+		return nil, err
+	}
+	return &ManagementSession{remoteCP: remoteCP, localCP: localCP, mode: mode, maxSessions: maxSessions, primaryWindow: 7}, nil
 }
 
 // NewStandaloneManagementSession serves an application LU after the carrier
@@ -138,7 +150,7 @@ func (s *ManagementSession) PrepareCNOS(request []byte) ([]byte, []byte, error) 
 	if err := trial.ReceiveRequest(request[7]&1 != 0); err != nil {
 		return nil, nil, err
 	}
-	responder, err := NewCNOSResponder("", 8)
+	responder, err := NewCNOSResponder(s.mode, s.maxSessions)
 	if err != nil {
 		return nil, nil, err
 	}

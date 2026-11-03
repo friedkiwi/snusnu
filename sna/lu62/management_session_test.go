@@ -85,3 +85,37 @@ func TestManagementSessionRequiresAcknowledgedEgress(t *testing.T) {
 		t.Fatalf("UNBIND ACK: %v", err)
 	}
 }
+
+func TestManagementSessionNegotiates5494Mode(t *testing.T) {
+	bind, _ := hex.DecodeString("2f00010200006b850031001307b0b05133078786868707060200000000000000944340000be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c7090301000000000000000c04e2d6d3d5c5e34be2d5c1c10a13000000000000000000000be2d6d3d5c5e34be2d5c1c2601411111111111111110b11111111111111111111112c0a00000000000000000000")
+	s, err := NewManagementSessionWithMode("SOLNET.SNAA", "SOLNET.SNAB", "QRMTWSC", 57)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := s.PrepareBind(bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBindSent(response); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckBind(); err != nil {
+		t.Fatal(err)
+	}
+	wanted, err := New5494ControllerCNOS(56)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := CandidateCNOSAttach(1, 2, 1, wanted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ipr, reply, err := s.PrepareCNOS(request)
+	if err != nil || len(ipr) != 9 {
+		t.Fatalf("QRMTWSC CNOS: %x %x %v", ipr, reply, err)
+	}
+	accepted, err := ParseCNOS(reply[9:])
+	if err != nil || accepted.Service != 0x0a || accepted.SessionLimit != 57 || accepted.SourceWinners != 1 || accepted.TargetWinners != 56 || accepted.Mode != "QRMTWSC" {
+		t.Fatalf("negotiated QRMTWSC: %+v %v", accepted, err)
+	}
+}

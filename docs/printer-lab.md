@@ -367,6 +367,22 @@ followed. The second QA/router pair was stopped, leaving the AnyNet circuit
 untouched. This trial establishes no cross-media correlation and gives no
 evidence that the guest accepted simultaneous paths to `SNUSNU.SVC`.
 
+In a later native LLC run with `LLCPRT` active, a guest-initiated
+`VFYAPPCCNN` management exchange negotiated `QRMTWSC` with 57 sessions,
+56 source winners, and one target winner. The guest accepted the probe's
+direct address-01 NMVT Reply PSID. After the management UNBIND, the QA
+probe sent a 5494-style controller BIND on FID2 address pair `(2,2)`.
+Verbose traces show the identical 108-byte BIND leaving QA, arriving at
+the router over WebSocket, and leaving `sol10` as an LLC I-frame. The guest
+acknowledged the frame and returned negative BIND sense `08090000` (mode
+inconsistency). The router received that 14-byte response on `sol10` and
+forwarded it to QA. This verifies both directions of the LLC relay, but
+the guest-initiated CNOS did not establish a usable 5494 source-winner
+controller session on that address pair. The next trial must establish the
+5494-originated source CNOS or derive the actual source BIND session
+addresses from the host's session descriptor; changing the BIND address
+pair alone has no supporting evidence.
+
 The [TCP62 transport draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00.txt)
 specifies LU 6.2 application conversion, whereas IBM's
 [management-services guide](https://public.dhe.ibm.com/software/network/commserver/publications/cslin_64/czx41100.pdf)

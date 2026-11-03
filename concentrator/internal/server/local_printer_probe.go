@@ -310,7 +310,11 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 		if bind.PLU != c.peer.NetID+"."+c.peer.LU || (bind.SLU != "SNUSNU.PRINTER" && bind.SLU != "SNUSNU.SVC") {
 			return fmt.Errorf("printer probe management BIND identity mismatch: %s to %s", bind.PLU, bind.SLU)
 		}
-		management, err := lu62.NewManagementSession(bind.PLU, bind.SLU)
+		mode, sessions := "", uint16(8)
+		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_SOURCE_BIND") == "1" {
+			mode, sessions = "QRMTWSC", 57
+		}
+		management, err := lu62.NewManagementSessionWithMode(bind.PLU, bind.SLU, mode, sessions)
 		if err != nil {
 			return err
 		}
@@ -406,6 +410,20 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 		if err := c.management.AckUnbind(); err != nil {
 			return err
 		}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_SOURCE_BIND") == "1" {
+			var pcid [8]byte
+			if _, err := rand.Read(pcid[:]); err != nil {
+				return err
+			}
+			bind, err := lu62.Candidate5494ControllerBind("SNUSNU.SVC", c.peer.NetID+"."+c.peer.LU, "SNUSNU.SVC", 2, 2, 0x86, pcid)
+			if err != nil {
+				return err
+			}
+			log.Printf("printer probe post-management controller BIND: circuit=%s piu=%x", id, bind)
+			c.initiated = true
+			c.managementPhase = 5
+			return p.sendInformation(id, bind)
+		}
 		return nil
 	}
 	return nil
@@ -497,7 +515,11 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			return p.sendInformation(id, bind)
 		}
 	case 5:
-		if len(data) < 36 || data[6] != 0xeb || data[9] != 0x31 || data[2] != 2 || data[3] != 1 {
+		wantDAF, wantOAF := byte(2), byte(1)
+		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_SOURCE_BIND") == "1" {
+			wantOAF = 2
+		}
+		if len(data) < 36 || data[6] != 0xeb || data[9] != 0x31 || data[2] != wantDAF || data[3] != wantOAF {
 			return nil
 		}
 		// VG10's controller Attach carries a fixed QND5MAIN TPN and one
@@ -512,7 +534,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			pipByte = byte(value)
 		}
 		attach := []byte{
-			0x2e, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20,
+			0x2e, 0, wantOAF, wantDAF, 0, 1, 0x0b, 0x91, 0x20,
 			0x11, 5, 2, 0xff, 8, 3, 0xd0, 0, 0, 4,
 			0x30, 0xf0, 0xf6, 0xf6, 0, 0, 0,
 			0, 0x12, 0x12, 0xf5, 0, 0x0e, 0x12, 0xe2,
