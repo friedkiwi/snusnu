@@ -103,8 +103,12 @@ RouteSetup, then exposed two independent gates:
    rejected the BIND because its standalone LU 6.2 responder also names only
    `SNUSNU.PING` (`unsupported user LU 6.2 BIND`).
 
-Those temporary changes live only in `/tmp/snusnu-printer-probe`. They do not
-constitute printer service support in the repository. This probe used EE to
+The repository now has a QA-only `-printer-probe` endpoint which advertises
+`SNUSNU.PRINTER`, completes link XID, and logs incoming FID2/session records.
+Run the QA binary with `-printer-probe -sna-debug` to record full protocol bytes
+and internal circuit state to stderr. The production service still does not
+advertise PRINTER or accept printer BIND. The earlier temporary router changes
+live only in `/tmp/snusnu-printer-probe`. That probe used EE to
 establish a known route baseline; it did **not** test the required AnyNet or
 LLC routes. The pending controller also shows that advertising a passive LU
 does not itself make a 5494-like printer available to the guest. The service
@@ -123,11 +127,13 @@ EBCDIC `SNASVCMG` constant appears in `VG10.BIN` at offset `0x7236`.
 `6B 80 00 31 00 13 07 B0 B0 D0 B3 00 00 86 86 80 00 06 02` at offset
 `0x7244`. This independently supports the fixed portion built by the Go
 candidate; it does not reveal the dynamically generated names or PCID.
-At `VG10.BIN` offset `0x9288`, a basic-conversation FMH-5 template has binary
+At `VG10.BIN` offset `0x928A`, a basic-conversation FMH-5 work area has binary
 TPN `30F0F5F1` and the PIP-present flag set. The firmware copies
 `30F0F6F6` from `5494CONF.DAT` over that TPN at runtime for the controller
-Attach. This establishes the target TP for Release 3.2, though the transmitted
-FMH-5 and PIP still need a trace. Another local constant contains `30F0F6F3`,
+Attach. VG0F constructs the 18-byte allocation/PIP area as
+`00 12 12 F5 00 0E 12 E2 03 20 01 xx 38 04 04 D4 07 30`.
+The runtime byte `xx` and final transmitted work area still need capture.
+Another local constant contains `30F0F6F3`,
 whose purpose still needs to be traced.
 `DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
 observations do not establish a successful 5494 conversation.
@@ -138,15 +144,17 @@ The firmware's `VG15.BIN` constructs an NMVT Reply PSID (`41 03 8D` request,
 copies machine type, model, plant and serial from runtime twinax VPD. The
 [research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
 traces `VG15`'s direct network-management send path. It does not pass the NMVT
-through a private LU 6.2 GDS. The dynamic FID2 TH/RH and IBM i's response
-still need a live trace.
+through a private LU 6.2 GDS. VG15 prepends a 12-byte FID2 TH/RH/NMVT header.
+RH0 is `0B`; RH1/RH2 and FID2 addressing come from runtime session state.
+VG15 marks the device ready after a resident-service transmit completion.
+IBM i's response and runtime header bytes still need a live trace.
 The configured `3812` machine type would be `F3 F8 F1 F2` in EBCDIC, but that
 value was not observed in a populated firmware VPD table.
 
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
-four-byte `04 D4 aa bb` subvector, whose final two bytes have not been
-identified. The [research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
+four-byte `04 D4 07 30` subvector identifying the 5494 controller family.
+The [research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
 also gives V5R4 `STRCMNTRC` commands for full LLC and AnyNet captures. This
 subvector is part of Attach PIP; treating it as the printer address or the
 power-on record would be unsupported.
