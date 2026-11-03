@@ -281,11 +281,7 @@ impl<'a> DirectHprRuntime<'a> {
 
     pub(crate) fn configure_local_llc(&mut self, config: &RouterConfig) -> io::Result<()> {
         if !config.llc.is_empty() {
-            self.llc = Some(HprLlcAttachments::new(
-                config,
-                &self.bootstrap.peer.cp,
-                &self.bootstrap.local.node_id,
-            )?);
+            self.llc = Some(HprLlcAttachments::new(config, &self.bootstrap.peer.cp)?);
         }
         Ok(())
     }
@@ -304,7 +300,6 @@ impl<'a> DirectHprRuntime<'a> {
                 &attachment.id,
                 self.bootstrap.peer.cp.clone(),
                 proxy_mac,
-                &self.bootstrap.local.node_id,
             )?);
             tracing::info!(attachment = %attachment.id, proxy_mac = %crate::endpoint::format_mac(proxy_mac),
                 "LLC ingress for local EE destinations listening");
@@ -790,7 +785,6 @@ impl<'a> DirectHprRuntime<'a> {
             ws.close()?;
             return Ok(());
         };
-        let adjacent_cp = llc.adjacent_cp().clone();
         let reservation = match llc.reserve_external(&attachment_id, &target_lu) {
             Ok(Some(reservation)) => reservation,
             Ok(None) => {
@@ -806,13 +800,20 @@ impl<'a> DirectHprRuntime<'a> {
                 return Ok(());
             }
         };
+        let adjacent_cp = identity
+            .source_cp
+            .as_ref()
+            .ok_or_else(|| protocol("SessionV1 source CP missing"))?
+            .clone();
+        let node_seed =
+            crate::llc_target_identity::LlcTargetIdentity::new(Some(&adjacent_cp), &attachment_id)?;
         let bridge = match LlcSessionWs::new(
             identity.clone(),
             ws,
             reservation.attachment_id.clone(),
             reservation.peer(),
             &adjacent_cp,
-            &self.bootstrap.local.node_id,
+            node_seed.node_seed(),
         ) {
             Ok(bridge) => bridge,
             Err(error) => {
@@ -822,7 +823,7 @@ impl<'a> DirectHprRuntime<'a> {
         };
         tracing::info!(attachment = %attachment_id,
             source_lu = %identity.source_lu, target_lu = %identity.target_lu,
-            source_cp = ?identity.source_cp, adjacent_cp = %adjacent_cp,
+            source_cp = ?identity.source_cp,
             target_cp = %target_cp,
             "concentrator SessionV1 admitted to local LLC peer");
         self.local_ws.push(bridge);

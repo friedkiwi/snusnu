@@ -98,6 +98,8 @@ mod llc_discovery_regression_tests;
 #[cfg(target_os = "linux")]
 mod llc_session_ws;
 #[cfg(target_os = "linux")]
+mod llc_target_identity;
+#[cfg(target_os = "linux")]
 mod local_status;
 #[cfg(target_os = "linux")]
 mod local_web;

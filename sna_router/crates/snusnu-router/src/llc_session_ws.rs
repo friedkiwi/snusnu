@@ -362,6 +362,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity.source_lu, q("BOBNET.BOB"));
+        assert_eq!(control_points(&identity).unwrap().0, &q("BOBNET.CP"));
         assert_eq!(identity.target_cp, Some(q("SOLNET.SNAA")));
         assert!(matches!(
             validate_open(
