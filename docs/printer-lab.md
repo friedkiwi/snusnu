@@ -24,9 +24,10 @@ settles the session direction: the 5494 first negotiates session limits with
 CNOS and initiates the controller BIND. It then reports a powered-on printer;
 IBM i validates the device and initiates a second LU 6.2 BIND for that printer.
 LU 4 printer traffic is encapsulated inside the LU 6.2 device session. The
-firmware shows that the power-on report uses a direct NMVT network-management
-FID2 PIU, separate from the LU 6.2 controller Attach conversation. The service
-needs both paths before a writer can send spool data.
+firmware shows that the power-on report is built as an NMVT FID2 PIU and
+submitted to a resident session service. The final framing produced by that
+service has not been recovered. The service needs the controller conversation
+and the power-on report before a writer can send spool data.
 
 The transport-independent Go `sna/services/printer` package now parses the
 IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds
@@ -40,8 +41,9 @@ short, hardware-only NMVT Reply Product Set ID used
 to announce a powered-on printer, with runtime SNA address and VPD supplied by
 the caller. The candidate ACTLU response has now been exercised against the
 guest for station 56; it led to a host LU 7 BIND. This is not the printer at
-address 01. The NMVT has no LU 6.2 GDS envelope; its live FID2 TH/RH and the
-printer device session's private GDS behavior remain to be established.
+address 01. VG15 itself adds no LU 6.2 GDS envelope to the NMVT; the resident
+session service's final wire framing, live FID2 TH/RH, and printer device
+session's private GDS behavior remain to be established.
 The package does not perform APPC session management, store jobs, or produce a
 PDF. The concentrator now has owner-scoped durable raw SCS storage,
 a searchable print list, a monospace preview, and a greenbar PDF writer. These
@@ -183,7 +185,7 @@ the guest itself sent a BIND using `(2,2)`. These responses do not establish
 that the guest accepted the source session or printer service. The next
 native gate is finding the correct source-session activation.
 
-The direct NMVT path is now confirmed on LLC. A QA-only short hardware PSID
+The candidate direct NMVT path received a positive SNA response on LLC. A QA-only short hardware PSID
 with FID2 addresses `00/00`, RH `0B 80 00`, and address-01 status
 `09 82 04 10 00 01 03 20 01` received a positive IBM i response:
 
@@ -493,8 +495,13 @@ The firmware's `VG15.BIN` constructs an NMVT Reply PSID (`41 03 8D` request,
 `09 82 04 10 00 01 03 20 01`. Its product subvector starts `19 10` and
 copies machine type, model, plant and serial from runtime twinax VPD. The
 [research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
-traces `VG15`'s direct network-management send path. It does not pass the NMVT
-through a private LU 6.2 GDS. VG15 prepends a 12-byte FID2 TH/RH/NMVT header.
+traces `VG15` building the NMVT and handing it to resident service `0x13`.
+VG15 does not add a private LU 6.2 GDS. It prepends a 12-byte FID2
+TH/RH/NMVT header, but the resident service's final wire framing has not
+been recovered. IBM's 5494 Functions Reference says workstation notification
+reaches the host on the controller session, so a direct NMVT probe's positive
+SNA response cannot, by itself, prove that the controller application saw the
+device announcement.
 RH0 is `0B`; RH1/RH2 and FID2 addressing come from runtime session state.
 VG15 marks the device ready after a resident-service transmit completion.
 The real 5494's runtime header bytes and any host application response beyond
