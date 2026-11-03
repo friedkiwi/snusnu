@@ -12,6 +12,8 @@ use tracing_subscriber::{fmt::time::UtcTime, EnvFilter};
 #[cfg(target_os = "linux")]
 mod anynet_port;
 #[cfg(target_os = "linux")]
+mod authorized_ee_attachment;
+#[cfg(target_os = "linux")]
 mod auto_address;
 #[cfg(target_os = "linux")]
 mod auto_gateway_runtime;

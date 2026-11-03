@@ -18,6 +18,7 @@ use std::{
 };
 
 use crate::{
+    authorized_ee_attachment::AuthorizedEeAttachment,
     auto_address::AutoProxyMacs,
     auto_hpr_external_management::{ExternalManagementRoutes, VerifiedExternalRoute},
     auto_hpr_identity::AuthorizedEeIdentity,
@@ -41,7 +42,6 @@ use router_core::{
     hpr_cp_initiator::{CpInitiatorPhase, ReciprocalCpSession},
     hpr_cp_management::CpManagementResponder,
     hpr_fid5::Fid5WholeBiu,
-    hpr_ip_activation::Phase,
     hpr_route_setup::{RouteSetupGds, RouteSetupKind},
     hpr_route_setup_reply::{encode_stale_path_switch_negative, ReverseLinkMetrics},
     hpr_route_setup_service::{DirectRouteSetupService, PreparedRouteSetupReply},
@@ -2147,28 +2147,24 @@ fn run_connected(
         }
         thread::sleep(IDLE_POLL);
     };
-    let peer_identity = identity.clone();
-    let mut link =
-        EeLdlcEndpoint::bind_dynamic(attachment.local_ip, attachment.peer_ip, move |xid| {
-            peer_identity.build_xids(xid, true)
-        })?;
-    let clock = Instant::now();
+    let mut ee = AuthorizedEeAttachment::bind(attachment, identity)?;
     let mut active: Option<DirectHprRuntime> = None;
     tracing::info!(attachment = %attachment.id, local_ip = %attachment.local_ip,
-        peer_ip = %attachment.peer_ip, proxy_cp = %identity.local_cp,
+        peer_ip = %attachment.peer_ip, proxy_cp = %ee.local_cp(),
         "HPR EE attachment listening");
     while !STOP.load(Ordering::Relaxed) {
-        if !identity.still_authorized(hub)? {
+        if !ee.authorized(hub)? {
             return Err(protocol("EE proxy CP route withdrawn"));
         }
         let now = Instant::now();
-        link.tick(now)?;
-        if link.phase() == Phase::Active {
+        ee.tick(now)?;
+        if ee.is_active() {
             if active
                 .as_ref()
-                .is_none_or(|runtime| runtime.bootstrap.generation != link.generation())
+                .is_none_or(|runtime| runtime.bootstrap.generation != ee.link().generation())
             {
-                let bootstrap = link
+                let bootstrap = ee
+                    .link()
                     .control_bootstrap()?
                     .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
                 let mut runtime = DirectHprRuntime::new(bootstrap);
@@ -2178,8 +2174,8 @@ fn run_connected(
                 runtime.configure_local_ingress(config, attachment)?;
                 runtime.publish_reachability(hub, None)?;
                 active = Some(runtime);
-                tracing::info!(attachment = %attachment.id, generation = link.generation().get(),
-                    peer_cp = ?link.peer_cp(), "HPR EE link activated");
+                tracing::info!(attachment = %attachment.id, generation = ee.link().generation().get(),
+                    peer_cp = ?ee.link().peer_cp(), "HPR EE link activated");
             }
         } else if let Some(mut runtime) = active.take() {
             if let Some(peer_lus) = runtime.peer_lus.as_mut() {
@@ -2220,7 +2216,8 @@ fn run_connected(
                             .next_handle
                             .checked_add(1)
                             .ok_or_else(|| protocol("HPR session handles exhausted"))?;
-                        let tg = link
+                        let tg = ee
+                            .link()
                             .tg_number()
                             .ok_or_else(|| protocol("active EE link has no TG"))?;
                         let (label, instance) = target_nce(
@@ -2264,15 +2261,15 @@ fn run_connected(
                 }
             }
         }
-        if let Some(datagram) = link.poll(now)? {
+        if let Some(datagram) = ee.poll(now)? {
             if let Some(runtime) = active.as_mut() {
-                runtime.on_datagram(&link, &datagram, clock.elapsed().as_micros() as u64)?;
+                runtime.on_datagram(ee.link(), &datagram, ee.elapsed().as_micros() as u64)?;
             }
         }
         if let Some(runtime) = active.as_mut() {
-            runtime.tick(&link, clock.elapsed().as_micros() as u64)?;
+            runtime.tick(ee.link(), ee.elapsed().as_micros() as u64)?;
             let started = Instant::now();
-            runtime.pump(&link, Some(hub), clock.elapsed().as_micros() as u64)?;
+            runtime.pump(ee.link(), Some(hub), ee.elapsed().as_micros() as u64)?;
             let elapsed = started.elapsed();
             if elapsed > Duration::from_millis(500) {
                 tracing::warn!(attachment = %attachment.id,
