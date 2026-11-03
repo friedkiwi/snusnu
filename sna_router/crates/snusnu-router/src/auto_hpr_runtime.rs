@@ -56,7 +56,7 @@ use router_core::{
     hpr_route_setup_service::{DirectRouteSetupService, PreparedRouteSetupReply},
     hpr_session_adapter::{negotiated_fixed_windows, HprSessionAdapter, HprSessionRole},
     route_registry::{LuType, RouteKey, RouteOrigin, RouteRecord, RouteSelection},
-    session::{Flow, SessionEvent, SessionIdentity, SessionUnit},
+    session::{Flow, QualifiedName, SessionEvent, SessionIdentity, SessionUnit},
     session_fabric::{AdapterId, FabricError, FabricSessionId, Reachability},
     ConnectionGeneration,
 };
@@ -231,12 +231,35 @@ fn discovered_llc_routes<'a>(
         .collect()
 }
 
+fn unique_cold_llc_route(
+    target: &QualifiedName,
+    candidates: &[(String, QualifiedName)],
+) -> io::Result<Option<Destination>> {
+    let mut selected = None;
+    for (attachment_id, hosting_cp) in candidates {
+        if hosting_cp.netid != target.netid {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(protocol(format!(
+                "HPR target {target} has multiple verified cold LLC peers in its NETID"
+            )));
+        }
+        selected = Some(Destination::Llc {
+            hosting_cp: hosting_cp.clone(),
+            attachment_id: attachment_id.clone(),
+        });
+    }
+    Ok(selected)
+}
+
 pub(crate) struct DirectHprRuntime<'a> {
     bootstrap: HprControlBootstrap,
     rtp: HprRtpPort,
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
     route_targets: HashMap<router_core::session::QualifiedName, Destination>,
     local_directory: HprDestinationDirectory,
+    cold_llc_candidates: Vec<(String, QualifiedName)>,
     other_ee_owners: HashSet<String>,
     external_management: ExternalManagementRoutes,
     local_exports: Vec<(router_core::session::QualifiedName, Destination)>,
@@ -286,6 +309,7 @@ impl<'a> DirectHprRuntime<'a> {
             route_setup: HashMap::new(),
             route_targets: HashMap::new(),
             local_directory: HprDestinationDirectory::new(),
+            cold_llc_candidates: Vec::new(),
             other_ee_owners: HashSet::new(),
             external_management: ExternalManagementRoutes::default(),
             local_exports: Vec::new(),
@@ -355,6 +379,7 @@ impl<'a> DirectHprRuntime<'a> {
         config: &RouterConfig,
     ) -> io::Result<()> {
         self.refresh_shared_llc_routes(runner, config)?;
+        self.cold_llc_candidates = runner.cold_llc_candidates()?;
         let routes = shared.trusted_mptn_routes(runner)?;
         self.local_directory.replace_owner("mptn", routes)?;
         Ok(())
@@ -501,7 +526,7 @@ impl<'a> DirectHprRuntime<'a> {
             .source_cp
             .as_ref()
             .ok_or_else(|| protocol("HPR LLC source has no CP"))?;
-        if self.local_directory.resolve_lu(&identity.target_lu)
+        if self.current_local_destination(&identity.target_lu)?
             != Some(Destination::Llc {
                 hosting_cp: target_cp.clone(),
                 attachment_id: attachment_id.to_owned(),
@@ -665,7 +690,7 @@ impl<'a> DirectHprRuntime<'a> {
         hub: Option<&AutoWsHub>,
         target: &router_core::session::QualifiedName,
     ) -> io::Result<Destination> {
-        let local = self.local_directory.resolve_lu(target);
+        let local = self.current_local_destination(target)?;
         let upstream = hub
             .map(|hub| hub.resolve_lu(&as_wire_name(target)))
             .transpose()?
@@ -711,6 +736,13 @@ impl<'a> DirectHprRuntime<'a> {
             (None, None) => Err(protocol(format!(
                 "HPR RouteSetup target {target} unavailable"
             ))),
+        }
+    }
+
+    fn current_local_destination(&self, target: &QualifiedName) -> io::Result<Option<Destination>> {
+        match self.local_directory.resolve_lu(target) {
+            Some(route) => Ok(Some(route)),
+            None => unique_cold_llc_route(target, &self.cold_llc_candidates),
         }
     }
 
@@ -846,7 +878,7 @@ impl<'a> DirectHprRuntime<'a> {
             .iter()
             .filter_map(|(lu, destination)| {
                 let current = match destination {
-                    Destination::Llc { .. } => self.local_directory.resolve_lu(lu),
+                    Destination::Llc { .. } => self.current_local_destination(lu).ok().flatten(),
                     Destination::Ws { .. } => {
                         self.resolve_route_setup_target(hub.as_deref(), lu).ok()
                     }
@@ -1589,7 +1621,7 @@ impl<'a> DirectHprRuntime<'a> {
         };
         let live = match destination {
             Destination::Llc { .. } | Destination::Mptn { .. } | Destination::Ee { .. } => {
-                self.local_directory.resolve_lu(&target) == Some(destination.clone())
+                self.current_local_destination(&target).ok().flatten() == Some(destination.clone())
             }
             Destination::Ws { .. } => {
                 self.resolve_route_setup_target(hub, &target).ok().as_ref() == Some(destination)
@@ -1649,7 +1681,7 @@ impl<'a> DirectHprRuntime<'a> {
                 .sessions
                 .values()
                 .any(|session| session.identity.target_lu == *target && session.local.is_some());
-            if !active_local && self.local_directory.resolve_lu(target) != Some(destination.clone())
+            if !active_local && self.current_local_destination(target)? != Some(destination.clone())
             {
                 return Ok(());
             }
@@ -1857,7 +1889,7 @@ impl<'a> DirectHprRuntime<'a> {
             ));
         }
         let current = match &destination {
-            Destination::Llc { .. } => self.local_directory.resolve_lu(&target_lu),
+            Destination::Llc { .. } => self.current_local_destination(&target_lu)?,
             Destination::Ws { .. } => self.resolve_route_setup_target(hub, &target_lu).ok(),
             _ => None,
         };
@@ -2013,7 +2045,7 @@ impl<'a> DirectHprRuntime<'a> {
             destination,
             Destination::Llc { .. } | Destination::Mptn { .. }
         ) {
-            match self.local_directory.resolve_lu(&selected_lu) {
+            match self.current_local_destination(&selected_lu)? {
                 Some(current) if current == destination => {}
                 Some(_) => return Err(protocol("HPR local target CP changed after RouteSetup")),
                 None => {
@@ -3374,6 +3406,29 @@ mod tests {
         hpr_session_address::RtpObservation,
         ConnectionGeneration,
     };
+
+    #[test]
+    fn cold_llc_route_uses_one_verified_cp_without_adding_an_lu_export() {
+        let alice = ("llc-a".to_owned(), q("QAALICE.CP"));
+        let bob = ("llc-b".to_owned(), q("QABOB.CP"));
+        assert_eq!(
+            unique_cold_llc_route(&q("QAALICE.UNKNOWN"), &[alice.clone(), bob]).unwrap(),
+            Some(Destination::Llc {
+                hosting_cp: alice.1.clone(),
+                attachment_id: alice.0.clone(),
+            })
+        );
+        assert!(
+            unique_cold_llc_route(&q("OTHER.UNKNOWN"), std::slice::from_ref(&alice))
+                .unwrap()
+                .is_none()
+        );
+        assert!(unique_cold_llc_route(
+            &q("QAALICE.UNKNOWN"),
+            &[alice, ("llc-c".to_owned(), q("QAALICE.OTHER"))]
+        )
+        .is_err());
+    }
 
     #[test]
     fn discovered_llc_lu62_routes_need_no_configured_lu_hint() {

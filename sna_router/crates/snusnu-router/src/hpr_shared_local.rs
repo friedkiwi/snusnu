@@ -6,7 +6,7 @@ use router_core::session::{QualifiedName, SessionIdentity, SessionUnit};
 
 use crate::{
     auto_address::AutoProxyMacs,
-    auto_hpr_local_ingress::{LocalToHprState, ReadyLocalLlc},
+    auto_hpr_local_ingress::ReadyLocalLlc,
     auto_runtime::AutoLocalSessionRunner,
     config::RouterConfig,
     hpr_destination_directory::{
@@ -37,7 +37,6 @@ pub(crate) struct HprSharedLocal {
 }
 
 struct EeLlcState {
-    llc: LocalToHprState,
     attachments: Vec<String>,
     proxy_mac: [u8; 6],
 }
@@ -86,7 +85,6 @@ impl HprSharedLocal {
         )?
         .get(attachment_id)
         .ok_or_else(|| io::Error::other("EE proxy MAC allocation failed"))?;
-        let state = LocalToHprState::new(attachment_id, peer_cp, proxy_mac)?;
         let mut registered: Vec<String> = Vec::new();
         for entry in &config.llc {
             if let Err(error) = runner.allow_llc_proxy_mac(&entry.id, proxy_mac) {
@@ -97,10 +95,15 @@ impl HprSharedLocal {
             }
             registered.push(entry.id.clone());
         }
+        if let Err(error) = runner.register_ee_llc_target(attachment_id, proxy_mac, peer_cp) {
+            for id in registered {
+                let _ = runner.withdraw_llc_proxy_mac(&id, proxy_mac);
+            }
+            return Err(error);
+        }
         self.ee_llc.insert(
             attachment_id.to_owned(),
             EeLlcState {
-                llc: state,
                 attachments: registered,
                 proxy_mac,
             },
@@ -160,33 +163,18 @@ impl HprSharedLocal {
             }
         }
         for (id, offer) in runner.take_unhandled_llc_offers() {
-            if can_accept_user {
-                if let Some(state) = self
-                    .ee_llc
-                    .values_mut()
-                    .find(|state| state.proxy_mac == offer.proxy_mac)
-                {
-                    state.llc.accept_offer(&id, offer);
-                } else {
-                    runner.release_llc(&id, offer.proxy_mac)?;
-                }
-            } else {
-                runner.release_llc(&id, offer.proxy_mac)?;
-            }
+            runner.release_llc(&id, offer.proxy_mac)?;
         }
-        for state in self.ee_llc.values_mut() {
-            if let Some(mut source) = state.llc.poll_ready(directory)? {
-                if can_accept_user && ready.is_none() {
-                    ready = Some(ReadyLocalHpr::Llc(source));
-                } else {
-                    if let Err(error) = source.source.close() {
-                        tracing::warn!(attachment = %source.ingress_id, error = %error,
-                            "failed to close LLC session while EE slot is busy");
-                    }
-                    state.llc.release(&source.ingress_id, source.proxy_mac)?;
+        for mut source in runner.take_ee_llc_handoffs() {
+            if can_accept_user && ready.is_none() {
+                ready = Some(ReadyLocalHpr::Llc(source));
+            } else {
+                if let Err(error) = source.source.close() {
+                    tracing::warn!(attachment = %source.ingress_id, error = %error,
+                        "failed to close LLC session while EE slot is busy");
                 }
+                runner.release_ee_llc_ingress(&source.ingress_id, source.proxy_mac)?;
             }
-            release_llc(runner, &mut state.llc)?;
         }
         Ok(ready)
     }
@@ -250,15 +238,7 @@ impl HprSharedLocal {
         ingress_id: &str,
         proxy_mac: [u8; 6],
     ) -> io::Result<()> {
-        let state = self
-            .ee_llc
-            .values_mut()
-            .find(|state| state.proxy_mac == proxy_mac)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "EE LLC session state absent")
-            })?;
-        state.llc.release(ingress_id, proxy_mac)?;
-        release_llc(runner, &mut state.llc)
+        runner.release_ee_llc_ingress(ingress_id, proxy_mac)
     }
 
     pub(crate) fn withdraw_ee(
@@ -266,9 +246,8 @@ impl HprSharedLocal {
         runner: &mut AutoLocalSessionRunner<'_>,
         attachment_id: &str,
     ) -> io::Result<()> {
-        if let Some(mut state) = self.ee_llc.remove(attachment_id) {
-            state.llc.shutdown();
-            release_llc(runner, &mut state.llc)?;
+        if let Some(state) = self.ee_llc.remove(attachment_id) {
+            runner.withdraw_ee_llc_target(attachment_id, state.proxy_mac)?;
             for id in state.attachments {
                 runner.withdraw_llc_proxy_mac(&id, state.proxy_mac)?;
             }
@@ -290,14 +269,4 @@ impl HprSharedLocal {
         }
         Ok(())
     }
-}
-
-fn release_llc(
-    runner: &mut AutoLocalSessionRunner<'_>,
-    state: &mut LocalToHprState,
-) -> io::Result<()> {
-    for (id, mac) in state.take_releases() {
-        runner.release_llc(&id, mac)?;
-    }
-    Ok(())
 }
