@@ -25,6 +25,7 @@ type printerProbeCircuit struct {
 	linkReadySent     bool
 	initiated         bool
 	managementPhase   uint8
+	management        *lu62.ManagementSession
 	fqpcid            []byte
 	peerIPR           bool
 }
@@ -129,8 +130,12 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 			log.Printf("printer probe PIU: circuit=%s th=%x rh=%x ru=%x", id, parsed.TH, parsed.RH, parsed.RU)
 			c.allowance += uint64(len(value.SnaInformation))
 			err = p.hub.credit(p.hub.local, &wire.CircuitCredit{CircuitId: idBytes, AllowanceBytes: c.allowance})
-			if err == nil && c.initiated {
-				err = p.managementInformation(id, c, value.SnaInformation)
+			if err == nil {
+				if c.initiated {
+					err = p.managementInformation(id, c, value.SnaInformation)
+				} else {
+					err = p.passiveManagementInformation(id, c, value.SnaInformation)
+				}
 			}
 		}
 	case *wire.CircuitEvent_SessionEvent:
@@ -279,6 +284,152 @@ func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) e
 
 func (p *localPrinterProbe) sendInformation(id string, data []byte) error {
 	return p.hub.event(p.hub.local, &wire.CircuitEvent{CircuitId: uuidBytes(id), Event: &wire.CircuitEvent_SnaInformation{SnaInformation: data}})
+}
+
+func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerProbeCircuit, data []byte) error {
+	if len(data) >= 12 && data[6] == 0x6b && data[9] == 0x0d {
+		responseRU, err := printer.ACTLUResponseRU(data[9:])
+		if err != nil {
+			return err
+		}
+		th := [6]byte{data[0], data[1], data[3], data[2], data[4], data[5]}
+		response, err := (piu.FID2{TH: th, RH: [3]byte{0xeb, data[7], 0}, RU: responseRU}).Bytes()
+		if err != nil {
+			return err
+		}
+		log.Printf("printer probe ACTLU response: circuit=%s piu=%x", id, response)
+		return p.sendInformation(id, response)
+	}
+	bind, err := lu62.ParseBind(data)
+	if err != nil {
+		return err
+	}
+	if bind != nil && bind.Management && c.management == nil {
+		if bind.PLU != c.peer.NetID+"."+c.peer.LU || bind.SLU != "SNUSNU.PRINTER" {
+			return fmt.Errorf("printer probe management BIND identity mismatch: %s to %s", bind.PLU, bind.SLU)
+		}
+		management, err := lu62.NewManagementSession(bind.PLU, bind.SLU)
+		if err != nil {
+			return err
+		}
+		response, err := management.PrepareBind(data)
+		if err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, response); err != nil {
+			return err
+		}
+		if err := management.MarkBindSent(response); err != nil {
+			return err
+		}
+		if err := management.AckBind(); err != nil {
+			return err
+		}
+		c.management = management
+		log.Printf("printer probe passive management BIND: circuit=%s plu=%s slu=%s", id, bind.PLU, bind.SLU)
+		return nil
+	}
+	if c.management == nil {
+		return nil
+	}
+	if lu62.IsPacingResponse(data) {
+		return c.management.ReceiveIPR(data)
+	}
+	switch c.management.Phase() {
+	case lu62.ManagementAwaitCNOS:
+		if len(data) < 10 || data[6] != 0x0b {
+			return nil
+		}
+		ipr, reply, err := c.management.PrepareCNOS(data)
+		if err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, ipr); err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, reply); err != nil {
+			return err
+		}
+		if err := c.management.MarkCNOSSent(ipr, reply); err != nil {
+			return err
+		}
+		if err := c.management.AckCNOS(); err != nil {
+			return err
+		}
+		if err := c.management.AckCNOS(); err != nil {
+			return err
+		}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_NMVT") == "1" {
+			return p.sendExperimentalNMVT(id)
+		}
+		return nil
+	case lu62.ManagementCNOSComplete:
+		if len(data) != 10 || data[6] != 0x4b {
+			return nil
+		}
+		ipr, reply, err := c.management.PrepareBIS(data, 2, true)
+		if err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, ipr); err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, reply); err != nil {
+			return err
+		}
+		if err := c.management.MarkBISSent(ipr, reply); err != nil {
+			return err
+		}
+		if err := c.management.AckBIS(); err != nil {
+			return err
+		}
+		if err := c.management.AckBIS(); err != nil {
+			return err
+		}
+		return nil
+	case lu62.ManagementBISComplete:
+		if len(data) < 10 || data[6] != 0x6b || data[9] != 0x32 {
+			return nil
+		}
+		reply, err := c.management.PrepareUnbind(data)
+		if err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, reply); err != nil {
+			return err
+		}
+		if err := c.management.MarkUnbindSent(reply); err != nil {
+			return err
+		}
+		if err := c.management.AckUnbind(); err != nil {
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
+// sendExperimentalNMVT is a QA-only wire probe. The VPD and address-list
+// fields below are lab placeholders; a real printer service must obtain them
+// from its attached device and maintain the independent SSCP-PU flow.
+func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
+	psid := printer.ReplyPSID{
+		ProcedureID: 1,
+		Address:     1, Station: 1,
+		VPD: printer.HardwarePSID{
+			MachineType: [4]byte{0xf3, 0xf8, 0xf1, 0xf2},
+			Model:       [3]byte{0xf0, 0xf0, 0xf1},
+			Plant:       [2]byte{0xf0, 0xf0},
+			Serial:      [7]byte{0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf1},
+		},
+		DateTime: [6]byte{0x26, 11, 3, 14, 0, 0},
+	}
+	out, err := psid.EncodeNMVTPIU([6]byte{0x2c, 0xff, 0, 0, 0, 1}, 0x80, 0)
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe experimental NMVT: circuit=%s piu=%x", id, out)
+	return p.sendInformation(id, out)
 }
 
 func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCircuit, data []byte) error {
