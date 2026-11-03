@@ -7,9 +7,12 @@ use crate::{
     auto_llc_ws::AutoLlcWsBridge,
     auto_local_dispatch::AutoLocalDispatch,
     config::{self, RouterConfig},
+    hpr_local_llc_ingress::LocalLlcIngress,
     hpr_mptn_session_source::MptnToHprSession,
+    hpr_session_source::{SessionSource, SourceUpdate},
     llc_proof_registry::{AssociationId, LlcProofRegistry},
     llc_session_ws::LlcSessionWs,
+    llc_source_ws::LlcSourceWs,
     local_status::LocalProxyMacStatus,
     mptn_session_ws::MptnSessionWs,
     mptn_target_ws::MptnTargetWs,
@@ -76,6 +79,22 @@ struct LlcSessionCircuit {
     listener: usize,
     proxy_mac: [u8; 6],
     verified_logged: bool,
+}
+
+struct PendingUpstreamLlc {
+    attachment: PortId,
+    listener: usize,
+    proxy_mac: [u8; 6],
+    target_cp: QualifiedName,
+    source: Option<LocalLlcIngress>,
+    opened_at: Instant,
+}
+
+struct ActiveUpstreamLlc {
+    attachment: PortId,
+    listener: usize,
+    proxy_mac: [u8; 6],
+    bridge: LlcSourceWs,
 }
 
 /// Keep automatic mode separate from the explicit pair router. Each selected
@@ -184,6 +203,8 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     next_mptn_target_id: u64,
     llc_ws_sessions: HashMap<u64, LlcSessionCircuit>,
     next_llc_ws_id: u64,
+    pending_llc_upstream: HashMap<u64, PendingUpstreamLlc>,
+    active_llc_upstream: HashMap<u64, ActiveUpstreamLlc>,
     unhandled_llc: Vec<(String, LlcIngressOffer)>,
     unhandled_mptn: Vec<(String, u64, IngressOffer)>,
     mptn_management: Vec<(String, Vec<(String, String)>)>,
@@ -303,6 +324,8 @@ impl<'a> AutoLocalSessionRunner<'a> {
             next_mptn_target_id: 0,
             llc_ws_sessions: HashMap::new(),
             next_llc_ws_id: 0,
+            pending_llc_upstream: HashMap::new(),
+            active_llc_upstream: HashMap::new(),
             unhandled_llc: Vec::new(),
             unhandled_mptn: Vec::new(),
             mptn_management: Vec::new(),
@@ -610,6 +633,26 @@ impl<'a> AutoLocalSessionRunner<'a> {
             }
         }
         let mut changed = HashSet::new();
+        for (id, mut pending) in self.pending_llc_upstream.drain() {
+            let _ = pending.source.as_mut().unwrap().close();
+            self.listeners[pending.listener].release(pending.proxy_mac);
+            if self
+                .proofs
+                .withdraw(&pending.attachment, &association("llc_upstream", id))
+            {
+                changed.insert(pending.attachment);
+            }
+        }
+        for (id, mut active) in self.active_llc_upstream.drain() {
+            let _ = active.bridge.close();
+            self.listeners[active.listener].release(active.proxy_mac);
+            if self
+                .proofs
+                .withdraw(&active.attachment, &association("llc_upstream", id))
+            {
+                changed.insert(active.attachment);
+            }
+        }
         for (id, mut circuit) in self.llc_ws_sessions.drain() {
             let attachment = PortId::new(circuit.bridge.attachment_id());
             if self
@@ -661,6 +704,8 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_ws_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
+            pending_llc_upstream,
+            active_llc_upstream,
             unhandled_llc,
             unhandled_mptn,
             mptn_management,
@@ -670,6 +715,162 @@ impl<'a> AutoLocalSessionRunner<'a> {
         let mut next_mptn_ws_id = self.next_mptn_ws_id;
         let mut changed_proofs = HashSet::<PortId>::new();
         let mut exports_changed = false;
+        for id in active_llc_upstream.keys().copied().collect::<Vec<_>>() {
+            let retired = match active_llc_upstream.get_mut(&id).unwrap().bridge.pump() {
+                Ok(true) => false,
+                Ok(false) => true,
+                Err(error) => {
+                    tracing::warn!(session = id, error = %error,
+                        "automatic LLC to concentrator SessionV1 circuit failed");
+                    true
+                }
+            };
+            if retired {
+                let mut active = active_llc_upstream.remove(&id).unwrap();
+                let _ = active.bridge.close();
+                listeners[active.listener].release(active.proxy_mac);
+                if proofs.withdraw(&active.attachment, &association("llc_upstream", id)) {
+                    changed_proofs.insert(active.attachment);
+                }
+            }
+        }
+        for id in pending_llc_upstream.keys().copied().collect::<Vec<_>>() {
+            let mut pending = pending_llc_upstream.remove(&id).unwrap();
+            let update = if pending.opened_at.elapsed() >= Duration::from_secs(60) {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "LLC source did not send a user BIND",
+                ))
+            } else {
+                pending.source.as_mut().unwrap().poll()
+            };
+            let ready = matches!(
+                update,
+                Ok(Some(SourceUpdate::Event(
+                    router_core::session::SessionEvent::BindRequest(_)
+                )))
+            );
+            if matches!(update, Ok(None)) {
+                pending_llc_upstream.insert(id, pending);
+                continue;
+            }
+            let result = if ready {
+                (|| -> io::Result<LlcSourceWs> {
+                    let identity =
+                        pending.source.as_ref().unwrap().identity().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "LLC BIND has no verified session identity",
+                            )
+                        })?;
+                    if identity.target_cp.as_ref() != Some(&pending.target_cp) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "LLC BIND target CP differs from managed MAC owner",
+                        ));
+                    }
+                    let source_cp = identity.source_cp.as_ref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "LLC BIND source CP is unverified",
+                        )
+                    })?;
+                    if proofs
+                        .snapshot(&pending.attachment)
+                        .as_ref()
+                        .map(|proof| &proof.cp)
+                        != Some(source_cp)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "LLC BIND source CP differs from live XID3 proof",
+                        ));
+                    }
+                    let connected = hub.as_deref_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "concentrator disconnected before LLC BIND",
+                        )
+                    })?;
+                    let target_lu = wire_name(&identity.target_lu);
+                    let source_lu = wire_name(&identity.source_lu);
+                    let (target_ref, target_cp) =
+                        connected.resolve_lu(&target_lu)?.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "LLC BIND target LU is not advertised",
+                            )
+                        })?;
+                    if target_cp.as_ref() != Some(&wire_name(&pending.target_cp)) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "LLC BIND target LU has a different hosting CP",
+                        ));
+                    }
+                    let target_route = connected.remote_route(&target_ref).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "LLC BIND target LU route changed")
+                    })?;
+                    require_session_v1_target(&target_route)?;
+                    proofs.observe_lu62(
+                        &pending.attachment,
+                        &association("llc_upstream", id),
+                        &identity.source_lu.to_string(),
+                    )?;
+                    if reconcile_proofs(
+                        proofs,
+                        bridge,
+                        std::iter::once(pending.attachment.clone()),
+                    )? {
+                        refresh_local_addresses(fabric, bridge, config, proxies)?;
+                        exports_changed = true;
+                    }
+                    let (cps, lus) =
+                        publication_records(fabric.directory(), connected.allowed_netid());
+                    connected.publish_local(&cps, &lus)?;
+                    let ws = connected
+                        .open_session_lu(&target_lu, &source_lu)?
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "published LLC source LU or remote target route is unavailable",
+                            )
+                        })?;
+                    Ok(LlcSourceWs::new(pending.source.take().unwrap(), ws))
+                })()
+            } else {
+                Err(match update {
+                    Err(error) => error,
+                    Ok(_) => io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LLC association closed or sent data before user BIND",
+                    ),
+                })
+            };
+            match result {
+                Ok(bridge) => {
+                    tracing::info!(session = id, attachment = %pending.attachment.0,
+                        "automatic LLC SessionV1 bridge installed");
+                    active_llc_upstream.insert(
+                        id,
+                        ActiveUpstreamLlc {
+                            attachment: pending.attachment,
+                            listener: pending.listener,
+                            proxy_mac: pending.proxy_mac,
+                            bridge,
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(session = id, attachment = %pending.attachment.0,
+                        error = %error, "automatic LLC upstream BIND rejected");
+                    let _ = pending.source.as_mut().unwrap().close();
+                    listeners[pending.listener].release(pending.proxy_mac);
+                    if proofs.withdraw(&pending.attachment, &association("llc_upstream", id)) {
+                        changed_proofs.insert(pending.attachment);
+                    }
+                }
+            }
+        }
         for id in mptn_ws_sessions.keys().copied().collect::<Vec<_>>() {
             let result = mptn_ws_sessions.get_mut(&id).unwrap().pump();
             let retired = match result {
@@ -914,7 +1115,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                         offer.peer_cp.as_deref(),
                         connected.allowed_netid(),
                     )?;
-                    let (target_ref, target_cp) =
+                    let (_, target_cp) =
                         connected.resolve_mac(&ingress_proxy)?.ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::NotFound,
@@ -924,7 +1125,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                     let id = next_id
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("automatic session ID exhausted"))?;
-                    let owner = association("fabric", id);
+                    let owner = association("llc_upstream", id);
                     proofs.observe_cp(
                         &ingress_id,
                         owner.clone(),
@@ -939,39 +1140,35 @@ impl<'a> AutoLocalSessionRunner<'a> {
                         let (cps, lus) =
                             publication_records(fabric.directory(), connected.allowed_netid());
                         connected.publish_local(&cps, &lus)?;
-                        let source_ref =
-                            connected.local_reference_cp(&source_cp).ok_or_else(|| {
+                        connected.local_reference_cp(&source_cp).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "verified LLC CP was not published as an unambiguous route",
+                            )
+                        })?;
+                        let target_cp = QualifiedName::new(&target_cp.netid, &target_cp.name)
+                            .map_err(|_| {
                                 io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "verified LLC CP was not published as an unambiguous route",
+                                    io::ErrorKind::InvalidData,
+                                    "managed MAC has invalid hosting CP",
                                 )
                             })?;
-                        let ws = connected.open_ref(
-                            target_ref,
-                            target_cp,
-                            None,
-                            Some(source_ref),
-                            source_cp,
-                        )?;
-                        let local = offer.open_port()?;
-                        fabric.open_pair(
+                        let source =
+                            LocalLlcIngress::from_offer(offer, target_cp.clone(), &ingress_id.0)?;
+                        pending_llc_upstream.insert(
                             id,
-                            &ingress_id,
-                            &destination,
-                            &target,
-                            Box::new(local),
-                            Box::new(ws),
-                        )?;
-                        sessions.insert(
-                            id,
-                            LlcSession {
-                                ingress: Some((ingress, ingress_proxy)),
-                                egress: None,
-                                upstream: true,
+                            PendingUpstreamLlc {
+                                attachment: ingress_id.clone(),
+                                listener: ingress,
+                                proxy_mac: ingress_proxy,
+                                target_cp: target_cp.clone(),
+                                source: Some(source),
+                                opened_at: Instant::now(),
                             },
                         );
                         next_id = id;
-                        observe_circuit(id, &ingress_id.0, &target.0);
+                        tracing::info!(session = id, attachment = %ingress_id.0,
+                            target_cp = %target_cp, "LLC upstream CP verified; waiting for user BIND");
                         Ok(())
                     })();
                     if opened.is_err() {
@@ -1343,8 +1540,20 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_ws_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
+            pending_llc_upstream,
+            active_llc_upstream,
             ..
         } = self;
+        for (_, mut pending) in pending_llc_upstream.drain() {
+            if let Some(source) = pending.source.as_mut() {
+                let _ = source.close();
+            }
+            listeners[pending.listener].release(pending.proxy_mac);
+        }
+        for (_, mut active) in active_llc_upstream.drain() {
+            let _ = active.bridge.close();
+            listeners[active.listener].release(active.proxy_mac);
+        }
         for (_, mut bridge) in mptn_ws_sessions.drain() {
             let gateway_id = bridge.gateway_id().to_owned();
             let _ = bridge.close();
@@ -1643,7 +1852,12 @@ fn reconcile_proofs(
                 &format!("{}.{}", snapshot.cp.netid, snapshot.cp.name),
             )?;
             for lu in snapshot.lus {
-                bridge.observe_bound_lu(&attachment, &format!("{}.{}", lu.netid, lu.name))?;
+                let name = format!("{}.{}", lu.netid, lu.name);
+                if snapshot.lu62.contains(&lu) {
+                    bridge.observe_bound_lu62(&attachment, &name)?;
+                } else {
+                    bridge.observe_bound_lu(&attachment, &name)?;
+                }
             }
         }
         let after = bridge.route_records(&attachment)?;
