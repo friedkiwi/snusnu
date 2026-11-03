@@ -69,124 +69,28 @@ pub(crate) fn run(config: &RouterConfig) -> io::Result<()> {
         }
         return crate::auto_hpr_runtime::run_hpr(config);
     }
-    let proxies = AutoProxyMacs::from_ids(
-        config
-            .llc
-            .iter()
-            .map(|peer| peer.id.as_str())
-            .chain(config.mptn_gateway.iter().map(|peer| peer.id.as_str())),
-    )?;
-    if let Some(status) = crate::status() {
-        status.replace_local_proxy_macs(
-            proxies
-                .iter()
-                .map(|(id, mac)| LocalProxyMacStatus {
-                    attachment_id: id.into(),
-                    mac: crate::endpoint::format_mac(mac),
-                })
-                .collect(),
-        );
-    }
-    run_attachments(config, proxies)
+    run_attachments(config)
 }
 
-fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<()> {
-    let mut fabric = AutomaticFabric::new();
-    let mut bridge = AutoLlcWsBridge::default();
-    let mut proofs = LlcProofRegistry::default();
-    for peer in &config.llc {
-        let mac = proxies.get(&peer.id).expect("local LLC proxy allocated");
-        fabric
-            .directory_mut()
-            .replace(PortId::new(&peer.id), [RouteAddress::Mac(mac)])?;
-        bridge.register(
-            PortId::new(&peer.id),
-            peer.interface.clone(),
-            config::parse_mac(&peer.guest_mac)?,
-        )?;
-        if let Some(expected_cp) = peer.local_cp.as_deref() {
-            bridge.configure_lu_hints(
-                &PortId::new(&peer.id),
-                expected_cp,
-                &peer.lus,
-                &peer.lu_types,
-            )?;
-        }
-    }
-    for gateway in &config.mptn_gateway {
-        fabric.directory_mut().replace(
-            PortId::new(&gateway.id),
-            [RouteAddress::Mac(
-                proxies.get(&gateway.id).expect("MPTN proxy allocated"),
-            )],
-        )?;
-    }
-    let mut listeners = Vec::with_capacity(config.llc.len());
-    for peer in &config.llc {
-        let mut listener =
-            LlcAutoListener::open(&peer.interface, config::parse_mac(&peer.guest_mac)?)?;
-        for (target, mac) in proxies.iter() {
-            if target != peer.id {
-                if config
-                    .mptn_gateway
-                    .iter()
-                    .any(|gateway| gateway.id == target)
-                {
-                    listener.allow_native_proxy_mac(mac)?;
-                } else {
-                    listener.allow_proxy_mac(mac)?;
-                }
-            }
-        }
-        listeners.push(listener);
-    }
-    let mut gateways = config
-        .mptn_gateway
-        .iter()
-        .map(AutoMptnGateway::bind)
-        .collect::<io::Result<Vec<_>>>()?;
+fn run_attachments(config: &RouterConfig) -> io::Result<()> {
+    let mut runner = AutoLocalSessionRunner::new(config)?;
     let remote = config.remote.first();
     let mut hub: Option<AutoWsHub> = None;
     let mut next_connect = Instant::now();
     let mut connect_delay = Duration::from_millis(500);
-    let mut remote_macs = HashSet::<[u8; 6]>::new();
-    let mut mptn_exports = HashMap::<String, (wire::SnaName, wire::LuReachability)>::new();
-    let mut mptn_owner = HashMap::<(String, String), String>::new();
-    let mut learned_mptn_lus = HashMap::<String, HashSet<(String, String)>>::new();
-    let mut local_dispatch = AutoLocalDispatch::new();
-    let mut sessions = HashMap::<u64, LlcSession>::new();
-    let mut next_id = 0u64;
-    let mut mptn_ws_sessions = HashMap::<u64, MptnSessionWs>::new();
-    let mut next_mptn_ws_id = 0u64;
-    let mut mptn_target_sessions = HashMap::<u64, MptnTargetWs>::new();
-    let mut next_mptn_target_id = 0u64;
-    let mut llc_ws_sessions = HashMap::<u64, LlcSessionCircuit>::new();
-    let mut next_llc_ws_id = 0u64;
     tracing::info!(
-        llc_attachments = listeners.len(),
-        mptn_attachments = gateways.len(),
+        llc_attachments = config.llc.len(),
+        mptn_attachments = config.mptn_gateway.len(),
         concentrator = remote.is_some(),
         "automatic routing started"
     );
     while !STOP.load(Ordering::Relaxed) {
-        let mut changed_proofs = HashSet::<PortId>::new();
         if let Some(remote) = remote.filter(|_| hub.is_none() && Instant::now() >= next_connect) {
             match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
                 Ok(mut connected) => {
-                    mptn_exports.clear();
-                    mptn_owner.clear();
-                    refresh_mptn_exports(
-                        config,
-                        &learned_mptn_lus,
-                        &connected,
-                        &mut mptn_exports,
-                        &mut mptn_owner,
-                    )?;
-                    publish_local(fabric.directory(), &mut connected)?;
-                    fabric.directory_mut().replace_upstream(
-                        PortId::new(&remote.id),
-                        connected.advertised_addresses(),
-                    )?;
+                    runner.sync_upstream(&connected)?;
+                    let (cps, lus) = runner.exports(connected.allowed_netid());
+                    connected.publish_local(&cps, &lus)?;
                     hub = Some(connected);
                     connect_delay = Duration::from_millis(500);
                 }
@@ -201,147 +105,449 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         }
         if let Some(connected) = hub.as_mut() {
             match connected.poll_incoming() {
-                Ok(Some(open)) => match incoming_lu_pair(connected, &open) {
-                    Ok((hosted_lu, hosted_cp, source_lu, source_cp)) => {
-                        let owner =
-                            mptn_owner.get(&(hosted_lu.netid.clone(), hosted_lu.name.clone()));
-                        let gateway = owner
-                            .and_then(|id| gateways.iter_mut().find(|gateway| gateway.id() == id));
-                        if let Some(gateway) = gateway.filter(|gateway| gateway.udp_available()) {
-                            if open.profile == wire::CircuitProfile::SessionV1 as i32 {
-                                if let Err(error) = open_incoming_mptn_target(
-                                    connected,
-                                    open.clone(),
+                Ok(Some(open)) => {
+                    if let OpenDisposition::Unhandled(open) =
+                        runner.accept_upstream(connected, open)?
+                    {
+                        connected.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "automatic concentrator directory disconnected");
+                    runner.on_hub_lost()?;
+                    hub = None;
+                    next_connect = Instant::now() + connect_delay;
+                }
+            }
+        }
+        if let Some(connected) = hub.as_ref() {
+            runner.sync_upstream(connected)?;
+        }
+        let result = runner.poll_local(hub.as_mut())?;
+        if result.hub_lost {
+            runner.on_hub_lost()?;
+            hub = None;
+            next_connect = Instant::now() + connect_delay;
+        } else if result.exports_changed {
+            if let Some(connected) = hub.as_mut() {
+                let (cps, lus) = runner.exports(connected.allowed_netid());
+                connected.publish_local(&cps, &lus)?;
+            }
+        }
+        if !result.active {
+            thread::sleep(IDLE_POLL);
+        }
+    }
+    runner.shutdown()
+}
+
+/// Owns local attachment sockets and proofs across concentrator and EE generations.
+/// The coordinator owns WebSocket polling and route publication.
+pub(crate) struct AutoLocalSessionRunner<'a> {
+    config: &'a RouterConfig,
+    proxies: AutoProxyMacs,
+    fabric: AutomaticFabric,
+    bridge: AutoLlcWsBridge,
+    proofs: LlcProofRegistry,
+    listeners: Vec<LlcAutoListener>,
+    gateways: Vec<AutoMptnGateway<'a>>,
+    remote_macs: HashSet<[u8; 6]>,
+    mptn_exports: HashMap<String, (wire::SnaName, wire::LuReachability)>,
+    mptn_owner: HashMap<(String, String), String>,
+    learned_mptn_lus: HashMap<String, HashSet<(String, String)>>,
+    local_dispatch: AutoLocalDispatch,
+    sessions: HashMap<u64, LlcSession>,
+    next_id: u64,
+    mptn_ws_sessions: HashMap<u64, MptnSessionWs>,
+    next_mptn_ws_id: u64,
+    mptn_target_sessions: HashMap<u64, MptnTargetWs>,
+    next_mptn_target_id: u64,
+    llc_ws_sessions: HashMap<u64, LlcSessionCircuit>,
+    next_llc_ws_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocalPoll {
+    pub(crate) active: bool,
+    pub(crate) exports_changed: bool,
+    pub(crate) hub_lost: bool,
+}
+
+/// The coordinator must route an unhandled open to another local carrier.
+pub(crate) enum OpenDisposition {
+    Handled,
+    Unhandled(wire::IncomingOpen),
+}
+
+impl<'a> AutoLocalSessionRunner<'a> {
+    pub(crate) fn new(config: &'a RouterConfig) -> io::Result<Self> {
+        let proxies = AutoProxyMacs::from_ids(
+            config
+                .llc
+                .iter()
+                .map(|peer| peer.id.as_str())
+                .chain(config.mptn_gateway.iter().map(|peer| peer.id.as_str())),
+        )?;
+        Self::new_with_proxies(config, proxies)
+    }
+
+    fn new_with_proxies(config: &'a RouterConfig, proxies: AutoProxyMacs) -> io::Result<Self> {
+        if let Some(status) = crate::status() {
+            status.replace_local_proxy_macs(
+                proxies
+                    .iter()
+                    .map(|(id, mac)| LocalProxyMacStatus {
+                        attachment_id: id.into(),
+                        mac: crate::endpoint::format_mac(mac),
+                    })
+                    .collect(),
+            );
+        }
+        let mut fabric = AutomaticFabric::new();
+        let mut bridge = AutoLlcWsBridge::default();
+        let proofs = LlcProofRegistry::default();
+        for peer in &config.llc {
+            let mac = proxies.get(&peer.id).expect("local LLC proxy allocated");
+            fabric
+                .directory_mut()
+                .replace(PortId::new(&peer.id), [RouteAddress::Mac(mac)])?;
+            bridge.register(
+                PortId::new(&peer.id),
+                peer.interface.clone(),
+                config::parse_mac(&peer.guest_mac)?,
+            )?;
+            if let Some(expected_cp) = peer.local_cp.as_deref() {
+                bridge.configure_lu_hints(
+                    &PortId::new(&peer.id),
+                    expected_cp,
+                    &peer.lus,
+                    &peer.lu_types,
+                )?;
+            }
+        }
+        for gateway in &config.mptn_gateway {
+            fabric.directory_mut().replace(
+                PortId::new(&gateway.id),
+                [RouteAddress::Mac(
+                    proxies.get(&gateway.id).expect("MPTN proxy allocated"),
+                )],
+            )?;
+        }
+        let mut listeners = Vec::with_capacity(config.llc.len());
+        for peer in &config.llc {
+            let mut listener =
+                LlcAutoListener::open(&peer.interface, config::parse_mac(&peer.guest_mac)?)?;
+            for (target, mac) in proxies.iter() {
+                if target != peer.id {
+                    if config
+                        .mptn_gateway
+                        .iter()
+                        .any(|gateway| gateway.id == target)
+                    {
+                        listener.allow_native_proxy_mac(mac)?;
+                    } else {
+                        listener.allow_proxy_mac(mac)?;
+                    }
+                }
+            }
+            listeners.push(listener);
+        }
+        let gateways = config
+            .mptn_gateway
+            .iter()
+            .map(AutoMptnGateway::bind)
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            config,
+            proxies,
+            fabric,
+            bridge,
+            proofs,
+            listeners,
+            gateways,
+            remote_macs: HashSet::new(),
+            mptn_exports: HashMap::new(),
+            mptn_owner: HashMap::new(),
+            learned_mptn_lus: HashMap::new(),
+            local_dispatch: AutoLocalDispatch::new(),
+            sessions: HashMap::new(),
+            next_id: 0,
+            mptn_ws_sessions: HashMap::new(),
+            next_mptn_ws_id: 0,
+            mptn_target_sessions: HashMap::new(),
+            next_mptn_target_id: 0,
+            llc_ws_sessions: HashMap::new(),
+            next_llc_ws_id: 0,
+        })
+    }
+
+    pub(crate) fn exports(&self, netid: &str) -> (Vec<wire::SnaName>, Vec<wire::LuReachability>) {
+        publication_records(self.fabric.directory(), netid)
+    }
+
+    pub(crate) fn sync_upstream(&mut self, connected: &AutoWsHub) -> io::Result<()> {
+        let addresses = connected.advertised_addresses();
+        let next_macs = addresses
+            .iter()
+            .filter_map(|address| match address {
+                RouteAddress::Mac(mac) => Some(*mac),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for mac in self.remote_macs.difference(&next_macs) {
+            for listener in &mut self.listeners {
+                listener.withdraw_proxy_mac(*mac);
+            }
+        }
+        for mac in next_macs.difference(&self.remote_macs) {
+            for listener in &mut self.listeners {
+                listener.allow_native_proxy_mac(*mac)?;
+            }
+        }
+        self.remote_macs = next_macs;
+        if let Some(remote) = self.config.remote.first() {
+            self.fabric
+                .directory_mut()
+                .replace_upstream(PortId::new(&remote.id), addresses)?;
+        }
+        refresh_mptn_exports(
+            self.config,
+            &self.learned_mptn_lus,
+            connected,
+            &mut self.mptn_exports,
+            &mut self.mptn_owner,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn accept_upstream(
+        &mut self,
+        connected: &mut AutoWsHub,
+        open: wire::IncomingOpen,
+    ) -> io::Result<OpenDisposition> {
+        let target = open
+            .target
+            .as_ref()
+            .and_then(|reference| connected.local_route(reference))
+            .and_then(|route| match route.resource.as_ref()? {
+                wire::route_export::Resource::LogicalUnit(lu) => Some(lu.clone()),
+                _ => None,
+            });
+        let Some(target) = target else {
+            return Ok(OpenDisposition::Unhandled(open));
+        };
+        let (Some(name), Some(cp), Some(remote)) = (
+            target.lu.as_ref(),
+            target.hosting_cp.as_ref(),
+            self.config.remote.first(),
+        ) else {
+            return Ok(OpenDisposition::Unhandled(open));
+        };
+        let destination = RouteAddress::LogicalUnit {
+            netid: name.netid.clone(),
+            cp: Some(cp.name.clone()),
+            name: name.name.clone(),
+        };
+        let Ok(selected) = self.fabric.resolve(&PortId::new(&remote.id), &destination) else {
+            return Ok(OpenDisposition::Unhandled(open));
+        };
+        if !self.config.llc.iter().any(|peer| peer.id == selected.0)
+            && !self
+                .config
+                .mptn_gateway
+                .iter()
+                .any(|peer| peer.id == selected.0)
+        {
+            return Ok(OpenDisposition::Unhandled(open));
+        }
+        let Self {
+            config,
+            bridge,
+            fabric,
+            listeners,
+            gateways,
+            mptn_owner,
+            mptn_target_sessions,
+            next_mptn_target_id,
+            llc_ws_sessions,
+            next_llc_ws_id,
+            sessions,
+            next_id,
+            ..
+        } = self;
+        match incoming_lu_pair(connected, &open) {
+            Ok((hosted_lu, hosted_cp, source_lu, source_cp)) => {
+                let owner = mptn_owner.get(&(hosted_lu.netid.clone(), hosted_lu.name.clone()));
+                let gateway =
+                    owner.and_then(|id| gateways.iter_mut().find(|gateway| gateway.id() == id));
+                if let Some(gateway) = gateway.filter(|gateway| gateway.udp_available()) {
+                    if open.profile == wire::CircuitProfile::SessionV1 as i32 {
+                        if let Err(error) = open_incoming_mptn_target(
+                            connected,
+                            open.clone(),
+                            &hosted_lu,
+                            &hosted_cp,
+                            &source_lu,
+                            &source_cp,
+                            gateway,
+                            mptn_target_sessions,
+                            next_mptn_target_id,
+                        ) {
+                            tracing::warn!(gateway = gateway.id(), error = %error,
+                                        "automatic SessionV1 to TCP62 session rejected");
+                            connected.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
+                        }
+                    } else {
+                        let seed =
+                            format!("{}:{}.{}", gateway.id(), hosted_lu.netid, hosted_lu.name);
+                        match connected.accept_incoming(open.clone())? {
+                            Some(ws) => {
+                                if let Err(error) = gateway.start_from_ws(
+                                    ws,
                                     &hosted_lu,
                                     &hosted_cp,
                                     &source_lu,
                                     &source_cp,
-                                    gateway,
-                                    &mut mptn_target_sessions,
-                                    &mut next_mptn_target_id,
+                                    seed.as_bytes(),
+                                    Duration::from_secs(600),
                                 ) {
                                     tracing::warn!(gateway = gateway.id(), error = %error,
-                                        "automatic SessionV1 to TCP62 session rejected");
-                                    connected
-                                        .reject_incoming(&open, wire::OpenFailure::RouteGone)?;
-                                }
-                            } else {
-                                let seed = format!(
-                                    "{}:{}.{}",
-                                    gateway.id(),
-                                    hosted_lu.netid,
-                                    hosted_lu.name
-                                );
-                                match connected.accept_incoming(open.clone())? {
-                                    Some(ws) => {
-                                        if let Err(error) = gateway.start_from_ws(
-                                            ws,
-                                            &hosted_lu,
-                                            &hosted_cp,
-                                            &source_lu,
-                                            &source_cp,
-                                            seed.as_bytes(),
-                                            Duration::from_secs(600),
-                                        ) {
-                                            tracing::warn!(gateway = gateway.id(), error = %error,
                                                 "automatic concentrator to TCP62 session failed to start");
-                                        }
-                                    }
-                                    None => connected
-                                        .reject_incoming(&open, wire::OpenFailure::RouteGone)?,
                                 }
                             }
-                        } else if owner.is_some() {
-                            connected.reject_incoming(&open, wire::OpenFailure::Busy)?;
-                        } else if let Some(remote) = remote {
-                            if open.profile == wire::CircuitProfile::SessionV1 as i32 {
-                                if let Err(error) = open_incoming_llc_session(
-                                    &bridge,
-                                    connected,
-                                    open.clone(),
-                                    &hosted_lu,
-                                    &hosted_cp,
-                                    config,
-                                    &mut listeners,
-                                    &mut llc_ws_sessions,
-                                    &mut next_llc_ws_id,
-                                ) {
-                                    tracing::warn!(error = %error,
+                            None => {
+                                connected.reject_incoming(&open, wire::OpenFailure::RouteGone)?
+                            }
+                        }
+                    }
+                } else if owner.is_some() {
+                    connected.reject_incoming(&open, wire::OpenFailure::Busy)?;
+                } else if let Some(remote) = config.remote.first() {
+                    if open.profile == wire::CircuitProfile::SessionV1 as i32 {
+                        if let Err(error) = open_incoming_llc_session(
+                            bridge,
+                            connected,
+                            open.clone(),
+                            &hosted_lu,
+                            &hosted_cp,
+                            config,
+                            listeners,
+                            llc_ws_sessions,
+                            next_llc_ws_id,
+                        ) {
+                            tracing::warn!(error = %error,
                                         "automatic SessionV1 to LLC session rejected");
-                                    connected
-                                        .reject_incoming(&open, wire::OpenFailure::RouteGone)?;
-                                }
-                            } else if let Err(error) = open_incoming_llc(
-                                &bridge,
-                                connected,
-                                open.clone(),
-                                remote,
-                                config,
-                                &mut listeners,
-                                &mut fabric,
-                                &mut sessions,
-                                &mut next_id,
-                            ) {
-                                tracing::warn!(error = %error,
-                                    "automatic concentrator to LLC session rejected");
-                                connected.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
-                            }
-                        } else {
                             connected.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
                         }
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "automatic incoming SNA session has no TCP62 destination");
-                        connected.reject_incoming(&open, wire::OpenFailure::Unsupported)?;
-                    }
-                },
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(error = %error, "automatic concentrator directory disconnected");
-                    changed_proofs.extend(retire_upstream_pairs(
-                        &mut fabric,
-                        &mut sessions,
-                        &mut listeners,
-                        &mut proofs,
+                    } else if let Err(error) = open_incoming_llc(
+                        bridge,
+                        connected,
+                        open.clone(),
+                        remote,
                         config,
-                    )?);
-                    hub = None;
-                    next_connect = Instant::now() + connect_delay;
-                    if let Some(remote) = remote {
-                        fabric.directory_mut().withdraw(&PortId::new(&remote.id))?;
+                        listeners,
+                        fabric,
+                        sessions,
+                        next_id,
+                    ) {
+                        tracing::warn!(error = %error,
+                                    "automatic concentrator to LLC session rejected");
+                        connected.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
                     }
-                    for mac in remote_macs.drain() {
-                        for listener in &mut listeners {
-                            listener.withdraw_proxy_mac(mac);
-                        }
-                    }
+                } else {
+                    return Ok(OpenDisposition::Unhandled(open));
                 }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "automatic incoming SNA session has no TCP62 destination");
+                connected.reject_incoming(&open, wire::OpenFailure::Unsupported)?;
             }
         }
-        if let (Some(connected), Some(remote)) = (hub.as_ref(), remote) {
-            let addresses = connected.advertised_addresses();
-            let next_macs = addresses
-                .iter()
-                .filter_map(|address| match address {
-                    RouteAddress::Mac(mac) => Some(*mac),
-                    _ => None,
-                })
-                .collect::<HashSet<_>>();
-            for mac in remote_macs.difference(&next_macs) {
-                for listener in &mut listeners {
-                    listener.withdraw_proxy_mac(*mac);
-                }
+        Ok(OpenDisposition::Handled)
+    }
+
+    pub(crate) fn on_hub_lost(&mut self) -> io::Result<()> {
+        for (_, mut bridge) in self.mptn_ws_sessions.drain() {
+            let gateway_id = bridge.gateway_id().to_owned();
+            let _ = bridge.close();
+            if let Some(gateway) = self
+                .gateways
+                .iter_mut()
+                .find(|gateway| gateway.id() == gateway_id)
+            {
+                gateway.release_udp();
             }
-            for mac in next_macs.difference(&remote_macs) {
-                for listener in &mut listeners {
-                    listener.allow_native_proxy_mac(*mac)?;
-                }
+        }
+        for (_, mut target) in self.mptn_target_sessions.drain() {
+            let gateway_id = target.gateway_id().to_owned();
+            let _ = target.close();
+            if let Some(gateway) = self
+                .gateways
+                .iter_mut()
+                .find(|gateway| gateway.id() == gateway_id)
+            {
+                gateway.release_udp();
             }
-            remote_macs = next_macs;
-            fabric
+        }
+        let mut changed = HashSet::new();
+        for (id, mut circuit) in self.llc_ws_sessions.drain() {
+            let attachment = PortId::new(circuit.bridge.attachment_id());
+            if self
+                .proofs
+                .withdraw(&attachment, &association("session_v1", id))
+            {
+                changed.insert(attachment);
+            }
+            let _ = circuit.bridge.close();
+            self.listeners[circuit.listener].release(circuit.proxy_mac);
+        }
+        changed.extend(retire_upstream_pairs(
+            &mut self.fabric,
+            &mut self.sessions,
+            &mut self.listeners,
+            &mut self.proofs,
+            self.config,
+        )?);
+        if reconcile_proofs(&self.proofs, &mut self.bridge, changed.into_iter())? {
+            refresh_local_addresses(&mut self.fabric, &self.bridge, self.config, &self.proxies)?;
+        }
+        if let Some(remote) = self.config.remote.first() {
+            self.fabric
                 .directory_mut()
-                .replace_upstream(PortId::new(&remote.id), addresses)?;
+                .withdraw(&PortId::new(&remote.id))?;
         }
+        for mac in self.remote_macs.drain() {
+            for listener in &mut self.listeners {
+                listener.withdraw_proxy_mac(mac);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poll_local(&mut self, mut hub: Option<&mut AutoWsHub>) -> io::Result<LocalPoll> {
+        let Self {
+            config,
+            proxies,
+            fabric,
+            bridge,
+            proofs,
+            listeners,
+            gateways,
+            mptn_exports,
+            mptn_owner,
+            learned_mptn_lus,
+            local_dispatch,
+            sessions,
+            mptn_ws_sessions,
+            mptn_target_sessions,
+            llc_ws_sessions,
+            ..
+        } = self;
+        let mut next_id = self.next_id;
+        let mut next_mptn_ws_id = self.next_mptn_ws_id;
+        let mut changed_proofs = HashSet::<PortId>::new();
+        let mut exports_changed = false;
         for id in mptn_ws_sessions.keys().copied().collect::<Vec<_>>() {
             let result = mptn_ws_sessions.get_mut(&id).unwrap().pump();
             let retired = match result {
@@ -426,27 +632,13 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         }
         let mut active = match fabric.poll_once() {
             Ok(active) => active,
-            Err(error) if remote.is_some() => {
-                tracing::warn!(error = %error,
-                    "automatic upstream circuit failed; retaining local routes");
-                changed_proofs.extend(retire_upstream_pairs(
-                    &mut fabric,
-                    &mut sessions,
-                    &mut listeners,
-                    &mut proofs,
-                    config,
-                )?);
-                hub = None;
-                next_connect = Instant::now() + connect_delay;
-                if let Some(remote) = remote {
-                    fabric.directory_mut().withdraw(&PortId::new(&remote.id))?;
-                }
-                for mac in remote_macs.drain() {
-                    for listener in &mut listeners {
-                        listener.withdraw_proxy_mac(mac);
-                    }
-                }
-                true
+            Err(error) if hub.is_some() => {
+                tracing::warn!(error = %error, "automatic upstream circuit failed; retaining local routes");
+                return Ok(LocalPoll {
+                    active: true,
+                    exports_changed,
+                    hub_lost: true,
+                });
             }
             Err(error) => return Err(error),
         };
@@ -462,7 +654,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             let Some(index) = attachment else { continue };
             let id = PortId::new(&config.llc[index].id);
             let owner = association("fabric", observation.session_id);
-            observe_proof(&mut proofs, &id, owner, observation.identity)?;
+            observe_proof(proofs, &id, owner, observation.identity)?;
             changed_proofs.insert(id);
         }
         for closed in closed_sessions {
@@ -511,11 +703,9 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             }
             active = true;
         }
-        if reconcile_proofs(&proofs, &mut bridge, changed_proofs.drain())? {
-            refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
-            if let Some(connected) = hub.as_mut() {
-                publish_local(fabric.directory(), connected)?;
-            }
+        if reconcile_proofs(proofs, bridge, changed_proofs.drain())? {
+            refresh_local_addresses(fabric, bridge, config, proxies)?;
+            exports_changed = true;
         }
         for ingress in 0..listeners.len() {
             let Some(offer) = listeners[ingress].poll_offer()? else {
@@ -628,7 +818,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     error = %error, "automatic LLC session rejected");
             }
         }
-        for gateway in &mut gateways {
+        for gateway in gateways.iter_mut() {
             let offered = gateway.poll_once()?;
             for (source, destination) in gateway.take_management_lus() {
                 let source = config::parse_cp(&source)?;
@@ -653,16 +843,17 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         .map(|lu| (lu.netid, lu.name))
                         .collect(),
                 );
-                refresh_mptn_registry(&mut fabric, config, &proxies, &learned_mptn_lus)?;
-                if let Some(connected) = hub.as_mut() {
+                refresh_mptn_registry(fabric, config, proxies, learned_mptn_lus)?;
+                exports_changed = true;
+                if let Some(connected) = hub.as_deref_mut() {
                     if refresh_mptn_exports(
                         config,
-                        &learned_mptn_lus,
+                        learned_mptn_lus,
                         connected,
-                        &mut mptn_exports,
-                        &mut mptn_owner,
+                        mptn_exports,
+                        mptn_owner,
                     )? {
-                        publish_local(fabric.directory(), connected)?;
+                        exports_changed = true;
                     }
                 }
             }
@@ -670,7 +861,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             for (association_id, attachment, identity) in gateway.take_identity_observations() {
                 let id = PortId::new(attachment);
                 observe_proof(
-                    &mut proofs,
+                    proofs,
                     &id,
                     association(&gateway_origin, association_id),
                     identity,
@@ -687,11 +878,9 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     changed_proofs.insert(id);
                 }
             }
-            if reconcile_proofs(&proofs, &mut bridge, changed_proofs.drain())? {
-                refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
-                if let Some(connected) = hub.as_mut() {
-                    publish_local(fabric.directory(), connected)?;
-                }
+            if reconcile_proofs(proofs, bridge, changed_proofs.drain())? {
+                refresh_local_addresses(fabric, bridge, config, proxies)?;
+                exports_changed = true;
             }
             let Some((association, offer)) = offered else {
                 continue;
@@ -764,7 +953,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
-                let connected = hub.as_mut().ok_or_else(|| {
+                let connected = hub.as_deref_mut().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "concentrator is unavailable")
                 })?;
                 if source.netid != connected.allowed_netid() {
@@ -835,49 +1024,70 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 }
             }
         }
-        if let Some(connected) = hub.as_mut() {
+        if let Some(connected) = hub {
             if refresh_mptn_exports(
                 config,
-                &learned_mptn_lus,
+                learned_mptn_lus,
                 connected,
-                &mut mptn_exports,
-                &mut mptn_owner,
+                mptn_exports,
+                mptn_owner,
             )? {
-                publish_local(fabric.directory(), connected)?;
+                exports_changed = true;
             }
         }
-        if !active {
-            thread::sleep(IDLE_POLL);
+        if reconcile_proofs(proofs, bridge, changed_proofs.drain())? {
+            refresh_local_addresses(fabric, bridge, config, proxies)?;
+            exports_changed = true;
         }
+        self.next_id = next_id;
+        self.next_mptn_ws_id = next_mptn_ws_id;
+        Ok(LocalPoll {
+            active,
+            exports_changed,
+            hub_lost: false,
+        })
     }
-    for (_, mut bridge) in mptn_ws_sessions.drain() {
-        let gateway_id = bridge.gateway_id().to_owned();
-        let _ = bridge.close();
-        if let Some(gateway) = gateways
-            .iter_mut()
-            .find(|gateway| gateway.id() == gateway_id)
-        {
-            gateway.release_udp();
+
+    pub(crate) fn shutdown(&mut self) -> io::Result<()> {
+        let Self {
+            fabric,
+            gateways,
+            listeners,
+            sessions,
+            mptn_ws_sessions,
+            mptn_target_sessions,
+            llc_ws_sessions,
+            ..
+        } = self;
+        for (_, mut bridge) in mptn_ws_sessions.drain() {
+            let gateway_id = bridge.gateway_id().to_owned();
+            let _ = bridge.close();
+            if let Some(gateway) = gateways
+                .iter_mut()
+                .find(|gateway| gateway.id() == gateway_id)
+            {
+                gateway.release_udp();
+            }
         }
-    }
-    for (_, mut target) in mptn_target_sessions.drain() {
-        let gateway_id = target.gateway_id().to_owned();
-        let _ = target.close();
-        if let Some(gateway) = gateways
-            .iter_mut()
-            .find(|gateway| gateway.id() == gateway_id)
-        {
-            gateway.release_udp();
+        for (_, mut target) in mptn_target_sessions.drain() {
+            let gateway_id = target.gateway_id().to_owned();
+            let _ = target.close();
+            if let Some(gateway) = gateways
+                .iter_mut()
+                .find(|gateway| gateway.id() == gateway_id)
+            {
+                gateway.release_udp();
+            }
         }
+        for (_, mut circuit) in llc_ws_sessions.drain() {
+            let _ = circuit.bridge.close();
+            listeners[circuit.listener].release(circuit.proxy_mac);
+        }
+        for session_id in sessions.keys().copied().collect::<Vec<_>>() {
+            fabric.close_pair(session_id)?;
+        }
+        Ok(())
     }
-    for (_, mut circuit) in llc_ws_sessions.drain() {
-        let _ = circuit.bridge.close();
-        listeners[circuit.listener].release(circuit.proxy_mac);
-    }
-    for session_id in sessions.keys().copied().collect::<Vec<_>>() {
-        fabric.close_pair(session_id)?;
-    }
-    Ok(())
 }
 
 fn refresh_mptn_registry(
@@ -988,14 +1198,6 @@ fn refresh_mptn_exports(
     *exports = next_exports;
     *owner = next_owner;
     Ok(changed)
-}
-
-fn publish_local(
-    directory: &crate::routing::AutomaticDirectory,
-    hub: &mut AutoWsHub,
-) -> io::Result<()> {
-    let (cps, lus) = publication_records(directory, hub.allowed_netid());
-    hub.publish_local(&cps, &lus)
 }
 
 fn publication_records(
@@ -1501,6 +1703,68 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn hub_loss_withdraws_upstream_but_keeps_local_discovery() {
+        let config: RouterConfig = toml::from_str(
+            "[[concentrator]]\nid = 'upstream'\nurl = 'ws://127.0.0.1:8081/router'\n",
+        )
+        .unwrap();
+        let mut runner = AutoLocalSessionRunner::new(&config).unwrap();
+        let local_cp = QualifiedName::new("LOCAL", "CPA").unwrap();
+        let local_lu = QualifiedName::new("LOCAL", "LUA").unwrap();
+        runner
+            .fabric
+            .directory_mut()
+            .replace_local_records(
+                PortId::new("llc-a"),
+                vec![
+                    RouteRecord::from(RouteKey::ControlPoint(local_cp.clone())),
+                    RouteRecord {
+                        key: RouteKey::LogicalUnit {
+                            lu: local_lu.clone(),
+                            hosting_cp: local_cp.clone(),
+                        },
+                        supported_types: vec![LuType::Lu7],
+                    },
+                ],
+            )
+            .unwrap();
+        runner
+            .fabric
+            .directory_mut()
+            .replace_upstream(
+                PortId::new("upstream"),
+                [RouteAddress::ControlPoint {
+                    netid: "REMOTE".into(),
+                    name: "CPB".into(),
+                }],
+            )
+            .unwrap();
+
+        runner.on_hub_lost().unwrap();
+        runner.poll_local(None).unwrap();
+        let (cps, lus) = runner.exports("LOCAL");
+        assert_eq!(cps, vec![wire_name(&local_cp)]);
+        assert_eq!(lus.len(), 1);
+        assert_eq!(lus[0].lu, Some(wire_name(&local_lu)));
+        assert_eq!(lus[0].supported_types, vec![wire::LuType::LuType7 as i32]);
+        assert!(runner.exports("REMOTE").0.is_empty());
+        assert_eq!(
+            runner
+                .fabric
+                .resolve(
+                    &PortId::new("llc-a"),
+                    &RouteAddress::ControlPoint {
+                        netid: "REMOTE".into(),
+                        name: "CPB".into(),
+                    },
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn llc_route_survives_one_association_closing_and_withdraws_on_last() {
