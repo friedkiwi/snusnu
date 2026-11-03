@@ -22,6 +22,7 @@ type wsCircuit struct {
 	targetRef      *wire.RouteReference
 	sourceRef      *wire.RouteReference
 	sourcePeer     LocalPeer
+	targetPeer     LocalPeer
 	profile        wire.CircuitProfile
 	pending        bool
 	allowance      [2]uint64 // data bytes each side may send
@@ -226,6 +227,11 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 					candidate.sourcePeer = LocalPeer{RouterID: source.router.ID, OwnerID: source.router.OwnerID, NetID: sourceLU.Lu.Netid, CP: sourceLU.HostingCp.Name, LU: sourceLU.Lu.Name}
 				}
 			}
+			if targetRoute := h.routeForRef(target, ref); targetRoute != nil {
+				if targetLU := targetRoute.GetLogicalUnit(); targetLU != nil {
+					candidate.targetPeer = LocalPeer{RouterID: target.router.ID, OwnerID: target.router.OwnerID, NetID: targetLU.Lu.Netid, CP: targetLU.HostingCp.Name, LU: targetLU.Lu.Name}
+				}
+			}
 			if h.routeValid(candidate) {
 				if !reserveCircuit(source, target) {
 					reason = wire.OpenFailure_OPEN_FAILURE_BUSY
@@ -275,6 +281,9 @@ func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision)
 	}
 	h.circuits.CompareAndDelete(id, c)
 	accepted := decision.Accept && decision.ReceiveAllowanceBytes > 0 && decision.ReceiveAllowanceBytes <= 1<<20 && h.routeValid(c) && h.allowed(c.source, target)
+	if accepted && c.source.local {
+		accepted = h.localServices != nil && h.localServices.bindCircuit(c.requestID, id)
+	}
 	if decision.Accept && !accepted {
 		c.discardQueued.Store(true)
 		h.send(c.source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: c.requestID, Accepted: false, Reason: wire.OpenFailure_OPEN_FAILURE_PROTOCOL}}}, "", 0)

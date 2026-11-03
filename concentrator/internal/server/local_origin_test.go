@@ -40,6 +40,7 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	events := make(chan *wire.CircuitEvent, 1)
 	printerIncoming := make(chan LocalPeer, 1)
 	printerEvents := make(chan *wire.CircuitEvent, 1)
+	printerOpened := make(chan LocalPeer, 1)
 	ping := localService{LU: "PING", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2}, AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) }, Handle: func(envelope *wire.WsEnvelope, peer LocalPeer) {
 		if open := envelope.GetIncomingOpen(); open != nil {
 			if peer.OwnerID != owner || peer.NetID != "PEERNET" || peer.CP != "CP" || peer.LU != "LU" {
@@ -55,7 +56,7 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 			events <- event
 		}
 	}}
-	printer := localService{LU: "PRINTER", Types: []wire.LuType{wire.LuType_LU_TYPE_1}, AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool {
+	printer := localService{LU: "PRINTER", Types: []wire.LuType{wire.LuType_LU_TYPE_1, wire.LuType_LU_TYPE_6_2}, AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool {
 		if route == nil || route.GetLogicalUnit() == nil {
 			return false
 		}
@@ -66,6 +67,9 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 		}
 		return false
 	}, Handle: func(envelope *wire.WsEnvelope, peer LocalPeer) {
+		if result := envelope.GetOpenResult(); result != nil && result.Accepted {
+			printerOpened <- peer
+		}
 		if open := envelope.GetIncomingOpen(); open != nil {
 			printerIncoming <- peer
 			_ = a.hub.decision(a.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500})
@@ -87,7 +91,7 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	if api.Code != 200 || json.Unmarshal(api.Body.Bytes(), &directory) != nil || len(directory) != 3 ||
 		directory[0].Kind != "CP" || directory[0].NetID != "SNUSNU" || directory[0].Name != "SVC" ||
 		directory[1].Kind != "LU" || directory[1].NetID != "SNUSNU" || directory[1].Name != "PING" ||
-		directory[1].HostingCPName != "SVC" || directory[2].Name != "PRINTER" || len(directory[2].LUTypes) != 1 || directory[2].LUTypes[0] != "LU 1" {
+		directory[1].HostingCPName != "SVC" || directory[2].Name != "PRINTER" || len(directory[2].LUTypes) != 2 || directory[2].LUTypes[0] != "LU 1" || directory[2].LUTypes[1] != "LU 6.2" {
 		t.Fatalf("local directory API: %d %+v", api.Code, directory)
 	}
 	if _, err := a.DB.Exec(ctx, "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, "local-peer@example.com", "unused", store.Now(), "PEERNET"); err != nil {
@@ -171,5 +175,54 @@ func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("printer service missed circuit event")
+	}
+	requestID, err := a.hub.localServices.openFrom(3, nonAppc, wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := expectTestBody(t, conn, "open").GetIncomingOpen()
+	if !proto.Equal(outbound.SourceRoute, printerTarget) || !proto.Equal(outbound.Target, nonAppc) || outbound.SourceRouterId == nil {
+		t.Fatalf("local outbound open: %+v", outbound)
+	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenDecision{OpenDecision: &wire.OpenDecision{CircuitId: outbound.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500}})
+	if ready := expectTestBody(t, conn, "ready").GetOpenReady(); string(ready.CircuitId) != string(outbound.CircuitId) {
+		t.Fatalf("local outbound ready: %+v", ready)
+	}
+	select {
+	case peer := <-printerOpened:
+		if peer.OwnerID != owner || peer.NetID != "PEERNET" || peer.CP != "CP" || peer.LU != "LUONE" {
+			t.Fatalf("local outbound target identity: %+v", peer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local service missed outbound result")
+	}
+	if requestID == 0 {
+		t.Fatal("local outbound request ID was zero")
+	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_CircuitEvent{CircuitEvent: &wire.CircuitEvent{CircuitId: outbound.CircuitId, Event: &wire.CircuitEvent_LinkReady{LinkReady: &wire.LinkReady{}}}})
+	select {
+	case event := <-printerEvents:
+		if event.GetLinkReady() == nil {
+			t.Fatalf("local outbound event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local service missed outbound event")
+	}
+	if _, err := a.hub.localServices.openFrom(3, source, wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1); err != nil {
+		t.Fatal(err)
+	}
+	sessionOpen := expectTestBody(t, conn, "open").GetIncomingOpen()
+	if sessionOpen.Profile != wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1 || !proto.Equal(sessionOpen.SourceRoute, printerTarget) || !proto.Equal(sessionOpen.Target, source) {
+		t.Fatalf("local outbound session open: %+v", sessionOpen)
+	}
+	sendTestEnvelope(t, conn, &wire.WsEnvelope_OpenDecision{OpenDecision: &wire.OpenDecision{CircuitId: sessionOpen.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500}})
+	expectTestBody(t, conn, "ready")
+	select {
+	case peer := <-printerOpened:
+		if peer.OwnerID != owner || peer.LU != "LU" {
+			t.Fatalf("session target identity: %+v", peer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local service missed outbound session result")
 	}
 }

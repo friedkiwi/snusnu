@@ -381,7 +381,10 @@ func (h *routerHub) send(c *routerSession, e *wire.WsEnvelope, circuit string, c
 	}
 	if c.local {
 		var idBytes []byte
+		var result *wire.OpenResult
 		switch body := e.Body.(type) {
+		case *wire.WsEnvelope_OpenResult:
+			result = body.OpenResult
 		case *wire.WsEnvelope_IncomingOpen:
 			idBytes = body.IncomingOpen.CircuitId
 		case *wire.WsEnvelope_OpenReady:
@@ -397,15 +400,33 @@ func (h *routerHub) send(c *routerSession, e *wire.WsEnvelope, circuit string, c
 		default:
 			return false
 		}
-		id, ok := uuidString(idBytes)
-		if !ok {
-			return false
+		peer := LocalPeer{}
+		if result != nil {
+			if h.localServices == nil {
+				return false
+			}
+			if _, ok := h.localServices.pendingRoute(result.RequestId); !ok {
+				return false
+			}
+			if result.Accepted {
+				idBytes = result.CircuitId
+			}
 		}
-		value, ok := h.circuits.Load(id)
-		if !ok {
-			return false
+		if len(idBytes) != 0 {
+			id, ok := uuidString(idBytes)
+			if !ok {
+				return false
+			}
+			value, ok := h.circuits.Load(id)
+			if !ok {
+				return false
+			}
+			circuit := value.(*wsCircuit)
+			peer = circuit.sourcePeer
+			if circuit.source == c {
+				peer = circuit.targetPeer
+			}
 		}
-		peer := value.(*wsCircuit).sourcePeer
 		select {
 		case c.localInbox <- localDelivery{Envelope: proto.Clone(e).(*wire.WsEnvelope), Peer: peer}:
 			return true

@@ -84,9 +84,10 @@ session, including `QRMTWSC` application records.
    print, completion, and teardown records rather than treating APING as a
    printer protocol.
 2. Generalize the router's service-directed BIND admission and both transport
-   adapters for the printer's session profile, including printer-initiated
-   sessions if the controller requires them. Verify the guest no longer stays
-   `VARY ON PENDING`.
+   adapters for the printer's session profile. The concentrator local service
+   registry can now open an outbound circuit from its own LU, but the router's
+   HPR attachment still rejects unsolicited opens. Verify the guest no longer
+   stays `VARY ON PENDING`.
 3. Add a reusable Go printer conversation in `sna`, then an embedded
    concentrator adapter that stamps the authenticated owner and source CP/LU,
    persists the raw stream, and acknowledges only durably accepted data.
