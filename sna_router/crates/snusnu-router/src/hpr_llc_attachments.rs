@@ -44,6 +44,26 @@ pub(crate) struct HprLlcAttachments {
     seed: Vec<u8>,
 }
 
+/// Owned endpoint parameters for one exclusive, remotely sourced LLC user
+/// session. The caller opens a fresh XID with the authenticated source CP.
+pub(crate) struct ReservedLlcPeer {
+    pub(crate) attachment_id: String,
+    pub(crate) interface: String,
+    pub(crate) guest_mac: [u8; 6],
+    pub(crate) proxy_mac: [u8; 6],
+    pub(crate) target_cp: QualifiedName,
+}
+
+impl ReservedLlcPeer {
+    pub(crate) fn peer(&self) -> LlcPeer<'_> {
+        LlcPeer {
+            interface: &self.interface,
+            guest_mac: self.guest_mac,
+            proxy_mac: self.proxy_mac,
+        }
+    }
+}
+
 impl HprLlcAttachments {
     pub(crate) fn new(
         config: &RouterConfig,
@@ -216,6 +236,69 @@ impl HprLlcAttachments {
         attachment.active_user = true;
         attachment.active_cp = Some(verified_cp);
         Ok(Some(session))
+    }
+
+    /// Exclusively reserve a previously XID-verified attachment for a
+    /// concentrator SessionV1 open. The old probe's source CP may belong to
+    /// a different NETID, so it is closed before a new source-specific probe
+    /// opens. Reachability is withdrawn until that new proof succeeds.
+    pub(crate) fn reserve_external(
+        &mut self,
+        attachment_id: &str,
+        target_lu: &QualifiedName,
+    ) -> io::Result<Option<ReservedLlcPeer>> {
+        let Some(attachment) = self.attachments.iter_mut().find(|a| a.id == attachment_id) else {
+            return Err(invalid("unknown LLC attachment"));
+        };
+        if attachment.active_user {
+            return Ok(None);
+        }
+        let Some(verified_cp) = attachment
+            .probe
+            .as_ref()
+            .and_then(HprToLlcProbe::verified_target_cp)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if !self.candidates.iter().any(|candidate| {
+            candidate.attachment_id == attachment_id
+                && candidate.lu == *target_lu
+                && candidate.verify_cp(&verified_cp).is_some()
+        }) {
+            return Err(invalid("LLC target LU has no verified attachment binding"));
+        }
+        let mut probe = attachment.probe.take().unwrap();
+        probe.close()?;
+        attachment.active_user = true;
+        attachment.active_cp = None;
+        attachment.ready_logged = false;
+        Ok(Some(ReservedLlcPeer {
+            attachment_id: attachment.id.clone(),
+            interface: attachment.interface.clone(),
+            guest_mac: attachment.guest_mac,
+            proxy_mac: attachment.proxy_mac,
+            target_cp: verified_cp,
+        }))
+    }
+
+    /// Reinstate local reachability only after the new source-specific
+    /// association has independently completed XID and management.
+    pub(crate) fn mark_external_verified(
+        &mut self,
+        attachment_id: &str,
+        target_cp: &QualifiedName,
+    ) -> io::Result<()> {
+        let attachment = self
+            .attachments
+            .iter_mut()
+            .find(|a| a.id == attachment_id)
+            .ok_or_else(|| invalid("unknown LLC attachment"))?;
+        if !attachment.active_user || attachment.expected_cp.as_ref() != Some(target_cp) {
+            return Err(invalid("LLC external proof disagrees with attachment"));
+        }
+        attachment.active_cp = Some(target_cp.clone());
+        Ok(())
     }
 
     /// Call after the selected user session closes or resets. The next pump

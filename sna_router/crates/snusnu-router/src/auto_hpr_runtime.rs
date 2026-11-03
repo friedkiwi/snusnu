@@ -31,6 +31,7 @@ use crate::{
     hpr_local_session::HprLocalSession,
     hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
+    llc_session_ws::LlcSessionWs,
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
     STOP,
 };
@@ -196,6 +197,7 @@ struct DirectHprRuntime<'a> {
     reverse: Option<ReverseRuntime>,
     local_ingress: Option<LocalToHprRuntime>,
     reverse_local_reservation: Option<(String, [u8; 6])>,
+    local_ws: Vec<LlcSessionWs>,
 }
 
 impl<'a> DirectHprRuntime<'a> {
@@ -233,6 +235,7 @@ impl<'a> DirectHprRuntime<'a> {
             reverse: None,
             local_ingress: None,
             reverse_local_reservation: None,
+            local_ws: Vec::new(),
         }
     }
 
@@ -407,6 +410,7 @@ impl<'a> DirectHprRuntime<'a> {
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
         self.pump_local_llc()?;
         self.pump_local_mptn()?;
+        self.pump_local_ws();
         let live_scopes = self.rtp.active_user_scopes();
         let directory = &self.local_directory;
         self.external_management
@@ -463,6 +467,97 @@ impl<'a> DirectHprRuntime<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn pump_local_ws(&mut self) {
+        let mut index = 0;
+        while index < self.local_ws.len() {
+            let attachment_id = self.local_ws[index].attachment_id().to_owned();
+            let result = self.local_ws[index].pump();
+            if let Some(cp) = self.local_ws[index].verified_target_cp() {
+                if let Some(llc) = self.llc.as_mut() {
+                    if let Err(error) = llc.mark_external_verified(&attachment_id, cp) {
+                        tracing::warn!(attachment = %attachment_id, error = %error,
+                            "SessionV1 local LLC proof rejected");
+                        let _ = self.local_ws[index].close();
+                        llc.release(&attachment_id);
+                        self.local_ws.remove(index);
+                        continue;
+                    }
+                }
+            }
+            match result {
+                Ok(true) => index += 1,
+                Ok(false) => {
+                    if let Some(llc) = self.llc.as_mut() {
+                        llc.release(&attachment_id);
+                    }
+                    self.local_ws.remove(index);
+                }
+                Err(error) => {
+                    tracing::warn!(attachment = %attachment_id, error = %error,
+                        "SessionV1 local LLC circuit closed after carrier error");
+                    let _ = self.local_ws[index].close();
+                    if let Some(llc) = self.llc.as_mut() {
+                        llc.release(&attachment_id);
+                    }
+                    self.local_ws.remove(index);
+                }
+            }
+        }
+    }
+
+    fn accept_local_llc(
+        &mut self,
+        hub: &mut AutoWsHub,
+        open: wire::IncomingOpen,
+        target_lu: router_core::session::QualifiedName,
+        target_cp: router_core::session::QualifiedName,
+        attachment_id: String,
+    ) -> io::Result<()> {
+        let Some((identity, mut ws)) =
+            crate::llc_session_ws::admit(hub, open, &target_lu, &target_cp)?
+        else {
+            return Ok(());
+        };
+        let Some(llc) = self.llc.as_mut() else {
+            ws.close()?;
+            return Ok(());
+        };
+        let reservation = match llc.reserve_external(&attachment_id, &target_lu) {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => {
+                ws.close()?;
+                tracing::warn!(attachment = %attachment_id, target_lu = %target_lu,
+                    "SessionV1 local LLC target is busy or proof was withdrawn");
+                return Ok(());
+            }
+            Err(error) => {
+                ws.close()?;
+                tracing::warn!(attachment = %attachment_id, target_lu = %target_lu, error = %error,
+                    "SessionV1 local LLC reservation rejected");
+                return Ok(());
+            }
+        };
+        let bridge = match LlcSessionWs::new(
+            identity.clone(),
+            ws,
+            reservation.attachment_id.clone(),
+            reservation.peer(),
+            &self.bootstrap.local.node_id,
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                llc.release(&attachment_id);
+                return Err(error);
+            }
+        };
+        tracing::info!(attachment = %attachment_id,
+            source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+            source_cp = ?identity.source_cp, target_cp = %target_cp,
+            "concentrator SessionV1 admitted to local LLC peer");
+        self.local_ws.push(bridge);
         Ok(())
     }
 
@@ -1642,6 +1737,34 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
     Ok(())
 }
 
+fn local_llc_target(
+    runtime: &DirectHprRuntime<'_>,
+    hub: &AutoWsHub,
+    open: &wire::IncomingOpen,
+) -> Option<(
+    router_core::session::QualifiedName,
+    router_core::session::QualifiedName,
+    String,
+)> {
+    let route = open
+        .target
+        .as_ref()
+        .and_then(|reference| hub.local_route(reference))?;
+    let wire::route_export::Resource::LogicalUnit(lu) = route.resource.as_ref()? else {
+        return None;
+    };
+    let name = lu.lu.as_ref()?;
+    let target_lu = router_core::session::QualifiedName::new(&name.netid, &name.name).ok()?;
+    let Destination::Llc {
+        hosting_cp,
+        attachment_id,
+    } = runtime.local_directory.resolve_lu(&target_lu)?
+    else {
+        return None;
+    };
+    Some((target_lu, hosting_cp, attachment_id))
+}
+
 fn run_connected(
     config: &RouterConfig,
     attachment: &crate::config::EeConfig,
@@ -1699,62 +1822,78 @@ fn run_connected(
             tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
         }
         if let Some(open) = hub.poll_incoming()? {
-            let ready = active.as_ref().is_some_and(|runtime| {
-                runtime.reverse.is_none()
-                    && runtime
-                        .reciprocal_cp
-                        .as_ref()
-                        .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
-            });
-            if !ready {
-                hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
-            } else if let Some(runtime) = active.as_mut() {
-                let peer_cp = runtime.bootstrap.peer.cp.clone();
-                if let Some((route_identity, mut ws)) =
-                    crate::auto_hpr_inbound::admit(hub, open, &peer_cp)?
-                {
-                    let handle = runtime.next_handle;
-                    runtime.next_handle = runtime
-                        .next_handle
-                        .checked_add(1)
-                        .ok_or_else(|| protocol("HPR session handles exhausted"))?;
-                    let tg = link
-                        .tg_number()
-                        .ok_or_else(|| protocol("active EE link has no TG"))?;
-                    let (label, instance) = target_nce(
-                        &runtime.bootstrap.local.tower.route_setup_nce_label,
-                        runtime.bootstrap.local.tower.route_setup_nce_instance,
-                        127,
-                    )?;
-                    let advertised = Reachability {
-                        lu: Some(route_identity.target_lu.clone()),
-                        cp: route_identity.target_cp.clone(),
-                    };
-                    if let Err(error) = runtime.switch.replace_routes(HPR_ADAPTER, vec![advertised])
+            let local_llc = active
+                .as_ref()
+                .and_then(|runtime| local_llc_target(runtime, hub, &open));
+            if let Some((target_lu, target_cp, attachment_id)) = local_llc {
+                active.as_mut().unwrap().accept_local_llc(
+                    hub,
+                    open,
+                    target_lu,
+                    target_cp,
+                    attachment_id,
+                )?;
+            } else {
+                let ready = active.as_ref().is_some_and(|runtime| {
+                    runtime.reverse.is_none()
+                        && runtime
+                            .reciprocal_cp
+                            .as_ref()
+                            .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+                });
+                if !ready {
+                    hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
+                } else if let Some(runtime) = active.as_mut() {
+                    let peer_cp = runtime.bootstrap.peer.cp.clone();
+                    if let Some((route_identity, mut ws)) =
+                        crate::auto_hpr_inbound::admit(hub, open, &peer_cp)?
                     {
-                        ws.close()?;
-                        return Err(protocol(format!("HPR reverse route admission: {error:?}")));
-                    }
-                    tracing::info!(attachment = %attachment.id,
+                        let handle = runtime.next_handle;
+                        runtime.next_handle = runtime
+                            .next_handle
+                            .checked_add(1)
+                            .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+                        let tg = link
+                            .tg_number()
+                            .ok_or_else(|| protocol("active EE link has no TG"))?;
+                        let (label, instance) = target_nce(
+                            &runtime.bootstrap.local.tower.route_setup_nce_label,
+                            runtime.bootstrap.local.tower.route_setup_nce_instance,
+                            127,
+                        )?;
+                        let advertised = Reachability {
+                            lu: Some(route_identity.target_lu.clone()),
+                            cp: route_identity.target_cp.clone(),
+                        };
+                        if let Err(error) =
+                            runtime.switch.replace_routes(HPR_ADAPTER, vec![advertised])
+                        {
+                            ws.close()?;
+                            return Err(protocol(format!(
+                                "HPR reverse route admission: {error:?}"
+                            )));
+                        }
+                        tracing::info!(attachment = %attachment.id,
                         source_lu = %route_identity.source_lu,
                         target_lu = %route_identity.target_lu,
                         peer_cp = %peer_cp, handle,
                         "concentrator LU session admitted to EE peer");
-                    runtime.reverse = Some(ReverseRuntime::new(
-                        route_identity,
-                        ws,
-                        runtime.bootstrap.clone(),
-                        handle,
-                        tg,
-                        reciprocal_nonce().to_be_bytes(),
-                        label,
-                        instance,
-                        router_core::hpr_route_setup_initiator::DirectLinkMetrics {
-                            transmission_time_us: 1000,
-                            capacity_kbps: 100_000,
-                            liveness_seconds: 10,
-                        },
-                    ));
+                        runtime.reverse = Some(ReverseRuntime::new(
+                            route_identity,
+                            ws,
+                            runtime.bootstrap.clone(),
+                            handle,
+                            tg,
+                            reciprocal_nonce().to_be_bytes(),
+                            label,
+                            instance,
+                            router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+                                transmission_time_us: 1000,
+                                capacity_kbps: 100_000,
+                                liveness_seconds: 10,
+                            },
+                        ));
+                    }
                 }
             }
         }
