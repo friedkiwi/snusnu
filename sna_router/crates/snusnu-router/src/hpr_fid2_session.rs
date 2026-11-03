@@ -50,6 +50,13 @@ fn unit(bytes: &[u8]) -> io::Result<SessionUnit> {
     SessionUnit::from_reduced(bytes).map_err(io::Error::other)
 }
 
+// A V4R4 user session sends BIS while ending an LU 6.2 session. It is a
+// normal-flow DFC request, so it uses the same local pacing as user data.
+// The PI bit is hop-local; only this captured DFC form crosses the SNA bus.
+fn is_user_bis(rh: &[u8], ru: &[u8]) -> bool {
+    matches!(rh, [0x4b, 0x90 | 0x91 | 0xb0 | 0xb1, 0]) && ru == [0x70]
+}
+
 fn qualified_lu(name: &str, cp: Option<&QualifiedName>) -> io::Result<QualifiedName> {
     if name.contains('.') {
         return name.parse().map_err(io::Error::other);
@@ -177,7 +184,10 @@ impl NativeFid2Session {
             next.pending_unbind_snf = None;
             return Ok((next, Some(SessionEvent::Unbind(unit(&piu[4..])?))));
         }
-        if self.phase != Phase::Open || rh[0] & 0x60 != 0 {
+        if self.phase != Phase::Open
+            || (rh[0] & 0x60 != 0 && !is_user_bis(rh, ru))
+            || (is_user_bis(rh, ru) && piu[0] & 1 != 0)
+        {
             return Err(invalid("unsupported native session-control PIU"));
         }
         if piu[0] & 1 == 0 && rh[0] & 0x80 == 0 {
@@ -284,7 +294,9 @@ impl NativeFid2Session {
                 Ok((next, None))
             }
             (Phase::Open, SessionEvent::Information { flow, unit }) => {
-                if unit.rh()[0] & 0x60 != 0 {
+                if unit.rh()[0] & 0x60 != 0
+                    && !(*flow == Flow::Normal && is_user_bis(unit.rh(), unit.ru()))
+                {
                     return Err(invalid("session or network control cannot be Information"));
                 }
                 let mut piu = self.outbound_piu(*flow, unit)?;
@@ -552,6 +564,58 @@ mod tests {
         let mut wrong = native.clone();
         wrong[2] = 3;
         assert!(codec.preview_native(&wrong).is_err());
+    }
+
+    #[test]
+    fn captured_user_bis_crosses_bus_with_local_pacing() {
+        let codec = opened();
+        // The live V4R4 frame used DAF=OAF=2. This fixture's admitted
+        // address is 1/2; the RH/RU and SNF are the captured shutdown form.
+        let bis = unhex("2c00010200034b910070");
+        let (candidate, event) = codec.preview_native(&bis).unwrap();
+        let Some(SessionEvent::Information {
+            flow,
+            unit: bis_unit,
+        }) = event
+        else {
+            panic!("BIS information expected")
+        };
+        assert_eq!(flow, Flow::Normal);
+        assert_eq!(bis_unit.as_reduced(), unhex("00034b900070"));
+        assert!(codec.preview_native_grant().unwrap().is_none());
+        let (_, grant) = candidate.preview_native_grant().unwrap().unwrap();
+        assert_eq!(grant, unhex("2d0002010000830100"));
+
+        let outbound = SessionEvent::Information {
+            flow: Flow::Normal,
+            unit: bis_unit,
+        };
+        let (_, piu) = codec.preview_event(&outbound, None).unwrap();
+        assert_eq!(piu.unwrap(), unhex("2c00020100034b910070"));
+        let reciprocal_bis = SessionEvent::Information {
+            flow: Flow::Normal,
+            unit: unit(&unhex("00034bb00070")).unwrap(),
+        };
+        let (_, piu) = codec.preview_event(&reciprocal_bis, None).unwrap();
+        assert_eq!(piu.unwrap(), unhex("2c00020100034bb10070"));
+
+        for invalid in [
+            unhex("2d00010200034b910070"),
+            unhex("2c00010200034b910071"),
+            unhex("2c00010200034b920070"),
+        ] {
+            assert!(codec.preview_native(&invalid).is_err());
+        }
+        let other_dfc = SessionEvent::Information {
+            flow: Flow::Normal,
+            unit: unit(&unhex("00034b900071")).unwrap(),
+        };
+        assert!(codec.preview_event(&other_dfc, None).is_err());
+        let expedited_bis = SessionEvent::Information {
+            flow: Flow::Expedited,
+            unit: unit(&unhex("00034b900070")).unwrap(),
+        };
+        assert!(codec.preview_event(&expedited_bis, None).is_err());
     }
 
     #[test]
