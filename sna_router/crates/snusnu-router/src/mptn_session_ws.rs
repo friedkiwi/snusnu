@@ -3,7 +3,10 @@
 //! The concentrator sees LU session events. The adapter retains TCP62/UDP
 //! framing, expedited acknowledgements, and UNBIND correlation locally.
 
-use std::io;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use router_core::session::SessionEvent;
 
@@ -19,6 +22,8 @@ pub(crate) struct MptnSessionWs {
     ws: SessionWsPort,
     gateway_id: String,
     pending_ws: Option<(SessionEvent, bool)>,
+    created_at: Instant,
+    opened_logged: bool,
 }
 
 impl MptnSessionWs {
@@ -28,6 +33,8 @@ impl MptnSessionWs {
             ws,
             gateway_id,
             pending_ws: None,
+            created_at: Instant::now(),
+            opened_logged: false,
         }
     }
 
@@ -38,6 +45,12 @@ impl MptnSessionWs {
     /// True while the circuit is alive. A false result means the owner must
     /// remove this bridge and release its gateway's exclusive UDP lease.
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
+        if !self.ws.is_open() && self.created_at.elapsed() > Duration::from_secs(30) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "automatic MPTN SessionV1 concentrator open timed out",
+            ));
+        }
         if self.pending_ws.is_none() {
             match self.ws.poll()? {
                 Some(SessionWsUpdate::Event(event)) => {
@@ -49,7 +62,14 @@ impl MptnSessionWs {
                     self.source.close()?;
                     return Ok(false);
                 }
-                Some(SessionWsUpdate::Opened) | None => {}
+                Some(SessionWsUpdate::Opened) if !self.opened_logged => {
+                    tracing::info!(gateway = %self.gateway_id,
+                        elapsed_ms = self.created_at.elapsed().as_millis(),
+                        "automatic MPTN SessionV1 circuit opened");
+                    self.opened_logged = true;
+                }
+                Some(SessionWsUpdate::Opened) => {}
+                None => {}
             }
         }
         if let Some((event, charge)) = &self.pending_ws {

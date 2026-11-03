@@ -108,6 +108,8 @@ mod mptn_outbound_port;
 #[cfg(target_os = "linux")]
 mod mptn_session_ws;
 #[cfg(target_os = "linux")]
+mod mptn_target_ws;
+#[cfg(target_os = "linux")]
 mod mptn_ws_gateway_lab;
 #[cfg(target_os = "linux")]
 mod mptn_ws_reverse;

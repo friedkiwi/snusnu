@@ -11,11 +11,13 @@ use crate::{
     llc_session_ws::LlcSessionWs,
     local_status::LocalProxyMacStatus,
     mptn_session_ws::MptnSessionWs,
+    mptn_target_ws::MptnTargetWs,
     remote::AutoWsHub,
     routing::{AutomaticFabric, IdentityObservation, PortId, RouteAddress, SessionSide},
     runtime::LlcPeer,
     STOP,
 };
+use router_core::session::{QualifiedName, SessionIdentity};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -148,6 +150,8 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
     let mut next_id = 0u64;
     let mut mptn_ws_sessions = HashMap::<u64, MptnSessionWs>::new();
     let mut next_mptn_ws_id = 0u64;
+    let mut mptn_target_sessions = HashMap::<u64, MptnTargetWs>::new();
+    let mut next_mptn_target_id = 0u64;
     let mut llc_ws_sessions = HashMap::<u64, LlcSessionCircuit>::new();
     let mut next_llc_ws_id = 0u64;
     tracing::info!(
@@ -187,25 +191,48 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         let gateway = owner
                             .and_then(|id| gateways.iter_mut().find(|gateway| gateway.id() == id));
                         if let Some(gateway) = gateway.filter(|gateway| gateway.udp_available()) {
-                            let seed =
-                                format!("{}:{}.{}", gateway.id(), hosted_lu.netid, hosted_lu.name);
-                            match connected.accept_incoming(open.clone())? {
-                                Some(ws) => {
-                                    if let Err(error) = gateway.start_from_ws(
-                                        ws,
-                                        &hosted_lu,
-                                        &hosted_cp,
-                                        &source_lu,
-                                        &source_cp,
-                                        seed.as_bytes(),
-                                        Duration::from_secs(600),
-                                    ) {
-                                        tracing::warn!(gateway = gateway.id(), error = %error,
-                                                "automatic concentrator to TCP62 session failed to start");
-                                    }
+                            if open.profile == wire::CircuitProfile::SessionV1 as i32 {
+                                if let Err(error) = open_incoming_mptn_target(
+                                    connected,
+                                    open.clone(),
+                                    &hosted_lu,
+                                    &hosted_cp,
+                                    &source_lu,
+                                    &source_cp,
+                                    gateway,
+                                    &mut mptn_target_sessions,
+                                    &mut next_mptn_target_id,
+                                ) {
+                                    tracing::warn!(gateway = gateway.id(), error = %error,
+                                        "automatic SessionV1 to TCP62 session rejected");
+                                    connected
+                                        .reject_incoming(&open, wire::OpenFailure::RouteGone)?;
                                 }
-                                None => connected
-                                    .reject_incoming(&open, wire::OpenFailure::RouteGone)?,
+                            } else {
+                                let seed = format!(
+                                    "{}:{}.{}",
+                                    gateway.id(),
+                                    hosted_lu.netid,
+                                    hosted_lu.name
+                                );
+                                match connected.accept_incoming(open.clone())? {
+                                    Some(ws) => {
+                                        if let Err(error) = gateway.start_from_ws(
+                                            ws,
+                                            &hosted_lu,
+                                            &hosted_cp,
+                                            &source_lu,
+                                            &source_cp,
+                                            seed.as_bytes(),
+                                            Duration::from_secs(600),
+                                        ) {
+                                            tracing::warn!(gateway = gateway.id(), error = %error,
+                                                "automatic concentrator to TCP62 session failed to start");
+                                        }
+                                    }
+                                    None => connected
+                                        .reject_incoming(&open, wire::OpenFailure::RouteGone)?,
+                                }
                             }
                         } else if owner.is_some() {
                             connected.reject_incoming(&open, wire::OpenFailure::Busy)?;
@@ -307,6 +334,29 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 let mut bridge = mptn_ws_sessions.remove(&id).unwrap();
                 let gateway_id = bridge.gateway_id().to_owned();
                 let _ = bridge.close();
+                if let Some(gateway) = gateways
+                    .iter_mut()
+                    .find(|gateway| gateway.id() == gateway_id)
+                {
+                    gateway.release_udp();
+                }
+            }
+        }
+        for id in mptn_target_sessions.keys().copied().collect::<Vec<_>>() {
+            let result = mptn_target_sessions.get_mut(&id).unwrap().pump();
+            let retired = match result {
+                Ok(true) => false,
+                Ok(false) => true,
+                Err(error) => {
+                    tracing::warn!(session = id, error = %error,
+                        "automatic SessionV1 to TCP62 circuit failed");
+                    true
+                }
+            };
+            if retired {
+                let mut target = mptn_target_sessions.remove(&id).unwrap();
+                let gateway_id = target.gateway_id().to_owned();
+                let _ = target.close();
                 if let Some(gateway) = gateways
                     .iter_mut()
                     .find(|gateway| gateway.id() == gateway_id)
@@ -689,6 +739,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 let endpoint = gateway.outbound_endpoint();
                 let (detached, udp) = gateway.detach_user_for_hpr(association, &offer)?;
                 detached_for_session = true;
+                let source_name = format!("{}.{}", source.netid, source.name);
                 let source = MptnToHprSession::new(detached, udp, endpoint, offer)?;
                 next_mptn_ws_id = next_mptn_ws_id
                     .checked_add(1)
@@ -697,6 +748,10 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     next_mptn_ws_id,
                     MptnSessionWs::new(source, ws, gateway.id().to_owned()),
                 );
+                tracing::info!(gateway = gateway.id(), session = next_mptn_ws_id,
+                    source_lu = %source_name,
+                    target_lu = %format!("{}.{}", destination.netid, destination.name),
+                    "automatic MPTN SessionV1 bridge installed");
                 Ok(())
             })();
             if let Err(error) = result {
@@ -727,6 +782,16 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
     for (_, mut bridge) in mptn_ws_sessions.drain() {
         let gateway_id = bridge.gateway_id().to_owned();
         let _ = bridge.close();
+        if let Some(gateway) = gateways
+            .iter_mut()
+            .find(|gateway| gateway.id() == gateway_id)
+        {
+            gateway.release_udp();
+        }
+    }
+    for (_, mut target) in mptn_target_sessions.drain() {
+        let gateway_id = target.gateway_id().to_owned();
+        let _ = target.close();
         if let Some(gateway) = gateways
             .iter_mut()
             .find(|gateway| gateway.id() == gateway_id)
@@ -921,6 +986,19 @@ fn incoming_lu_pair(
             wire::route_export::Resource::LogicalUnit(hosted),
             wire::route_export::Resource::LogicalUnit(source),
         ) => {
+            if open.profile == wire::CircuitProfile::SessionV1 as i32
+                && (!hosted
+                    .supported_types
+                    .contains(&(wire::LuType::LuType62 as i32))
+                    || !source
+                        .supported_types
+                        .contains(&(wire::LuType::LuType62 as i32)))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "incoming SessionV1 LU pair does not advertise LU 6.2",
+                ));
+            }
             Ok((
                 hosted.lu.clone().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "hosted LU missing")
@@ -941,6 +1019,61 @@ fn incoming_lu_pair(
             "incoming route is not an LU6.2 pair",
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_incoming_mptn_target(
+    hub: &mut AutoWsHub,
+    open: wire::IncomingOpen,
+    target_lu: &wire::SnaName,
+    target_cp: &wire::SnaName,
+    source_lu: &wire::SnaName,
+    source_cp: &wire::SnaName,
+    gateway: &mut AutoMptnGateway<'_>,
+    circuits: &mut HashMap<u64, MptnTargetWs>,
+    next_id: &mut u64,
+) -> io::Result<()> {
+    let udp = gateway.lease_udp()?;
+    let mut claimed = false;
+    let result = (|| -> io::Result<()> {
+        let Some(ws) = hub.accept_session_incoming(open)? else {
+            return Ok(());
+        };
+        let source_lu =
+            QualifiedName::new(&source_lu.netid, &source_lu.name).map_err(io::Error::other)?;
+        let target_lu =
+            QualifiedName::new(&target_lu.netid, &target_lu.name).map_err(io::Error::other)?;
+        let source_cp =
+            QualifiedName::new(&source_cp.netid, &source_cp.name).map_err(io::Error::other)?;
+        let target_cp =
+            QualifiedName::new(&target_cp.netid, &target_cp.name).map_err(io::Error::other)?;
+        let identity = SessionIdentity::new(source_lu, target_lu)
+            .with_control_points(Some(source_cp), Some(target_cp))
+            .map_err(io::Error::other)?;
+        let id = next_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("automatic MPTN target SessionV1 ID exhausted"))?;
+        let target = MptnTargetWs::new(
+            identity,
+            ws,
+            udp,
+            gateway.outbound_endpoint(),
+            gateway.id().to_owned(),
+        )?;
+        *next_id = id;
+        circuits.insert(id, target);
+        claimed = true;
+        tracing::info!(
+            gateway = gateway.id(),
+            session = id,
+            "automatic SessionV1 to TCP62 bridge installed"
+        );
+        Ok(())
+    })();
+    if result.is_err() || !claimed {
+        gateway.release_udp();
+    }
+    result
 }
 
 // One admission needs the bridge, the live hub, both listener registries and
