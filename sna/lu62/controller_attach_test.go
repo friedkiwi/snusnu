@@ -6,9 +6,9 @@ import (
 )
 
 func Test5494ControllerAttachCandidateAndAllocation(t *testing.T) {
-	// Both the allocation bytes and unchanged DIA work-area bytes are candidate
+	// The PIP attribute and unchanged DIA work-area bytes are candidate
 	// fixtures; the TPN overwrite and length-prefixed append are firmware facts.
-	allocation := []byte{0, 4, 0x12, 0x34}
+	allocation := Encode5494ControllerPIP(0x55)
 	ru, err := Candidate5494ControllerAttachRU(allocation)
 	wantPrefix := []byte{0x11, 5, 2, 0xff, 8, 3, 0xd0, 0, 0, 4,
 		0x30, 0xf0, 0xf6, 0xf6, 0, 0, 0}

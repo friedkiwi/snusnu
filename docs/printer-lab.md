@@ -57,10 +57,11 @@ accepts the 12-byte form captured from V4R4. Its
 binary architecture-TP Attach parser can retain the controller TPN
 `30F0F6F6` without treating it as an EBCDIC application name. These requests
 have not been accepted by a live IBM i controller session. The library now
-offers a candidate controller Attach from the DIA-initialized work area and
-appends caller-supplied PIP data. The firmware proves the TPN overwrite and
-append length, but not the remaining prefix bytes on the wire. Supplying valid
-runtime PIP, processing the Attach reply,
+offers a candidate controller Attach from the mutable work area and appends
+the 18-byte allocation/PIP record built by VG0F. That PIP is fixed except for
+one runtime controller-table byte, which the caller must supply. The firmware
+proves the TPN overwrite, PIP construction and append length; a live capture
+still needs to confirm the final outer PIU. Processing the Attach reply,
 and sending the NMVT on the network-management session remain to be implemented.
 
 IBM's [LU 6.2 guide](https://www.ibm.com/docs/en/SSLTBW_3.1.0/pdf/istp620_v3r1.pdf)
