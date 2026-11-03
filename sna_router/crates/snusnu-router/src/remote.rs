@@ -150,6 +150,12 @@ impl SharedWs {
                 continue;
             }
             if let Body::OpenResult(result) = &body {
+                debug!(
+                    request_id = result.request_id,
+                    owner = index,
+                    remaining = self.inbox[index].len(),
+                    "dequeued concentrator circuit OpenResult"
+                );
                 if !self.request_owners.contains_key(&result.request_id)
                     && self.closed_requests.contains(&result.request_id)
                 {
@@ -268,8 +274,20 @@ impl SharedWs {
             }
             Body::OpenResult(result) => {
                 if let Some(owner) = self.request_owners.get(&result.request_id).copied() {
+                    debug!(
+                        request_id = result.request_id,
+                        owner,
+                        accepted = result.accepted,
+                        inbox_depth = self.inbox[owner].len(),
+                        "received concentrator circuit OpenResult"
+                    );
                     self.inbox[owner].push_back(body);
                 } else if self.closed_requests.contains(&result.request_id) {
+                    debug!(
+                        request_id = result.request_id,
+                        accepted = result.accepted,
+                        "received late concentrator circuit OpenResult"
+                    );
                     if result.accepted && result.circuit_id.len() == 16 {
                         self.client
                             .send(envelope(Body::CircuitClose(wire::CircuitClose {

@@ -23,17 +23,22 @@ pub(crate) struct MptnSessionWs {
     gateway_id: String,
     pending_ws: Option<(SessionEvent, bool)>,
     created_at: Instant,
+    last_open_wait_log: Instant,
+    opening_polls: u64,
     opened_logged: bool,
 }
 
 impl MptnSessionWs {
     pub(crate) fn new(source: MptnToHprSession, ws: SessionWsPort, gateway_id: String) -> Self {
+        let now = Instant::now();
         Self {
             source,
             ws,
             gateway_id,
             pending_ws: None,
-            created_at: Instant::now(),
+            created_at: now,
+            last_open_wait_log: now,
+            opening_polls: 0,
             opened_logged: false,
         }
     }
@@ -45,6 +50,14 @@ impl MptnSessionWs {
     /// True while the circuit is alive. A false result means the owner must
     /// remove this bridge and release its gateway's exclusive UDP lease.
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
+        self.opening_polls = self.opening_polls.saturating_add(1);
+        if !self.ws.is_open() && self.last_open_wait_log.elapsed() >= Duration::from_secs(5) {
+            tracing::warn!(gateway = %self.gateway_id,
+                elapsed_ms = self.created_at.elapsed().as_millis(),
+                opening_polls = self.opening_polls,
+                "automatic MPTN SessionV1 circuit still waiting for OpenResult");
+            self.last_open_wait_log = Instant::now();
+        }
         if !self.ws.is_open() && self.created_at.elapsed() > Duration::from_secs(30) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -59,6 +72,10 @@ impl MptnSessionWs {
                     self.pending_ws = Some((event, charge));
                 }
                 Some(SessionWsUpdate::Closed) => {
+                    tracing::warn!(gateway = %self.gateway_id,
+                        elapsed_ms = self.created_at.elapsed().as_millis(),
+                        opened = self.opened_logged,
+                        "automatic MPTN SessionV1 concentrator circuit closed");
                     self.source.close()?;
                     return Ok(false);
                 }
@@ -94,6 +111,10 @@ impl MptnSessionWs {
                     }
                 }
                 SourceUpdate::Closed => {
+                    tracing::warn!(gateway = %self.gateway_id,
+                        elapsed_ms = self.created_at.elapsed().as_millis(),
+                        opened = self.opened_logged,
+                        "automatic MPTN SessionV1 TCP62 source closed");
                     self.source.complete_received(false)?;
                     self.ws.close()?;
                     self.source.close()?;
