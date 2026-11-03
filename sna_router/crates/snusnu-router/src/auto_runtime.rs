@@ -48,6 +48,23 @@ fn require_session_v1_target(route: &wire::RouteExport) -> io::Result<()> {
     }
 }
 
+fn verified_upstream_llc_cp(cp: Option<&str>, allowed_netid: &str) -> io::Result<wire::SnaName> {
+    let cp = cp.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream LLC circuit has no verified XID3 CP",
+        )
+    })?;
+    let source = config::parse_cp(cp)?;
+    if source.netid != allowed_netid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("LLC CP {cp} is outside assigned NETID {allowed_netid}"),
+        ));
+    }
+    Ok(source)
+}
+
 struct LlcSession {
     ingress: Option<(usize, [u8; 6])>,
     egress: Option<(usize, [u8; 6])>,
@@ -878,6 +895,102 @@ impl<'a> AutoLocalSessionRunner<'a> {
                         tracing::warn!(ingress = %ingress_id.0, gateway = gateway.id(),
                             error = %error, "automatic LLC to TCP62 session rejected");
                     }
+                }
+                continue;
+            }
+            if config
+                .remote
+                .first()
+                .is_some_and(|remote| remote.id == target.0)
+            {
+                let result = (|| -> io::Result<()> {
+                    let connected = hub.as_deref_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "concentrator disconnected before LLC circuit admission",
+                        )
+                    })?;
+                    let source_cp = verified_upstream_llc_cp(
+                        offer.peer_cp.as_deref(),
+                        connected.allowed_netid(),
+                    )?;
+                    let (target_ref, target_cp) =
+                        connected.resolve_mac(&ingress_proxy)?.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "managed MAC has no current upstream CP route",
+                            )
+                        })?;
+                    let id = next_id
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("automatic session ID exhausted"))?;
+                    let owner = association("fabric", id);
+                    proofs.observe_cp(
+                        &ingress_id,
+                        owner.clone(),
+                        offer.peer_cp.as_deref().expect("validated LLC XID3 CP"),
+                    )?;
+                    changed_proofs.insert(ingress_id.clone());
+                    let opened = (|| -> io::Result<()> {
+                        if reconcile_proofs(proofs, bridge, changed_proofs.drain())? {
+                            refresh_local_addresses(fabric, bridge, config, proxies)?;
+                            exports_changed = true;
+                        }
+                        let (cps, lus) =
+                            publication_records(fabric.directory(), connected.allowed_netid());
+                        connected.publish_local(&cps, &lus)?;
+                        let source_ref =
+                            connected.local_reference_cp(&source_cp).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "verified LLC CP was not published as an unambiguous route",
+                                )
+                            })?;
+                        let ws = connected.open_ref(
+                            target_ref,
+                            target_cp,
+                            None,
+                            Some(source_ref),
+                            source_cp,
+                        )?;
+                        let local = offer.open_port()?;
+                        fabric.open_pair(
+                            id,
+                            &ingress_id,
+                            &destination,
+                            &target,
+                            Box::new(local),
+                            Box::new(ws),
+                        )?;
+                        sessions.insert(
+                            id,
+                            LlcSession {
+                                ingress: Some((ingress, ingress_proxy)),
+                                egress: None,
+                                upstream: true,
+                            },
+                        );
+                        next_id = id;
+                        observe_circuit(id, &ingress_id.0, &target.0);
+                        Ok(())
+                    })();
+                    if opened.is_err() {
+                        proofs.withdraw(&ingress_id, &owner);
+                        if reconcile_proofs(proofs, bridge, std::iter::once(ingress_id.clone()))? {
+                            refresh_local_addresses(fabric, bridge, config, proxies)?;
+                            exports_changed = true;
+                        }
+                        let (cps, lus) =
+                            publication_records(fabric.directory(), connected.allowed_netid());
+                        connected.publish_local(&cps, &lus)?;
+                    }
+                    opened
+                })();
+                if let Err(error) = result {
+                    listeners[ingress].release(ingress_proxy);
+                    tracing::warn!(ingress = %ingress_id.0,
+                        proxy_mac = %crate::endpoint::format_mac(ingress_proxy),
+                        error = %error, "automatic LLC to concentrator circuit rejected");
                 }
                 continue;
             }
@@ -1885,6 +1998,28 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn upstream_llc_bootstrap_requires_verified_cp_in_assigned_netid() {
+        assert_eq!(
+            verified_upstream_llc_cp(Some("QAALICE.SNAA"), "QAALICE")
+                .unwrap()
+                .name,
+            "SNAA"
+        );
+        assert_eq!(
+            verified_upstream_llc_cp(None, "QAALICE")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            verified_upstream_llc_cp(Some("QABOB.SNAA"), "QAALICE")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn mptn_lu_selection_rejects_ee_upstream_and_llc_collisions() {
