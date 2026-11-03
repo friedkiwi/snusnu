@@ -2817,6 +2817,10 @@ impl AutoWsHub {
             ));
         }
         let index = if let Some(index) = shared.auto_free_indexes.pop() {
+            // Origin snapshots also reach idle inbox slots. A new owner must
+            // start from the directory's selected route, not stale notices
+            // queued for the previous owner of this slot.
+            shared.inbox[index].clear();
             index
         } else {
             shared.inbox.push(VecDeque::new());
