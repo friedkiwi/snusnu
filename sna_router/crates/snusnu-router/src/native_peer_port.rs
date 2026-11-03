@@ -53,6 +53,7 @@ pub(crate) struct NativePeerPort {
     converter_offer: Option<UserBindOffer>,
     converter_bind_waits_for_bis_ack: bool,
     converter_bind_response_pending: bool,
+    converter_negative_bind_pending: bool,
     converter_bind_response_acked: bool,
     converter_first_attach_seen: bool,
 }
@@ -82,6 +83,19 @@ fn exclusive_bind_ack(completed: usize) -> io::Result<bool> {
             "converter user BIND ACK includes another LLC completion",
         )),
     }
+}
+
+fn negative_user_bind_reply(mut positive: Vec<u8>, sense: [u8; 4]) -> io::Result<Vec<u8>> {
+    if positive.len() < 10 || positive[6..9] != [0xeb, 0x80, 0] || positive[9] != 0x31 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "validated native user BIND response has invalid profile",
+        ));
+    }
+    positive.truncate(6);
+    positive.extend_from_slice(&[0xeb, 0x90, 0]);
+    positive.extend_from_slice(&sense);
+    Ok(positive)
 }
 
 impl NativePeerPort {
@@ -122,6 +136,7 @@ impl NativePeerPort {
             converter_offer: None,
             converter_bind_waits_for_bis_ack: false,
             converter_bind_response_pending: false,
+            converter_negative_bind_pending: false,
             converter_bind_response_acked: false,
             converter_first_attach_seen: false,
         })
@@ -229,6 +244,34 @@ impl NativePeerPort {
             .map_err(management_error)
     }
 
+    /// Refuse a user BIND without retiring its verified LLC2 adjacency.
+    /// The fixed positive template supplies the exact TH address/SNF pair;
+    /// only the response type and four-byte SNA sense are changed.
+    pub(crate) fn reject_converter_user_bind(&mut self, sense: [u8; 4]) -> io::Result<bool> {
+        if self.converter_offer.is_none()
+            || self.converter_bind_response_pending
+            || self.converter_bind_response_acked
+            || self.converter_negative_bind_pending
+            || self.management.as_ref().map(ManagementSession::phase)
+                != Some(ManagementPhase::Closed)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native user BIND is not awaiting a response",
+            ));
+        }
+        if self.endpoint.buffered_information_count() != 0 {
+            return Ok(false);
+        }
+        let reply = negative_user_bind_reply(self.converter_positive_bind_response()?, sense)?;
+        if !self.endpoint.queue_information(reply)? {
+            return Ok(false);
+        }
+        self.converter_bind_response_pending = true;
+        self.converter_negative_bind_pending = true;
+        Ok(true)
+    }
+
     pub(crate) fn replay_converter_user_bind(&mut self, piu: Vec<u8>) -> io::Result<()> {
         if self
             .converter_offer
@@ -333,7 +376,18 @@ impl NativePeerPort {
             let completed = self.endpoint.take_completed_information_count();
             if self.converter_bind_response_pending && exclusive_bind_ack(completed)? {
                 self.converter_bind_response_pending = false;
-                self.converter_bind_response_acked = true;
+                if self.converter_negative_bind_pending {
+                    self.converter_negative_bind_pending = false;
+                    self.converter_offer = None;
+                    self.converter_policy = None;
+                    self.converter_bind_waits_for_bis_ack = false;
+                    self.converter_bind_response_acked = false;
+                    self.converter_first_attach_seen = false;
+                    tracing::info!(peer_cp = ?self.type1.peer_name(),
+                        "native user BIND rejected; LLC2 adjacency remains available");
+                } else {
+                    self.converter_bind_response_acked = true;
+                }
                 self.converter_events
                     .push_back(NativeLlcEvent::BindResponseAck);
             } else if self.converter_policy.is_some()
@@ -984,7 +1038,8 @@ impl RoutePort for NativePeerPort {
 #[cfg(test)]
 mod completion_tests {
     use super::{
-        exclusive_bind_ack, publish_pending_converter_bind, queue_converter_bind, NativeLlcEvent,
+        exclusive_bind_ack, negative_user_bind_reply, publish_pending_converter_bind,
+        queue_converter_bind, NativeLlcEvent,
     };
     use router_core::{fid2_session_control::ManagementBind, native_management::Phase};
     use std::collections::VecDeque;
@@ -995,6 +1050,14 @@ mod completion_tests {
             .chunks_exact(2)
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn rejected_user_bind_preserves_native_correlation_and_carries_sense() {
+        let positive = hex("2f0002011234eb8000310000");
+        let negative = negative_user_bind_reply(positive, [0x08, 0xa0, 0, 2]).unwrap();
+        assert_eq!(negative, hex("2f0002011234eb900008a00002"));
+        assert!(negative_user_bind_reply(hex("2f0002011234eb900031"), [0; 4]).is_err());
     }
 
     fn bind_pair() -> (ManagementBind, Vec<u8>) {
