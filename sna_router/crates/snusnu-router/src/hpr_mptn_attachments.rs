@@ -343,33 +343,12 @@ impl HprMptnPeerState {
         if gateway.id() != self.gateway_id || self.active_user || !gateway.udp_available() {
             return Vec::new();
         }
-        self.observed_peer_lus
-            .iter()
-            .filter_map(|(lu, cp)| {
-                if self
-                    .management_target_lu
-                    .as_ref()
-                    .is_some_and(|expected| expected != lu)
-                    || self
-                        .trusted_peer_cp
-                        .as_ref()
-                        .is_some_and(|expected| expected != cp)
-                    || candidates
-                        .iter()
-                        .filter(|candidate| candidate.attachment_id == self.gateway_id)
-                        .any(|candidate| candidate.lu == *lu && candidate.verify_cp(cp).is_none())
-                {
-                    return None;
-                }
-                Some((
-                    lu.clone(),
-                    Destination::Mptn {
-                        hosting_cp: cp.clone(),
-                        attachment_id: self.gateway_id.clone(),
-                    },
-                ))
-            })
-            .collect()
+        trusted_observed_routes(
+            &self.gateway_id,
+            self.trusted_peer_cp.as_ref(),
+            &self.observed_peer_lus,
+            candidates,
+        )
     }
 
     pub(crate) fn take_session(
@@ -388,11 +367,7 @@ impl HprMptnPeerState {
             .observed_peer_lus
             .get(&identity.target_lu)
             .ok_or_else(|| invalid("MPTN target LU has no completed management proof"))?;
-        if self
-            .management_target_lu
-            .as_ref()
-            .is_some_and(|expected| expected != &identity.target_lu)
-            || identity.target_cp.as_ref() != Some(cp)
+        if identity.target_cp.as_ref() != Some(cp)
             || candidates.iter().any(|candidate| {
                 candidate.attachment_id == self.gateway_id
                     && candidate.lu == identity.target_lu
@@ -617,6 +592,34 @@ impl HprMptnPeerState {
     }
 }
 
+fn trusted_observed_routes(
+    gateway_id: &str,
+    trusted_peer_cp: Option<&QualifiedName>,
+    observed: &HashMap<QualifiedName, QualifiedName>,
+    candidates: &[ConfiguredCandidate],
+) -> Vec<(QualifiedName, Destination)> {
+    observed
+        .iter()
+        .filter_map(|(lu, cp)| {
+            if trusted_peer_cp.is_some_and(|expected| expected != cp)
+                || candidates
+                    .iter()
+                    .filter(|candidate| candidate.attachment_id == gateway_id)
+                    .any(|candidate| candidate.lu == *lu && candidate.verify_cp(cp).is_none())
+            {
+                return None;
+            }
+            Some((
+                lu.clone(),
+                Destination::Mptn {
+                    hosting_cp: cp.clone(),
+                    attachment_id: gateway_id.to_owned(),
+                },
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn route_for_candidate(
     candidate: &ConfiguredCandidate,
@@ -643,6 +646,24 @@ fn invalid(reason: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_probe_target_does_not_hide_other_discovered_gateway_lus() {
+        let cp: QualifiedName = "SOLNET.CP400".parse().unwrap();
+        let probed: QualifiedName = "SOLNET.PROBED".parse().unwrap();
+        let second: QualifiedName = "SOLNET.SECOND".parse().unwrap();
+        let observed = HashMap::from([(probed.clone(), cp.clone()), (second.clone(), cp.clone())]);
+        let candidates = [ConfiguredCandidate {
+            lu: probed.clone(),
+            cp_hint: Some(cp.clone()),
+            attachment_id: "gateway".into(),
+            carrier: CandidateCarrier::Mptn,
+        }];
+        let routes = trusted_observed_routes("gateway", Some(&cp), &observed, &candidates);
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|(lu, _)| lu == &probed));
+        assert!(routes.iter().any(|(lu, _)| lu == &second));
+    }
 
     #[test]
     fn live_lu_needs_explicit_same_netid_cp_assertion() {

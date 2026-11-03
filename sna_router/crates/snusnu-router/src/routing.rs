@@ -153,6 +153,10 @@ impl AutomaticDirectory {
         self.registry.local_exports(netid)
     }
 
+    pub(crate) fn local_routes(&self) -> Vec<RouteSelection> {
+        self.registry.local_routes()
+    }
+
     pub(crate) fn withdraw(&mut self, attachment: &PortId) -> io::Result<()> {
         let Some((origin, _)) = self.snapshots.get(attachment) else {
             return Ok(());

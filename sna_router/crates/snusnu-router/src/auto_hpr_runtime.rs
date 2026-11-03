@@ -331,9 +331,8 @@ impl<'a> DirectHprRuntime<'a> {
         shared: &mut HprSharedLocal,
         runner: &mut AutoLocalSessionRunner<'_>,
         config: &RouterConfig,
-        netid: &str,
     ) -> io::Result<()> {
-        self.refresh_shared_llc_routes(runner, config, netid)?;
+        self.refresh_shared_llc_routes(runner, config)?;
         self.reconcile_pending_shared_llc(runner)?;
         let routes = shared.trusted_mptn_routes(runner)?;
         self.local_directory.replace_owner("mptn", routes)?;
@@ -441,10 +440,9 @@ impl<'a> DirectHprRuntime<'a> {
         &mut self,
         runner: &AutoLocalSessionRunner<'_>,
         config: &RouterConfig,
-        netid: &str,
     ) -> io::Result<()> {
         let routes = discovered_llc_routes(
-            runner.local_exports(netid),
+            runner.local_routes(),
             config.llc.iter().map(|peer| peer.id.as_str()),
         );
         self.local_directory.replace_owner("llc", routes)
@@ -2655,13 +2653,7 @@ fn run_connected(
                 continue;
             }
             if let Some(runtime) = active.as_mut() {
-                runtime.poll_shared_local(
-                    ee.as_ref().unwrap().link(),
-                    shared,
-                    local,
-                    config,
-                    hub.allowed_netid(),
-                )?;
+                runtime.poll_shared_local(ee.as_ref().unwrap().link(), shared, local, config)?;
             } else {
                 shared.poll(local, &HprDestinationDirectory::new(), false)?;
             }
@@ -2933,6 +2925,39 @@ mod tests {
             )]
         );
         assert!(discovered_llc_routes(registry.local_exports("LOCAL"), ["other"]).is_empty());
+    }
+
+    #[test]
+    fn ee_local_llc_selection_keeps_other_netids() {
+        let mut registry = RouteRegistry::new();
+        let cp = q("OTHER.CP");
+        let lu = q("OTHER.USER");
+        registry
+            .replace_records(
+                OwnerId::new("llc-association").unwrap(),
+                AttachmentId::new("llc0").unwrap(),
+                RouteOrigin::Local,
+                OwnerVersion::new(1, 1).unwrap(),
+                vec![RouteRecord {
+                    key: RouteKey::LogicalUnit {
+                        lu: lu.clone(),
+                        hosting_cp: cp.clone(),
+                    },
+                    supported_types: vec![LuType::Lu62],
+                }],
+            )
+            .unwrap();
+        assert!(registry.local_exports("LOCAL").is_empty());
+        assert_eq!(
+            discovered_llc_routes(registry.local_routes(), ["llc0"]),
+            vec![(
+                lu,
+                Destination::Llc {
+                    hosting_cp: cp,
+                    attachment_id: "llc0".into()
+                }
+            )]
+        );
     }
 
     #[test]
