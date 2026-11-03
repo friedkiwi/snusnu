@@ -103,6 +103,11 @@ impl HprSharedLocal {
                 state.observe_management(observations)?;
             }
         }
+        for (id, snapshot) in runner.take_mptn_discovery() {
+            if let Some(state) = self.mptn.get_mut(&id) {
+                state.observe_discovery(snapshot);
+            }
+        }
         for (id, state) in &mut self.mptn {
             runner.with_gateway(id, |gateway| state.poll_probes(gateway))?;
         }

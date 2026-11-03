@@ -146,6 +146,8 @@ fn run_attachments(config: &RouterConfig) -> io::Result<()> {
 
 /// Owns local attachment sockets and proofs across concentrator and EE generations.
 /// The coordinator owns WebSocket polling and route publication.
+pub(crate) type MptnManagementHandoff = (String, Vec<(String, String, String)>);
+
 pub(crate) struct AutoLocalSessionRunner<'a> {
     config: &'a RouterConfig,
     proxies: AutoProxyMacs,
@@ -157,7 +159,7 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     remote_macs: HashSet<[u8; 6]>,
     mptn_exports: HashMap<String, (wire::SnaName, wire::LuReachability)>,
     mptn_owner: HashMap<(String, String), String>,
-    learned_mptn_lus: HashMap<String, HashSet<(String, String)>>,
+    learned_mptn_lus: HashMap<String, HashMap<QualifiedName, QualifiedName>>,
     local_dispatch: AutoLocalDispatch,
     sessions: HashMap<u64, LlcSession>,
     next_id: u64,
@@ -169,7 +171,8 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     next_llc_ws_id: u64,
     unhandled_llc: Vec<(String, LlcIngressOffer)>,
     unhandled_mptn: Vec<(String, u64, IngressOffer)>,
-    mptn_management: Vec<(String, Vec<(String, String)>)>,
+    mptn_management: Vec<MptnManagementHandoff>,
+    mptn_discovery: Vec<(String, crate::mptn_discovery::MptnDiscoverySnapshot)>,
     ee_snapshots: HashMap<String, Vec<RouteRecord>>,
 }
 
@@ -289,6 +292,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             unhandled_llc: Vec::new(),
             unhandled_mptn: Vec::new(),
             mptn_management: Vec::new(),
+            mptn_discovery: Vec::new(),
             ee_snapshots: HashMap::new(),
         })
     }
@@ -339,8 +343,14 @@ impl<'a> AutoLocalSessionRunner<'a> {
         std::mem::take(&mut self.unhandled_mptn)
     }
 
-    pub(crate) fn take_mptn_management(&mut self) -> Vec<(String, Vec<(String, String)>)> {
+    pub(crate) fn take_mptn_management(&mut self) -> Vec<MptnManagementHandoff> {
         std::mem::take(&mut self.mptn_management)
+    }
+
+    pub(crate) fn take_mptn_discovery(
+        &mut self,
+    ) -> Vec<(String, crate::mptn_discovery::MptnDiscoverySnapshot)> {
+        std::mem::take(&mut self.mptn_discovery)
     }
 
     pub(crate) fn with_gateway<T>(
@@ -414,9 +424,8 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 .replace_upstream(PortId::new(&remote.id), addresses)?;
         }
         refresh_mptn_exports(
-            self.config,
             &self.learned_mptn_lus,
-            connected,
+            connected.allowed_netid(),
             &mut self.mptn_exports,
             &mut self.mptn_owner,
         )?;
@@ -647,6 +656,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             unhandled_llc,
             unhandled_mptn,
             mptn_management,
+            mptn_discovery,
             ..
         } = self;
         let mut next_id = self.next_id;
@@ -934,14 +944,22 @@ impl<'a> AutoLocalSessionRunner<'a> {
             }
         }
         for gateway in gateways.iter_mut() {
-            let offered = gateway.poll_once()?;
+            let offered = match gateway.poll_once() {
+                Ok(offered) => offered,
+                Err(error) => {
+                    tracing::warn!(gateway = gateway.id(), error = %error,
+                        "MPTN gateway poll failed; withdrawing attachment discovery");
+                    None
+                }
+            };
             let management = gateway.take_management_lus();
-            for (source, destination) in &management {
+            for (source, destination, peer_cp) in &management {
                 let source = config::parse_cp(source)?;
                 let destination = config::parse_cp(destination)?;
                 tracing::info!(gateway = gateway.id(),
                     source_lu = %format!("{}.{}", source.netid, source.name),
                     destination_lu = %format!("{}.{}", destination.netid, destination.name),
+                    peer_cp = %peer_cp,
                     "TCP62 management disclosed local LU reachability");
             }
             if !config.ee.is_empty() && !management.is_empty() {
@@ -955,27 +973,31 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 mptn_management.push((gateway.id().to_owned(), management));
             }
             if let Some(snapshot) = gateway.take_discovery_snapshot() {
+                if !config.ee.is_empty() {
+                    if let Some(previous) =
+                        mptn_discovery.iter_mut().find(|(id, _)| id == gateway.id())
+                    {
+                        previous.1 = snapshot.clone();
+                    } else {
+                        mptn_discovery.push((gateway.id().to_owned(), snapshot.clone()));
+                    }
+                }
                 tracing::debug!(
                     gateway = gateway.id(),
                     revision = snapshot.revision,
-                    learned_lus = snapshot.lus.len(),
+                    learned_lus = snapshot.routes.len(),
                     "MPTN attachment discovery snapshot changed"
                 );
                 learned_mptn_lus.insert(
                     gateway.id().to_owned(),
-                    snapshot
-                        .lus
-                        .into_iter()
-                        .map(|lu| (lu.netid, lu.name))
-                        .collect(),
+                    snapshot.routes.into_iter().collect(),
                 );
                 refresh_mptn_registry(fabric, config, proxies, learned_mptn_lus)?;
                 exports_changed = true;
                 if let Some(connected) = hub.as_deref_mut() {
                     if refresh_mptn_exports(
-                        config,
                         learned_mptn_lus,
-                        connected,
+                        connected.allowed_netid(),
                         mptn_exports,
                         mptn_owner,
                     )? {
@@ -1199,9 +1221,8 @@ impl<'a> AutoLocalSessionRunner<'a> {
         }
         if let Some(connected) = hub {
             if refresh_mptn_exports(
-                config,
                 learned_mptn_lus,
-                connected,
+                connected.allowed_netid(),
                 mptn_exports,
                 mptn_owner,
             )? {
@@ -1267,7 +1288,7 @@ fn refresh_mptn_registry(
     fabric: &mut AutomaticFabric,
     config: &RouterConfig,
     proxies: &AutoProxyMacs,
-    learned: &HashMap<String, HashSet<(String, String)>>,
+    learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
 ) -> io::Result<()> {
     for gateway in &config.mptn_gateway {
         let mut records = vec![RouteRecord::from(RouteKey::ProxyMac(
@@ -1275,28 +1296,17 @@ fn refresh_mptn_registry(
         ))];
         let mut control_points = HashSet::new();
         if let Some(lus) = learned.get(&gateway.id) {
-            for (netid, name) in lus {
-                let source = wire::SnaName {
-                    netid: netid.clone(),
-                    name: name.clone(),
-                };
-                let seed = format!("{}:{netid}.{name}", gateway.id);
-                let configured_cp =
-                    (!gateway.local_cp.is_empty()).then_some(gateway.local_cp.as_str());
-                let cp = virtual_cp_for_source(&source, seed.as_bytes(), configured_cp)?;
-                let hosting_cp = QualifiedName::new(&cp.netid, &cp.name).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN hosting CP")
-                })?;
-                let lu = QualifiedName::new(netid, name).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN source LU")
-                })?;
+            for (lu, hosting_cp) in lus {
                 if control_points.insert(hosting_cp.clone()) {
                     records.push(RouteRecord::from(RouteKey::ControlPoint(
                         hosting_cp.clone(),
                     )));
                 }
                 records.push(RouteRecord {
-                    key: RouteKey::LogicalUnit { lu, hosting_cp },
+                    key: RouteKey::LogicalUnit {
+                        lu: lu.clone(),
+                        hosting_cp: hosting_cp.clone(),
+                    },
                     supported_types: vec![LuType::Lu62],
                 });
             }
@@ -1309,9 +1319,8 @@ fn refresh_mptn_registry(
 }
 
 fn refresh_mptn_exports(
-    config: &RouterConfig,
-    learned: &HashMap<String, HashSet<(String, String)>>,
-    hub: &AutoWsHub,
+    learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
+    allowed_netid: &str,
     exports: &mut HashMap<String, (wire::SnaName, wire::LuReachability)>,
     owner: &mut HashMap<(String, String), String>,
 ) -> io::Result<bool> {
@@ -1319,40 +1328,32 @@ fn refresh_mptn_exports(
     // disappear from both the upstream export and the reverse-route owner map.
     let mut counts = HashMap::<(String, String), usize>::new();
     for lus in learned.values() {
-        for (netid, name) in lus {
-            if netid == hub.allowed_netid() {
-                *counts.entry((netid.clone(), name.clone())).or_default() += 1;
+        for lu in lus.keys() {
+            if lu.netid == allowed_netid {
+                *counts
+                    .entry((lu.netid.clone(), lu.name.clone()))
+                    .or_default() += 1;
             }
         }
     }
     let mut next_exports = HashMap::new();
     let mut next_owner = HashMap::new();
     for (gateway_id, lus) in learned {
-        for (netid, name) in lus {
-            if netid != hub.allowed_netid() {
-                tracing::warn!(gateway = gateway_id, source_lu = %format!("{netid}.{name}"),
-                    assigned_netid = hub.allowed_netid(),
+        for (lu, cp) in lus {
+            if lu.netid != allowed_netid {
+                tracing::warn!(gateway = gateway_id, source_lu = %lu,
+                    assigned_netid = allowed_netid,
                     "learned TCP62 LU excluded from upstream announcement: NETID mismatch");
                 continue;
             }
-            let key = format!("{gateway_id}:{netid}.{name}");
-            if counts.get(&(netid.clone(), name.clone())) != Some(&1) {
-                tracing::warn!(source_lu = %format!("{netid}.{name}"), gateway = gateway_id,
+            let key = format!("{gateway_id}:{lu}");
+            if counts.get(&(lu.netid.clone(), lu.name.clone())) != Some(&1) {
+                tracing::warn!(source_lu = %lu, gateway = gateway_id,
                     "ambiguous learned TCP62 LU; route withheld");
                 continue;
             }
-            let source = wire::SnaName {
-                netid: netid.clone(),
-                name: name.clone(),
-            };
-            let seed = format!("{}:{netid}.{name}", gateway_id);
-            let configured_cp = config
-                .mptn_gateway
-                .iter()
-                .find(|gateway| gateway.id == *gateway_id)
-                .map(|gateway| gateway.local_cp.as_str())
-                .filter(|value| !value.is_empty());
-            let cp = virtual_cp_for_source(&source, seed.as_bytes(), configured_cp)?;
+            let source = wire_name(lu);
+            let cp = wire_name(cp);
             next_exports.insert(
                 key,
                 (
@@ -1364,7 +1365,7 @@ fn refresh_mptn_exports(
                     },
                 ),
             );
-            next_owner.insert((netid.clone(), name.clone()), gateway_id.clone());
+            next_owner.insert((lu.netid.clone(), lu.name.clone()), gateway_id.clone());
         }
     }
     let changed = *exports != next_exports || *owner != next_owner;
@@ -1885,6 +1886,70 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn mptn_exports_use_observed_cp_and_filter_upstream_netid() {
+        let local_lu: QualifiedName = "OWNNET.APP".parse().unwrap();
+        let local_cp: QualifiedName = "OWNNET.HOSTCP".parse().unwrap();
+        let foreign_lu: QualifiedName = "OTHER.APP".parse().unwrap();
+        let foreign_cp: QualifiedName = "OTHER.HOSTCP".parse().unwrap();
+        let learned = HashMap::from([(
+            "mptn-a".to_owned(),
+            HashMap::from([
+                (local_lu.clone(), local_cp.clone()),
+                (foreign_lu, foreign_cp),
+            ]),
+        )]);
+        let mut exports = HashMap::new();
+        let mut owner = HashMap::new();
+        assert!(refresh_mptn_exports(&learned, "OWNNET", &mut exports, &mut owner).unwrap());
+        assert_eq!(exports.len(), 1);
+        let (cp, reachability) = exports.get("mptn-a:OWNNET.APP").unwrap();
+        assert_eq!(*cp, wire_name(&local_cp));
+        assert_eq!(
+            reachability.hosting_cp.as_ref(),
+            Some(&wire_name(&local_cp))
+        );
+        assert_eq!(reachability.lu.as_ref(), Some(&wire_name(&local_lu)));
+        assert_eq!(
+            owner.get(&("OWNNET".into(), "APP".into())),
+            Some(&"mptn-a".to_owned())
+        );
+        assert!(!refresh_mptn_exports(&learned, "OWNNET", &mut exports, &mut owner).unwrap());
+    }
+
+    #[test]
+    fn mptn_local_registry_uses_observed_cp_without_configured_names() {
+        let config: RouterConfig = toml::from_str(
+            "[[mptn]]\nprofile='gateway'\nid='mptn-a'\nlocal_ip='127.0.0.1'\npeer_ip='127.0.0.2'\n",
+        )
+        .unwrap();
+        let lu: QualifiedName = "OWNNET.APP".parse().unwrap();
+        let cp: QualifiedName = "OWNNET.HOSTCP".parse().unwrap();
+        let learned = HashMap::from([(
+            "mptn-a".to_owned(),
+            HashMap::from([(lu.clone(), cp.clone())]),
+        )]);
+        let mut fabric = AutomaticFabric::new();
+        let proxies = AutoProxyMacs::from_ids(["mptn-a"]).unwrap();
+        refresh_mptn_registry(&mut fabric, &config, &proxies, &learned).unwrap();
+        let exports = fabric.directory().local_exports("OWNNET");
+        assert!(exports
+            .iter()
+            .any(|route| route.key == RouteKey::ControlPoint(cp.clone())));
+        assert!(exports.iter().any(|route| route.key
+            == RouteKey::LogicalUnit {
+                lu: lu.clone(),
+                hosting_cp: cp.clone(),
+            }));
+        assert_eq!(
+            fabric
+                .directory()
+                .resolve_lu(&PortId::new("source"), &lu)
+                .unwrap(),
+            PortId::new("mptn-a")
+        );
+    }
 
     #[test]
     fn mptn_lu_selection_rejects_ee_upstream_and_llc_collisions() {
