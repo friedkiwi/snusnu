@@ -1010,6 +1010,13 @@ impl WsRoutePort {
                     return Err(protocol("invalid route epoch"));
                 }
                 if self.auto_owned {
+                    // A destination can withdraw an exclusive LU while its
+                    // accepted circuit owns the local attachment. That
+                    // withdrawal only blocks new opens; the concentrator
+                    // controls the lifetime of this established circuit.
+                    if self.circuit.is_some() {
+                        return Ok(Vec::new());
+                    }
                     // A SessionV1 source may have opened just as the selected
                     // router disconnected. Keep its owner identity while the
                     // WebSocket stays up, so a fresh epoch can be selected
@@ -1136,6 +1143,9 @@ impl WsRoutePort {
                 }
             }
             Body::OriginWithdraw(withdraw) => {
+                if self.auto_owned && self.circuit.is_some() {
+                    return Ok(Vec::new());
+                }
                 if !self.auto_owned
                     && self.target_lu.is_none()
                     && self.managed_binding_seen
@@ -3303,6 +3313,19 @@ mod tests {
                     accepted: true,
                     peer_receive_allowance_bytes: 1500,
                     reason: wire::OpenFailure::Unspecified as i32,
+                }),
+            );
+            // The target reserves this exclusive LU for the accepted
+            // circuit, then removes it from new-route announcements.
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![11; 16],
+                        revision: 2,
+                        routes: vec![],
+                    }),
                 }),
             );
             let wire::ws_envelope::Body::CircuitEvent(bind) = read(&mut socket) else {
