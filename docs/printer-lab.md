@@ -36,9 +36,10 @@ prepared response is acknowledged by the transport. The outer device-session
 envelope remains outside that state machine. The package also encodes the
 short, hardware-only NMVT Reply Product Set ID used
 to announce a powered-on printer, with runtime SNA address and VPD supplied by
-the caller. These candidates have not been exercised against the guest. The
-NMVT has no LU 6.2 GDS envelope; its live FID2 TH/RH and the device session's
-private GDS envelope remain to be established.
+the caller. The candidate ACTLU response has now been exercised against the
+guest for station 56; it led to a host LU 7 BIND. This is not the printer at
+address 01. The NMVT has no LU 6.2 GDS envelope; its live FID2 TH/RH and the
+printer device session's private GDS behavior remain to be established.
 The package does not perform APPC session management, store jobs, or produce a
 PDF. The concentrator now has owner-scoped durable raw SCS storage,
 a searchable print list, a monospace preview, and a greenbar PDF writer. These
@@ -55,14 +56,15 @@ and reversed FID2 addresses before the controller can proceed. Outbound CNOS
 uses the 15-byte FMH-5 Attach observed in the 5494 firmware; the parser also
 accepts the 12-byte form captured from V4R4. Its
 binary architecture-TP Attach parser can retain the controller TPN
-`30F0F6F6` without treating it as an EBCDIC application name. These requests
-have not been accepted by a live IBM i controller session. The library now
+`30F0F6F6` without treating it as an EBCDIC application name. The CNOS and
+controller BIND requests have been accepted by a live V5R4 guest over AnyNet.
+The library now
 offers a candidate controller Attach from the mutable work area and appends
 the 18-byte allocation/PIP record built by VG0F. That PIP is fixed except for
 one runtime controller-table byte, which the caller must supply. The firmware
-proves the TPN overwrite, PIP construction and append length; a live capture
-still needs to confirm the final outer PIU. Processing the Attach reply,
-and sending the NMVT on the network-management session remain to be implemented.
+proves the TPN overwrite, PIP construction and append length; the QA probe's
+Attach was positively acknowledged by V5R4. Sending the NMVT on the
+network-management path remains to be implemented.
 
 IBM's [LU 6.2 guide](https://www.ibm.com/docs/en/SSLTBW_3.1.0/pdf/istp620_v3r1.pdf)
 defines both basic and mapped FMH-5 conversation forms. The parser accepts
@@ -130,8 +132,10 @@ responder. The router then completes a separate outbound AnyNet management
 exchange with the isolated V5R4 guest. The guest's positive BIND response
 used instance marker `25`, which the TCP62 validator now accepts. The next
 QA controller BIND reached the router and exposed its fixed default-mode
-profile restriction; QRMTWSC BIND negotiation, controller Attach, NMVT, and
-the LU4 data path still need completion before a spool file can be accepted.
+profile restriction. The router now accepts the 5494 controller BIND profile,
+and the guest has acknowledged that BIND and the following Attach. NMVT and
+the address-01 LU4 data path still need completion before a spool file can be
+accepted.
 
 The original V5R4 B guest still has an `ANYPRT` controller varied off because
 its active `EETOA` low-entry-node controller already targets `SNUSNU.SVC`
@@ -140,6 +144,45 @@ that guest elicited no response; the isolated clone is the current capture
 target for both media.
 
 ## Remaining acceptance work
+
+### Live V5R4 AnyNet controller trace, 2026-11-03
+
+An isolated V5R4 clone at `10.99.6.2` accepted `QRMTWSC` source CNOS
+(57 sessions, one source winner, 56 target winners), the 5494 controller
+BIND, and the `30F0F6F6` controller Attach with the firmware-derived PIP.
+The initial `08640000` FMH-7 termination followed an earlier failed
+`SNUPRT` controller state: guest message `CPF9360` reported that later
+connection attempts were rejected because the controller was not valid.
+Varying `SNUPRT` off and on cleared that state.
+
+With the controller active, the host sent a private `D822` record, then a
+`D824` GDS carrying an inner FID3 ACTLU:
+
+```text
+00 0C D8 24 3D 78 6B 80 00 0D 01 01
+```
+
+The QA probe answered that ACTLU and the guest advanced to an inner LU 7
+BIND at FID3 address `38` (LSID `F8`):
+
+```text
+00 23 D8 24 3D F8 6B 80 00 31 00 07 07 B0 B0 10 81 ...
+```
+
+The probe echoed this BIND as a positive inner response. The guest then
+sent `00 10 D8 24 3C F8 03 90 20 04 F3 00 05 D8 20 02`.
+These are observed guest bytes. The probe responses are constructed, not
+captured from a real 5494. Station `38` is not the configured printer at
+address `01`, and its LU type is 7 rather than 4. The controller remains
+`VARY ON PENDING`; the guest has queued spool files but has not sent an
+address-01 printer BIND or SCS data. No spool has reached the concentrator.
+
+The next protocol gate is delivering the firmware-derived address-01 NMVT
+Reply PSID over its independent network-management FID2 path, then observing
+the host's printer-session BIND and private `D824` records. The current
+AnyNet reverse gateway completes and releases its separate SNASVCMG
+management association before the controller session, so it cannot yet carry
+that NMVT. An LLC route has not yet been verified.
 
 The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
 provide a direct source for the missing controller sender code. In
