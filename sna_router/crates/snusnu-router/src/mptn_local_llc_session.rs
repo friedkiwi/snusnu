@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use router_core::session::{SessionEvent, SessionIdentity};
+use router_core::session::{QualifiedName, SessionEvent, SessionIdentity};
 
 use crate::{
     hpr_local_llc::HprToLlcSession,
@@ -27,6 +27,7 @@ pub(crate) struct MptnLocalLlcSession {
     carrier_id: u64,
     draining_since: Option<Instant>,
     target_closed_since: Option<Instant>,
+    verified_target_lu: Option<QualifiedName>,
 }
 
 impl MptnLocalLlcSession {
@@ -46,6 +47,7 @@ impl MptnLocalLlcSession {
             carrier_id,
             draining_since: None,
             target_closed_since: None,
+            verified_target_lu: None,
         }
     }
 
@@ -54,6 +56,11 @@ impl MptnLocalLlcSession {
     }
     pub(crate) fn carrier_id(&self) -> u64 {
         self.carrier_id
+    }
+
+    /// The exact LU that accepted a native user BIND on this LLC adjacency.
+    pub(crate) fn take_verified_target_lu(&mut self) -> Option<QualifiedName> {
+        self.verified_target_lu.take()
     }
 
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
@@ -120,6 +127,9 @@ impl MptnLocalLlcSession {
             if let Some(event) = target.poll()? {
                 if self.source.send(&event)? {
                     target.confirm_polled()?;
+                    if matches!(event, SessionEvent::BindResult { accepted: true, .. }) {
+                        self.verified_target_lu = Some(self.identity.target_lu.clone());
+                    }
                     if matches!(
                         event,
                         SessionEvent::BindResult {

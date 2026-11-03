@@ -191,6 +191,52 @@ fn local_llc_hosting_cp(
     Ok(cp)
 }
 
+/// A cold LLC adjacency has proved its CP through XID3 and management, but
+/// cannot prove a user LU until the first user BIND succeeds. With exactly one
+/// idle adjacency in the requested NETID, the BIND can be tried there. This
+/// candidate is never added to the route directory or upstream publication.
+fn unique_cold_llc_target(
+    config: &RouterConfig,
+    bridge: &AutoLlcWsBridge,
+    pending: &HashMap<u64, PendingUpstreamLlc>,
+    target_lu: &QualifiedName,
+) -> io::Result<Option<(PortId, QualifiedName)>> {
+    let mut candidates = Vec::new();
+    for attachment in &config.llc {
+        let id = PortId::new(&attachment.id);
+        let Some(cp) = bridge.observed_cp(&id) else {
+            continue;
+        };
+        match verified_llc_carrier(pending, &id) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
+        let cp = QualifiedName::new(&cp.netid, &cp.name).map_err(io::Error::other)?;
+        candidates.push((id, cp));
+    }
+    select_unique_cold_llc_cp(target_lu, candidates)
+}
+
+fn select_unique_cold_llc_cp(
+    target_lu: &QualifiedName,
+    candidates: impl IntoIterator<Item = (PortId, QualifiedName)>,
+) -> io::Result<Option<(PortId, QualifiedName)>> {
+    let mut selected = None;
+    for (id, cp) in candidates {
+        if cp.netid != target_lu.netid {
+            continue;
+        }
+        if selected.replace((id, cp)).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "target LU has multiple live LLC adjacencies in its NETID",
+            ));
+        }
+    }
+    Ok(selected)
+}
+
 fn local_llc_to_mptn_identity(
     fabric: &AutomaticFabric,
     learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
@@ -1528,6 +1574,26 @@ impl<'a> AutoLocalSessionRunner<'a> {
                     (true, true)
                 }
             };
+            if let Some(lu) = mptn_local_llc_sessions
+                .get_mut(&id)
+                .unwrap()
+                .take_verified_target_lu()
+            {
+                let carrier_id = mptn_local_llc_sessions.get(&id).unwrap().carrier_id();
+                let attachment = &leased_llc
+                    .get(&carrier_id)
+                    .expect("local MPTN circuit owns its LLC carrier lease")
+                    .attachment;
+                proofs.observe_lu62(
+                    attachment,
+                    &association("llc_upstream", carrier_id),
+                    &lu.to_string(),
+                )?;
+                changed_proofs.insert(attachment.clone());
+                tracing::info!(session = id, carrier = carrier_id,
+                    attachment = %attachment.0, target_lu = %lu,
+                    "local LLC target LU verified by positive user BIND");
+            }
             if retired {
                 let mut circuit = mptn_local_llc_sessions.remove(&id).unwrap();
                 let gateway_id = circuit.gateway_id().to_owned();
@@ -2220,23 +2286,51 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 }
             }
             active = true;
-            let selection = AutoMptnGateway::offer_lus(&offer)
+            let requested_target = AutoMptnGateway::offer_lus(&offer)
                 .and_then(|(_, target)| config::parse_cp(&target))
                 .and_then(|target| {
                     QualifiedName::new(&target.netid, &target.name).map_err(io::Error::other)
-                })
+                });
+            let selection = requested_target
+                .as_ref()
+                .map_err(|error| io::Error::new(error.kind(), error.to_string()))
                 .and_then(|target| {
                     fabric
                         .directory()
-                        .resolve_lu(&PortId::new(gateway.id()), &target)
+                        .resolve_lu(&PortId::new(gateway.id()), target)
                         .map_err(|error| {
                             tracing::warn!(gateway = gateway.id(), target_lu = %target,
                                 error = %error, "MPTN destination route unresolved");
                             error
                         })
                 });
+            let mut cold_llc_cp = None;
             let target_id = match selection {
                 Ok(id) => id,
+                Err(error)
+                    if config.remote.is_empty()
+                        && error.kind() == io::ErrorKind::NotFound
+                        && requested_target.is_ok() =>
+                {
+                    let target = requested_target.as_ref().unwrap();
+                    match unique_cold_llc_target(config, bridge, pending_llc_upstream, target) {
+                        Ok(Some((id, cp))) => {
+                            tracing::info!(gateway = gateway.id(), association,
+                                target_lu = %target, target_cp = %cp, egress = %id.0,
+                                "trying unlearned TCP62 target LU on unique verified LLC adjacency");
+                            cold_llc_cp = Some(cp);
+                            id
+                        }
+                        Ok(None) => {
+                            gateway.reject_offer(association, &error.to_string())?;
+                            continue;
+                        }
+                        Err(error) => {
+                            gateway.reject_offer(association, &error.to_string())?;
+                            continue;
+                        }
+                    }
+                }
                 Err(error) if !config.ee.is_empty() && error.kind() == io::ErrorKind::NotFound => {
                     if unhandled_mptn.len() < MAX_PENDING_HANDOFFS {
                         unhandled_mptn.push((gateway.id().to_owned(), association, offer));
@@ -2300,7 +2394,10 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 "MPTN source LU has no management CP proof",
                             )
                         })?;
-                    let target_cp = local_llc_hosting_cp(fabric, &target_id, &target_lu)?;
+                    let target_cp = match cold_llc_cp.as_ref() {
+                        Some(cp) => cp.clone(),
+                        None => local_llc_hosting_cp(fabric, &target_id, &target_lu)?,
+                    };
                     if bridge.observed_cp(&target_id) != Some(&wire_name(&target_cp)) {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -3325,6 +3422,28 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn cold_llc_target_requires_unique_cp_in_requested_netid_without_assuming_cp_equals_lu() {
+        let target: QualifiedName = "QAALICE.USERLU".parse().unwrap();
+        let alice = (PortId::new("alice"), "QAALICE.SNAA".parse().unwrap());
+        let other_net = (PortId::new("other"), "OTHER.CPB".parse().unwrap());
+        assert_eq!(
+            select_unique_cold_llc_cp(&target, [other_net.clone(), alice.clone()]).unwrap(),
+            Some(alice.clone())
+        );
+        assert_eq!(
+            select_unique_cold_llc_cp(&target, [other_net]).unwrap(),
+            None
+        );
+        let second = (PortId::new("second"), "QAALICE.CPC".parse().unwrap());
+        assert_eq!(
+            select_unique_cold_llc_cp(&target, [alice, second])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn standalone_llc_to_mptn_uses_observed_target_cp_not_proxy_cp() {
