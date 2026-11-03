@@ -19,6 +19,9 @@ mod auto_gateway_runtime;
 #[allow(dead_code)] // The EE runtime uses this once its live session loop is wired.
 mod auto_hpr_identity;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Inbound EE admission is activated with outbound user RTP.
+mod auto_hpr_inbound;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // Prepared for HPR gateway integration; automatic config remains gated.
 mod auto_hpr_ip;
 #[cfg(target_os = "linux")]

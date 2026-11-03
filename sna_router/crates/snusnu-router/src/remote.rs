@@ -2675,7 +2675,13 @@ impl AutoWsHub {
         port.profile = profile;
         port.target = Some(source_ref.clone());
         port.incoming_open(open)?;
-        Ok(Some(port))
+        // `incoming_open` may reject a stale or busy request after the route
+        // checks above. Never hand that rejected port to a carrier adapter.
+        if port.circuit.is_some() {
+            Ok(Some(port))
+        } else {
+            Ok(None)
+        }
     }
 
     fn new_port(

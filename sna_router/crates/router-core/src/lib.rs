@@ -15,6 +15,7 @@ pub mod hpr_ip_activation;
 pub mod hpr_lan;
 pub mod hpr_ldlc_adjacency;
 pub mod hpr_route_setup;
+pub mod hpr_route_setup_initiator;
 pub mod hpr_route_setup_reply;
 pub mod hpr_route_setup_service;
 pub mod hpr_rtp;
