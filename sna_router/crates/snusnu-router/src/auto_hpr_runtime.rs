@@ -2141,27 +2141,37 @@ fn run_connected(
     hub: &mut AutoWsHub,
     local: &mut HprLocalSessionRunner<'_>,
 ) -> io::Result<()> {
-    let identity = loop {
-        if STOP.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        poll_unsolicited(hub)?;
-        local.poll_idle()?;
-        if let Some(identity) = AuthorizedEeIdentity::resolve(hub, attachment)? {
-            break identity;
-        }
-        thread::sleep(IDLE_POLL);
-    };
-    let mut ee = AuthorizedEeAttachment::bind(attachment, identity)?;
+    let mut ee: Option<AuthorizedEeAttachment> = None;
     let mut active: Option<DirectHprRuntime> = None;
-    tracing::info!(attachment = %attachment.id, local_ip = %attachment.local_ip,
-        peer_ip = %attachment.peer_ip, proxy_cp = %ee.local_cp(),
-        "HPR EE attachment listening");
     let result = (|| -> io::Result<()> {
         while !STOP.load(Ordering::Relaxed) {
-            if !ee.authorized(hub)? {
-                return Err(protocol("EE proxy CP route withdrawn"));
+            if ee.is_none() {
+                poll_unsolicited(hub)?;
+                local.poll_idle()?;
+                if let Some(identity) = AuthorizedEeIdentity::resolve(hub, attachment)? {
+                    let authorized = AuthorizedEeAttachment::bind(attachment, identity)?;
+                    tracing::info!(attachment = %attachment.id, local_ip = %attachment.local_ip,
+                        peer_ip = %attachment.peer_ip, proxy_cp = %authorized.local_cp(),
+                        "HPR EE attachment listening");
+                    ee = Some(authorized);
+                }
+                thread::sleep(IDLE_POLL);
+                continue;
             }
+            if !ee.as_ref().unwrap().authorized(hub)? {
+                if let Some(mut runtime) = active.take() {
+                    if let Some(peer_lus) = runtime.peer_lus.as_mut() {
+                        peer_lus.deactivate();
+                    }
+                    local.return_from_ee(runtime.detach_local_mptn());
+                    hub.publish_local(&[], &[])?;
+                }
+                ee = None;
+                tracing::warn!(attachment = %attachment.id,
+                    "HPR EE proxy CP route withdrawn; awaiting reauthorization on current concentrator connection");
+                continue;
+            }
+            let ee = ee.as_mut().unwrap();
             let now = Instant::now();
             ee.tick(now)?;
             if ee.is_active() {
