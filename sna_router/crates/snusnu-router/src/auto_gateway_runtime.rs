@@ -173,7 +173,7 @@ pub(crate) struct AutoMptnGateway<'a> {
     reverse: Option<AutoReverseWsSession>,
     reverse_status_id: Option<String>,
     udp_leased: bool,
-    identity_observations: Vec<(String, IdentityObservation)>,
+    identity_observations: Vec<(u64, String, IdentityObservation)>,
     closed_local_attachments: Vec<String>,
     management_lus: Vec<(String, String)>,
     discovery: MptnDiscovery,
@@ -249,7 +249,7 @@ impl<'a> AutoMptnGateway<'a> {
     }
 
     #[allow(dead_code)] // Mixed local gateway routing consumes this observation queue.
-    pub(crate) fn take_identity_observations(&mut self) -> Vec<(String, IdentityObservation)> {
+    pub(crate) fn take_identity_observations(&mut self) -> Vec<(u64, String, IdentityObservation)> {
         std::mem::take(&mut self.identity_observations)
     }
 
@@ -334,7 +334,7 @@ impl<'a> AutoMptnGateway<'a> {
                         .port
                         .take_inner_identity_observations()
                         .into_iter()
-                        .map(|identity| (attachment.clone(), identity)),
+                        .map(|identity| (id, attachment.clone(), identity)),
                 );
             }
             match result {
