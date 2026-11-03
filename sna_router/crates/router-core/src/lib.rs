@@ -10,6 +10,7 @@ pub mod hpr_control_bootstrap;
 pub mod hpr_cp_initiator;
 pub mod hpr_cp_management;
 pub mod hpr_cv61;
+pub mod hpr_external_management;
 pub mod hpr_fid5;
 pub mod hpr_ip_activation;
 pub mod hpr_lan;
