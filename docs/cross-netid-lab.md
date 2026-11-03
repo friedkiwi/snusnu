@@ -360,3 +360,36 @@ had no listeners. No remote sign-on credentials were entered.
 
 The [IBM SNA Formats reference](https://vtda.org/docs/computing/IBM/Other/SNA/GA27-3136-7_SystemsNetworkArchitecture_Mar87.pdf)
 identifies DFC RU `70` as Bracket Initiation Stop (BIS).
+
+## Automatic discovery and EE gateway retest, 2026-11-03
+
+The latest automatic runtime used one concentrator-assigned NETID per owner:
+`QAALICE.SNAA` on V4R4 LLC2 and `QABOB.SNAB` on V5R4 TCP62 or EE. Neither
+router required configured local CP/LU hints for the successful TCP62 and EE
+sessions. Each carrier verified its adjacent peer and updated the shared
+local route registry. The concentrator's assigned NETID filtered each
+router's publication; it did not block a local route in another NETID.
+
+With no live Bob route initially advertised, V4 Alice dialed the server-owned
+Bob proxy MAC `02:53:4e:00:00:01`. Rust answered null XID and XID3, established
+LLC2, and published the verified Alice CP/LU. The idle route remained
+available after the first user session. V5 Bob then initiated a TCP62
+pass-through that traversed Bob Rust → QA concentrator → Alice Rust → V4 LLC2
+and displayed V4's remote Sign On (`S1012345`, `QPADEV0001`). A second V5
+attempt used EE instead of TCP62 and reached the same V4 Sign On. The EE
+router also carried one successful V5 APINGD round trip to the embedded
+concentrator responder, reported by the guest as 31 ms.
+
+The reverse V4 LLC2 → QA → V5 EE test reached V5's positive user BIND
+response after external SNASVCMG management, CNOS and BIS. Rust rejected the
+response while interpreting its pacing fields, so this direction had not
+reached Sign On at the time of this record. EE → LLC2 request end closed its
+QA circuit, but the V4 native UNBIND response still needs a synchronized
+capture and parser fix. The live successes prove the stated directions
+through the first remote display or APING reply; they do not prove normal
+teardown, simultaneous sessions, or every carrier combination.
+
+The QA concentrator was left listening on `0.0.0.0:8081` for inspection. It
+used a persistent QA database so router IDs, tokens and managed MAC bindings
+survived restarts. Private guest screens, router logs and packet captures
+remain outside the repository.
