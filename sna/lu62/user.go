@@ -50,29 +50,25 @@ func CandidateUserResponse(request []byte, expectedPLU, expectedSLU string, mana
 }
 
 // CandidateStandaloneUserResponse also accepts the captured V5R4 EE BIND
-// profile after an HPR adapter has established its own control plane. The
+// profile after a carrier adapter has established its own control plane. The
 // native FID2 service keeps the older strict candidate profile above.
 func CandidateStandaloneUserResponse(request []byte, expectedPLU, expectedSLU string, receiveWindow byte) ([]byte, error) {
-	// OS/400 uses SNASVCMG for the APING session addressed to the server's
-	// PING LU. The carrier adapter has already established CP control flow;
-	// this BIND is admitted only for that exact local service identity. Keep
-	// native user sessions and CPSVCMG control sessions on their own paths.
-	if expectedSLU == "SNUSNU.PING" {
-		bind, err := ParseBind(request)
-		if err == nil && bind != nil && bind.Mode == "SNASVCMG" {
-			response, err := CandidateManagementResponse(request, expectedPLU, expectedSLU, receiveWindow)
-			if err != nil {
-				return nil, ErrUserBind
-			}
-			// The guest accepts the CP response when these negotiated profile
-			// bytes retain its supported security, synchronization, and
-			// limited-resource settings. The response still selects a bounded
-			// receive window in CandidateManagementResponse.
-			copy(response[9+23:9+26], request[9+23:9+26])
-			// V5R4 accepted the seven-frame management window in the live
-			// exchange and aborted the BIND when offered three frames.
-			return response, nil
+	// OS/400 can use SNASVCMG for a session addressed to an application LU.
+	// The carrier adapter must already have authorized that LU and CP pair.
+	bind, err := ParseBind(request)
+	if err == nil && bind != nil && bind.Mode == "SNASVCMG" {
+		response, err := CandidateManagementResponse(request, expectedPLU, expectedSLU, receiveWindow)
+		if err != nil {
+			return nil, ErrUserBind
 		}
+		// The guest accepts the CP response when these negotiated profile
+		// bytes retain its supported security, synchronization, and
+		// limited-resource settings. The response still selects a bounded
+		// receive window in CandidateManagementResponse.
+		copy(response[9+23:9+26], request[9+23:9+26])
+		// V5R4 accepted the seven-frame management window in the live
+		// exchange and aborted the BIND when offered three frames.
+		return response, nil
 	}
 	return candidateUserResponse(request, expectedPLU, expectedSLU, nil, receiveWindow, true)
 }

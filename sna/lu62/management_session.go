@@ -58,13 +58,10 @@ func NewManagementSession(remoteCP, localCP string) (*ManagementSession, error) 
 	return &ManagementSession{remoteCP: remoteCP, localCP: localCP, primaryWindow: 7}, nil
 }
 
-// NewStandaloneManagementSession serves the server-owned PING LU after the
-// carrier adapter has established CP control flow. Its SNASVCMG session is
-// distinct from the later APING user session and uses a seven-frame window.
+// NewStandaloneManagementSession serves an application LU after the carrier
+// adapter has established CP control flow. The caller authorizes localLU;
+// this session is distinct from any later user session.
 func NewStandaloneManagementSession(remoteCP, localLU string) (*ManagementSession, error) {
-	if localLU != "SNUSNU.PING" {
-		return nil, ErrManagementState
-	}
 	s, err := NewManagementSession(remoteCP, localLU)
 	if err != nil {
 		return nil, err
