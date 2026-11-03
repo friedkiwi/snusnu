@@ -1,6 +1,10 @@
 package printer
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/friedkiwi/snusnu/sna/piu"
+)
 
 // ErrPSID means a 5494 Reply Product Set ID cannot be constructed from the
 // supplied runtime identity. The caller must obtain VPD and SNA addressing
@@ -61,6 +65,17 @@ func (p ReplyPSID) EncodeNMVT() ([]byte, error) {
 		return nil, ErrPSID
 	}
 	return ru, nil
+}
+
+// EncodeNMVTPIU adds the firmware-observed FID2 and RH envelope. The caller
+// supplies the resolved session's TH and runtime RH1/RH2; the firmware fixes
+// RH0 at 0B. No LU 6.2 GDS or LLID surrounds this network-management PIU.
+func (p ReplyPSID) EncodeNMVTPIU(th [6]byte, rh1, rh2 byte) ([]byte, error) {
+	ru, err := p.EncodeNMVT()
+	if err != nil {
+		return nil, err
+	}
+	return (piu.FID2{TH: th, RH: [3]byte{0x0b, rh1, rh2}, RU: ru}).Bytes()
 }
 
 func ebcdicDigits(b []byte) bool {

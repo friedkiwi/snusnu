@@ -22,6 +22,11 @@ func TestReplyPSIDAddress01FirmwareLayout(t *testing.T) {
 		!bytes.Equal(ru[56:60], []byte{0x0a, 1, 8, 0x10}) {
 		t.Fatalf("address-01 Reply PSID: %x %v", ru, err)
 	}
+	th := [6]byte{0x2c, 0, 2, 1, 0x12, 0x34}
+	full, err := p.EncodeNMVTPIU(th, 0x80, 0)
+	if err != nil || len(full) != 75 || !bytes.Equal(full[:12], []byte{0x2c, 0, 2, 1, 0x12, 0x34, 0x0b, 0x80, 0, 0x41, 3, 0x8d}) || !bytes.Equal(full[9:], ru) {
+		t.Fatalf("Reply PSID PIU envelope: %x %v", full, err)
+	}
 	p.Station = 2
 	if _, err := p.EncodeNMVT(); err == nil {
 		t.Fatal("wrong address-01 port/station accepted")
