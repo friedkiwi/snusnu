@@ -694,6 +694,18 @@ Exception-response chains are accepted without an unnecessary positive inner
 response. CD is a candidate job boundary for this probe, not a verified
 separator between two consecutive IBM i spool files. No address-01 chain has
 arrived from the guest yet; the live acceptance result above is unchanged.
+
+The rebuilt QA and verbose LLC router were exercised again on 3 November at
+21:38 CET. IBM i reopened circuit
+`08788555-a367-4e27-a328-29b44a3056f0`; QA reached controller management
+phase 6 and marked its experimental NMVT sent. The guest's `WRKCFGSTS` still
+showed `SNUPRT` and `SNUPRT01` as `VARY ON PENDING`, and `WRKDEV` described
+`SNUPRT01` as "Powered off or not yet available". Replying `R` to the pending
+`CPA3387` printer-writer inquiry produced no address-01 PIU or print row; the
+new QA database contained zero print jobs. The most recent `CPI5935` controller
+failure message was stamped 21:34:12, before this fresh circuit. This run
+checks the new binary and the writer retry, but still does not demonstrate a
+printer session.
 4. Print from the guest through AnyNet and LLC separately, capturing each
    router-to-concentrator circuit and confirming the received spool and both
    renderings. Passing APING or `VFYAPPCCNN` alone is insufficient.
