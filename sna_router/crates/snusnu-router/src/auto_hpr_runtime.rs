@@ -19,6 +19,7 @@ use std::{
 
 use crate::{
     auto_address::AutoProxyMacs,
+    auto_hpr_external_management::{ExternalManagementRoutes, VerifiedExternalRoute},
     auto_hpr_identity::AuthorizedEeIdentity,
     auto_hpr_local_ingress::LocalToHprRuntime,
     auto_hpr_reverse_runtime::ReverseRuntime,
@@ -34,6 +35,7 @@ use crate::{
     STOP,
 };
 use router_core::{
+    fid2_bind::BindClass,
     hpr_control_bootstrap::HprControlBootstrap,
     hpr_cp_initiator::{CpInitiatorPhase, ReciprocalCpSession},
     hpr_cp_management::CpManagementResponder,
@@ -171,6 +173,7 @@ struct DirectHprRuntime<'a> {
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
     route_targets: HashMap<router_core::session::QualifiedName, Destination>,
     local_directory: HprDestinationDirectory,
+    external_management: ExternalManagementRoutes,
     local_exports: Vec<(router_core::session::QualifiedName, Destination)>,
     llc: Option<HprLlcAttachments>,
     mptn: Option<HprMptnAttachments<'a>>,
@@ -208,6 +211,7 @@ impl<'a> DirectHprRuntime<'a> {
             route_setup: HashMap::new(),
             route_targets: HashMap::new(),
             local_directory: HprDestinationDirectory::new(),
+            external_management: ExternalManagementRoutes::default(),
             local_exports: Vec::new(),
             llc: None,
             mptn: None,
@@ -403,12 +407,24 @@ impl<'a> DirectHprRuntime<'a> {
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
         self.pump_local_llc()?;
         self.pump_local_mptn()?;
+        let live_scopes = self.rtp.active_user_scopes();
+        let directory = &self.local_directory;
+        self.external_management
+            .retain(|lu, cp, attachment, scope| {
+                live_scopes.contains(&scope)
+                    && directory.resolve_lu(lu)
+                        == Some(Destination::Llc {
+                            hosting_cp: cp.clone(),
+                            attachment_id: attachment.to_owned(),
+                        })
+            });
         self.refresh_local_exports(hub)?;
         self.try_local_reverse(link)?;
         self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
         self.try_cp_replies(link, now_us)?;
         self.try_reciprocal_replies(link, now_us)?;
+        self.try_external_management_replies(link, now_us)?;
         while let Some(message) = self.pending_rtp.front().cloned() {
             let result = match message.kind {
                 RtpIngressKind::RouteSetup => self.route_message(link, hub, &message, now_us),
@@ -433,6 +449,7 @@ impl<'a> DirectHprRuntime<'a> {
             self.try_route_reply(link, now_us)?;
             self.try_cp_replies(link, now_us)?;
             self.try_reciprocal_replies(link, now_us)?;
+            self.try_external_management_replies(link, now_us)?;
         }
         self.pump_sessions(link, hub, now_us)?;
         if let Some(reverse) = self.reverse.as_mut() {
@@ -445,6 +462,28 @@ impl<'a> DirectHprRuntime<'a> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn try_external_management_replies(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        now_us: u64,
+    ) -> io::Result<()> {
+        let rtp = &mut self.rtp;
+        let bound = self
+            .external_management
+            .pump(|scope, reply| rtp.send_user_on_scope(link, scope, reply, now_us))?;
+        if let Some(scope) = bound {
+            if !self.bound_user_scopes.contains(&scope) {
+                self.bound_user_scopes.push(scope);
+            }
+            tracing::info!(
+                generation = scope.generation.get(),
+                user_tcid = format_args!("{:016x}", scope.initial_plu_tcid),
+                "external CP management BIND answered on EE user RTP"
+            );
         }
         Ok(())
     }
@@ -873,11 +912,41 @@ impl<'a> DirectHprRuntime<'a> {
     fn user_message(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
         let fid5 = Fid5WholeBiu::parse_complete(&message.bytes)
             .map_err(|error| protocol(format!("invalid HPR user BIU: {error:?}")))?;
-        if fid5
+        let bind = fid5
             .classify_bind()
-            .map_err(|error| protocol(format!("invalid HPR BIND: {error:?}")))?
-            .is_some()
-        {
+            .map_err(|error| protocol(format!("invalid HPR BIND: {error:?}")))?;
+        let external_start = if let Some(bind) = bind.as_ref() {
+            match self.external_management_start(message, bind) {
+                Ok(start) => start,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    tracing::warn!(error = %error, generation = message.observation.generation.get(),
+                        user_tcid = format_args!("{:016x}", message.observation.tcid),
+                        "external CP BIND rejected without dropping EE adjacency");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let external = match self.external_management.receive(
+            message.observation,
+            &message.bytes,
+            external_start,
+        ) {
+            Ok(handled) => handled,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                tracing::warn!(error = %error, generation = message.observation.generation.get(),
+                    user_tcid = format_args!("{:016x}", message.observation.tcid),
+                    "external CP management BIU rejected without dropping EE adjacency");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if external {
+            return Ok(());
+        }
+        if bind.is_some() {
             let peer_sa = u64::from_be_bytes(fid5.session_address);
             if let Some(session) = self
                 .sessions
@@ -947,6 +1016,67 @@ impl<'a> DirectHprRuntime<'a> {
             }
         }
         Ok(())
+    }
+
+    fn external_management_start(
+        &mut self,
+        message: &RtpIngress,
+        bind: &router_core::fid2_bind::BindIdentity,
+    ) -> io::Result<Option<VerifiedExternalRoute>> {
+        if bind.class
+            != (BindClass::Management {
+                mode: "SNASVCMG".into(),
+            })
+        {
+            return Ok(None);
+        }
+        let target_lu: router_core::session::QualifiedName = bind
+            .slu
+            .parse()
+            .map_err(|_| protocol("external CP BIND target is not qualified"))?;
+        let Some(Destination::Llc {
+            hosting_cp,
+            attachment_id,
+        }) = self.route_targets.get(&target_lu).cloned()
+        else {
+            return Ok(None);
+        };
+        if bind.plu != self.bootstrap.peer.cp.to_string()
+            || target_lu != hosting_cp
+            || self.rtp.user_target_for(&message.observation) != Some(&target_lu)
+        {
+            return Err(protocol(
+                "external CP BIND conflicts with authorized EE route",
+            ));
+        }
+        if self.local_directory.resolve_lu(&target_lu)
+            != Some(Destination::Llc {
+                hosting_cp: hosting_cp.clone(),
+                attachment_id: attachment_id.clone(),
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "external CP BIND awaits live LLC XID proof",
+            ));
+        }
+        let scope = self
+            .rtp
+            .user_scope_for(&message.observation)
+            .ok_or_else(|| protocol("external CP user RTP scope missing"))?;
+        let handle = self.next_handle;
+        if handle >= (1u64 << 62) {
+            return Err(protocol("external CP session addresses exhausted"));
+        }
+        self.next_handle += 1;
+        Ok(Some(VerifiedExternalRoute {
+            scope,
+            peer_cp: self.bootstrap.peer.cp.clone(),
+            target_lu,
+            target_cp: hosting_cp,
+            attachment_id,
+            assigned_sa: (1u64 << 63) | handle,
+        }))
     }
 
     fn publish_reachability(
