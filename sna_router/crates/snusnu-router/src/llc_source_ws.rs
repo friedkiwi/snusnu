@@ -33,6 +33,7 @@ pub(crate) struct LlcSourceWs {
     bound: bool,
     user_rejected: bool,
     source_closed: bool,
+    retiring: bool,
 }
 
 impl LlcSourceWs {
@@ -53,31 +54,43 @@ impl LlcSourceWs {
             bound: false,
             user_rejected: false,
             source_closed: false,
+            retiring: false,
         }
     }
 
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
+        if self.retiring {
+            match self.source.poll()? {
+                Some(SourceUpdate::Closed) => {
+                    self.source_closed = true;
+                    return Ok(false);
+                }
+                Some(SourceUpdate::Event(_)) | None => {}
+            }
+            if self.source.reject_user_bind()? {
+                self.user_rejected = true;
+                return Ok(false);
+            }
+            return Ok(true);
+        }
         if !self.ws.is_open() && self.opened_at.elapsed() >= OPEN_TIMEOUT {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "LLC SessionV1 concentrator open timed out",
-            ));
+            self.retiring = true;
+            self.ws.close()?;
+            return Ok(true);
         }
         if self
             .pending_ws
             .as_ref()
             .is_some_and(|(_, _, since)| since.elapsed() >= EVENT_TIMEOUT)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "LLC SessionV1 native egress stalled",
-            ));
+            self.retiring = true;
+            self.ws.close()?;
+            return Ok(true);
         }
         if bind_result_expired(self.bind_sent_at, self.bound, Instant::now()) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "LLC SessionV1 remote BIND result timed out",
-            ));
+            self.retiring = true;
+            self.ws.close()?;
+            return Ok(true);
         }
         if self.pending_ws.is_none() {
             match self.ws.poll()? {
@@ -97,12 +110,14 @@ impl LlcSourceWs {
                     self.pending_ws = Some((event, charged, Instant::now()));
                 }
                 Some(SessionWsUpdate::Closed) => {
-                    return Ok(false);
+                    self.retiring = true;
+                    return Ok(true);
                 }
                 Some(SessionWsUpdate::Opened) | None => {}
             }
         } else if self.ws.poll_control()? {
-            return Ok(false);
+            self.retiring = true;
+            return Ok(true);
         }
         if let Some((event, charged, _)) = &self.pending_ws {
             if matches!(
@@ -171,10 +186,10 @@ impl LlcSourceWs {
                 "LLC user circuit cannot return a closed or bound link",
             ));
         }
-        if !self.user_rejected && !self.source.reject_user_bind()? {
+        if !self.user_rejected {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "native negative BIND response queue is full",
+                "native negative BIND response has not been queued",
             ));
         }
         self.ws.close()?;
