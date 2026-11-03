@@ -1757,7 +1757,7 @@ mod tests {
         assert!(!port.submit_udp_abort(9, &reduced).unwrap());
         port.drive_user_flow().unwrap();
         let unbind = port.inner.information.last().unwrap();
-        assert_eq!(&unbind[..15], &hex("2f00020200006b8000320f08010000"));
+        assert_eq!(&unbind[..15], &hex("2f00020200006b8000320100000000"));
         assert_eq!(port.take_completed_udp_abort(), None);
 
         port.inner.completed = 1;

@@ -128,14 +128,19 @@ impl ReverseUserTeardown {
             self.phase = Phase::Closed;
             return Err(error);
         }
-        let mut native = Vec::with_capacity(body.len() + 4);
+        // TCP62 carries the extended X'0f08' Abort correlation image. The
+        // V4R4 LLC peer expects the short SNA user UNBIND carrying the same
+        // verified FQPCID; sending the extended bearer image yields a
+        // negative RSP(UNBIND) with sense X'10020000'.
+        let mut native = Vec::with_capacity(15 + self.fqpcid.len());
         native.extend_from_slice(&[
             0x2d | (u8::from(self.address.odai) << 1),
             0,
             self.address.daf,
             self.address.oaf,
         ]);
-        native.extend_from_slice(body);
+        native.extend_from_slice(&[0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0]);
+        native.extend_from_slice(&self.fqpcid);
         self.pending = Some(native);
         self.bearer = Some(bearer);
         self.phase = Phase::NativeUnbindPrepared;
@@ -237,7 +242,7 @@ mod tests {
     const CONNECT: &str = "000000e6800a00e22a0b010ce2d6d3d5c5e34be2d5c1c2010b010ce2d6d3d5c5e34be2d5c1c10109b0239f7a1a3280000f00008005000000760000007620000508000601010a02008d00006b800031001307b0b0513303838c8c8303060200000000000000944300000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301239f773c9a00000c04e2d6d3d5c5e34be2d5c1c10a1300b0239f773c9a0000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dc29a10be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e31800000501190a000a0020010310831a00000584";
     const ABORT: &str = "0000003b1000006b8000320f080100006014cec37477b5dc29a10be2d6d3d5c5e34be2d5c1c13513080100000c000be2d6d3d5c5e34be2d5c1c200";
 
-    fn fixture() -> ReverseUserTeardown {
+    fn fixture_at(address: NativeAddress) -> ReverseUserTeardown {
         let mut ingress = IngressSession::new(IngressPolicy {
             source_lu: "SOLNET.SNAA".into(),
             destination_lu: "SOLNET.SNAB".into(),
@@ -249,15 +254,45 @@ mod tests {
         })
         .unwrap();
         let offer = ingress.receive(&hex(CONNECT)).unwrap();
-        ReverseUserTeardown::from_user_offer(
-            offer,
-            NativeAddress {
-                daf: 2,
-                oaf: 1,
-                odai: false,
-            },
-        )
-        .unwrap()
+        ReverseUserTeardown::from_user_offer(offer, address).unwrap()
+    }
+
+    fn fixture() -> ReverseUserTeardown {
+        fixture_at(NativeAddress {
+            daf: 2,
+            oaf: 1,
+            odai: false,
+        })
+    }
+
+    #[test]
+    fn v4r4_negative_response_to_extended_native_unbind_stays_rejected() {
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        let mut teardown = fixture_at(address);
+        let canonical = teardown.canonical_udp_abort().unwrap();
+        let native = teardown.prepare_udp_abort(&canonical).unwrap().to_vec();
+        assert_eq!(&native[..15], &hex("2f00020200006b8000320100000000"));
+        teardown.mark_native_unbind_enqueued(&native).unwrap();
+        // Captured OS/400 V4R4 sense X'10020000' rejects the old extended
+        // native image. It must never be mistaken for a completed UNBIND.
+        assert!(teardown
+            .accept_native_response(&hex("2f0002020000eb90001002000032"))
+            .is_err());
+        assert_eq!(teardown.phase(), Phase::Closed);
+
+        let mut teardown = fixture_at(address);
+        let native = teardown.prepare_udp_abort(&canonical).unwrap().to_vec();
+        teardown.mark_native_unbind_enqueued(&native).unwrap();
+        assert_eq!(
+            teardown
+                .accept_native_response(&hex("2f0002020000eb800032"))
+                .unwrap(),
+            AbortBearer::Udp
+        );
     }
 
     #[test]
@@ -270,9 +305,10 @@ mod tests {
         let native = native.to_vec();
         assert_eq!(
             &native[..15],
-            &[0x2d, 0, 2, 1, 0, 0, 0x6b, 0x80, 0, 0x32, 0x0f, 0x08, 1, 0, 0]
+            &[0x2d, 0, 2, 1, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0]
         );
-        assert_eq!(native.len(), 58);
+        assert_eq!(native.len(), 15 + teardown.fqpcid.len());
+        assert_eq!(&native[15..], teardown.fqpcid);
         teardown.mark_native_unbind_enqueued(&native).unwrap();
         assert_eq!(
             teardown
@@ -288,8 +324,9 @@ mod tests {
         let reduced = &hex(ABORT)[5..];
         let mut teardown = fixture();
         let native = teardown.prepare_udp_abort(reduced).unwrap().to_vec();
-        assert_eq!(native.len(), 58);
-        assert_eq!(&native[4..], reduced);
+        assert_eq!(native.len(), 15 + teardown.fqpcid.len());
+        assert_eq!(&native[6..15], &[0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0]);
+        assert_eq!(&native[15..], teardown.fqpcid);
         assert_eq!(teardown.phase(), Phase::NativeUnbindPrepared);
         assert!(teardown.prepare_udp_abort(reduced).is_err());
         assert!(teardown
@@ -298,6 +335,13 @@ mod tests {
         assert_eq!(teardown.phase(), Phase::NativeUnbindPrepared);
         teardown.mark_native_unbind_enqueued(&native).unwrap();
         assert_eq!(teardown.phase(), Phase::AwaitNativeResponse);
+        assert!(teardown
+            .accept_native_response(&[0x2d, 0, 1, 2, 0, 0, 0xeb, 0x90, 0, 0x10, 0x02, 0, 0, 0x32])
+            .is_err());
+        assert_eq!(teardown.phase(), Phase::Closed);
+        let mut teardown = fixture();
+        let native = teardown.prepare_udp_abort(reduced).unwrap().to_vec();
+        teardown.mark_native_unbind_enqueued(&native).unwrap();
         assert_eq!(
             teardown
                 .accept_native_response(&[0x2d, 0, 1, 2, 0, 0, 0xeb, 0x80, 0, 0x32])
