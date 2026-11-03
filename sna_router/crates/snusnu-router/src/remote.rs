@@ -360,6 +360,7 @@ pub(crate) struct WsRoutePort {
     target_cp: wire::SnaName,
     target_lu: Option<wire::SnaName>,
     target: Option<wire::RouteReference>,
+    retired_target_epochs: HashSet<Vec<u8>>,
     source_route: Option<wire::RouteReference>,
     profile: wire::CircuitProfile,
     require_managed_binding: bool,
@@ -880,6 +881,7 @@ impl WsRoutePort {
                 target_cp: config.target_cp,
                 target_lu: config.target_lu,
                 target: None,
+                retired_target_epochs: HashSet::new(),
                 source_route: source_routes
                     .as_ref()
                     .and_then(|routes| routes[index].clone()),
@@ -1019,6 +1021,12 @@ impl WsRoutePort {
                         if current.router_id != origin.router_id {
                             return Ok(Vec::new());
                         }
+                        if self.retired_target_epochs.contains(&snapshot.epoch) {
+                            debug!(origin_router_id = %format_uuid(&origin.router_id),
+                                origin_epoch = %format_uuid(&snapshot.epoch),
+                                "ignoring retired target route epoch");
+                            return Ok(Vec::new());
+                        }
                         let next = snapshot
                             .routes
                             .iter()
@@ -1030,6 +1038,12 @@ impl WsRoutePort {
                                 route_generation: route.generation,
                             });
                         if self.target.as_ref() != next.as_ref() {
+                            if next
+                                .as_ref()
+                                .is_some_and(|route| route.epoch != current.epoch)
+                            {
+                                self.retired_target_epochs.insert(current.epoch.clone());
+                            }
                             if self.circuit.is_some() {
                                 self.disconnect()?;
                                 return Ok(vec![RouterEvent::Closed]);
@@ -1156,6 +1170,7 @@ impl WsRoutePort {
                         self.clear_circuit();
                     }
                     if retryable_auto_lu {
+                        self.retired_target_epochs.insert(withdraw.epoch.clone());
                         self.retry_at = Some(Instant::now() + Duration::from_secs(30));
                     }
                 }
@@ -2790,6 +2805,7 @@ impl AutoWsHub {
             target_cp,
             target_lu,
             target: None,
+            retired_target_epochs: HashSet::new(),
             source_route,
             profile: wire::CircuitProfile::NativeDlc,
             require_managed_binding: false,
@@ -3256,6 +3272,29 @@ mod tests {
             };
             assert!(reopened.request_id > open.request_id);
             assert_eq!(reopened.target.as_ref().unwrap().epoch, vec![11; 16]);
+            // A delayed snapshot from the retired epoch must not supersede
+            // the replacement and start a second circuit for the same LU.
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![10; 16],
+                        revision: 2,
+                        routes: vec![wire::RouteExport {
+                            id: 2,
+                            generation: 1,
+                            resource: Some(wire::route_export::Resource::LogicalUnit(
+                                wire::LuReachability {
+                                    lu: Some(name("SNUSNU", "PING")),
+                                    hosting_cp: Some(name("SNUSNU", "SVC")),
+                                    supported_types: vec![wire::LuType::LuType62 as i32],
+                                },
+                            )),
+                        }],
+                    }),
+                }),
+            );
             send(
                 &mut socket,
                 wire::ws_envelope::Body::OpenResult(wire::OpenResult {
