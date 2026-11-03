@@ -98,6 +98,22 @@ fn negative_user_bind_reply(mut positive: Vec<u8>, sense: [u8; 4]) -> io::Result
     Ok(positive)
 }
 
+fn converter_rejection_ready(
+    offer_present: bool,
+    response_pending: bool,
+    response_acked: bool,
+    negative_pending: bool,
+    phase: Option<ManagementPhase>,
+) -> io::Result<bool> {
+    if !offer_present || response_pending || response_acked || negative_pending {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native user BIND is not awaiting a response",
+        ));
+    }
+    Ok(phase == Some(ManagementPhase::Closed))
+}
+
 impl NativePeerPort {
     pub(crate) fn open(peer: LlcPeer<'_>, local_xid: Xid3) -> io::Result<Self> {
         let mut endpoint = Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?;
@@ -248,17 +264,14 @@ impl NativePeerPort {
     /// The fixed positive template supplies the exact TH address/SNF pair;
     /// only the response type and four-byte SNA sense are changed.
     pub(crate) fn reject_converter_user_bind(&mut self, sense: [u8; 4]) -> io::Result<bool> {
-        if self.converter_offer.is_none()
-            || self.converter_bind_response_pending
-            || self.converter_bind_response_acked
-            || self.converter_negative_bind_pending
-            || self.management.as_ref().map(ManagementSession::phase)
-                != Some(ManagementPhase::Closed)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "native user BIND is not awaiting a response",
-            ));
+        if !converter_rejection_ready(
+            self.converter_offer.is_some(),
+            self.converter_bind_response_pending,
+            self.converter_bind_response_acked,
+            self.converter_negative_bind_pending,
+            self.management.as_ref().map(ManagementSession::phase),
+        )? {
+            return Ok(false);
         }
         if self.endpoint.buffered_information_count() != 0 {
             return Ok(false);
@@ -1038,8 +1051,8 @@ impl RoutePort for NativePeerPort {
 #[cfg(test)]
 mod completion_tests {
     use super::{
-        exclusive_bind_ack, negative_user_bind_reply, publish_pending_converter_bind,
-        queue_converter_bind, NativeLlcEvent,
+        converter_rejection_ready, exclusive_bind_ack, negative_user_bind_reply,
+        publish_pending_converter_bind, queue_converter_bind, NativeLlcEvent,
     };
     use router_core::{fid2_session_control::ManagementBind, native_management::Phase};
     use std::collections::VecDeque;
@@ -1058,6 +1071,22 @@ mod completion_tests {
         let negative = negative_user_bind_reply(positive, [0x08, 0xa0, 0, 2]).unwrap();
         assert_eq!(negative, hex("2f0002011234eb900008a00002"));
         assert!(negative_user_bind_reply(hex("2f0002011234eb900031"), [0; 4]).is_err());
+    }
+
+    #[test]
+    fn early_remote_close_waits_for_management_unbind_ack_before_rejecting_user_bind() {
+        assert!(
+            !converter_rejection_ready(true, false, false, false, Some(Phase::AwaitBisAck))
+                .unwrap()
+        );
+        assert!(
+            !converter_rejection_ready(true, false, false, false, Some(Phase::AwaitUnbindAck))
+                .unwrap()
+        );
+        assert!(converter_rejection_ready(true, false, false, false, Some(Phase::Closed)).unwrap());
+        assert!(
+            converter_rejection_ready(false, false, false, false, Some(Phase::Closed)).is_err()
+        );
     }
 
     fn bind_pair() -> (ManagementBind, Vec<u8>) {
