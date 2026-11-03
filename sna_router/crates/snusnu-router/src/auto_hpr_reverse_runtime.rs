@@ -18,13 +18,12 @@ use router_core::{
 
 use crate::{
     auto_hpr_reverse::ReverseHprUser,
-    auto_hpr_runtime::{
-        from_session_wire, to_session_wire, SessionSwitch, SwitchError, HPR_ADAPTER, WS_ADAPTER,
-    },
+    auto_hpr_runtime::{from_session_wire, to_session_wire},
     ee_ldlc_endpoint::EeLdlcEndpoint,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     hpr_session_source::{SessionSource, SourceUpdate},
     remote::{SessionWsPort, SessionWsUpdate},
+    session_switch::{SessionSwitch, SwitchError, HPR_ADAPTER, WS_ADAPTER},
 };
 
 const MAX_EARLY_USER_BIUS: usize = 16;
