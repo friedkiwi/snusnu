@@ -268,7 +268,11 @@ func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) e
 	token[0] = 0x23
 	copy(token[1:5], random[8:12])
 	token[5] = 0x80
-	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+c.peer.CP, 1, 2, instance, token)
+	remoteLU := c.peer.CP
+	if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC") == "1" {
+		remoteLU = c.peer.LU
+	}
+	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+remoteLU, 1, 2, instance, token)
 	if err != nil {
 		return err
 	}
@@ -458,7 +462,15 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if len(data) < 37 || data[6] != 0xeb || data[9] != 0x31 || data[2] != 2 || data[3] != 1 {
 			return nil
 		}
-		gds, err := lu62.EncodeCNOS(lu62.CNOS{Service: 2, SessionLimit: 8, SourceWinners: 4, TargetWinners: 4, ModeWidth: 8})
+		cnos := lu62.CNOS{Service: 2, SessionLimit: 8, SourceWinners: 4, TargetWinners: 4, ModeWidth: 8}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC") == "1" {
+			var err error
+			cnos, err = lu62.New5494ControllerCNOS(56)
+			if err != nil {
+				return err
+			}
+		}
+		gds, err := lu62.EncodeCNOS(cnos)
 		if err != nil {
 			return err
 		}

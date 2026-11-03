@@ -383,6 +383,18 @@ controller session on that address pair. The next trial must establish the
 addresses from the host's session descriptor; changing the BIND address
 pair alone has no supporting evidence.
 
+A QA-only outbound LLC trial then prepared a 5494 source CNOS request
+(`QRMTWSC`, 57 sessions, one source winner, 56 target winners) and used
+the guest's management LU `SOLNET.S1054504` in the preceding source
+SNASVCMG BIND. The guest replied to that BIND on `(2,1)` with negative
+sense `80040000` before any CNOS was sent. The earlier source BIND using
+the guest CP name `SOLNET.PRTGUEST` received the same sense. Both tests
+followed XID3/link readiness after varying `LLCPRT` on, with the guest's
+ACTLU following the rejected BIND. The source-CNOS option is gated by
+`SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC=1`; it makes the intended mode limits
+explicit once a source management session can be activated. The successful
+AnyNet source CNOS uses a separate router-to-guest management path.
+
 The [TCP62 transport draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00.txt)
 specifies LU 6.2 application conversion, whereas IBM's
 [management-services guide](https://public.dhe.ibm.com/software/network/commserver/publications/cslin_64/czx41100.pdf)
