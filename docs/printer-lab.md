@@ -551,6 +551,13 @@ flag, and the Go PSID encoder rejected zero. A subsequent LLC trial sent
 NMVT response, but SNUPRT and SNUPRT01 remained pending and no address-01
 BIND followed. The library now requires zero for its unsolicited form.
 
+The 5494 firmware also converts BIOS BCD clock fields to binary before
+placing them in the Reply-PSID Date/Time subvector. QA's fixed year `26`
+was encoded as hex `26`, or binary 38, and its fixed time was stale. QA now
+uses the process's current local date and time as binary fields. A live LLC
+trial with this date, zero PRID, and TH byte 1 zero received the same positive
+SNA response, but still produced no address-01 BIND or SCS data.
+
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
 four-byte `04 D4 07 30` subvector identifying the 5494 controller family.

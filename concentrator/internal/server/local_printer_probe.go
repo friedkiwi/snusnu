@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/friedkiwi/snusnu/sna"
@@ -473,6 +474,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 // fields below are lab placeholders; a real printer service must obtain them
 // from its attached device and maintain the independent SSCP-PU flow.
 func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
+	now := time.Now()
 	psid := printer.ReplyPSID{
 		ProcedureID: 0,
 		Address:     1, Station: 1,
@@ -482,7 +484,10 @@ func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
 			Plant:       [2]byte{0xf0, 0xf0},
 			Serial:      [7]byte{0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf1},
 		},
-		DateTime: [6]byte{0x26, 11, 3, 14, 0, 0},
+		DateTime: [6]byte{
+			byte(now.Year() % 100), byte(now.Month()), byte(now.Day()),
+			byte(now.Hour()), byte(now.Minute()), byte(now.Second()),
+		},
 	}
 	out, err := psid.EncodeNMVTPIU([6]byte{0x2c, 0, 0, 0, 0, 1}, 0x80, 0)
 	if err != nil {
