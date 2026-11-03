@@ -34,6 +34,7 @@ use crate::{
     hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     llc_session_ws::LlcSessionWs,
+    publication::EeOwnerExport,
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
     session_switch::{SessionSwitch, SwitchError, HPR_ADAPTER, LOCAL_ADAPTER, WS_ADAPTER},
     STOP,
@@ -48,6 +49,7 @@ use router_core::{
     hpr_route_setup_reply::{encode_stale_path_switch_negative, ReverseLinkMetrics},
     hpr_route_setup_service::{DirectRouteSetupService, PreparedRouteSetupReply},
     hpr_session_adapter::{negotiated_fixed_windows, HprSessionAdapter, HprSessionRole},
+    route_registry::{LuType, RouteKey, RouteRecord},
     session::{Flow, SessionEvent, SessionIdentity, SessionUnit},
     session_fabric::{AdapterId, FabricError, FabricSessionId, Reachability},
     ConnectionGeneration,
@@ -1517,25 +1519,54 @@ impl<'a> DirectHprRuntime<'a> {
         }))
     }
 
-    fn publish_reachability(
-        &self,
-        hub: &mut AutoWsHub,
-        extra: Option<&SessionIdentity>,
-    ) -> io::Result<()> {
+    pub(crate) fn ee_owner_export(&self) -> EeOwnerExport {
         let peer_cp = self
             .peer_lus
             .as_ref()
             .and_then(EePeerLus::peer_cp)
             .cloned()
             .unwrap_or_else(|| self.bootstrap.peer.cp.clone());
-        let mut cps = HashSet::from([peer_cp.clone()]);
-        let mut lus = self
-            .peer_lus
-            .as_ref()
-            .into_iter()
-            .flat_map(EePeerLus::advertised)
-            .map(|lu| (lu, peer_cp.clone()))
-            .collect::<HashSet<_>>();
+        let mut records = vec![RouteRecord::from(RouteKey::ControlPoint(peer_cp.clone()))];
+        records.extend(
+            self.peer_lus
+                .as_ref()
+                .into_iter()
+                .flat_map(EePeerLus::advertised)
+                .map(|lu| RouteRecord {
+                    key: RouteKey::LogicalUnit {
+                        lu,
+                        hosting_cp: peer_cp.clone(),
+                    },
+                    supported_types: vec![LuType::Lu62],
+                }),
+        );
+        EeOwnerExport {
+            owner: self
+                .ee_attachment_id
+                .clone()
+                .unwrap_or_else(|| "hpr_ip".into()),
+            records,
+        }
+    }
+
+    fn publish_reachability(
+        &self,
+        hub: &mut AutoWsHub,
+        extra: Option<&SessionIdentity>,
+    ) -> io::Result<()> {
+        let mut cps = HashSet::new();
+        let mut lus = HashSet::new();
+        for record in self.ee_owner_export().records {
+            match record.key {
+                RouteKey::ControlPoint(cp) => {
+                    cps.insert(cp);
+                }
+                RouteKey::LogicalUnit { lu, hosting_cp } => {
+                    lus.insert((lu, hosting_cp));
+                }
+                RouteKey::ProxyMac(_) => {}
+            }
+        }
         for (lu, cp) in eligible_local_exports(&self.local_exports, hub.allowed_netid()) {
             cps.insert(cp.clone());
             lus.insert((lu, cp));
