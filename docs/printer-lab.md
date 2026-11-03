@@ -21,11 +21,12 @@ target is SCS text; an HPT or IPDS stream needs a separate renderer.
 
 The [IBM 5494 Functions Reference, chapter 8](https://bitsavers.trailing-edge.com/pdf/ibm/5494/SC30-3533-02_5494_Remote_Control_Unit_Functions_Reference_Rel_2.0_199311.pdf)
 settles the session direction: the 5494 first negotiates session limits with
-CNOS and initiates the controller BIND. It then reports a powered-on printer
-on that controller session; IBM i validates the device and initiates a second
-LU 6.2 BIND for that printer. LU 4 printer traffic is encapsulated inside the
-LU 6.2 device session. The service therefore needs both session directions
-and the controller notification before a writer can send spool data.
+CNOS and initiates the controller BIND. It then reports a powered-on printer;
+IBM i validates the device and initiates a second LU 6.2 BIND for that printer.
+LU 4 printer traffic is encapsulated inside the LU 6.2 device session. The
+firmware shows that the power-on report uses a direct NMVT network-management
+FID2 PIU, separate from the LU 6.2 controller Attach conversation. The service
+needs both paths before a writer can send spool data.
 
 The transport-independent Go `sna/services/printer` package now parses the
 IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds
@@ -33,7 +34,8 @@ candidate ACTLU and printer BIND responses, and renders common SCS fixed-pitch
 text. It also encodes the short, hardware-only NMVT Reply Product Set ID used
 to announce a powered-on printer, with runtime SNA address and VPD supplied by
 the caller. These candidates have not been exercised against the guest. The
-enclosing LU 6.2 controller and device GDS envelopes remain unknown.
+NMVT has no LU 6.2 GDS envelope; its live FID2 TH/RH and the device session's
+private GDS envelope remain to be established.
 The package does not perform APPC session management, store jobs, or produce a
 PDF. The concentrator now has owner-scoped durable raw SCS storage,
 a searchable print list, a monospace preview, and a greenbar PDF writer. These
@@ -47,13 +49,15 @@ CNOS reply validator checks the accepted-pending service, mode, session limits,
 and reversed FID2 addresses before the controller can proceed. Its
 binary architecture-TP Attach parser can retain the controller TPN
 `30F0F6F6` without treating it as an EBCDIC application name. These requests
-have not been accepted by a live IBM i controller session. Building the
-controller Attach, processing its reply, and wrapping the NMVT in the live
-controller exchange remain to be implemented.
+have not been accepted by a live IBM i controller session. The library now
+encodes the firmware's 17-byte controller Attach prefix and appends caller-
+supplied PIP data. Supplying valid runtime PIP, processing the Attach reply,
+and sending the NMVT on the network-management session remain to be implemented.
 
 IBM's [LU 6.2 guide](https://www.ibm.com/docs/en/SSLTBW_3.1.0/pdf/istp620_v3r1.pdf)
 defines both basic and mapped FMH-5 conversation forms. The parser accepts
-either form; the 5494's choice and its allocation data still need a trace.
+either form. The Release 3.2 controller template uses the basic `D0` form;
+its complete runtime PIP and transmitted Attach still need a trace.
 
 ## V5R4 guest setup and probe
 
@@ -123,7 +127,9 @@ The firmware's `VG15.BIN` constructs an NMVT Reply PSID (`41 03 8D` request,
 `09 82 04 10 00 01 03 20 01`. Its product subvector starts `19 10` and
 copies machine type, model, plant and serial from runtime twinax VPD. The
 [research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
-lists exact firmware offsets and the remaining unknown wrapper and host reply.
+traces `VG15`'s direct network-management send path. It does not pass the NMVT
+through a private LU 6.2 GDS. The dynamic FID2 TH/RH and IBM i's response
+still need a live trace.
 The configured `3812` machine type would be `F3 F8 F1 F2` in EBCDIC, but that
 value was not observed in a populated firmware VPD table.
 
@@ -137,8 +143,9 @@ power-on record would be unsupported.
 
 1. Capture the actual V5R4 `QRMTWSC` control and printer sessions against a
    compatible 5494 or APPC printer peer. The firmware establishes the NMVT
-   Reply PSID payload, but its outer controller record, IBM i's immediate
-   reply, and correlation with the parallel printer session still need a trace.
+   Reply PSID payload and its direct network-management path, but dynamic
+   TH/RH fields, IBM i's response, and correlation with the parallel printer
+   session still need a trace.
 2. Generalize the router's service-directed BIND admission and both transport
    adapters for the printer's session profile. The concentrator local service
    registry can now open an outbound circuit from its own LU, but the router's
