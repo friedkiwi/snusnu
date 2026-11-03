@@ -494,9 +494,35 @@ traces `VG15`'s direct network-management send path. It does not pass the NMVT
 through a private LU 6.2 GDS. VG15 prepends a 12-byte FID2 TH/RH/NMVT header.
 RH0 is `0B`; RH1/RH2 and FID2 addressing come from runtime session state.
 VG15 marks the device ready after a resident-service transmit completion.
-IBM i's response and runtime header bytes still need a live trace.
+The real 5494's runtime header bytes and any host application response beyond
+the SNA response still need a live trace.
 The configured `3812` machine type would be `F3 F8 F1 F2` in EBCDIC, but that
 value was not observed in a populated firmware VPD table.
+
+The November 3 LLC probe used the firmware-derived 5494 controller XID and
+sent a constructed address-01 Reply PSID after the controller Attach. With
+both router and concentrator QA debug enabled, the same 75-byte PIU appears
+as QA WebSocket output, router WebSocket input, and an LLC information frame
+sent to IBM i. IBM i returned `8B 80 00 41 03 8D`, which the router relayed
+back to QA. This is a positive SNA response to the NMVT; it does not prove
+that IBM i accepted the printer VPD or associated `SNUPRT01` with the
+controller. `SNUPRT` and `SNUPRT01` remained `VARY ON PENDING`.
+
+IBM i then completed an address-56 LU7 ACTLU and BIND, followed by `D820/02`
+query and `D821/10` station-state exchanges. QA's candidate replies received
+positive SNA responses. IBM i next sent an inner LU7 `D822/02` record, for
+which the probe has no handler; it later sent an expedited SIGNAL. No
+address-01 LU4 BIND or SCS data followed. The 5494 firmware contains `D822`
+handling in `VG03.BIN`, so the next probe must derive this exchange from the
+firmware rather than treat the positive SNA responses as device readiness.
+
+One disposable probe sent `00 05 D8 23 02` on the controller session after
+the NMVT response. IBM i subsequently sent UNBIND with sense `20020000`
+(chain error). The probe was removed. `VG0F.BIN` runtime `0x1537` constructs
+that GDS only for a station record whose state byte at offset `+3` is `01`;
+the `0x044F` event path invokes it when station state reaches `07`. It cannot
+be sent opportunistically on the controller session. Neither this trial nor
+the address-56 dialogue has activated the configured printer.
 
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
