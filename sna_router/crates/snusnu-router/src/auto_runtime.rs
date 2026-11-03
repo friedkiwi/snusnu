@@ -1431,7 +1431,16 @@ fn observe_proof(
 ) -> io::Result<()> {
     match identity {
         IdentityObservation::ControlPoint(cp) => proofs.observe_cp(attachment, owner, &cp),
-        IdentityObservation::LogicalUnit(lu) => proofs.observe_lu(attachment, &owner, &lu),
+        IdentityObservation::LogicalUnit(lu) => match proofs.observe_lu(attachment, &owner, &lu) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                tracing::warn!(attachment = %attachment.0, association_origin = %owner.origin,
+                        association = owner.id, lu = %lu, error = %error,
+                        "LLC LU observation rejected; retaining live CP proof");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
         IdentityObservation::Withdraw => {
             proofs.withdraw(attachment, &owner);
             Ok(())
@@ -1809,6 +1818,44 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn invalid_lu_observation_does_not_remove_verified_cp_or_routes() {
+        let attachment = PortId::new("llc-a");
+        let owner = association("fabric", 7);
+        let mut proofs = LlcProofRegistry::default();
+        proofs
+            .observe_cp(&attachment, owner.clone(), "LOCAL.CPA")
+            .unwrap();
+        observe_proof(
+            &mut proofs,
+            &attachment,
+            owner.clone(),
+            IdentityObservation::LogicalUnit("OTHER.LUA".into()),
+        )
+        .unwrap();
+        observe_proof(
+            &mut proofs,
+            &attachment,
+            owner.clone(),
+            IdentityObservation::LogicalUnit("bad-name".into()),
+        )
+        .unwrap();
+        let snapshot = proofs.snapshot(&attachment).unwrap();
+        assert_eq!(snapshot.cp, QualifiedName::new("LOCAL", "CPA").unwrap());
+        assert!(snapshot.lus.is_empty());
+        observe_proof(
+            &mut proofs,
+            &attachment,
+            owner,
+            IdentityObservation::LogicalUnit("LOCAL.LUA".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            proofs.snapshot(&attachment).unwrap().lus,
+            vec![QualifiedName::new("LOCAL", "LUA").unwrap()]
+        );
+    }
 
     #[test]
     fn hub_loss_withdraws_upstream_but_keeps_local_discovery() {
