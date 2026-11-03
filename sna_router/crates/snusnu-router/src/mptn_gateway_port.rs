@@ -122,6 +122,14 @@ struct Association {
     outbound_abort_pending: bool,
 }
 
+/// A validated user Connect removed from the shared listener before a
+/// carrier-neutral EE session source takes over its TCP and UDP scheduling.
+pub(crate) struct DetachedUserAssociation {
+    pub(crate) tcp: TcpSession,
+    pub(crate) incoming: VecDeque<TcpRecord>,
+    pub(crate) incoming_bytes: usize,
+}
+
 pub(crate) struct MptnGatewayPort {
     config: GatewayConfig,
     dynamic_lus: bool,
@@ -1377,6 +1385,42 @@ impl MptnGatewayPort {
             self.completed_by_association.remove(&id);
         }
         Ok(())
+    }
+
+    pub(crate) fn detach_validated_user_for(
+        &mut self,
+        id: u64,
+        offer: &IngressOffer,
+    ) -> io::Result<DetachedUserAssociation> {
+        let association = self
+            .association(id)
+            .ok_or_else(|| invalid("unknown TCP62 user association"))?;
+        let SessionState::UserAwaitResponse(admitted) = &association.state else {
+            return Err(invalid(
+                "TCP62 association is not awaiting a user BIND response",
+            ));
+        };
+        if !matches!(offer.kind(), IngressKind::User { .. })
+            || admitted.connect() != offer.connect()
+            || association.user_inflight
+            || !association.writes.is_empty()
+            || association.pending_oob.is_some()
+            || association.outbound_oob.is_some()
+            || association.pending_tcp_expedited.is_some()
+        {
+            return Err(invalid("TCP62 user association changed before detach"));
+        }
+        let detached = if id == 0 {
+            self.active.take().unwrap()
+        } else {
+            self.completed_by_association.remove(&id);
+            self.associations.remove(&id).unwrap()
+        };
+        Ok(DetachedUserAssociation {
+            tcp: detached.tcp,
+            incoming: detached.incoming,
+            incoming_bytes: detached.incoming_bytes,
+        })
     }
 
     pub(crate) fn queue_user_bind_response_for(

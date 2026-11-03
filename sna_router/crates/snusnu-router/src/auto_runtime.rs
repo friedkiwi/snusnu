@@ -7,7 +7,9 @@ use crate::{
     auto_llc_ws::AutoLlcWsBridge,
     auto_local_dispatch::AutoLocalDispatch,
     config::{self, RouterConfig},
+    hpr_mptn_session_source::MptnToHprSession,
     local_status::LocalProxyMacStatus,
+    mptn_session_ws::MptnSessionWs,
     remote::AutoWsHub,
     routing::{AutomaticFabric, IdentityObservation, PortId, RouteAddress, SessionSide},
     STOP,
@@ -22,6 +24,19 @@ use std::{
 use transport_ws::wire;
 
 const IDLE_POLL: Duration = Duration::from_micros(200);
+
+fn require_session_v1_target(route: &wire::RouteExport) -> io::Result<()> {
+    if matches!(route.resource.as_ref(), Some(wire::route_export::Resource::LogicalUnit(lu))
+        if lu.supported_types.contains(&(wire::LuType::LuType62 as i32)))
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "automatic MPTN target does not advertise LU 6.2 SessionV1",
+        ))
+    }
+}
 
 struct LlcSession {
     ingress: Option<(usize, [u8; 6])>,
@@ -114,6 +129,8 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
     let mut local_dispatch = AutoLocalDispatch::new();
     let mut sessions = HashMap::<u64, LlcSession>::new();
     let mut next_id = 0u64;
+    let mut mptn_ws_sessions = HashMap::<u64, MptnSessionWs>::new();
+    let mut next_mptn_ws_id = 0u64;
     tracing::info!(
         llc_attachments = listeners.len(),
         mptn_attachments = gateways.len(),
@@ -238,6 +255,29 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             fabric
                 .directory_mut()
                 .replace(PortId::new(&remote.id), addresses);
+        }
+        for id in mptn_ws_sessions.keys().copied().collect::<Vec<_>>() {
+            let result = mptn_ws_sessions.get_mut(&id).unwrap().pump();
+            let retired = match result {
+                Ok(true) => false,
+                Ok(false) => true,
+                Err(error) => {
+                    tracing::warn!(session = id, error = %error,
+                        "automatic MPTN SessionV1 circuit failed");
+                    true
+                }
+            };
+            if retired {
+                let mut bridge = mptn_ws_sessions.remove(&id).unwrap();
+                let gateway_id = bridge.gateway_id().to_owned();
+                let _ = bridge.close();
+                if let Some(gateway) = gateways
+                    .iter_mut()
+                    .find(|gateway| gateway.id() == gateway_id)
+                {
+                    gateway.release_udp();
+                }
+            }
         }
         let mut active = match fabric.poll_once() {
             Ok(active) => active,
@@ -458,6 +498,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 continue;
             };
             active = true;
+            let mut detached_for_session = false;
             let result = (|| -> io::Result<()> {
                 let (source, destination) = AutoMptnGateway::offer_lus(&offer)?;
                 let source = config::parse_cp(&source)?;
@@ -542,12 +583,19 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         ),
                     ));
                 }
-                let (_, target_cp) = connected.resolve_lu(&destination)?.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "TCP62 target LU is not advertised")
+                let (target_ref, target_cp) =
+                    connected.resolve_lu(&destination)?.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "TCP62 target LU is not advertised")
+                    })?;
+                let target_route = connected.remote_route(&target_ref).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "TCP62 target LU route changed")
                 })?;
+                require_session_v1_target(&target_route)?;
                 let target_cp = target_cp.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "TCP62 target LU has no hosting CP")
                 })?;
+                tracing::debug!(gateway = gateway.id(), target_cp = %format!("{}.{}", target_cp.netid, target_cp.name),
+                    "automatic TCP62 target LU resolved for SessionV1");
                 let seed = format!("{}:{}.{}", gateway.id(), source.netid, source.name);
                 let local_cp = gateway
                     .configured_local_cp()?
@@ -569,26 +617,35 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     gateway.id().into(),
                 );
                 publish_local(&bridge, &mptn_exports, connected)?;
-                let ws = connected.open_lu(&destination, &source)?.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "TCP62 route changed before circuit open",
-                    )
-                })?;
-                gateway.start_to_ws(
-                    association,
-                    offer,
-                    ws,
-                    &local_cp,
-                    &target_cp,
-                    seed.as_bytes(),
-                    Duration::from_secs(600),
-                )
+                let ws = connected
+                    .open_session_lu(&destination, &source)?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "TCP62 route changed before circuit open",
+                        )
+                    })?;
+                let endpoint = gateway.outbound_endpoint();
+                let (detached, udp) = gateway.detach_user_for_hpr(association, &offer)?;
+                detached_for_session = true;
+                let source = MptnToHprSession::new(detached, udp, endpoint, offer)?;
+                next_mptn_ws_id = next_mptn_ws_id
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("MPTN SessionV1 ID exhausted"))?;
+                mptn_ws_sessions.insert(
+                    next_mptn_ws_id,
+                    MptnSessionWs::new(source, ws, gateway.id().to_owned()),
+                );
+                Ok(())
             })();
             if let Err(error) = result {
                 tracing::warn!(gateway = gateway.id(), association, error = %error,
                     "automatic TCP62 session rejected");
-                gateway.reject_offer(association, &error.to_string())?;
+                if detached_for_session {
+                    gateway.release_udp();
+                } else {
+                    gateway.reject_offer(association, &error.to_string())?;
+                }
             }
         }
         if let Some(connected) = hub.as_mut() {
@@ -604,6 +661,16 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         }
         if !active {
             thread::sleep(IDLE_POLL);
+        }
+    }
+    for (_, mut bridge) in mptn_ws_sessions.drain() {
+        let gateway_id = bridge.gateway_id().to_owned();
+        let _ = bridge.close();
+        if let Some(gateway) = gateways
+            .iter_mut()
+            .find(|gateway| gateway.id() == gateway_id)
+        {
+            gateway.release_udp();
         }
     }
     for session_id in sessions.keys().copied().collect::<Vec<_>>() {
@@ -913,4 +980,48 @@ fn open_incoming_llc(
         listeners[index].release(selected.proxy_mac);
     }
     result
+}
+
+#[cfg(test)]
+mod session_profile_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_mptn_lu62_uses_session_profile_and_rejects_cp_or_untyped_lu() {
+        let lu = wire::LuReachability {
+            lu: Some(wire::SnaName {
+                netid: "SOLNET".into(),
+                name: "SNAB".into(),
+            }),
+            hosting_cp: Some(wire::SnaName {
+                netid: "SOLNET".into(),
+                name: "SNAB".into(),
+            }),
+            supported_types: vec![wire::LuType::LuType62 as i32],
+        };
+        let mut route = wire::RouteExport {
+            id: 1,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::LogicalUnit(lu.clone())),
+        };
+        assert!(require_session_v1_target(&route).is_ok());
+        route.resource = Some(wire::route_export::Resource::ControlPoint(
+            lu.hosting_cp.unwrap(),
+        ));
+        assert_eq!(
+            require_session_v1_target(&route).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        route.resource = Some(wire::route_export::Resource::LogicalUnit(
+            wire::LuReachability {
+                lu: lu.lu,
+                hosting_cp: None,
+                supported_types: Vec::new(),
+            },
+        ));
+        assert_eq!(
+            require_session_v1_target(&route).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
 }

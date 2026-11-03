@@ -71,6 +71,8 @@ mod hpr_local_session;
 #[allow(dead_code)] // Live MPTN gateway routes for the EE switch.
 mod hpr_mptn_attachments;
 #[cfg(target_os = "linux")]
+mod hpr_mptn_session_source;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // The HPR session loop attaches this adapter once wired.
 mod hpr_rtp_port;
 #[cfg(target_os = "linux")]
@@ -93,6 +95,8 @@ mod mptn_ingress_lab;
 mod mptn_llc_reverse;
 #[cfg(target_os = "linux")]
 mod mptn_outbound_port;
+#[cfg(target_os = "linux")]
+mod mptn_session_ws;
 #[cfg(target_os = "linux")]
 mod mptn_ws_gateway_lab;
 #[cfg(target_os = "linux")]

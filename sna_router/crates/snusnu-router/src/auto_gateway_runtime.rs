@@ -192,10 +192,14 @@ impl Drop for AutoMptnGateway<'_> {
 
 impl<'a> AutoMptnGateway<'a> {
     pub(crate) fn bind(config: &'a MptnGatewayConfig) -> io::Result<Self> {
+        Self::bind_on_port(config, 397)
+    }
+
+    fn bind_on_port(config: &'a MptnGatewayConfig, port: u16) -> io::Result<Self> {
         let required =
             CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83]).map_err(io::Error::other)?;
         let listener = MptnGatewayPort::bind_dynamic(GatewayConfig {
-            local: SocketAddr::new(config.local_ip, 397),
+            local: SocketAddr::new(config.local_ip, port),
             peer_ip: config.peer_ip,
             source_lu: config.source_lu.clone(),
             destination_lu: config.destination_lu.clone(),
@@ -380,8 +384,11 @@ impl<'a> AutoMptnGateway<'a> {
         MptnGatewayPort::offer_lus(offer)
     }
 
+    /// Legacy native-DLC converter used by explicit routes. Automatic LU 6.2
+    /// routing uses SessionV1 after the validated TCP62 association detaches.
     /// Start one independently credited converter after the runtime has
     /// selected a unique destination and obtained a WebSocket circuit port.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)] // Circuit identity and converter policy are distinct inputs.
     pub(crate) fn start_to_ws(
         &mut self,
@@ -524,6 +531,27 @@ impl<'a> AutoMptnGateway<'a> {
 
     pub(crate) fn release_udp(&mut self) {
         self.udp_leased = false;
+    }
+
+    /// Move one validated inbound TCP62 user association into an independent
+    /// EE session source. The listener keeps its management associations and
+    /// switches to TCP-only polling while the source owns UDP/397.
+    pub(crate) fn detach_user_for_hpr(
+        &mut self,
+        association: u64,
+        offer: &IngressOffer,
+    ) -> io::Result<(
+        crate::mptn_gateway_port::DetachedUserAssociation,
+        std::net::UdpSocket,
+    )> {
+        let udp = self.lease_udp()?;
+        match self.listener.detach_validated_user_for(association, offer) {
+            Ok(detached) => Ok((detached, udp)),
+            Err(error) => {
+                self.release_udp();
+                Err(error)
+            }
+        }
     }
 
     fn retire_session(&mut self, id: u64) {
@@ -923,5 +951,24 @@ mod tests {
         let xid = virtual_xid(&cp, b"seed", None, None, 1).unwrap();
         assert_eq!(xid.cp_name().unwrap(), format!("{}.{}", cp.netid, cp.name));
         assert!(virtual_xid(&cp, b"seed", None, Some("bad"), 1).is_err());
+    }
+
+    #[test]
+    fn detached_mptn_source_exclusively_leases_udp_until_release() {
+        let config: crate::config::RouterConfig = toml::from_str(
+            "[[mptn]]\nprofile='gateway'\nid='test'\nlocal_ip='127.0.0.1'\npeer_ip='127.0.0.2'\n",
+        )
+        .unwrap();
+        let mut gateway = AutoMptnGateway::bind_on_port(&config.mptn_gateway[0], 0).unwrap();
+        assert!(gateway.udp_available());
+        let leased = gateway.lease_udp().unwrap();
+        assert!(!gateway.udp_available());
+        assert_eq!(
+            gateway.lease_udp().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(leased);
+        gateway.release_udp();
+        assert!(gateway.udp_available());
     }
 }
