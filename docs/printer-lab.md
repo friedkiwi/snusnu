@@ -47,6 +47,10 @@ have not been accepted by a live IBM i controller session. Building the
 controller Attach, processing its reply, and issuing the private power-on
 notification remain to be implemented.
 
+IBM's [LU 6.2 guide](https://www.ibm.com/docs/en/SSLTBW_3.1.0/pdf/istp620_v3r1.pdf)
+defines both basic and mapped FMH-5 conversation forms. The parser accepts
+either form; the 5494's choice and its allocation data still need a trace.
+
 ## V5R4 guest setup and probe
 
 The writable V5R4 B clone from the [EE APING lab](ee-aping-lab.md) has a

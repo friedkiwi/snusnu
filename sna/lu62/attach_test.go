@@ -35,6 +35,11 @@ func TestFirstArchitectureAttachKeepsBinaryTPN(t *testing.T) {
 	if named, err := ParseFirstAttach(piu); !errors.Is(err, ErrAttach) || named != nil {
 		t.Fatalf("binary TPN parsed as EBCDIC name: %+v %v", named, err)
 	}
+	basic := append([]byte(nil), piu...)
+	basic[15] = 0xd0
+	if parsed, err := ParseFirstArchitectureAttach(basic); err != nil || parsed == nil || parsed.TPN != got.TPN {
+		t.Fatalf("basic conversation Attach: %+v %v", parsed, err)
+	}
 	bad := append([]byte(nil), piu...)
 	bad[18] = 5
 	if _, err := ParseFirstArchitectureAttach(bad); !errors.Is(err, ErrAttach) {

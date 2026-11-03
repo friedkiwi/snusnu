@@ -39,7 +39,7 @@ func ParseFirstArchitectureAttach(data []byte) (*ArchitectureAttach, error) {
 	if p.RH != [3]byte{0x0a, 0x91, 0} || p.TH[4] != 0 || p.TH[5] != 1 ||
 		len(p.RU) < 14 || int(p.RU[0]) > len(p.RU) || int(p.RU[0]) < 14 ||
 		p.RU[2] != 2 || p.RU[3] != 0xff || p.RU[4] != 0 || p.RU[5] != 3 ||
-		p.RU[6] != 0xd1 || p.RU[7] != 0 || p.RU[8] != 0x40 || p.RU[9] != 4 {
+		(p.RU[6] != 0xd0 && p.RU[6] != 0xd1) || p.RU[7] != 0 || p.RU[8] != 0x40 || p.RU[9] != 4 {
 		return nil, ErrAttach
 	}
 	var tpn [4]byte
