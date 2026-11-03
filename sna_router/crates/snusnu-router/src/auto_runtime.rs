@@ -2473,6 +2473,11 @@ fn open_incoming_llc_session(
             .is_some_and(LocalLlcIngress::can_lease_reverse)
             || circuits.values().any(|circuit| circuit.listener == index)
         {
+            tracing::warn!(attachment = %selected.attachment.0, carrier = carrier_id,
+                selected_proxy_mac = ?selected.proxy_mac,
+                carrier_ready = pending.source.as_ref().is_some_and(LocalLlcIngress::can_lease_reverse),
+                active_circuit = circuits.values().any(|circuit| circuit.listener == index),
+                "incoming SessionV1 cannot borrow LLC2 adjacency yet");
             hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
             return Ok(());
         }
@@ -2518,6 +2523,11 @@ fn open_incoming_llc_session(
     if circuits.values().any(|circuit| circuit.listener == index)
         || !listeners[index].attachment_idle()
     {
+        tracing::warn!(attachment = %selected.attachment.0,
+            selected_proxy_mac = ?selected.proxy_mac,
+            live_carriers = ?pending_llc_upstream.values().filter(|pending| pending.listener == index)
+                .map(|pending| pending.proxy_mac).collect::<Vec<_>>(),
+            "incoming SessionV1 has no matching idle LLC2 adjacency");
         hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
         return Ok(());
     }

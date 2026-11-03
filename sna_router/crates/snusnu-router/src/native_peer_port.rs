@@ -116,6 +116,12 @@ fn converter_rejection_ready(
     Ok(phase == Some(ManagementPhase::Closed))
 }
 
+fn reverse_management_available(phase: Option<ManagementPhase>, reached_bind: bool) -> bool {
+    phase.is_none()
+        || (phase == Some(ManagementPhase::AwaitBind) && !reached_bind)
+        || phase == Some(ManagementPhase::Closed)
+}
+
 impl NativePeerPort {
     pub(crate) fn open(peer: LlcPeer<'_>, local_xid: Xid3) -> io::Result<Self> {
         let mut endpoint = Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?;
@@ -417,12 +423,17 @@ impl NativePeerPort {
     }
 
     pub(crate) fn begin_reverse_management_mode(&mut self) -> io::Result<()> {
-        if !self.reverse_link_available() || self.management.is_some() {
+        if !self.reverse_link_available() || !self.reverse_needs_management() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "native LLC link is not idle for reverse management",
             ));
         }
+        // XID installs a passive responder before the guest sends any BIND.
+        // Transfer that untouched role to VirtualWsPort, which can process a
+        // reciprocal guest BIND while initiating our own SNASVCMG exchange.
+        self.management = None;
+        self.converter_policy = None;
         self.reverse_user_mode = true;
         self.reverse_completed = 0;
         Ok(())
@@ -430,6 +441,9 @@ impl NativePeerPort {
 
     pub(crate) fn reverse_needs_management(&self) -> bool {
         self.management.is_none()
+            || (self.management.as_ref().map(ManagementSession::phase)
+                == Some(ManagementPhase::AwaitBind)
+                && !self.reached_management_bind)
     }
 
     pub(crate) fn reverse_link_available(&self) -> bool {
@@ -438,9 +452,10 @@ impl NativePeerPort {
             && self.converter_offer.is_none()
             && !self.converter_bind_response_pending
             && self.converter_events.is_empty()
-            && (self.management.is_none()
-                || self.management.as_ref().map(ManagementSession::phase)
-                    == Some(ManagementPhase::Closed))
+            && reverse_management_available(
+                self.management.as_ref().map(ManagementSession::phase),
+                self.reached_management_bind,
+            )
     }
 
     pub(crate) fn reverse_idle_ready(&self) -> bool {
@@ -459,6 +474,22 @@ impl NativePeerPort {
             ));
         }
         self.reverse_user_mode = false;
+        if self.management.is_none() {
+            let peer_cp = self
+                .type1
+                .peer_name()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "verified LLC peer CP disappeared",
+                    )
+                })?
+                .to_owned();
+            let local_cp = self.local_xid.cp_name().map_err(management_error)?;
+            self.management = Some(ManagementSession::new(peer_cp.clone(), local_cp.clone()));
+            self.converter_policy = Some((peer_cp, local_cp));
+            self.reached_management_bind = false;
+        }
         Ok(())
     }
 
@@ -1176,7 +1207,8 @@ impl RoutePort for NativePeerPort {
 mod completion_tests {
     use super::{
         converter_rejection_ready, exclusive_bind_ack, negative_user_bind_reply,
-        publish_pending_converter_bind, queue_converter_bind, NativeLlcEvent,
+        publish_pending_converter_bind, queue_converter_bind, reverse_management_available,
+        NativeLlcEvent,
     };
     use router_core::{fid2_session_control::ManagementBind, native_management::Phase};
     use std::collections::VecDeque;
@@ -1211,6 +1243,17 @@ mod completion_tests {
         assert!(
             converter_rejection_ready(false, false, false, false, Some(Phase::Closed)).is_err()
         );
+    }
+
+    #[test]
+    fn untouched_passive_management_on_dialout_link_can_be_leased_for_reverse() {
+        assert!(reverse_management_available(Some(Phase::AwaitBind), false));
+        assert!(!reverse_management_available(Some(Phase::AwaitBind), true));
+        assert!(!reverse_management_available(
+            Some(Phase::AwaitBisAck),
+            true
+        ));
+        assert!(reverse_management_available(Some(Phase::Closed), true));
     }
 
     fn bind_pair() -> (ManagementBind, Vec<u8>) {
