@@ -56,8 +56,15 @@ configurations.
   Sign On at 19:32:13 UTC using the verified LLC dialout adjacency borrowed
   by the EE session. No concentrator participated in either call.
 - Multiple EE attachments and their bounded shared session bridge are
-  implemented and code-gated. No live session between two EE guests through
-  that path has passed yet. Local MPTN↔MPTN needs separate live acceptance.
+  implemented and code-gated. The in-process EE↔EE bridge test exchanges
+  BIND/result, information in both directions, credit and UNBIND, then
+  withdraws one destination while another pair remains open. No live
+  session between two EE guests through that bridge has passed yet.
+- In-process local MPTN↔MPTN and MPTN→EE event-path tests cover deferred
+  target open, BIND/result, bidirectional information, credit, UNBIND and
+  close/lease cleanup. These are not two-peer live guest results. A cold
+  destination LU is withheld when another verified local CP in the NETID
+  makes the fallback ambiguous; the router must not guess the LLC peer.
 - On master `ef8c033`, a controlled V5R4 EE source `ENDJOB` closed one QA
   circuit; the router returned the same verified V4R4 LLC carrier and
   accepted a reverse call about 10 ms later without new XID or SNASVCMG.

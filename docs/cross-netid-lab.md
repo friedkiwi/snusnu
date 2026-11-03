@@ -421,8 +421,13 @@ The current Rust tree also has focused tests for short native UNBIND and
 source-close handling. A later controlled close and reverse session verified
 native user UNBIND and retention of the same LLC adjacency, as recorded below.
 Multiple EE attachments and their bounded session event bridge are
-code-gated, but no two-EE guest session through that bridge has been
-observed yet.
+code-gated. A later in-process test exercised EE↔EE BIND/result,
+bidirectional information and credit, UNBIND, and selective destination
+loss while another EE pair stayed open. No two-EE guest session through
+that bridge has been observed yet. Local MPTN↔MPTN and MPTN→EE event-path
+tests also pass, including BIND/data/credit/close handling; neither has a
+live two-peer guest result yet. The cold LU guard withholds a guessed LLC
+destination when another verified CP in the NETID makes it ambiguous.
 
 ## Standalone automatic LLC2 and EE, 2026-11-03
 

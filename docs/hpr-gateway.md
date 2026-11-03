@@ -18,6 +18,14 @@ registry model.
 | [`SessionFabric`](../sna_router/crates/router-core/src/session_fabric.rs) | Bounded LU/CP session selection and event queues | Each ingress and egress adapter must implement its own wire protocol and session lifecycle |
 | [`transport-ws`](../sna_router/crates/transport-ws/src) | `SessionV1` BIND, result, information, pacing credit and UNBIND over the concentrator | Go's relay authorizes and forwards the session, but does not convert carriers |
 
+The in-process [`session_switch`](../sna_router/crates/snusnu-router/src/session_switch.rs)
+test drives two EE adapters through BIND/result, bidirectional information,
+credit and UNBIND. It also withdraws one EE destination and verifies that
+another pair remains active. The local MPTN→EE event-path test checks
+BIND/result, two-way events, credit and close. These tests exercise the
+bounded shared session path; they do not establish live two-guest EE↔EE or
+MPTN↔EE interoperability.
+
 The EE adapter validates XID3 CP identity and derives LU reachability from
 RouteSetup/BIND and other verified control exchange. It does not infer every
 LU from a CP XID. LLC and MPTN adapters maintain their own discovery proofs.
@@ -82,8 +90,8 @@ outside the repository.
 3. Connect two EE guests to different attachments on one router and verify
    the bounded `SessionEvent` bridge in both directions. Test repeated and
    overlapping sessions, normal close and recovery after a guest or
-   concentrator disconnect. The multi-EE implementation is code-gated but
-   has no two-EE live guest result yet.
+   concentrator disconnect. The in-process bridge tests pass, but no
+   two-EE live guest result exists yet.
 4. Keep the configured EE↔EE relay, native LLC↔LLC and MPTN↔LLC live paths
    as regression tests. Run the staged-tree CI gate before each commit and
    push.
