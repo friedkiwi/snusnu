@@ -31,6 +31,7 @@ pub(crate) struct LlcAutoListener {
     native_proxy_macs: HashSet<[u8; 6]>,
     native_pending: HashMap<[u8; 6], Instant>,
     active_proxy_macs: HashSet<[u8; 6]>,
+    exclusive_proxy: Option<[u8; 6]>,
 }
 
 pub(crate) struct LlcIngressOffer {
@@ -57,6 +58,7 @@ impl LlcAutoListener {
             native_proxy_macs: HashSet::new(),
             native_pending: HashMap::new(),
             active_proxy_macs: HashSet::new(),
+            exclusive_proxy: None,
         })
     }
 
@@ -84,6 +86,35 @@ impl LlcAutoListener {
     pub(crate) fn release(&mut self, mac: [u8; 6]) {
         self.active_proxy_macs.remove(&mac);
         self.native_pending.remove(&mac);
+        if self.exclusive_proxy == Some(mac) {
+            self.exclusive_proxy = None;
+        }
+    }
+
+    /// A SessionV1 LLC target opens its own source-specific XID association.
+    /// It may reserve this attachment only when no proxy association or
+    /// native XID bootstrap is already using the guest MAC.
+    pub(crate) fn attachment_idle(&self) -> bool {
+        self.active_proxy_macs.is_empty()
+            && self.native_pending.is_empty()
+            && self.exclusive_proxy.is_none()
+    }
+
+    /// Reserve the whole guest MAC for a source-specific SessionV1 native
+    /// association, rather than only one proxy destination.
+    pub(crate) fn reserve_exclusive(&mut self, mac: [u8; 6]) -> io::Result<bool> {
+        if !self.allowed_proxy_macs.contains(&mac) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LLC proxy MAC is not registered for this attachment",
+            ));
+        }
+        if !self.attachment_idle() {
+            return Ok(false);
+        }
+        self.active_proxy_macs.insert(mac);
+        self.exclusive_proxy = Some(mac);
+        Ok(true)
     }
 
     /// Reserve a destination before an upstream-initiated circuit opens its
@@ -94,6 +125,9 @@ impl LlcAutoListener {
                 io::ErrorKind::InvalidInput,
                 "LLC proxy MAC is not registered for this attachment",
             ));
+        }
+        if self.exclusive_proxy.is_some() {
+            return Ok(false);
         }
         Ok(self.active_proxy_macs.insert(mac))
     }
@@ -109,6 +143,9 @@ impl LlcAutoListener {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
+        if self.exclusive_proxy.is_some() {
+            return Ok(None);
+        }
         let destination: [u8; 6] =
             match bytes[..length].get(..6).and_then(|mac| mac.try_into().ok()) {
                 Some(mac) => mac,

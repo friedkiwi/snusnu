@@ -88,6 +88,8 @@ mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
 #[cfg(target_os = "linux")]
+mod llc_session_ws;
+#[cfg(target_os = "linux")]
 mod local_status;
 #[cfg(target_os = "linux")]
 mod local_web;

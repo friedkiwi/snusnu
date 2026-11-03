@@ -8,10 +8,12 @@ use crate::{
     auto_local_dispatch::AutoLocalDispatch,
     config::{self, RouterConfig},
     hpr_mptn_session_source::MptnToHprSession,
+    llc_session_ws::LlcSessionWs,
     local_status::LocalProxyMacStatus,
     mptn_session_ws::MptnSessionWs,
     remote::AutoWsHub,
     routing::{AutomaticFabric, IdentityObservation, PortId, RouteAddress, SessionSide},
+    runtime::LlcPeer,
     STOP,
 };
 use std::{
@@ -42,6 +44,13 @@ struct LlcSession {
     ingress: Option<(usize, [u8; 6])>,
     egress: Option<(usize, [u8; 6])>,
     upstream: bool,
+}
+
+struct LlcSessionCircuit {
+    bridge: LlcSessionWs,
+    listener: usize,
+    proxy_mac: [u8; 6],
+    verified_logged: bool,
 }
 
 /// Keep automatic mode separate from the explicit pair router. Each selected
@@ -85,6 +94,14 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             peer.interface.clone(),
             config::parse_mac(&peer.guest_mac)?,
         )?;
+        if let Some(expected_cp) = peer.local_cp.as_deref() {
+            bridge.configure_lu_hints(
+                &PortId::new(&peer.id),
+                expected_cp,
+                &peer.lus,
+                &peer.lu_types,
+            )?;
+        }
     }
     for gateway in &config.mptn_gateway {
         fabric.directory_mut().replace(
@@ -131,6 +148,8 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
     let mut next_id = 0u64;
     let mut mptn_ws_sessions = HashMap::<u64, MptnSessionWs>::new();
     let mut next_mptn_ws_id = 0u64;
+    let mut llc_ws_sessions = HashMap::<u64, LlcSessionCircuit>::new();
+    let mut next_llc_ws_id = 0u64;
     tracing::info!(
         llc_attachments = listeners.len(),
         mptn_attachments = gateways.len(),
@@ -191,7 +210,24 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         } else if owner.is_some() {
                             connected.reject_incoming(&open, wire::OpenFailure::Busy)?;
                         } else if let Some(remote) = remote {
-                            if let Err(error) = open_incoming_llc(
+                            if open.profile == wire::CircuitProfile::SessionV1 as i32 {
+                                if let Err(error) = open_incoming_llc_session(
+                                    &bridge,
+                                    connected,
+                                    open.clone(),
+                                    &hosted_lu,
+                                    &hosted_cp,
+                                    config,
+                                    &mut listeners,
+                                    &mut llc_ws_sessions,
+                                    &mut next_llc_ws_id,
+                                ) {
+                                    tracing::warn!(error = %error,
+                                        "automatic SessionV1 to LLC session rejected");
+                                    connected
+                                        .reject_incoming(&open, wire::OpenFailure::RouteGone)?;
+                                }
+                            } else if let Err(error) = open_incoming_llc(
                                 &bridge,
                                 connected,
                                 open.clone(),
@@ -277,6 +313,31 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 {
                     gateway.release_udp();
                 }
+            }
+        }
+        for id in llc_ws_sessions.keys().copied().collect::<Vec<_>>() {
+            let circuit = llc_ws_sessions.get_mut(&id).unwrap();
+            let result = circuit.bridge.pump();
+            if result.is_ok() && !circuit.verified_logged {
+                if let Some(cp) = circuit.bridge.verified_target_cp() {
+                    tracing::info!(session = id, attachment = circuit.bridge.attachment_id(),
+                        target_cp = %cp, "automatic LLC SessionV1 target verified by XID");
+                    circuit.verified_logged = true;
+                }
+            }
+            let retired = match result {
+                Ok(true) => false,
+                Ok(false) => true,
+                Err(error) => {
+                    tracing::warn!(session = id, error = %error,
+                        "automatic LLC SessionV1 circuit failed");
+                    true
+                }
+            };
+            if retired {
+                let mut circuit = llc_ws_sessions.remove(&id).unwrap();
+                let _ = circuit.bridge.close();
+                listeners[circuit.listener].release(circuit.proxy_mac);
             }
         }
         let mut active = match fabric.poll_once() {
@@ -673,6 +734,10 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             gateway.release_udp();
         }
     }
+    for (_, mut circuit) in llc_ws_sessions.drain() {
+        let _ = circuit.bridge.close();
+        listeners[circuit.listener].release(circuit.proxy_mac);
+    }
     for session_id in sessions.keys().copied().collect::<Vec<_>>() {
         fabric.close_pair(session_id)?;
     }
@@ -977,6 +1042,82 @@ fn open_incoming_llc(
         Ok(())
     })();
     if result.is_err() {
+        listeners[index].release(selected.proxy_mac);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_incoming_llc_session(
+    bridge: &AutoLlcWsBridge,
+    hub: &mut AutoWsHub,
+    open: wire::IncomingOpen,
+    hosted_lu: &wire::SnaName,
+    hosted_cp: &wire::SnaName,
+    config: &RouterConfig,
+    listeners: &mut [LlcAutoListener],
+    circuits: &mut HashMap<u64, LlcSessionCircuit>,
+    next_id: &mut u64,
+) -> io::Result<()> {
+    let selected = bridge.incoming_selection(hub, &open)?;
+    let index = config
+        .llc
+        .iter()
+        .position(|peer| peer.id == selected.attachment.0)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "selected LLC attachment is absent")
+        })?;
+    if circuits.values().any(|circuit| circuit.listener == index)
+        || !listeners[index].attachment_idle()
+    {
+        hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
+        return Ok(());
+    }
+    listeners[index].allow_native_proxy_mac(selected.proxy_mac)?;
+    if !listeners[index].reserve_exclusive(selected.proxy_mac)? {
+        hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
+        return Ok(());
+    }
+    let mut admitted = false;
+    let result = (|| -> io::Result<()> {
+        let target_lu = router_core::session::QualifiedName::new(&hosted_lu.netid, &hosted_lu.name)
+            .map_err(io::Error::other)?;
+        let target_cp = router_core::session::QualifiedName::new(&hosted_cp.netid, &hosted_cp.name)
+            .map_err(io::Error::other)?;
+        let Some((identity, ws)) = crate::llc_session_ws::admit(hub, open, &target_lu, &target_cp)?
+        else {
+            return Ok(());
+        };
+        let id = next_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("automatic LLC SessionV1 ID exhausted"))?;
+        let peer = LlcPeer {
+            interface: &selected.interface,
+            guest_mac: selected.guest_mac,
+            proxy_mac: selected.proxy_mac,
+        };
+        let seed = format!("{}:{}", selected.attachment.0, id);
+        let session = LlcSessionWs::new(
+            identity,
+            ws,
+            selected.attachment.0.clone(),
+            peer,
+            seed.as_bytes(),
+        )?;
+        *next_id = id;
+        circuits.insert(
+            id,
+            LlcSessionCircuit {
+                bridge: session,
+                listener: index,
+                proxy_mac: selected.proxy_mac,
+                verified_logged: false,
+            },
+        );
+        admitted = true;
+        Ok(())
+    })();
+    if result.is_err() || !admitted {
         listeners[index].release(selected.proxy_mac);
     }
     result

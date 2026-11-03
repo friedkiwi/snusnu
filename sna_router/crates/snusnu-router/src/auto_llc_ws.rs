@@ -5,7 +5,7 @@
 //! establishes each LU. Only those observations can be announced upstream.
 
 use crate::{
-    config::parse_cp,
+    config::{parse_cp, ConfiguredLuType},
     remote::{AutoWsHub, WsRoutePort},
     routing::{PortId, RouteAddress},
 };
@@ -20,7 +20,11 @@ struct LocalLlcIdentity {
     interface: String,
     guest_mac: [u8; 6],
     cp: Option<wire::SnaName>,
-    lus: HashSet<(String, String)>,
+    // Qualified LU types come from configured hints after exact XID CP proof
+    // or from a validated BIND. Generic observations carry no LU type.
+    lus: HashMap<(String, String), Vec<i32>>,
+    expected_cp: Option<wire::SnaName>,
+    configured_lus: HashMap<(String, String), Vec<i32>>,
 }
 
 /// The local side of automatic LLC-to-WebSocket routing. The upstream
@@ -52,7 +56,7 @@ impl AutoLlcWsBridge {
                 netid: cp.netid.clone(),
                 name: cp.name.clone(),
             });
-            for (netid, name) in &local.lus {
+            for (netid, name) in local.lus.keys() {
                 addresses.push(RouteAddress::LogicalUnit {
                     netid: netid.clone(),
                     cp: Some(cp.name.clone()),
@@ -89,9 +93,49 @@ impl AutoLlcWsBridge {
                 interface,
                 guest_mac,
                 cp: None,
-                lus: HashSet::new(),
+                lus: HashMap::new(),
+                expected_cp: None,
+                configured_lus: HashMap::new(),
             },
         );
+        Ok(())
+    }
+
+    /// Install operator LU hints. They become reachable only after XID3 on
+    /// this attachment proves the exact expected CP. The caller passes the
+    /// config's explicit LU type declarations; unspecified types stay empty.
+    pub(crate) fn configure_lu_hints(
+        &mut self,
+        id: &PortId,
+        expected_cp: &str,
+        lus: &[String],
+        lu_types: &HashMap<String, Vec<ConfiguredLuType>>,
+    ) -> io::Result<()> {
+        let cp = parse_cp(expected_cp)?;
+        let mut configured_lus = HashMap::new();
+        for lu in lus {
+            let name = parse_cp(lu)?;
+            if name.netid != cp.netid {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configured LLC LU is outside expected CP NETID",
+                ));
+            }
+            let types = lu_types
+                .get(lu)
+                .map(|types| types.iter().map(|kind| kind.wire_value()).collect())
+                .unwrap_or_else(|| vec![wire::LuType::LuType62 as i32]);
+            configured_lus.insert((name.netid, name.name), types);
+        }
+        let local = self
+            .local
+            .get_mut(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LLC attachment is absent"))?;
+        local.expected_cp = Some(cp.clone());
+        local.configured_lus = configured_lus;
+        if local.cp.as_ref() == Some(&cp) {
+            local.lus.extend(local.configured_lus.clone());
+        }
         Ok(())
     }
 
@@ -113,12 +157,32 @@ impl AutoLlcWsBridge {
         }
         local.cp = Some(cp);
         local.lus.clear();
+        if local.cp == local.expected_cp {
+            local.lus.extend(local.configured_lus.clone());
+        }
         Ok(true)
     }
 
     /// Call only after a native BIND has established the LU on this guest's
     /// private association. A CP name alone never implies an LU export.
     pub(crate) fn observe_bound_lu(&mut self, id: &PortId, name: &str) -> io::Result<bool> {
+        self.observe_bound_lu_typed(id, name, None)
+    }
+
+    /// Use only when a native session parser has validated a user LU 6.2
+    /// BIND for this exact attachment. A generic LU observation must not
+    /// claim SessionV1 capability.
+    #[allow(dead_code)] // Native BIND observation will call this after FID2 ingress is wired.
+    pub(crate) fn observe_bound_lu62(&mut self, id: &PortId, name: &str) -> io::Result<bool> {
+        self.observe_bound_lu_typed(id, name, Some(wire::LuType::LuType62 as i32))
+    }
+
+    fn observe_bound_lu_typed(
+        &mut self,
+        id: &PortId,
+        name: &str,
+        lu_type: Option<i32>,
+    ) -> io::Result<bool> {
         let lu = parse_cp(name)?;
         let local = self
             .local
@@ -140,7 +204,18 @@ impl AutoLlcWsBridge {
                 ),
             ));
         }
-        Ok(local.lus.insert((lu.netid, lu.name)))
+        let key = (lu.netid, lu.name);
+        match local.lus.get_mut(&key) {
+            Some(existing) if lu_type.is_some_and(|kind| !existing.contains(&kind)) => {
+                existing.push(lu_type.unwrap());
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+            None => {
+                local.lus.insert(key, lu_type.into_iter().collect());
+                Ok(true)
+            }
+        }
     }
 
     pub(crate) fn advertisements(
@@ -169,7 +244,7 @@ impl AutoLlcWsBridge {
                 ));
             }
             cps.push(cp.clone());
-            for (netid, name) in &local.lus {
+            for ((netid, name), types) in &local.lus {
                 if !lu_names.insert((netid.clone(), name.clone())) {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
@@ -182,7 +257,7 @@ impl AutoLlcWsBridge {
                         name: name.clone(),
                     }),
                     hosting_cp: Some(cp.clone()),
-                    supported_types: Vec::new(),
+                    supported_types: types.clone(),
                 });
             }
         }
@@ -345,7 +420,7 @@ impl AutoLlcWsBridge {
 
     pub(crate) fn select_lu(&self, lu: &wire::SnaName) -> io::Result<PortId> {
         self.select(
-            |local| local.lus.contains(&(lu.netid.clone(), lu.name.clone())),
+            |local| local.lus.contains_key(&(lu.netid.clone(), lu.name.clone())),
             &format_name(lu),
         )
     }
@@ -419,6 +494,14 @@ mod tests {
         assert_eq!(lus.len(), 1);
         assert_eq!(lus[0].lu, Some(parse_cp("NETA.LUA").unwrap()));
         assert_eq!(lus[0].hosting_cp, Some(parse_cp("NETA.CPA").unwrap()));
+        assert!(lus[0].supported_types.is_empty());
+        assert!(bridge.observe_bound_lu62(&alice, "NETA.LUA").unwrap());
+        assert!(!bridge.observe_bound_lu(&alice, "NETA.LUA").unwrap());
+        let (_, typed_lus) = bridge.advertisements("NETA").unwrap();
+        assert_eq!(
+            typed_lus[0].supported_types,
+            vec![wire::LuType::LuType62 as i32]
+        );
         assert_eq!(
             bridge.select_cp(&parse_cp("NETB.CPB").unwrap()).unwrap(),
             bob
@@ -427,6 +510,62 @@ mod tests {
             bridge.select_lu(&parse_cp("NETA.LUA").unwrap()).unwrap(),
             alice
         );
+    }
+
+    #[test]
+    fn configured_lu62_hint_requires_exact_live_xid_cp_and_withdraws_on_change() {
+        let mut bridge = AutoLlcWsBridge::default();
+        let id = PortId::new("peer");
+        bridge
+            .register(id.clone(), "tap0".into(), [2, 0, 0, 0, 0, 1])
+            .unwrap();
+        bridge
+            .configure_lu_hints(
+                &id,
+                "SOLNET.SNAA",
+                &["SOLNET.APP1".into()],
+                &HashMap::from([("SOLNET.APP1".into(), vec![ConfiguredLuType::Lu6_2])]),
+            )
+            .unwrap();
+        assert!(bridge.advertisements("SOLNET").unwrap().1.is_empty());
+        bridge.observe_cp(&id, "SOLNET.OTHER").unwrap();
+        assert!(bridge.advertisements("SOLNET").unwrap().1.is_empty());
+        bridge.observe_cp(&id, "SOLNET.SNAA").unwrap();
+        let (_, lus) = bridge.advertisements("SOLNET").unwrap();
+        assert_eq!(lus.len(), 1);
+        assert_eq!(lus[0].lu, Some(parse_cp("SOLNET.APP1").unwrap()));
+        assert_eq!(lus[0].supported_types, vec![wire::LuType::LuType62 as i32]);
+        bridge.observe_cp(&id, "SOLNET.OTHER").unwrap();
+        assert!(bridge.advertisements("SOLNET").unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn configured_lu_defaults_to_lu62_but_explicit_lu4_does_not_claim_it() {
+        let mut bridge = AutoLlcWsBridge::default();
+        let id = PortId::new("peer");
+        bridge
+            .register(id.clone(), "tap0".into(), [2, 0, 0, 0, 0, 1])
+            .unwrap();
+        bridge
+            .configure_lu_hints(
+                &id,
+                "SOLNET.SNAA",
+                &["SOLNET.APPC".into(), "SOLNET.DATA".into()],
+                &HashMap::from([("SOLNET.DATA".into(), vec![ConfiguredLuType::Lu4])]),
+            )
+            .unwrap();
+        bridge.observe_cp(&id, "SOLNET.SNAA").unwrap();
+        let (_, lus) = bridge.advertisements("SOLNET").unwrap();
+        let appc = lus
+            .iter()
+            .find(|lu| lu.lu == Some(parse_cp("SOLNET.APPC").unwrap()))
+            .unwrap();
+        assert_eq!(appc.supported_types, vec![wire::LuType::LuType62 as i32]);
+        let data = lus
+            .iter()
+            .find(|lu| lu.lu == Some(parse_cp("SOLNET.DATA").unwrap()))
+            .unwrap();
+        assert_eq!(data.supported_types, vec![wire::LuType::LuType4 as i32]);
     }
 
     #[test]

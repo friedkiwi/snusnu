@@ -65,7 +65,7 @@ Configured `[[concentrator]]` entries share one WebSocket connection and publish
 
 For the embedded APING responder, set `target_cp = "SNUSNU.SVC"` and `target_lu = "SNUSNU.PING"` on the concentrator entry, and configure the guest's remote controller for NETID `SNUSNU`, CP `SVC`, and adapter address `02:53:4e:ff:ff:ff`. The guest's local CP and LU must be declared under `[[llc]]` and supported as LU 6.2. This selects the service for that LLC route until destination selection can be derived from each incoming session. The current service supports APINGD only, with a maximum single PIU of 1496 bytes.
 
-An exported LU can optionally declare its supported type on its local peer for the global directory and remote route metadata. Omitted declarations remain `Unknown`; they are not inferred from the LU name. Keys must also appear in the same peer's `lus`, and duplicate or empty type lists are rejected:
+An exported LU can optionally declare its supported type on its local peer for the global directory and remote route metadata. In an explicit route, an omitted declaration remains `Unknown`; it is never inferred from the LU name. Keys must also appear in the same peer's `lus`, and duplicate or empty type lists are rejected:
 
 ```toml
 lus = ["SOLNET.PAYROLL"]
@@ -237,12 +237,24 @@ LUs (`lus`). These names are candidate routes until the router verifies that
 CP through XID3 and completes native management on the same LLC association.
 The local proxy MAC for each LLC attachment is generated from its ID and must
 be configured as the EE peer's remote adapter address on the LLC guest when
-that guest also dials out. The local web UI shows the generated MAC. LLC-originated
-sessions toward the EE attachment are not yet admitted by this automatic path.
+that guest also dials out. The local web UI shows the generated MAC. An
+LLC-originated session can reach a verified EE LU through the same router;
+the router checks the incoming CP through XID3 before opening the EE route.
 Verified local LLC and MPTN LUs are published to the concentrator only when
 their NETID matches its assigned NETID; they remain usable for local routes
 when another NETID is assigned. Losing the live peer proof withdraws the
 upstream route.
+
+For automatic LLC routing, `local_cp` and `lus` can provide answer-only LU
+destinations. These hints enter the upstream directory only after that LLC
+attachment's live XID3 identifies the exact configured CP; a different CP
+withdraws them. Each hinted LU must share the CP's NETID. The automatic
+SessionV1 adapter treats a hinted LU with no `lu_types` declaration as LU 6.2;
+an explicit declaration overrides that default, so `lu_4` is not offered as
+LU 6.2. LUs learned from generic session observations remain untyped. On an
+incoming LU 6.2 session, the
+router reserves the entire LLC attachment and repeats XID3 and native
+management using the authenticated source CP before forwarding the BIND.
 
 An EE-originated session can also target a local MPTN gateway. TCP62
 management confirms the peer LU and NETID, but does not identify a separate
