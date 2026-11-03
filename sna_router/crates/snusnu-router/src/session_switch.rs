@@ -290,6 +290,10 @@ impl SessionSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        hpr_local_session::HprLocalSession,
+        hpr_session_source::{SessionSource, SourceUpdate},
+    };
     use router_core::session::{Flow, QualifiedName};
 
     #[test]
@@ -524,5 +528,339 @@ mod tests {
             .unwrap();
         switch.withdraw(AdapterId(1));
         assert_eq!(switch.session_count(), 0);
+    }
+
+    fn ee_switch(target: AdapterId) -> SessionSwitch {
+        let mut switch = SessionSwitch::new();
+        switch.register(HPR_ADAPTER);
+        switch.register(LOCAL_ADAPTER);
+        switch
+            .replace_routes(
+                target,
+                vec![Reachability {
+                    lu: Some(q("SNUSNU.PING")),
+                    cp: Some(q("SNUSNU.SVC")),
+                }],
+            )
+            .unwrap();
+        switch
+    }
+
+    fn move_switch_to_local(
+        switch: &mut SessionSwitch,
+        adapter: AdapterId,
+        handle: u64,
+        local: &mut HprLocalSession,
+    ) -> SessionEvent {
+        let event = switch.next_delivery(adapter, handle).unwrap().unwrap();
+        assert!(local.send(&event).unwrap());
+        switch.mark_sent(adapter, handle).unwrap();
+        event
+    }
+
+    fn move_source_to_switch(
+        source: &mut impl SessionSource,
+        switch: &mut SessionSwitch,
+        adapter: AdapterId,
+        handle: u64,
+    ) -> SessionEvent {
+        let Some(SourceUpdate::Event(event)) = source.poll().unwrap() else {
+            panic!("EE source has no session event");
+        };
+        switch.submit(adapter, handle, event.clone()).unwrap();
+        source.complete_received(true).unwrap();
+        event
+    }
+
+    fn move_local_to_switch(
+        local: &mut HprLocalSession,
+        switch: &mut SessionSwitch,
+        adapter: AdapterId,
+        handle: u64,
+    ) -> SessionEvent {
+        let event = local.poll().unwrap().unwrap();
+        switch.submit(adapter, handle, event.clone()).unwrap();
+        local.confirm_polled().unwrap();
+        event
+    }
+
+    #[test]
+    fn ee_to_ee_switches_bind_data_credit_unbind_and_withdrawal() {
+        let mut ingress_switch = ee_switch(LOCAL_ADAPTER);
+        let mut target_switch = ee_switch(HPR_ADAPTER);
+        let (ingress, mut source) = ee_bridge::pair();
+        let mut ingress_local = HprLocalSession::Ee(ingress);
+        let (ingress_id, selected) = ingress_switch
+            .open(HPR_ADAPTER, 11, identity(), unit(0x31))
+            .unwrap();
+        assert_eq!(selected, LOCAL_ADAPTER);
+        ingress_switch
+            .bind_egress(ingress_id, LOCAL_ADAPTER, 11)
+            .unwrap();
+        assert_eq!(
+            move_switch_to_local(&mut ingress_switch, LOCAL_ADAPTER, 11, &mut ingress_local),
+            SessionEvent::BindRequest(unit(0x31))
+        );
+        let Some(SourceUpdate::Event(SessionEvent::BindRequest(bind))) = source.poll().unwrap()
+        else {
+            panic!("destination EE did not receive BIND");
+        };
+        let (target_id, selected) = target_switch
+            .open(LOCAL_ADAPTER, 22, identity(), bind)
+            .unwrap();
+        assert_eq!(selected, HPR_ADAPTER);
+        target_switch
+            .bind_egress(target_id, HPR_ADAPTER, 22)
+            .unwrap();
+        source.complete_received(true).unwrap();
+        assert_eq!(
+            target_switch.next_delivery(HPR_ADAPTER, 22).unwrap(),
+            Some(SessionEvent::BindRequest(unit(0x31)))
+        );
+        target_switch.mark_sent(HPR_ADAPTER, 22).unwrap();
+
+        let accepted = SessionEvent::BindResult {
+            accepted: true,
+            unit: unit(0x31),
+        };
+        target_switch
+            .submit(HPR_ADAPTER, 22, accepted.clone())
+            .unwrap();
+        let target_result = target_switch
+            .next_delivery(LOCAL_ADAPTER, 22)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_result, accepted);
+        assert!(source.send(&target_result).unwrap());
+        target_switch.mark_sent(LOCAL_ADAPTER, 22).unwrap();
+        assert_eq!(
+            move_local_to_switch(&mut ingress_local, &mut ingress_switch, LOCAL_ADAPTER, 11),
+            accepted
+        );
+        assert_eq!(
+            ingress_switch.next_delivery(HPR_ADAPTER, 11).unwrap(),
+            Some(accepted)
+        );
+        ingress_switch.mark_sent(HPR_ADAPTER, 11).unwrap();
+
+        let outbound = SessionEvent::Information {
+            flow: Flow::Normal,
+            unit: unit(0x01),
+        };
+        ingress_switch
+            .submit(HPR_ADAPTER, 11, outbound.clone())
+            .unwrap();
+        move_switch_to_local(&mut ingress_switch, LOCAL_ADAPTER, 11, &mut ingress_local);
+        assert_eq!(
+            move_source_to_switch(&mut source, &mut target_switch, LOCAL_ADAPTER, 22),
+            outbound
+        );
+        assert_eq!(
+            target_switch.next_delivery(HPR_ADAPTER, 22).unwrap(),
+            Some(outbound)
+        );
+        target_switch.mark_sent(HPR_ADAPTER, 22).unwrap();
+
+        let inbound = SessionEvent::Information {
+            flow: Flow::Expedited,
+            unit: unit(0x02),
+        };
+        target_switch
+            .submit(HPR_ADAPTER, 22, inbound.clone())
+            .unwrap();
+        let event = target_switch
+            .next_delivery(LOCAL_ADAPTER, 22)
+            .unwrap()
+            .unwrap();
+        assert!(source.send(&event).unwrap());
+        target_switch.mark_sent(LOCAL_ADAPTER, 22).unwrap();
+        move_local_to_switch(&mut ingress_local, &mut ingress_switch, LOCAL_ADAPTER, 11);
+        assert_eq!(
+            ingress_switch.next_delivery(HPR_ADAPTER, 11).unwrap(),
+            Some(inbound)
+        );
+        ingress_switch.mark_sent(HPR_ADAPTER, 11).unwrap();
+
+        let credit = SessionEvent::Credit {
+            normal: 2,
+            expedited: 1,
+        };
+        target_switch
+            .submit(HPR_ADAPTER, 22, credit.clone())
+            .unwrap();
+        let event = target_switch
+            .next_delivery(LOCAL_ADAPTER, 22)
+            .unwrap()
+            .unwrap();
+        assert!(source.send(&event).unwrap());
+        target_switch.mark_sent(LOCAL_ADAPTER, 22).unwrap();
+        move_local_to_switch(&mut ingress_local, &mut ingress_switch, LOCAL_ADAPTER, 11);
+        assert_eq!(
+            ingress_switch.next_delivery(HPR_ADAPTER, 11).unwrap(),
+            Some(credit)
+        );
+        ingress_switch.mark_sent(HPR_ADAPTER, 11).unwrap();
+
+        let unbind_request = SessionEvent::Unbind(
+            SessionUnit::from_reduced(&[0x12, 0x34, 0x6b, 0x80, 0, 0x32]).unwrap(),
+        );
+        ingress_switch
+            .submit(HPR_ADAPTER, 11, unbind_request.clone())
+            .unwrap();
+        move_switch_to_local(&mut ingress_switch, LOCAL_ADAPTER, 11, &mut ingress_local);
+        move_source_to_switch(&mut source, &mut target_switch, LOCAL_ADAPTER, 22);
+        assert_eq!(
+            target_switch.next_delivery(HPR_ADAPTER, 22).unwrap(),
+            Some(unbind_request)
+        );
+        target_switch.mark_sent(HPR_ADAPTER, 22).unwrap();
+        let unbind_response = SessionEvent::Unbind(
+            SessionUnit::from_reduced(&[0x12, 0x34, 0xeb, 0x80, 0, 0x32]).unwrap(),
+        );
+        target_switch
+            .submit(HPR_ADAPTER, 22, unbind_response.clone())
+            .unwrap();
+        let event = target_switch
+            .next_delivery(LOCAL_ADAPTER, 22)
+            .unwrap()
+            .unwrap();
+        assert!(source.send(&event).unwrap());
+        target_switch.mark_sent(LOCAL_ADAPTER, 22).unwrap();
+        move_local_to_switch(&mut ingress_local, &mut ingress_switch, LOCAL_ADAPTER, 11);
+        assert_eq!(
+            ingress_switch.next_delivery(HPR_ADAPTER, 11).unwrap(),
+            Some(unbind_response)
+        );
+        ingress_switch.mark_sent(HPR_ADAPTER, 11).unwrap();
+        assert_eq!(ingress_switch.session_count(), 0);
+        assert_eq!(target_switch.session_count(), 0);
+
+        // Another EE pair stays open when the first pair's destination link
+        // is withdrawn below.
+        let mut other_ingress_switch = ee_switch(LOCAL_ADAPTER);
+        let mut other_target_switch = ee_switch(HPR_ADAPTER);
+        let (other_ingress, mut other_source) = ee_bridge::pair();
+        let mut other_local = HprLocalSession::Ee(other_ingress);
+        let (other_ingress_id, _) = other_ingress_switch
+            .open(HPR_ADAPTER, 31, identity(), unit(0x31))
+            .unwrap();
+        other_ingress_switch
+            .bind_egress(other_ingress_id, LOCAL_ADAPTER, 31)
+            .unwrap();
+        move_switch_to_local(
+            &mut other_ingress_switch,
+            LOCAL_ADAPTER,
+            31,
+            &mut other_local,
+        );
+        let Some(SourceUpdate::Event(SessionEvent::BindRequest(other_bind))) =
+            other_source.poll().unwrap()
+        else {
+            panic!("other EE destination did not receive BIND");
+        };
+        let (other_target_id, _) = other_target_switch
+            .open(LOCAL_ADAPTER, 41, identity(), other_bind)
+            .unwrap();
+        other_target_switch
+            .bind_egress(other_target_id, HPR_ADAPTER, 41)
+            .unwrap();
+        other_source.complete_received(true).unwrap();
+        other_target_switch.next_delivery(HPR_ADAPTER, 41).unwrap();
+        other_target_switch.mark_sent(HPR_ADAPTER, 41).unwrap();
+        other_target_switch
+            .submit(
+                HPR_ADAPTER,
+                41,
+                SessionEvent::BindResult {
+                    accepted: true,
+                    unit: unit(0x31),
+                },
+            )
+            .unwrap();
+        let result = other_target_switch
+            .next_delivery(LOCAL_ADAPTER, 41)
+            .unwrap()
+            .unwrap();
+        assert!(other_source.send(&result).unwrap());
+        other_target_switch.mark_sent(LOCAL_ADAPTER, 41).unwrap();
+        move_local_to_switch(
+            &mut other_local,
+            &mut other_ingress_switch,
+            LOCAL_ADAPTER,
+            31,
+        );
+        other_ingress_switch.next_delivery(HPR_ADAPTER, 31).unwrap();
+        other_ingress_switch.mark_sent(HPR_ADAPTER, 31).unwrap();
+
+        let (ingress, mut source) = ee_bridge::pair();
+        let mut ingress_local = HprLocalSession::Ee(ingress);
+        let (ingress_id, _) = ingress_switch
+            .open(HPR_ADAPTER, 12, identity(), unit(0x31))
+            .unwrap();
+        ingress_switch
+            .bind_egress(ingress_id, LOCAL_ADAPTER, 12)
+            .unwrap();
+        move_switch_to_local(&mut ingress_switch, LOCAL_ADAPTER, 12, &mut ingress_local);
+        let Some(SourceUpdate::Event(SessionEvent::BindRequest(bind))) = source.poll().unwrap()
+        else {
+            panic!("second destination EE did not receive BIND");
+        };
+        let (target_id, _) = target_switch
+            .open(LOCAL_ADAPTER, 23, identity(), bind)
+            .unwrap();
+        target_switch
+            .bind_egress(target_id, HPR_ADAPTER, 23)
+            .unwrap();
+        source.complete_received(true).unwrap();
+        assert_eq!(
+            target_switch.next_delivery(HPR_ADAPTER, 23).unwrap(),
+            Some(SessionEvent::BindRequest(unit(0x31)))
+        );
+        target_switch.mark_sent(HPR_ADAPTER, 23).unwrap();
+        target_switch.withdraw(HPR_ADAPTER);
+        assert_eq!(
+            target_switch.next_delivery(LOCAL_ADAPTER, 23).unwrap(),
+            Some(SessionEvent::Reset)
+        );
+        assert!(source.send(&SessionEvent::Reset).unwrap());
+        target_switch.mark_sent(LOCAL_ADAPTER, 23).unwrap();
+        move_local_to_switch(&mut ingress_local, &mut ingress_switch, LOCAL_ADAPTER, 12);
+        assert_eq!(
+            ingress_switch.next_delivery(HPR_ADAPTER, 12).unwrap(),
+            Some(SessionEvent::Reset)
+        );
+        ingress_switch.mark_sent(HPR_ADAPTER, 12).unwrap();
+        assert_eq!(ingress_switch.session_count(), 0);
+        assert_eq!(target_switch.session_count(), 0);
+        assert_eq!(other_ingress_switch.session_count(), 1);
+        assert_eq!(other_target_switch.session_count(), 1);
+        other_ingress_switch
+            .submit(
+                HPR_ADAPTER,
+                31,
+                SessionEvent::Information {
+                    flow: Flow::Normal,
+                    unit: unit(0x04),
+                },
+            )
+            .unwrap();
+        move_switch_to_local(
+            &mut other_ingress_switch,
+            LOCAL_ADAPTER,
+            31,
+            &mut other_local,
+        );
+        assert_eq!(
+            move_source_to_switch(
+                &mut other_source,
+                &mut other_target_switch,
+                LOCAL_ADAPTER,
+                41,
+            ),
+            SessionEvent::Information {
+                flow: Flow::Normal,
+                unit: unit(0x04),
+            }
+        );
     }
 }
