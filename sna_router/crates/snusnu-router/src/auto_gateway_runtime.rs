@@ -175,7 +175,7 @@ pub(crate) struct AutoMptnGateway<'a> {
     udp_leased: bool,
     identity_observations: Vec<(u64, String, IdentityObservation)>,
     closed_local_attachments: Vec<(u64, String)>,
-    management_lus: Vec<(String, String)>,
+    management_lus: Vec<(String, String, String)>,
     discovery: MptnDiscovery,
 }
 
@@ -200,7 +200,7 @@ impl<'a> AutoMptnGateway<'a> {
     fn bind_on_port(config: &'a MptnGatewayConfig, port: u16) -> io::Result<Self> {
         let required =
             CompensationSet::from_codes(&[0, 1, 3, 0x10, 0x20, 0x83]).map_err(io::Error::other)?;
-        let listener = MptnGatewayPort::bind_dynamic(GatewayConfig {
+        let mut listener = MptnGatewayPort::bind_dynamic(GatewayConfig {
             local: SocketAddr::new(config.local_ip, port),
             peer_ip: config.peer_ip,
             source_lu: config.source_lu.clone(),
@@ -214,6 +214,9 @@ impl<'a> AutoMptnGateway<'a> {
             cnos_limit: 8,
             allow_resumed_user: true,
         })?;
+        if !config.peer_cp.is_empty() {
+            listener.set_expected_peer_cp(config.peer_cp.clone());
+        }
         Ok(Self {
             config,
             listener,
@@ -259,15 +262,13 @@ impl<'a> AutoMptnGateway<'a> {
     }
 
     /// Validated management Connect names make a cold local MPTN peer's LU
-    /// visible before it starts any user BIND. No CP identity is inferred.
+    /// visible before it starts any user BIND. CP comes from FQPCID.
     #[allow(dead_code)] // The mixed runtime consumes this queue during cold-start publication.
-    pub(crate) fn take_management_lus(&mut self) -> Vec<(String, String)> {
+    pub(crate) fn take_management_lus(&mut self) -> Vec<(String, String, String)> {
         std::mem::take(&mut self.management_lus)
     }
 
-    /// Complete, attachment-owned LU reachability after a membership change.
-    /// The caller combines these LUs with its configured peer CP assertion;
-    /// TCP62 itself does not prove a hosting CP.
+    /// Complete, attachment-owned LU/CP reachability after a membership change.
     #[allow(dead_code)] // The shared registry integration will consume this snapshot.
     pub(crate) fn take_discovery_snapshot(&mut self) -> Option<MptnDiscoverySnapshot> {
         self.discovery.take_changed_snapshot()
@@ -281,6 +282,16 @@ impl<'a> AutoMptnGateway<'a> {
     #[allow(dead_code)] // Called when the owning attachment is explicitly lost.
     pub(crate) fn withdraw_discovery(&mut self) -> io::Result<()> {
         self.discovery.withdraw_all()
+    }
+
+    /// A successful outbound SNASVCMG exchange proves the configured LU is
+    /// reachable. Its CP still comes from the operator's explicit assertion.
+    pub(crate) fn observe_configured_probe(
+        &mut self,
+        lu: router_core::session::QualifiedName,
+        cp: router_core::session::QualifiedName,
+    ) -> io::Result<()> {
+        self.discovery.observe(lu, cp, Instant::now())
     }
 
     pub(crate) fn udp_available(&self) -> bool {
@@ -375,7 +386,10 @@ impl<'a> AutoMptnGateway<'a> {
                         "invalid MPTN management source LU",
                     )
                 })?;
-                self.discovery.observe(source, Instant::now())?;
+                let cp = lus.2.parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN management CP")
+                })?;
+                self.discovery.observe(source, cp, Instant::now())?;
                 self.management_lus.push(lus);
             }
         }
@@ -400,7 +414,16 @@ impl<'a> AutoMptnGateway<'a> {
                 let source = source.parse().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN user source LU")
                 })?;
-                self.discovery.observe(source, Instant::now())?;
+                let cp = offer.peer_cp().parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN user CP")
+                })?;
+                if !self
+                    .discovery
+                    .refresh_if_known(&source, &cp, Instant::now())?
+                {
+                    tracing::debug!(gateway = %self.config.id, source_lu = %source, source_cp = %cp,
+                        "TCP62 user BIND lacks matching completed management proof");
+                }
                 Ok(Some((id, offer)))
             }
             GatewayEvent::UserBind(_) => {
