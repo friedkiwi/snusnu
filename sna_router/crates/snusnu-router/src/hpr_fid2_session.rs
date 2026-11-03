@@ -59,6 +59,9 @@ fn qualified_lu(name: &str, cp: Option<&QualifiedName>) -> io::Result<QualifiedN
 }
 
 impl NativeFid2Session {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.phase == Phase::Closed
+    }
     /// Consume the native converter's already validated user BIND. The CP
     /// must have been observed on this same LLC association's XID3 exchange.
     pub(crate) fn from_user_bind(
@@ -572,5 +575,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.unwrap(), unhex("2d0002010004eb800032"));
         assert_eq!(closed.phase, Phase::Closed);
+        assert!(closed.is_closed());
     }
 }

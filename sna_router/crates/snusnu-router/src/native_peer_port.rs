@@ -122,6 +122,14 @@ fn reverse_management_available(phase: Option<ManagementPhase>, reached_bind: bo
         || phase == Some(ManagementPhase::Closed)
 }
 
+fn converter_user_drained(
+    buffered: usize,
+    bind_response_pending: bool,
+    queued_events: usize,
+) -> bool {
+    buffered == 0 && !bind_response_pending && queued_events == 0
+}
+
 impl NativePeerPort {
     pub(crate) fn open(peer: LlcPeer<'_>, local_xid: Xid3) -> io::Result<Self> {
         let mut endpoint = Endpoint::open(peer.interface, peer.guest_mac, peer.proxy_mac)?;
@@ -456,6 +464,33 @@ impl NativePeerPort {
                 self.management.as_ref().map(ManagementSession::phase),
                 self.reached_management_bind,
             )
+    }
+
+    /// Clear a completed converter user session while retaining its verified
+    /// LLC2 and SNASVCMG carrier. The caller must have correlated the final
+    /// UNBIND with its session codec before invoking this method.
+    pub(crate) fn retire_converter_user(&mut self) -> io::Result<bool> {
+        if !self.converter_dynamic || !self.link_established() {
+            return Ok(false);
+        }
+        if self.converter_offer.is_none() {
+            return Ok(self.reverse_link_available());
+        }
+        self.tick()?;
+        if !converter_user_drained(
+            self.endpoint.buffered_information_count(),
+            self.converter_bind_response_pending,
+            self.converter_events.len(),
+        ) {
+            return Ok(false);
+        }
+        self.converter_offer = None;
+        self.converter_policy = None;
+        self.converter_bind_response_acked = false;
+        self.converter_first_attach_seen = false;
+        self.converter_bind_waits_for_bis_ack = false;
+        self.converter_negative_bind_pending = false;
+        Ok(self.reverse_link_available())
     }
 
     pub(crate) fn reverse_idle_ready(&self) -> bool {
@@ -1206,9 +1241,9 @@ impl RoutePort for NativePeerPort {
 #[cfg(test)]
 mod completion_tests {
     use super::{
-        converter_rejection_ready, exclusive_bind_ack, negative_user_bind_reply,
-        publish_pending_converter_bind, queue_converter_bind, reverse_management_available,
-        NativeLlcEvent,
+        converter_rejection_ready, converter_user_drained, exclusive_bind_ack,
+        negative_user_bind_reply, publish_pending_converter_bind, queue_converter_bind,
+        reverse_management_available, NativeLlcEvent,
     };
     use router_core::{fid2_session_control::ManagementBind, native_management::Phase};
     use std::collections::VecDeque;
@@ -1254,6 +1289,14 @@ mod completion_tests {
             true
         ));
         assert!(reverse_management_available(Some(Phase::Closed), true));
+    }
+
+    #[test]
+    fn converter_user_retirement_waits_for_native_ack_and_events() {
+        assert!(!converter_user_drained(1, false, 0));
+        assert!(!converter_user_drained(0, true, 0));
+        assert!(!converter_user_drained(0, false, 1));
+        assert!(converter_user_drained(0, false, 0));
     }
 
     fn bind_pair() -> (ManagementBind, Vec<u8>) {
