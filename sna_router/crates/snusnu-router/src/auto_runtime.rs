@@ -17,7 +17,10 @@ use crate::{
     runtime::LlcPeer,
     STOP,
 };
-use router_core::session::{QualifiedName, SessionIdentity};
+use router_core::{
+    route_registry::{LuType, RouteKey, RouteRecord},
+    session::{QualifiedName, SessionIdentity},
+};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -169,7 +172,14 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 Ok(mut connected) => {
                     mptn_exports.clear();
                     mptn_owner.clear();
-                    publish_local(&bridge, &mptn_exports, &mut connected)?;
+                    refresh_mptn_exports(
+                        config,
+                        &learned_mptn_lus,
+                        &connected,
+                        &mut mptn_exports,
+                        &mut mptn_owner,
+                    )?;
+                    publish_local(fabric.directory(), &mut connected)?;
                     fabric.directory_mut().replace_upstream(
                         PortId::new(&remote.id),
                         connected.advertised_addresses(),
@@ -472,7 +482,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         if learned {
             refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
             if let Some(connected) = hub.as_mut() {
-                publish_local(&bridge, &mptn_exports, connected)?;
+                publish_local(fabric.directory(), connected)?;
             }
         }
         for ingress in 0..listeners.len() {
@@ -496,7 +506,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     if bridge.observe_cp(&ingress_id, cp)? {
                         refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
                         if let Some(connected) = hub.as_mut() {
-                            publish_local(&bridge, &mptn_exports, connected)?;
+                            publish_local(fabric.directory(), connected)?;
                         }
                     }
                     observe_native_llc_peer(&offer, cp);
@@ -604,6 +614,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         .map(|lu| (lu.netid, lu.name))
                         .collect(),
                 );
+                refresh_mptn_registry(&mut fabric, config, &proxies, &learned_mptn_lus)?;
                 if let Some(connected) = hub.as_mut() {
                     if refresh_mptn_exports(
                         config,
@@ -612,7 +623,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         &mut mptn_exports,
                         &mut mptn_owner,
                     )? {
-                        publish_local(&bridge, &mptn_exports, connected)?;
+                        publish_local(fabric.directory(), connected)?;
                     }
                 }
             }
@@ -634,7 +645,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             if learned_local {
                 refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
                 if let Some(connected) = hub.as_mut() {
-                    publish_local(&bridge, &mptn_exports, connected)?;
+                    publish_local(fabric.directory(), connected)?;
                 }
             }
             let Some((association, offer)) = offered else {
@@ -787,7 +798,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 &mut mptn_exports,
                 &mut mptn_owner,
             )? {
-                publish_local(&bridge, &mptn_exports, connected)?;
+                publish_local(fabric.directory(), connected)?;
             }
         }
         if !active {
@@ -820,6 +831,51 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
     }
     for session_id in sessions.keys().copied().collect::<Vec<_>>() {
         fabric.close_pair(session_id)?;
+    }
+    Ok(())
+}
+
+fn refresh_mptn_registry(
+    fabric: &mut AutomaticFabric,
+    config: &RouterConfig,
+    proxies: &AutoProxyMacs,
+    learned: &HashMap<String, HashSet<(String, String)>>,
+) -> io::Result<()> {
+    for gateway in &config.mptn_gateway {
+        let mut records = vec![RouteRecord::from(RouteKey::ProxyMac(
+            proxies.get(&gateway.id).expect("MPTN proxy allocated"),
+        ))];
+        let mut control_points = HashSet::new();
+        if let Some(lus) = learned.get(&gateway.id) {
+            for (netid, name) in lus {
+                let source = wire::SnaName {
+                    netid: netid.clone(),
+                    name: name.clone(),
+                };
+                let seed = format!("{}:{netid}.{name}", gateway.id);
+                let configured_cp =
+                    (!gateway.local_cp.is_empty()).then_some(gateway.local_cp.as_str());
+                let cp = virtual_cp_for_source(&source, seed.as_bytes(), configured_cp)?;
+                let hosting_cp = QualifiedName::new(&cp.netid, &cp.name).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN hosting CP")
+                })?;
+                let lu = QualifiedName::new(netid, name).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN source LU")
+                })?;
+                if control_points.insert(hosting_cp.clone()) {
+                    records.push(RouteRecord::from(RouteKey::ControlPoint(
+                        hosting_cp.clone(),
+                    )));
+                }
+                records.push(RouteRecord {
+                    key: RouteKey::LogicalUnit { lu, hosting_cp },
+                    supported_types: vec![LuType::Lu62],
+                });
+            }
+        }
+        fabric
+            .directory_mut()
+            .replace_local_records(PortId::new(&gateway.id), records)?;
     }
     Ok(())
 }
@@ -890,22 +946,67 @@ fn refresh_mptn_exports(
 }
 
 fn publish_local(
-    bridge: &AutoLlcWsBridge,
-    mptn: &HashMap<String, (wire::SnaName, wire::LuReachability)>,
+    directory: &crate::routing::AutomaticDirectory,
     hub: &mut AutoWsHub,
 ) -> io::Result<()> {
-    let (mut cps, mut lus) = bridge.advertisements(hub.allowed_netid())?;
-    for (cp, lu) in mptn.values() {
-        if cp.netid == hub.allowed_netid() {
-            cps.push(cp.clone());
-            lus.push(lu.clone());
-        } else {
-            tracing::warn!(local_cp = %format!("{}.{}", cp.netid, cp.name),
-                assigned_netid = hub.allowed_netid(),
-                "local TCP62 identity excluded from upstream announcement: NETID mismatch");
+    let (cps, lus) = publication_records(directory, hub.allowed_netid());
+    hub.publish_local(&cps, &lus)
+}
+
+fn publication_records(
+    directory: &crate::routing::AutomaticDirectory,
+    allowed_netid: &str,
+) -> (Vec<wire::SnaName>, Vec<wire::LuReachability>) {
+    let exports = directory.local_exports(allowed_netid);
+    let mut cps = Vec::new();
+    let mut cp_names = HashSet::new();
+    for export in &exports {
+        if let RouteKey::ControlPoint(cp) = &export.key {
+            cp_names.insert((cp.netid.clone(), cp.name.clone()));
+            cps.push(wire_name(cp));
         }
     }
-    hub.publish_local(&cps, &lus)
+    let mut lus = Vec::new();
+    for export in exports {
+        if let RouteKey::LogicalUnit { lu, hosting_cp } = export.key {
+            if !cp_names.contains(&(hosting_cp.netid.clone(), hosting_cp.name.clone())) {
+                tracing::warn!(local_lu = %lu, hosting_cp = %hosting_cp,
+                    attachment = export.attachment.as_str(),
+                    "local LU withheld from concentrator: hosting CP is not advertised");
+                continue;
+            }
+            lus.push(wire::LuReachability {
+                lu: Some(wire_name(&lu)),
+                hosting_cp: Some(wire_name(&hosting_cp)),
+                supported_types: export
+                    .supported_types
+                    .into_iter()
+                    .map(wire_lu_type)
+                    .collect(),
+            });
+        }
+    }
+    (cps, lus)
+}
+
+fn wire_name(name: &QualifiedName) -> wire::SnaName {
+    wire::SnaName {
+        netid: name.netid.clone(),
+        name: name.name.clone(),
+    }
+}
+
+fn wire_lu_type(kind: LuType) -> i32 {
+    match kind {
+        LuType::Lu0 => wire::LuType::LuType0 as i32,
+        LuType::Lu1 => wire::LuType::LuType1 as i32,
+        LuType::Lu2 => wire::LuType::LuType2 as i32,
+        LuType::Lu3 => wire::LuType::LuType3 as i32,
+        LuType::Lu4 => wire::LuType::LuType4 as i32,
+        LuType::Lu61 => wire::LuType::LuType61 as i32,
+        LuType::Lu62 => wire::LuType::LuType62 as i32,
+        LuType::Lu7 => wire::LuType::LuType7 as i32,
+    }
 }
 
 fn refresh_local_addresses(
@@ -916,11 +1017,11 @@ fn refresh_local_addresses(
 ) -> io::Result<()> {
     for peer in &config.llc {
         let id = PortId::new(&peer.id);
-        let mut addresses = vec![RouteAddress::Mac(
+        let mut records = bridge.route_records(&id)?;
+        records.push(RouteRecord::from(RouteKey::ProxyMac(
             proxies.get(&peer.id).expect("LLC proxy allocated"),
-        )];
-        addresses.extend(bridge.local_addresses(&id));
-        fabric.directory_mut().replace(id, addresses)?;
+        )));
+        fabric.directory_mut().replace_local_records(id, records)?;
     }
     Ok(())
 }
@@ -1288,6 +1389,58 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn local_publication_preserves_lu7_and_excludes_other_netids_and_upstream() {
+        let mut directory = crate::routing::AutomaticDirectory::default();
+        let local_cp = QualifiedName::new("LOCAL", "CP1").unwrap();
+        let local_lu = QualifiedName::new("LOCAL", "PRINTER").unwrap();
+        directory
+            .replace_local_records(
+                PortId::new("llc-a"),
+                vec![
+                    RouteRecord::from(RouteKey::ControlPoint(local_cp.clone())),
+                    RouteRecord {
+                        key: RouteKey::LogicalUnit {
+                            lu: local_lu.clone(),
+                            hosting_cp: local_cp.clone(),
+                        },
+                        supported_types: vec![LuType::Lu7],
+                    },
+                ],
+            )
+            .unwrap();
+        directory
+            .replace_upstream(
+                PortId::new("concentrator"),
+                [RouteAddress::ControlPoint {
+                    netid: "LOCAL".into(),
+                    name: "REMOTE".into(),
+                }],
+            )
+            .unwrap();
+        let (cps, lus) = publication_records(&directory, "LOCAL");
+        assert_eq!(cps, vec![wire_name(&local_cp)]);
+        assert_eq!(lus.len(), 1);
+        assert_eq!(lus[0].lu, Some(wire_name(&local_lu)));
+        assert_eq!(lus[0].supported_types, vec![wire::LuType::LuType7 as i32]);
+        assert_eq!(publication_records(&directory, "OTHER"), (vec![], vec![]));
+    }
+
+    #[test]
+    fn ambiguous_local_identity_is_not_published() {
+        let mut directory = crate::routing::AutomaticDirectory::default();
+        let cp = QualifiedName::new("LOCAL", "CP1").unwrap();
+        for attachment in ["llc-a", "mptn-b"] {
+            directory
+                .replace_local_records(
+                    PortId::new(attachment),
+                    vec![RouteRecord::from(RouteKey::ControlPoint(cp.clone()))],
+                )
+                .unwrap();
+        }
+        assert!(publication_records(&directory, "LOCAL").0.is_empty());
+    }
 
     #[test]
     fn automatic_mptn_lu62_uses_session_profile_and_rejects_cp_or_untyped_lu() {
