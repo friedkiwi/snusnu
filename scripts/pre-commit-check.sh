@@ -28,19 +28,33 @@ trap 'rm -rf "$check_dir"' EXIT
 
 # CI checks the committed tree. Build the staged tree so concurrent or
 # unrelated worktree edits cannot make a commit appear to pass or fail.
+# Keep the checkout path stable for Cargo's incremental cache. Serialize checks
+# in this worktree because they also share its checkout and target directory.
+check_state="$repo_root/sna_router/target"
+mkdir -p "$check_state"
+exec {check_lock_fd}> "$check_state/precommit.lock"
+flock "$check_lock_fd"
+check_tree="$check_state/precommit-tree"
 git diff --cached --binary "$base_commit" > "$check_dir/staged.patch"
-env -u GIT_INDEX_FILE git clone --quiet --local --shared --no-checkout "$repo_root" "$check_dir/tree"
-env -u GIT_INDEX_FILE git -C "$check_dir/tree" checkout --quiet "$base_commit"
+if [[ ! -d "$check_tree/.git" ]]; then
+  env -u GIT_INDEX_FILE git clone --quiet --local --shared --no-checkout "$repo_root" "$check_tree"
+fi
+env -u GIT_INDEX_FILE git -C "$check_tree" checkout --quiet --detach --force "$base_commit"
+env -u GIT_INDEX_FILE git -C "$check_tree" clean --quiet -fdx
 if [[ -s "$check_dir/staged.patch" ]]; then
-  env -u GIT_INDEX_FILE git -C "$check_dir/tree" apply --index "$check_dir/staged.patch"
+  env -u GIT_INDEX_FILE git -C "$check_tree" apply --index "$check_dir/staged.patch"
+fi
+if [[ $(env -u GIT_INDEX_FILE git -C "$check_tree" write-tree) != "$staged_tree" ]]; then
+  echo "pre-commit: staged checkout does not match index" >&2
+  exit 1
 fi
 
 check_go_module() {
   local module=$1
   echo "pre-commit: $module formatting, vet, tests, build"
   (
-    cd "$check_dir/tree/$module"
-    go_version=$(awk '$1 == "go" { print $2; exit }' "$check_dir/tree/concentrator/go.mod")
+    cd "$check_tree/$module"
+    go_version=$(awk '$1 == "go" { print $2; exit }' "$check_tree/concentrator/go.mod")
     export GOTOOLCHAIN="go${go_version}+auto"
     go_toolchain_root=$(go env GOROOT)
     unformatted=$("$go_toolchain_root/bin/gofmt" -l .)
@@ -62,7 +76,7 @@ fi
 if $check_rust; then
   echo "pre-commit: Rust formatting, clippy, tests, build"
   (
-    cd "$check_dir/tree/sna_router"
+    cd "$check_tree/sna_router"
     export CARGO_TARGET_DIR="$repo_root/sna_router/target/precommit"
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
@@ -73,11 +87,11 @@ fi
 
 if $check_protocol; then
   echo "pre-commit: protocol documentation gate"
-  test -f "$check_dir/tree/docs/protocol.md"
-  test -d "$check_dir/tree/docs/test-vectors"
-  test -f "$check_dir/tree/docs/test-vectors/README.md"
-  grep -q '## Implemented invariants' "$check_dir/tree/docs/protocol.md"
-  grep -q '## Captured vectors' "$check_dir/tree/docs/test-vectors/README.md"
+  test -f "$check_tree/docs/protocol.md"
+  test -d "$check_tree/docs/test-vectors"
+  test -f "$check_tree/docs/test-vectors/README.md"
+  grep -q '## Implemented invariants' "$check_tree/docs/protocol.md"
+  grep -q '## Captured vectors' "$check_tree/docs/test-vectors/README.md"
 fi
 
 # Another worker can stage files while this hook runs. Git commits the index
