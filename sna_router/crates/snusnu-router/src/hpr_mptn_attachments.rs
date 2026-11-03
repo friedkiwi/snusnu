@@ -147,148 +147,41 @@ impl<'a> HprMptnAttachments<'a> {
         bind: &SessionUnit,
         timeout: Duration,
     ) -> io::Result<Option<HprToMptnSession>> {
+        let candidates = &self.candidates;
         let attachment = self
             .attachments
             .iter_mut()
             .find(|entry| entry.gateway.id() == gateway_id)
             .ok_or_else(|| invalid("unknown MPTN attachment"))?;
-        if attachment.state.active_user || !attachment.gateway.udp_available() {
-            return Ok(None);
-        }
-        let cp = attachment
+        attachment
             .state
-            .trusted_peer_cp
-            .as_ref()
-            .ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
-        if !attachment
-            .state
-            .observed_peer_lus
-            .contains(&identity.target_lu)
-            || identity.target_cp.as_ref() != Some(cp)
-            || !self.candidates.iter().any(|candidate| {
-                candidate.attachment_id == gateway_id
-                    && candidate.lu == identity.target_lu
-                    && candidate.verify_cp(cp).is_some()
-            })
-        {
-            return Err(invalid(
-                "MPTN target LU has no live management and trusted CP binding",
-            ));
-        }
-        let endpoint = attachment.gateway.outbound_endpoint();
-        let udp = attachment.gateway.lease_udp()?;
-        let session = match HprToMptnSession::new(endpoint, udp, identity, bind, timeout) {
-            Ok(session) => session,
-            Err(error) => {
-                attachment.gateway.release_udp();
-                return Err(error);
-            }
-        };
-        attachment.state.active_user = true;
-        Ok(Some(session))
+            .take_session(&mut attachment.gateway, candidates, identity, bind, timeout)
     }
 
     pub(crate) fn take_ingress_session(
         &mut self,
         offered: MptnIngressOffer,
     ) -> io::Result<MptnToHprSession> {
-        let attachment = self
-            .attachments
-            .iter_mut()
-            .find(|entry| entry.gateway.id() == offered.gateway_id)
-            .ok_or_else(|| invalid("unknown MPTN ingress gateway"))?;
-        if attachment.state.active_user {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "MPTN UDP lease is busy",
-            ));
-        }
-        let endpoint = attachment.gateway.outbound_endpoint();
-        let (detached, udp) = match attachment
-            .gateway
-            .detach_user_for_hpr(offered.association, &offered.offer)
-        {
-            Ok(detached) => detached,
-            Err(error) => {
-                let _ = attachment
-                    .gateway
-                    .reject_offer(offered.association, &error.to_string());
-                return Err(error);
-            }
-        };
-        let session = match MptnToHprSession::new(detached, udp, endpoint, offered.offer) {
-            Ok(session) => session,
-            Err(error) => {
-                attachment.gateway.release_udp();
-                return Err(error);
-            }
-        };
-        attachment.state.active_user = true;
-        Ok(session)
+        let attachment = self.attachment_mut(&offered.gateway_id)?;
+        attachment
+            .state
+            .take_ingress_session(&mut attachment.gateway, offered)
     }
 
-    /// Turn a validated inbound TCP62 user BIND into a local EE source only
-    /// when both LU names have live ownership proof. TCP62 management proves
-    /// the adjacent LU; the configured peer CP remains an operator assertion.
-    /// This method closes an offer it rejects before detach. Callers must not
-    /// reject the association a second time after an error.
     pub(crate) fn take_source(
         &mut self,
         offered: MptnIngressOffer,
         directory: &crate::hpr_destination_directory::HprDestinationDirectory,
     ) -> io::Result<ReadyMptnSource> {
-        let gateway_id = offered.gateway_id.clone();
-        let association = offered.association;
-        let preflight = (|| -> io::Result<(SessionIdentity, String)> {
-            let source_lu = parse_name(&offered.offer.connect().source.qualified_lu()?)?;
-            let target_lu = parse_name(&offered.offer.connect().destination.qualified_lu()?)?;
-            let attachment = self
-                .attachments
-                .iter()
-                .find(|entry| entry.gateway.id() == offered.gateway_id)
-                .ok_or_else(|| invalid("unknown MPTN ingress gateway"))?;
-            if attachment.state.active_user || !attachment.gateway.udp_available() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "MPTN UDP lease is busy",
-                ));
-            }
-            trusted_source_identity(
-                source_lu,
-                target_lu,
-                attachment.state.trusted_peer_cp.as_ref(),
-                &attachment.state.observed_peer_lus,
-                directory,
-            )
-        })();
-        let (identity, target_ee_id) = match preflight {
-            Ok(ready) => ready,
-            Err(error) => {
-                let _ = self.reject_offer(&gateway_id, association, &error.to_string());
-                return Err(error);
-            }
-        };
-        let session = self.take_ingress_session(offered)?;
-        tracing::info!(gateway = %gateway_id, target_ee = %target_ee_id,
-            source_lu = %identity.source_lu, target_lu = %identity.target_lu,
-            source_cp = %identity.source_cp.as_ref().unwrap(),
-            "validated TCP62 user BIND selected local EE route");
-        Ok(ReadyMptnSource {
-            gateway_id,
-            target_ee_id,
-            identity,
-            source: Box::new(session),
-        })
+        let attachment = self.attachment_mut(&offered.gateway_id)?;
+        attachment
+            .state
+            .take_source(&mut attachment.gateway, offered, directory)
     }
 
     pub(crate) fn release(&mut self, gateway_id: &str) {
-        if let Some(attachment) = self
-            .attachments
-            .iter_mut()
-            .find(|entry| entry.gateway.id() == gateway_id)
-        {
-            attachment.state.active_user = false;
-            attachment.gateway.release_udp();
+        if let Ok(attachment) = self.attachment_mut(gateway_id) {
+            attachment.state.release(&mut attachment.gateway);
         }
     }
 
@@ -298,12 +191,17 @@ impl<'a> HprMptnAttachments<'a> {
         association: u64,
         reason: &str,
     ) -> io::Result<()> {
+        let attachment = self.attachment_mut(gateway_id)?;
+        attachment
+            .state
+            .reject_offer(&mut attachment.gateway, association, reason)
+    }
+
+    fn attachment_mut(&mut self, gateway_id: &str) -> io::Result<&mut Attachment<'a>> {
         self.attachments
             .iter_mut()
             .find(|entry| entry.gateway.id() == gateway_id)
-            .ok_or_else(|| invalid("unknown MPTN attachment"))?
-            .gateway
-            .reject_offer(association, reason)
+            .ok_or_else(|| invalid("unknown MPTN attachment"))
     }
 }
 
@@ -368,6 +266,7 @@ impl HprMptnPeerState {
         &mut self,
         gateway: &mut AutoMptnGateway<'_>,
     ) -> io::Result<Option<MptnIngressOffer>> {
+        self.check_gateway(gateway)?;
         let bind = if Instant::now() < self.poll_retry_at {
             None
         } else {
@@ -414,6 +313,7 @@ impl HprMptnPeerState {
     }
 
     pub(crate) fn poll_probes(&mut self, gateway: &AutoMptnGateway<'_>) -> io::Result<()> {
+        self.check_gateway(gateway)?;
         self.poll_probe();
         self.start_probe_if_needed(gateway)
     }
@@ -423,7 +323,7 @@ impl HprMptnPeerState {
         gateway: &AutoMptnGateway<'_>,
         candidates: &[ConfiguredCandidate],
     ) -> Vec<(QualifiedName, Destination)> {
-        if self.active_user || !gateway.udp_available() {
+        if gateway.id() != self.gateway_id || self.active_user || !gateway.udp_available() {
             return Vec::new();
         }
         candidates
@@ -437,6 +337,159 @@ impl HprMptnPeerState {
                 )
             })
             .collect()
+    }
+
+    pub(crate) fn take_session(
+        &mut self,
+        gateway: &mut AutoMptnGateway<'_>,
+        candidates: &[ConfiguredCandidate],
+        identity: &SessionIdentity,
+        bind: &SessionUnit,
+        timeout: Duration,
+    ) -> io::Result<Option<HprToMptnSession>> {
+        self.check_gateway(gateway)?;
+        if self.active_user || !gateway.udp_available() {
+            return Ok(None);
+        }
+        let cp = self
+            .trusted_peer_cp
+            .as_ref()
+            .ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
+        if !self.observed_peer_lus.contains(&identity.target_lu)
+            || identity.target_cp.as_ref() != Some(cp)
+            || !candidates.iter().any(|candidate| {
+                candidate.attachment_id == self.gateway_id
+                    && candidate.lu == identity.target_lu
+                    && candidate.verify_cp(cp).is_some()
+            })
+        {
+            return Err(invalid(
+                "MPTN target LU has no live management and trusted CP binding",
+            ));
+        }
+        let endpoint = gateway.outbound_endpoint();
+        let udp = gateway.lease_udp()?;
+        let session = match HprToMptnSession::new(endpoint, udp, identity, bind, timeout) {
+            Ok(session) => session,
+            Err(error) => {
+                gateway.release_udp();
+                return Err(error);
+            }
+        };
+        self.active_user = true;
+        Ok(Some(session))
+    }
+
+    pub(crate) fn take_ingress_session(
+        &mut self,
+        gateway: &mut AutoMptnGateway<'_>,
+        offered: MptnIngressOffer,
+    ) -> io::Result<MptnToHprSession> {
+        self.check_gateway(gateway)?;
+        if offered.gateway_id != self.gateway_id {
+            return Err(invalid("MPTN offer belongs to another gateway"));
+        }
+        if self.active_user {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "MPTN UDP lease is busy",
+            ));
+        }
+        let endpoint = gateway.outbound_endpoint();
+        let (detached, udp) = match gateway.detach_user_for_hpr(offered.association, &offered.offer)
+        {
+            Ok(detached) => detached,
+            Err(error) => {
+                let _ = gateway.reject_offer(offered.association, &error.to_string());
+                return Err(error);
+            }
+        };
+        let session = match MptnToHprSession::new(detached, udp, endpoint, offered.offer) {
+            Ok(session) => session,
+            Err(error) => {
+                gateway.release_udp();
+                return Err(error);
+            }
+        };
+        self.active_user = true;
+        Ok(session)
+    }
+
+    /// Rejects invalid source or destination proof before detaching the
+    /// gateway offer. The shared socket owner must not reject it again.
+    pub(crate) fn take_source(
+        &mut self,
+        gateway: &mut AutoMptnGateway<'_>,
+        offered: MptnIngressOffer,
+        directory: &crate::hpr_destination_directory::HprDestinationDirectory,
+    ) -> io::Result<ReadyMptnSource> {
+        self.check_gateway(gateway)?;
+        if offered.gateway_id != self.gateway_id {
+            return Err(invalid("MPTN offer belongs to another gateway"));
+        }
+        let gateway_id = offered.gateway_id.clone();
+        let association = offered.association;
+        let preflight = (|| -> io::Result<(SessionIdentity, String)> {
+            let source_lu = parse_name(&offered.offer.connect().source.qualified_lu()?)?;
+            let target_lu = parse_name(&offered.offer.connect().destination.qualified_lu()?)?;
+            if self.active_user || !gateway.udp_available() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "MPTN UDP lease is busy",
+                ));
+            }
+            trusted_source_identity(
+                source_lu,
+                target_lu,
+                self.trusted_peer_cp.as_ref(),
+                &self.observed_peer_lus,
+                directory,
+            )
+        })();
+        let (identity, target_ee_id) = match preflight {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = self.reject_offer(gateway, association, &error.to_string());
+                return Err(error);
+            }
+        };
+        let session = self.take_ingress_session(gateway, offered)?;
+        tracing::info!(gateway = %gateway_id, target_ee = %target_ee_id,
+            source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+            source_cp = %identity.source_cp.as_ref().unwrap(),
+            "validated TCP62 user BIND selected local EE route");
+        Ok(ReadyMptnSource {
+            gateway_id,
+            target_ee_id,
+            identity,
+            source: Box::new(session),
+        })
+    }
+
+    pub(crate) fn release(&mut self, gateway: &mut AutoMptnGateway<'_>) {
+        if self.check_gateway(gateway).is_err() {
+            return;
+        }
+        self.active_user = false;
+        gateway.release_udp();
+    }
+
+    pub(crate) fn reject_offer(
+        &mut self,
+        gateway: &mut AutoMptnGateway<'_>,
+        association: u64,
+        reason: &str,
+    ) -> io::Result<()> {
+        self.check_gateway(gateway)?;
+        gateway.reject_offer(association, reason)
+    }
+
+    fn check_gateway(&self, gateway: &AutoMptnGateway<'_>) -> io::Result<()> {
+        if gateway.id() == self.gateway_id {
+            Ok(())
+        } else {
+            Err(invalid("MPTN state and gateway IDs disagree"))
+        }
     }
 
     fn poll_probe(&mut self) {
