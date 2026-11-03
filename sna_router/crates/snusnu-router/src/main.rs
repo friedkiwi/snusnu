@@ -91,6 +91,8 @@ mod hpr_session_source;
 mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
+#[cfg(all(test, target_os = "linux"))]
+mod llc_discovery_regression_tests;
 #[cfg(target_os = "linux")]
 mod llc_session_ws;
 #[cfg(target_os = "linux")]
