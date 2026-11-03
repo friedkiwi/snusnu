@@ -26,6 +26,11 @@ BIND/result, two-way events, credit and close. These tests exercise the
 bounded shared session path; they do not establish live two-guest EE↔EE or
 MPTN↔EE interoperability.
 
+The EE→MPTN production egress adapter has a separate in-process test with
+a synthetic TCP62/UDP peer. It verifies BIND/result, normal information in
+both directions, credit, UNBIND and release of the UDP socket. This exercises
+real adapter framing and cleanup, but live OS/400 MPTN↔EE remains pending.
+
 The EE adapter validates XID3 CP identity and derives LU reachability from
 RouteSetup/BIND and other verified control exchange. It does not infer every
 LU from a CP XID. LLC and MPTN adapters maintain their own discovery proofs.

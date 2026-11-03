@@ -65,6 +65,10 @@ configurations.
   close/lease cleanup. These are not two-peer live guest results. A cold
   destination LU is withheld when another verified local CP in the NETID
   makes the fallback ambiguous; the router must not guess the LLC peer.
+- The EE→MPTN production egress adapter also passed an in-process test with
+  a synthetic TCP62/UDP peer: BIND/result, normal data in both directions,
+  credit, UNBIND and UDP socket release. Live OS/400 MPTN↔EE interworking
+  remains unverified.
 - On master `ef8c033`, a controlled V5R4 EE source `ENDJOB` closed one QA
   circuit; the router returned the same verified V4R4 LLC carrier and
   accepted a reverse call about 10 ms later without new XID or SNASVCMG.
