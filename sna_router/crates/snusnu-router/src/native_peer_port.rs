@@ -416,14 +416,36 @@ impl NativePeerPort {
         Ok(address)
     }
 
-    pub(crate) fn reverse_idle_ready(&self) -> bool {
+    pub(crate) fn begin_reverse_management_mode(&mut self) -> io::Result<()> {
+        if !self.reverse_link_available() || self.management.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native LLC link is not idle for reverse management",
+            ));
+        }
+        self.reverse_user_mode = true;
+        self.reverse_completed = 0;
+        Ok(())
+    }
+
+    pub(crate) fn reverse_needs_management(&self) -> bool {
+        self.management.is_none()
+    }
+
+    pub(crate) fn reverse_link_available(&self) -> bool {
         !self.reverse_user_mode
             && self.link_established()
-            && self.management.as_ref().map(ManagementSession::phase)
-                == Some(ManagementPhase::Closed)
             && self.converter_offer.is_none()
             && !self.converter_bind_response_pending
             && self.converter_events.is_empty()
+            && (self.management.is_none()
+                || self.management.as_ref().map(ManagementSession::phase)
+                    == Some(ManagementPhase::Closed))
+    }
+
+    pub(crate) fn reverse_idle_ready(&self) -> bool {
+        self.reverse_link_available()
+            && self.management.is_some()
             && self
                 .converter_management_bind()
                 .is_some_and(|bind| bind.request_addresses().0 < u8::MAX)
@@ -445,10 +467,18 @@ impl NativePeerPort {
     }
 
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
+        if self.reverse_user_mode {
+            self.reverse_completed = self
+                .reverse_completed
+                .saturating_add(self.endpoint.take_completed_information_count());
+        }
         if let Some(management) = self.management.as_mut() {
-            let completed = self.endpoint.take_completed_information_count();
+            let completed = if self.reverse_user_mode {
+                0
+            } else {
+                self.endpoint.take_completed_information_count()
+            };
             if self.reverse_user_mode {
-                self.reverse_completed = self.reverse_completed.saturating_add(completed);
             } else if self.converter_bind_response_pending && exclusive_bind_ack(completed)? {
                 self.converter_bind_response_pending = false;
                 if self.converter_negative_bind_pending {

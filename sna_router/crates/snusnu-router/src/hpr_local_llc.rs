@@ -472,6 +472,7 @@ impl HprToLlcSession<NativePeerPort> {
 
     pub(crate) fn from_verified_port(
         mut native: NativePeerPort,
+        source_cp: &QualifiedName,
         target_cp: &QualifiedName,
         source_lu: &QualifiedName,
         target_lu: &QualifiedName,
@@ -484,14 +485,26 @@ impl HprToLlcSession<NativePeerPort> {
         }
         let local_xid = native.local_xid().clone();
         let local_cp = local_xid.cp_name().map_err(io::Error::other)?;
-        let address = native.begin_reverse_user_mode()?;
-        let port = VirtualWsPort::from_verified_native(
-            native,
-            local_xid,
-            &local_cp,
-            &target_cp.to_string(),
-            address,
-        )?;
+        validate_lu_cp_pair(source_cp, target_cp, source_lu, target_lu)?;
+        let port = if native.reverse_needs_management() {
+            native.begin_reverse_management_mode()?;
+            VirtualWsPort::from_verified_link(
+                native,
+                local_xid,
+                &local_cp,
+                &target_cp.to_string(),
+                fresh_management(&source_cp.to_string(), &target_cp.to_string())?,
+            )?
+        } else {
+            let address = native.begin_reverse_user_mode()?;
+            VirtualWsPort::from_verified_native(
+                native,
+                local_xid,
+                &local_cp,
+                &target_cp.to_string(),
+                address,
+            )?
+        };
         Self::with_port(port, source_lu, target_lu, bind)
     }
 

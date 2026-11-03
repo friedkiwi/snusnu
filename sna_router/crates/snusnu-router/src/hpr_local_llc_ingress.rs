@@ -65,7 +65,7 @@ impl LocalLlcIngress {
             && self.pending.is_none()
             && self.codec.is_none()
             && self.native.pending.is_none()
-            && self.native.port.reverse_idle_ready()
+            && self.native.port.reverse_link_available()
     }
 
     pub(crate) fn into_verified_port(self) -> io::Result<NativePeerPort> {

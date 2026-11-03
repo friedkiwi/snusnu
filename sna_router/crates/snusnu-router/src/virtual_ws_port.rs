@@ -59,6 +59,7 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     local_cp: String,
     peer_cp: String,
     initial_xid_sent: bool,
+    preverified_link: bool,
     inherited_management_address: Option<NativeAddress>,
     management: Option<NativeManagementInitiator>,
     reciprocal_management: Option<ManagementSession>,
@@ -118,6 +119,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             local_cp: local_cp.to_owned(),
             peer_cp: peer_cp.to_owned(),
             initial_xid_sent: false,
+            preverified_link: false,
             inherited_management_address: None,
             management: None,
             reciprocal_management: None,
@@ -156,11 +158,11 @@ impl<P: RoutePort> VirtualWsPort<P> {
     }
 
     pub(crate) fn ready(&self) -> bool {
-        self.inherited_management_address.is_some() || self.cp.ready()
+        self.preverified_link || self.cp.ready()
     }
 
     pub(crate) fn verified_user_closed(&self) -> bool {
-        self.inherited_management_address.is_some()
+        self.preverified_link
             && self.user_closed
             && self.native_user_input.is_none()
             && self.native_user_output.is_none()
@@ -192,7 +194,22 @@ impl<P: RoutePort> VirtualWsPort<P> {
             return Err(protocol("verified native user address is invalid"));
         }
         let mut port = Self::new(inner, local_xid, local_cp, peer_cp)?;
+        port.preverified_link = true;
         port.inherited_management_address = Some(address);
+        port.initial_xid_sent = true;
+        Ok(port)
+    }
+
+    pub(crate) fn from_verified_link(
+        inner: P,
+        local_xid: Xid3,
+        local_cp: &str,
+        peer_cp: &str,
+        initiator: NativeManagementInitiator,
+    ) -> io::Result<Self> {
+        let mut port = Self::new(inner, local_xid, local_cp, peer_cp)?;
+        port.attach_management(initiator)?;
+        port.preverified_link = true;
         port.initial_xid_sent = true;
         Ok(port)
     }
@@ -1421,6 +1438,33 @@ mod tests {
         assert!(port.inner.sent.is_empty(), "second XID was sent");
         assert_eq!(port.inner.information.len(), 1);
         assert_eq!(&port.inner.information[0][..9], &hex("2f00020200006b8500"));
+    }
+
+    #[test]
+    fn verified_llc2_link_initiates_management_without_second_xid() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::from_verified_link(
+            inner,
+            xid("QABOB.SNAB", Role::Secondary),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            crate::mptn_bidirectional_gateway::fresh_management("QABOB.SNAB", "QAALICE.SNAA")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(port.ready());
+        assert!(!port.management_complete());
+        port.poll(true).unwrap();
+        assert!(port.inner.sent.is_empty(), "second Type1 was sent");
+        assert_eq!(port.inner.information.len(), 1);
+        assert_eq!(port.inner.information[0][9], 0x31);
     }
 
     fn fresh_management(marker: u8) -> NativeManagementInitiator {
