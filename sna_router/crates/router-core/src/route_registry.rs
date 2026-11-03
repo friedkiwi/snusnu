@@ -92,6 +92,52 @@ pub enum RouteKey {
     ProxyMac([u8; 6]),
 }
 
+/// SNA LU session protocols. The WebSocket adapter maps these to its wire
+/// enum; the registry does not depend on a particular concentrator protocol.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LuType {
+    Lu0,
+    Lu1,
+    Lu2,
+    Lu3,
+    Lu4,
+    Lu61,
+    Lu62,
+    Lu7,
+}
+
+/// Reachability metadata belongs to a proof, not to the route identity key.
+/// An empty LU type list means that no session capability has been verified.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteRecord {
+    pub key: RouteKey,
+    pub supported_types: Vec<LuType>,
+}
+
+impl From<RouteKey> for RouteRecord {
+    fn from(key: RouteKey) -> Self {
+        Self {
+            key,
+            supported_types: Vec::new(),
+        }
+    }
+}
+
+impl RouteRecord {
+    fn validate(&self) -> Result<(), RegistryError> {
+        self.key.validate()?;
+        if !matches!(&self.key, RouteKey::LogicalUnit { .. }) && !self.supported_types.is_empty() {
+            return Err(RegistryError::InvalidRoute);
+        }
+        Ok(())
+    }
+
+    fn canonicalize(&mut self) {
+        self.supported_types.sort_unstable();
+        self.supported_types.dedup();
+    }
+}
+
 impl RouteKey {
     fn validate(&self) -> Result<(), RegistryError> {
         match self {
@@ -155,6 +201,7 @@ pub struct RouteSelection {
     pub attachment: AttachmentId,
     pub origin: RouteOrigin,
     pub key: RouteKey,
+    pub supported_types: Vec<LuType>,
     pub owner_version: OwnerVersion,
     pub lease: RouteLease,
 }
@@ -162,6 +209,7 @@ pub struct RouteSelection {
 #[derive(Clone, Debug)]
 struct OwnedRoute {
     key: RouteKey,
+    supported_types: Vec<LuType>,
     incarnation: u64,
 }
 
@@ -216,14 +264,34 @@ impl RouteRegistry {
         version: OwnerVersion,
         routes: Vec<RouteKey>,
     ) -> Result<(), RegistryError> {
+        self.replace_records(
+            owner,
+            attachment,
+            origin,
+            version,
+            routes.into_iter().map(RouteRecord::from).collect(),
+        )
+    }
+
+    /// Replace reachability with LU capability metadata. A metadata change
+    /// retires the old route lease even if its CP/LU key is unchanged.
+    pub fn replace_records(
+        &mut self,
+        owner: OwnerId,
+        attachment: AttachmentId,
+        origin: RouteOrigin,
+        version: OwnerVersion,
+        mut routes: Vec<RouteRecord>,
+    ) -> Result<(), RegistryError> {
         self.check_update(&owner, origin, version)?;
         if routes.len() > MAX_ROUTES_PER_OWNER {
             return Err(RegistryError::Capacity);
         }
         let mut distinct = HashSet::new();
-        for route in &routes {
+        for route in &mut routes {
             route.validate()?;
-            if !distinct.insert(route.clone()) {
+            route.canonicalize();
+            if !distinct.insert(route.key.clone()) {
                 return Err(RegistryError::DuplicateRoute);
             }
         }
@@ -234,10 +302,18 @@ impl RouteRegistry {
         });
         let mut next_incarnation = self.next_incarnation;
         let mut snapshot = Vec::with_capacity(routes.len());
-        for key in routes {
+        for record in routes {
+            let RouteRecord {
+                key,
+                supported_types,
+            } = record;
             let incarnation = if same_generation {
                 previous
-                    .and_then(|state| state.routes.iter().find(|route| route.key == key))
+                    .and_then(|state| {
+                        state.routes.iter().find(|route| {
+                            route.key == key && route.supported_types == supported_types
+                        })
+                    })
                     .map(|route| route.incarnation)
             } else {
                 None
@@ -252,7 +328,11 @@ impl RouteRegistry {
                     value
                 }
             };
-            snapshot.push(OwnedRoute { key, incarnation });
+            snapshot.push(OwnedRoute {
+                key,
+                supported_types,
+                incarnation,
+            });
         }
         self.owners.insert(
             owner.clone(),
@@ -362,6 +442,7 @@ impl RouteRegistry {
                     if first.attachment != state.attachment
                         || first.origin != state.origin
                         || first.key != route.key
+                        || first.supported_types != route.supported_types
                     {
                         return Err(RegistryError::AmbiguousRoute);
                     }
@@ -387,12 +468,19 @@ impl RouteRegistry {
     /// A locally owned CP or LU may be advertised only in the assigned NETID.
     /// Collisions with any other owner are omitted rather than published.
     pub fn local_exports(&self, netid: &str) -> Vec<RouteSelection> {
-        let mut identities =
-            HashMap::<PublicationIdentity, Option<(AttachmentId, RouteKey, RouteOrigin)>>::new();
+        let mut identities = HashMap::<
+            PublicationIdentity,
+            Option<(AttachmentId, RouteKey, RouteOrigin, Vec<LuType>)>,
+        >::new();
         for state in self.owners.values() {
             for route in &state.routes {
                 if let Some(identity) = PublicationIdentity::from_key(&route.key) {
-                    let signature = (state.attachment.clone(), route.key.clone(), state.origin);
+                    let signature = (
+                        state.attachment.clone(),
+                        route.key.clone(),
+                        state.origin,
+                        route.supported_types.clone(),
+                    );
                     identities
                         .entry(identity)
                         .and_modify(|current| {
@@ -413,7 +501,12 @@ impl RouteRegistry {
                 let Some(identity) = PublicationIdentity::from_key(&route.key) else {
                     continue;
                 };
-                let signature = (state.attachment.clone(), route.key.clone(), state.origin);
+                let signature = (
+                    state.attachment.clone(),
+                    route.key.clone(),
+                    state.origin,
+                    route.supported_types.clone(),
+                );
                 if identity.netid() != netid || identities.get(&identity) != Some(&Some(signature))
                 {
                     continue;
@@ -454,6 +547,7 @@ fn selection(owner: &OwnerId, state: &OwnerState, route: &OwnedRoute) -> RouteSe
         attachment: state.attachment.clone(),
         origin: state.origin,
         key: route.key.clone(),
+        supported_types: route.supported_types.clone(),
         owner_version: state.version,
         lease: RouteLease {
             owner: owner.clone(),
@@ -791,5 +885,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(registry.entries().len(), 1);
+    }
+
+    #[test]
+    fn lu7_capability_survives_export_and_metadata_change_retires_old_lease() {
+        let mut registry = RouteRegistry::new();
+        let key = lu("SOLNET.PRT01", "SOLNET.SNAA");
+        let record = RouteRecord {
+            key: key.clone(),
+            supported_types: vec![LuType::Lu7],
+        };
+        registry
+            .replace_records(
+                owner("llc-printer"),
+                attachment("llc-a"),
+                RouteOrigin::Local,
+                version(1, 1),
+                vec![record.clone()],
+            )
+            .unwrap();
+        let first = registry
+            .resolve_lu(&name("SOLNET.PRT01"), None, None)
+            .unwrap();
+        assert_eq!(first.supported_types, vec![LuType::Lu7]);
+        assert_eq!(
+            registry.local_exports("SOLNET")[0].supported_types,
+            vec![LuType::Lu7]
+        );
+        registry
+            .replace_records(
+                owner("llc-printer"),
+                attachment("llc-a"),
+                RouteOrigin::Local,
+                version(1, 2),
+                vec![record],
+            )
+            .unwrap();
+        assert!(registry.validate_lease(&first.lease));
+        registry
+            .replace_records(
+                owner("llc-printer"),
+                attachment("llc-a"),
+                RouteOrigin::Local,
+                version(1, 3),
+                vec![RouteRecord {
+                    key,
+                    supported_types: vec![LuType::Lu62],
+                }],
+            )
+            .unwrap();
+        assert!(!registry.validate_lease(&first.lease));
+        assert_eq!(
+            registry.local_exports("SOLNET")[0].supported_types,
+            vec![LuType::Lu62]
+        );
+    }
+
+    #[test]
+    fn conflicting_lu_types_on_same_attachment_fail_closed() {
+        let mut registry = RouteRegistry::new();
+        let key = lu("SOLNET.PRT01", "SOLNET.SNAA");
+        for (proof, kind) in [("proof-a", LuType::Lu7), ("proof-b", LuType::Lu62)] {
+            registry
+                .replace_records(
+                    owner(proof),
+                    attachment("llc-a"),
+                    RouteOrigin::Local,
+                    version(1, 1),
+                    vec![RouteRecord {
+                        key: key.clone(),
+                        supported_types: vec![kind],
+                    }],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            registry.resolve_lu(&name("SOLNET.PRT01"), None, None),
+            Err(RegistryError::AmbiguousRoute)
+        );
+        assert!(registry.local_exports("SOLNET").is_empty());
     }
 }
