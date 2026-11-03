@@ -78,6 +78,9 @@ if $check_rust; then
   (
     cd "$check_tree/sna_router"
     export CARGO_TARGET_DIR="$repo_root/sna_router/target/precommit"
+    # Checkout reuses this path while changing source trees. Refresh workspace
+    # mtimes so Cargo cannot reuse an rlib built from an older staged tree.
+    find crates -type f -name '*.rs' -exec touch {} +
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
