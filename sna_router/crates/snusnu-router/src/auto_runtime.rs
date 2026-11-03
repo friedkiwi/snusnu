@@ -2,7 +2,9 @@
 
 use crate::{
     auto_address::AutoProxyMacs,
-    auto_gateway_runtime::{virtual_cp_for_source, AutoMptnGateway},
+    auto_gateway_runtime::{
+        confirmed_mptn_transport_failure, virtual_cp_for_source, AutoMptnGateway,
+    },
     auto_llc::{AutoLlcPort, LlcAutoListener, LlcIngressOffer},
     auto_llc_ws::AutoLlcWsBridge,
     auto_local_dispatch::AutoLocalDispatch,
@@ -947,8 +949,14 @@ impl<'a> AutoLocalSessionRunner<'a> {
             let offered = match gateway.poll_once() {
                 Ok(offered) => offered,
                 Err(error) => {
-                    tracing::warn!(gateway = gateway.id(), error = %error,
-                        "MPTN gateway poll failed; withdrawing attachment discovery");
+                    if confirmed_mptn_transport_failure(&error) {
+                        gateway.withdraw_discovery()?;
+                        tracing::warn!(gateway = gateway.id(), error = %error,
+                            "MPTN shared transport failed; attachment discovery withdrawn");
+                    } else {
+                        tracing::warn!(gateway = gateway.id(), error = %error,
+                            "MPTN poll failed; attachment discovery retained pending retry");
+                    }
                     None
                 }
             };
@@ -1886,6 +1894,59 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn withdrawn_mptn_snapshot_removes_registry_and_upstream_export() {
+        let config: RouterConfig = toml::from_str(
+            "[[mptn]]\nprofile='gateway'\nid='mptn-a'\nlocal_ip='127.0.0.1'\npeer_ip='127.0.0.2'\n",
+        )
+        .unwrap();
+        let lu: QualifiedName = "OWNNET.APP".parse().unwrap();
+        let cp: QualifiedName = "OWNNET.HOSTCP".parse().unwrap();
+        let mut discovery =
+            crate::mptn_discovery::MptnDiscovery::new(Duration::from_secs(60)).unwrap();
+        discovery.observe(lu.clone(), cp, Instant::now()).unwrap();
+        let mut learned = HashMap::new();
+        let mut fabric = AutomaticFabric::new();
+        let proxies = AutoProxyMacs::from_ids(["mptn-a"]).unwrap();
+        let mut exports = HashMap::new();
+        let mut owner = HashMap::new();
+        learned.insert(
+            "mptn-a".to_owned(),
+            discovery
+                .take_changed_snapshot()
+                .unwrap()
+                .routes
+                .into_iter()
+                .collect(),
+        );
+        refresh_mptn_registry(&mut fabric, &config, &proxies, &learned).unwrap();
+        refresh_mptn_exports(&learned, "OWNNET", &mut exports, &mut owner).unwrap();
+        assert!(fabric
+            .directory()
+            .resolve_lu(&PortId::new("source"), &lu)
+            .is_ok());
+        assert_eq!(exports.len(), 1);
+
+        discovery.withdraw_all().unwrap();
+        learned.insert(
+            "mptn-a".to_owned(),
+            discovery
+                .take_changed_snapshot()
+                .unwrap()
+                .routes
+                .into_iter()
+                .collect(),
+        );
+        refresh_mptn_registry(&mut fabric, &config, &proxies, &learned).unwrap();
+        refresh_mptn_exports(&learned, "OWNNET", &mut exports, &mut owner).unwrap();
+        assert!(fabric
+            .directory()
+            .resolve_lu(&PortId::new("source"), &lu)
+            .is_err());
+        assert!(exports.is_empty());
+        assert!(owner.is_empty());
+    }
 
     #[test]
     fn mptn_exports_use_observed_cp_and_filter_upstream_netid() {

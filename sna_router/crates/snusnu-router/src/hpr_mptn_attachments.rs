@@ -15,7 +15,7 @@ use router_core::session::{QualifiedName, SessionIdentity, SessionUnit};
 use transport_ip_sna::mptn_ingress::IngressOffer;
 
 use crate::{
-    auto_gateway_runtime::AutoMptnGateway,
+    auto_gateway_runtime::{confirmed_mptn_transport_failure, AutoMptnGateway},
     config::{MptnGatewayConfig, RouterConfig},
     hpr_destination_directory::{
         configured_candidates, CandidateCarrier, ConfiguredCandidate, Destination,
@@ -272,10 +272,14 @@ impl HprMptnPeerState {
             match gateway.poll_once() {
                 Ok(bind) => bind,
                 Err(error) => {
-                    self.observed_peer_lus.clear();
+                    if confirmed_mptn_transport_failure(&error) {
+                        gateway.withdraw_discovery()?;
+                        self.observed_peer_lus.clear();
+                    }
                     self.poll_retry_at = Instant::now() + Duration::from_secs(1);
                     tracing::warn!(gateway = %self.gateway_id, error = %error,
-                        "MPTN gateway poll failed; learned routes withdrawn");
+                        confirmed_failure = confirmed_mptn_transport_failure(&error),
+                        "MPTN gateway poll failed");
                     None
                 }
             }
@@ -331,6 +335,9 @@ impl HprMptnPeerState {
 
     pub(crate) fn poll_probes(&mut self, gateway: &mut AutoMptnGateway<'_>) -> io::Result<()> {
         self.check_gateway(gateway)?;
+        if !gateway.discovery_available() {
+            return Ok(());
+        }
         self.poll_probe(gateway);
         self.start_probe_if_needed(gateway)
     }

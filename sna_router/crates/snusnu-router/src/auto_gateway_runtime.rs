@@ -18,6 +18,7 @@ use crate::{
     virtual_ws_port::VirtualWsPort,
     ws_native_responder::WsNativeResponder,
 };
+
 use router_core::{
     xid3::{Role, Xid3},
     xid3_local::LocalLlcProfile,
@@ -33,6 +34,21 @@ use transport_ip_sna::{
     mptn_management_responder::V5Options, mptn_reverse_user_bind::NativeAddress,
 };
 use transport_ws::wire;
+
+/// EBADF and ENOTSOCK mean a shared listener or UDP socket descriptor is no
+/// longer usable. Association protocol errors and temporary socket errors do
+/// not prove that every LU behind this gateway disappeared.
+pub(crate) fn confirmed_mptn_transport_failure(error: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(error.raw_os_error(), Some(9 | 88))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
 
 const BASE36: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -173,6 +189,7 @@ pub(crate) struct AutoMptnGateway<'a> {
     reverse: Option<AutoReverseWsSession>,
     reverse_status_id: Option<String>,
     udp_leased: bool,
+    transport_healthy: bool,
     identity_observations: Vec<(u64, String, IdentityObservation)>,
     closed_local_attachments: Vec<(u64, String)>,
     management_lus: Vec<(String, String, String)>,
@@ -224,6 +241,7 @@ impl<'a> AutoMptnGateway<'a> {
             reverse: None,
             reverse_status_id: None,
             udp_leased: false,
+            transport_healthy: true,
             identity_observations: Vec::new(),
             closed_local_attachments: Vec::new(),
             management_lus: Vec::new(),
@@ -284,6 +302,10 @@ impl<'a> AutoMptnGateway<'a> {
         self.discovery.withdraw_all()
     }
 
+    pub(crate) fn discovery_available(&self) -> bool {
+        self.transport_healthy
+    }
+
     /// A successful outbound SNASVCMG exchange proves the configured LU is
     /// reachable. Its CP still comes from the operator's explicit assertion.
     pub(crate) fn observe_configured_probe(
@@ -291,6 +313,12 @@ impl<'a> AutoMptnGateway<'a> {
         lu: router_core::session::QualifiedName,
         cp: router_core::session::QualifiedName,
     ) -> io::Result<()> {
+        if !self.transport_healthy {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "MPTN listener unavailable",
+            ));
+        }
         self.discovery.observe(lu, cp, Instant::now())
     }
 
@@ -369,9 +397,15 @@ impl<'a> AutoMptnGateway<'a> {
             self.listener.poll_association_once_with_credit(can_accept)
         };
         let event = match event_result {
-            Ok(event) => event,
+            Ok(event) => {
+                self.transport_healthy = true;
+                event
+            }
             Err(error) => {
-                self.discovery.withdraw_all()?;
+                if confirmed_mptn_transport_failure(&error) {
+                    self.transport_healthy = false;
+                    self.discovery.withdraw_all()?;
+                }
                 return Err(error);
             }
         };
@@ -963,6 +997,28 @@ impl MptnToWsSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_lost_shared_descriptors_confirm_attachment_failure() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(confirmed_mptn_transport_failure(
+                &io::Error::from_raw_os_error(9)
+            ));
+            assert!(confirmed_mptn_transport_failure(
+                &io::Error::from_raw_os_error(88)
+            ));
+            for code in [4, 11, 24, 104] {
+                assert!(!confirmed_mptn_transport_failure(
+                    &io::Error::from_raw_os_error(code)
+                ));
+            }
+        }
+        assert!(!confirmed_mptn_transport_failure(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad BIND"
+        )));
+    }
 
     fn name(netid: &str, name: &str) -> wire::SnaName {
         wire::SnaName {
