@@ -266,6 +266,18 @@ BIND at FID3 address `38` (LSID `F8`):
 
 The probe echoed this BIND as a positive inner response. The guest then
 sent `00 10 D8 24 3C F8 03 90 20 04 F3 00 05 D8 20 02`.
+An AnyNet rerun with verbose router and QA logging matched the QA ACTLU
+response to the router's WebSocket receive event and to the complete TCP62
+normal record accepted by the socket:
+
+```text
+QA PIU:     2e00010200020391200011d8243d78eb80000d01010084000000
+TCP62:      0000001b0000020390200011d8243d78eb80000d01010084000000
+```
+
+The guest's following LU 7 BIND confirms it processed that response. The
+router also logs each complete TCP62 record at the socket boundary when
+`transport_ip_sna=debug` is enabled.
 These are observed guest bytes. The probe responses are constructed, not
 captured from a real 5494. Station `38` is not the configured printer at
 address `01`, and its LU type is 7 rather than 4. The controller remains

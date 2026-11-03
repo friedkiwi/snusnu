@@ -6,6 +6,7 @@
 
 use std::{
     collections::VecDeque,
+    fmt,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
 };
@@ -13,6 +14,17 @@ use std::{
 pub const MPTN_PORT: u16 = 397;
 pub const MAX_RECORD: usize = 65_536;
 const MAX_QUEUED: usize = MAX_RECORD * 4;
+
+struct HexBytes<'a>(&'a [u8]);
+
+impl fmt::Display for HexBytes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TcpKind {
@@ -189,7 +201,13 @@ impl TcpSession {
                     "MPTN TCP closed",
                 ))
             }
-            Ok(n) => self.decoder.push(&scratch[..n]).map(Some),
+            Ok(n) => {
+                let records = self.decoder.push(&scratch[..n])?;
+                for record in &records {
+                    tracing::debug!(peer = ?self.stream.peer_addr().ok(), kind = ?record.kind, bytes = %HexBytes(&record.bytes), "TCP62 record received");
+                }
+                Ok(Some(records))
+            }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(Some(Vec::new())),
             Err(err) => Err(err),
@@ -217,7 +235,13 @@ impl TcpSession {
                     }
                     return Ok(result);
                 }
-                Ok(n) => result.extend(self.decoder.push(&scratch[..n])?),
+                Ok(n) => {
+                    let records = self.decoder.push(&scratch[..n])?;
+                    for record in &records {
+                        tracing::debug!(peer = ?self.stream.peer_addr().ok(), kind = ?record.kind, bytes = %HexBytes(&record.bytes), "TCP62 record received");
+                    }
+                    result.extend(records);
+                }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(result),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
@@ -263,6 +287,7 @@ impl TcpSession {
                 let sent = self.outbound.pop_front().unwrap();
                 self.outbound_bytes -= sent.len();
                 self.write_offset = 0;
+                tracing::debug!(peer = ?self.stream.peer_addr().ok(), compensation = sent[4], bytes = %HexBytes(&sent), "TCP62 record written to socket");
                 on_complete(sent.len());
             }
         }
