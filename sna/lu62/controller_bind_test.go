@@ -30,3 +30,30 @@ func Test5494ControllerBindCandidate(t *testing.T) {
 		t.Fatal("identical FID2 addresses accepted")
 	}
 }
+
+func TestQRMTWSCCNOSRequest(t *testing.T) {
+	request := CNOS{Service: 2, SessionLimit: 57, SourceWinners: 56, TargetWinners: 1, Mode: "QRMTWSC", ModeWidth: 8}
+	encoded, err := EncodeCNOS(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ParseCNOS(encoded)
+	if err != nil || decoded != request {
+		t.Fatalf("QRMTWSC CNOS: %+v %v, data=%x", decoded, err, encoded)
+	}
+	attach, err := CandidateCNOSAttach(1, 2, 1, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responder, err := NewCNOSResponder("QRMTWSC", 57)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := responder.AcceptAttach(attach); err != nil {
+		t.Fatalf("CNOS Attach rejected by responder: %v", err)
+	}
+	request.TargetWinners = 2
+	if _, err := EncodeCNOS(request); err == nil {
+		t.Fatal("overcommitted session winners accepted")
+	}
+}

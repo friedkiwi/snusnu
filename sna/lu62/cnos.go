@@ -46,6 +46,69 @@ func ParseCNOS(data []byte) (CNOS, error) {
 	return c, nil
 }
 
+// EncodeCNOS encodes an IBM LU 6.2 CNOS GDS. For a 5494 controller the
+// caller supplies QRMTWSC and the configured local/remote winner limits;
+// session negotiation still requires an active SNASVCMG conversation.
+func EncodeCNOS(c CNOS) ([]byte, error) {
+	if c.Service != 2 || c.Modifier != 0 || c.SessionLimit == 0 || c.SessionLimit > 0x7fff ||
+		c.SourceWinners > c.SessionLimit || c.TargetWinners > c.SessionLimit ||
+		uint32(c.SourceWinners)+uint32(c.TargetWinners) > uint32(c.SessionLimit) ||
+		c.ModeWidth > 8 || len(c.Mode) > int(c.ModeWidth) {
+		return nil, ErrCNOS
+	}
+	data := make([]byte, 17+int(c.ModeWidth))
+	binary.BigEndian.PutUint16(data[:2], uint16(len(data)))
+	data[2], data[3], data[4] = 0x12, 0x10, c.Service
+	binary.BigEndian.PutUint16(data[9:11], c.SessionLimit)
+	binary.BigEndian.PutUint16(data[11:13], c.SourceWinners)
+	binary.BigEndian.PutUint16(data[13:15], c.TargetWinners)
+	data[16] = c.ModeWidth
+	for i := 17; i < len(data); i++ {
+		data[i] = 0x40
+	}
+	for i := range c.Mode {
+		value := c.Mode[i]
+		switch {
+		case value >= 'A' && value <= 'I':
+			data[17+i] = 0xc1 + value - 'A'
+		case value >= 'J' && value <= 'R':
+			data[17+i] = 0xd1 + value - 'J'
+		case value >= 'S' && value <= 'Z':
+			data[17+i] = 0xe2 + value - 'S'
+		case value >= '0' && value <= '9':
+			data[17+i] = 0xf0 + value - '0'
+		case value == '@':
+			data[17+i] = 0x7c
+		case value == '#':
+			data[17+i] = 0x7b
+		case value == '$':
+			data[17+i] = 0x5b
+		default:
+			return nil, ErrCNOS
+		}
+	}
+	if _, err := ParseCNOS(data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// CandidateCNOSAttach wraps a source CNOS request in the observed LU 6.2
+// control-operator FMH-5 Attach. The caller must have an active management
+// session and must handle pacing, CONFIRM, and the accepted-pending reply.
+func CandidateCNOSAttach(daf, oaf byte, sequence uint16, c CNOS) ([]byte, error) {
+	if daf == 0 || oaf == 0 || daf == oaf || sequence == 0 {
+		return nil, ErrCNOS
+	}
+	gds, err := EncodeCNOS(c)
+	if err != nil {
+		return nil, err
+	}
+	piu := []byte{0x2e, 0, daf, oaf, byte(sequence >> 8), byte(sequence), 0x0b, 0x91, 0x20,
+		0x0c, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}
+	return append(piu, gds...), nil
+}
+
 type CNOSResponder struct {
 	phase       byte
 	mode        string
