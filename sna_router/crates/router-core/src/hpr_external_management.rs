@@ -8,7 +8,7 @@
 use crate::{
     appn_control::ControlResponder,
     fid2_bind::BindClass,
-    fid2_session_control::{ManagementBind, ManagementPacing},
+    fid2_session_control::{request_fqpcid, ManagementBind, ManagementPacing},
     hpr_fid5::Fid5WholeBiu,
     hpr_session_address::{RtpAssociationScope, RtpObservation},
     session::QualifiedName,
@@ -34,6 +34,7 @@ pub enum ExternalManagementPhase {
     AwaitCnos,
     CnosComplete,
     BisComplete,
+    Closed,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,7 @@ pub struct ExternalCpManagementResponder {
     target_cp: QualifiedName,
     assigned_sa: u64,
     request_sa: Option<u64>,
+    fqpcid: Option<Vec<u8>>,
     phase: ExternalManagementPhase,
     bind_request: Option<Vec<u8>>,
     bind_response: Option<Vec<u8>>,
@@ -50,6 +52,8 @@ pub struct ExternalCpManagementResponder {
     cnos_replies: Option<Vec<Vec<u8>>>,
     bis_request: Option<Vec<u8>>,
     bis_replies: Option<Vec<Vec<u8>>>,
+    unbind_request: Option<Vec<u8>>,
+    unbind_response: Option<Vec<u8>>,
 }
 
 impl ExternalCpManagementResponder {
@@ -72,6 +76,7 @@ impl ExternalCpManagementResponder {
             target_cp,
             assigned_sa,
             request_sa: None,
+            fqpcid: None,
             phase: ExternalManagementPhase::AwaitBind,
             bind_request: None,
             bind_response: None,
@@ -79,6 +84,8 @@ impl ExternalCpManagementResponder {
             cnos_replies: None,
             bis_request: None,
             bis_replies: None,
+            unbind_request: None,
+            unbind_response: None,
         })
     }
 
@@ -119,7 +126,8 @@ impl ExternalCpManagementResponder {
             }
             ExternalManagementPhase::AwaitCnos
             | ExternalManagementPhase::CnosComplete
-            | ExternalManagementPhase::BisComplete => {
+            | ExternalManagementPhase::BisComplete
+            | ExternalManagementPhase::Closed => {
                 (observation.tcid == self.scope.subsequent_plu_tcid
                     && u64::from_be_bytes(fid5.session_address) == self.assigned_sa & !ASSIGNOR)
                     || (observation.tcid == self.scope.initial_plu_tcid
@@ -148,12 +156,18 @@ impl ExternalCpManagementResponder {
         if self.bis_request.as_deref() == Some(bytes) {
             return Ok((next, self.bis_replies.clone().unwrap()));
         }
+        if self.unbind_request.as_deref() == Some(bytes) {
+            return Ok((next, vec![self.unbind_response.clone().unwrap()]));
+        }
         let fid5 = Fid5WholeBiu::parse_complete(bytes)
             .map_err(|_| ExternalManagementError::InvalidControl)?;
         match self.phase {
             ExternalManagementPhase::AwaitBind => {
                 let response = self.positive_bind(fid5)?;
                 next.request_sa = Some(u64::from_be_bytes(fid5.session_address) & !ASSIGNOR);
+                next.fqpcid = Some(
+                    request_fqpcid(fid5.ru).map_err(|_| ExternalManagementError::InvalidBind)?,
+                );
                 next.bind_request = Some(bytes.to_vec());
                 next.bind_response = Some(response.clone());
                 next.phase = ExternalManagementPhase::AwaitCnos;
@@ -182,10 +196,17 @@ impl ExternalCpManagementResponder {
             ExternalManagementPhase::BisComplete => {
                 if is_ipr(fid5) || (fid5.rh[0] & 0xe0 == 0xc0 && fid5.ru == [0x70]) {
                     Ok((next, Vec::new()))
+                } else if fid5.expedited && fid5.rh == [0x6b, 0x80, 0] {
+                    let response = self.reply_unbind(fid5)?;
+                    next.unbind_request = Some(bytes.to_vec());
+                    next.unbind_response = Some(response.clone());
+                    next.phase = ExternalManagementPhase::Closed;
+                    Ok((next, vec![response]))
                 } else {
                     Err(ExternalManagementError::UnexpectedUnit)
                 }
             }
+            ExternalManagementPhase::Closed => Err(ExternalManagementError::UnexpectedUnit),
         }
     }
 
@@ -263,10 +284,30 @@ impl ExternalCpManagementResponder {
         let bis = encode_fid5(false, 2, address, &[0x4b, 0xb0, 0, 0x70])?;
         Ok(vec![ipr, bis])
     }
+
+    fn reply_unbind(&self, fid5: Fid5WholeBiu<'_>) -> Result<Vec<u8>, ExternalManagementError> {
+        let fqpcid = self
+            .fqpcid
+            .as_deref()
+            .ok_or(ExternalManagementError::InvalidScope)?;
+        if fid5.ru.len() != 6 + fqpcid.len()
+            || fid5.ru[..6] != [0x32, 1, 0, 0, 0, 0]
+            || fid5.ru[6..] != *fqpcid
+        {
+            return Err(ExternalManagementError::InvalidControl);
+        }
+        encode_fid5(
+            true,
+            fid5.sequence_number,
+            self.request_sa
+                .ok_or(ExternalManagementError::InvalidScope)?,
+            &[0xeb, 0x80, 0, 0x32],
+        )
+    }
 }
 
 fn is_ipr(fid5: Fid5WholeBiu<'_>) -> bool {
-    fid5.expedited && fid5.rh == [0x83, 0x01, 0] && fid5.ru.is_empty()
+    fid5.rh == [0x83, 0x01, 0] && fid5.ru.is_empty()
 }
 
 fn as_fid2(fid5: Fid5WholeBiu<'_>, daf: u8, oaf: u8) -> Vec<u8> {
@@ -440,5 +481,82 @@ mod tests {
             [0x4b, 0xb0, 0]
         );
         assert_eq!(ready.preview_ingress(subsequent, &bis).unwrap().1, replies);
+    }
+
+    #[test]
+    fn live_normal_ipr_and_correlated_unbind_finish_only_management_leg() {
+        let scope = scope();
+        let responder = ExternalCpManagementResponder::new(
+            scope,
+            "SOLNET.SNAB".parse().unwrap(),
+            "SOLNET.SNAA".parse().unwrap(),
+            0x8000_0000_0000_0001,
+        )
+        .unwrap();
+        let mut bind = observed_bind();
+        // This live generation's CV60 PCID ended X'3e' rather than X'31'.
+        let pcid = bind
+            .windows(8)
+            .position(|part| part == [0xce, 0xc3, 0x70, 0xe7, 0xb2, 0x83, 0xa3, 0x31])
+            .unwrap();
+        bind[pcid + 7] = 0x3e;
+        let observed = RtpObservation {
+            generation: scope.generation,
+            tcid: scope.initial_plu_tcid,
+        };
+        let (bound, _) = responder.preview_ingress(observed, &bind).unwrap();
+        let subsequent = RtpObservation {
+            tcid: scope.subsequent_plu_tcid,
+            ..observed
+        };
+        let cnos = encode_fid5(
+            false,
+            1,
+            1,
+            &[
+                0x0b, 0x91, 0x20, 0x0c, 0x05, 0x02, 0xff, 0, 3, 0xd0, 0, 0, 2, 0x06, 0xf1, 0, 25,
+                0x12, 0x10, 2, 0, 0, 0, 0, 0, 8, 0, 4, 0, 4, 0, 8, 0x40, 0x40, 0x40, 0x40, 0x40,
+                0x40, 0x40, 0x40,
+            ],
+        )
+        .unwrap();
+        let (cnos, _) = bound.preview_ingress(subsequent, &cnos).unwrap();
+        // Live 10:27:33.639 V5R4 sent canonical IPR on normal flow (X'5c'),
+        // exactly as the V4 native management path permits.
+        let normal_ipr = [0x5c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x83, 0x01, 0];
+        let (cnos, replies) = cnos.preview_ingress(subsequent, &normal_ipr).unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(cnos.phase(), ExternalManagementPhase::CnosComplete);
+        let bis = encode_fid5(false, 2, 1, &[0x4b, 0x91, 0, 0x70]).unwrap();
+        let (ready, _) = cnos.preview_ingress(subsequent, &bis).unwrap();
+        assert!(ready.ready());
+        // Complete live FID5 UNBIND from 10:27:33.699, including CV60.
+        let unbind = "5d 00 00 00 00 00 00 00 00 00 00 01 6b 80 00
+            32 01 00 00 00 00 60 14 ce c3 70 e7 b2 83 a3 3e
+            0b e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c2"
+            .split_ascii_whitespace()
+            .map(|pair| u8::from_str_radix(pair, 16).unwrap())
+            .collect::<Vec<_>>();
+        let (closed, replies) = ready.preview_ingress(subsequent, &unbind).unwrap();
+        assert_eq!(closed.phase(), ExternalManagementPhase::Closed);
+        assert!(!closed.ready());
+        assert_eq!(replies.len(), 1);
+        let positive = Fid5WholeBiu::parse_complete(&replies[0]).unwrap();
+        assert_eq!(positive.rh, [0xeb, 0x80, 0]);
+        assert_eq!(positive.ru, [0x32]);
+        assert_eq!(
+            u64::from_be_bytes(positive.session_address),
+            0x0002_0700_f0f1_0001
+        );
+        assert_eq!(
+            closed.preview_ingress(subsequent, &unbind).unwrap().1,
+            replies
+        );
+        let mut wrong_pcid = unbind.clone();
+        wrong_pcid[30] ^= 1;
+        assert!(matches!(
+            ready.preview_ingress(subsequent, &wrong_pcid),
+            Err(ExternalManagementError::InvalidControl)
+        ));
     }
 }
