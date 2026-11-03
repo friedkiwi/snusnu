@@ -17,6 +17,7 @@ use crate::{
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 const BIND_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+const NATIVE_UNBIND_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn bind_result_expired(sent: Option<Instant>, bound: bool, now: Instant) -> bool {
     !bound && sent.is_some_and(|sent| now.duration_since(sent) >= BIND_RESULT_TIMEOUT)
@@ -32,6 +33,8 @@ pub(crate) struct LlcSourceWs {
     bind_sent_at: Option<Instant>,
     bound: bool,
     user_rejected: bool,
+    user_teardown_complete: bool,
+    bound_close_started: Option<Instant>,
     source_closed: bool,
     retiring: bool,
 }
@@ -53,6 +56,8 @@ impl LlcSourceWs {
             bind_sent_at: None,
             bound: false,
             user_rejected: false,
+            user_teardown_complete: false,
+            bound_close_started: None,
             source_closed: false,
             retiring: false,
         }
@@ -60,6 +65,26 @@ impl LlcSourceWs {
 
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
         if self.retiring {
+            if self.bound {
+                if self.source.drain_bound_user()? {
+                    self.bound = false;
+                    self.user_teardown_complete = true;
+                    tracing::info!(session = self.session_id,
+                        attachment = %self.attachment_id,
+                        "remote circuit closed; native user UNBIND completed");
+                    return Ok(false);
+                }
+                if self
+                    .bound_close_started
+                    .is_some_and(|started| started.elapsed() >= NATIVE_UNBIND_TIMEOUT)
+                {
+                    tracing::warn!(session = self.session_id,
+                        attachment = %self.attachment_id,
+                        "native user UNBIND timed out after remote circuit close");
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
             self.source.poll_carrier_control()?;
             if self.source.reject_user_bind()? {
                 self.user_rejected = true;
@@ -69,6 +94,9 @@ impl LlcSourceWs {
         }
         if !self.ws.is_open() && self.opened_at.elapsed() >= OPEN_TIMEOUT {
             self.retiring = true;
+            if self.bound {
+                self.bound_close_started = Some(Instant::now());
+            }
             self.ws.close()?;
             return Ok(true);
         }
@@ -78,6 +106,9 @@ impl LlcSourceWs {
             .is_some_and(|(_, _, since)| since.elapsed() >= EVENT_TIMEOUT)
         {
             self.retiring = true;
+            if self.bound {
+                self.bound_close_started = Some(Instant::now());
+            }
             self.ws.close()?;
             return Ok(true);
         }
@@ -95,7 +126,6 @@ impl LlcSourceWs {
                             attachment = %self.attachment_id, accepted,
                             elapsed_ms = self.bind_sent_at.map(|sent| sent.elapsed().as_millis()),
                             "LLC SessionV1 remote BIND result received");
-                        self.bound = *accepted;
                         if !accepted {
                             self.bind_sent_at = None;
                         }
@@ -105,12 +135,18 @@ impl LlcSourceWs {
                 }
                 Some(SessionWsUpdate::Closed) => {
                     self.retiring = true;
+                    if self.bound {
+                        self.bound_close_started = Some(Instant::now());
+                    }
                     return Ok(true);
                 }
                 Some(SessionWsUpdate::Opened) | None => {}
             }
         } else if self.ws.poll_control()? {
             self.retiring = true;
+            if self.bound {
+                self.bound_close_started = Some(Instant::now());
+            }
             return Ok(true);
         }
         if let Some((event, charged, _)) = &self.pending_ws {
@@ -132,6 +168,9 @@ impl LlcSourceWs {
                 return Ok(false);
             }
             if self.source.send(event)? {
+                if matches!(event, SessionEvent::BindResult { accepted: true, .. }) {
+                    self.bound = true;
+                }
                 if *charged {
                     self.ws.complete_received(1)?;
                 }
@@ -180,7 +219,7 @@ impl LlcSourceWs {
                 "LLC user circuit cannot return a closed or bound link",
             ));
         }
-        if !self.user_rejected {
+        if !self.user_rejected && !self.user_teardown_complete {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "native negative BIND response has not been queued",

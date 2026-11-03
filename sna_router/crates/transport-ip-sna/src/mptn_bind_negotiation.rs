@@ -122,6 +122,12 @@ fn fields(data: &[u8], response: bool) -> Result<BindFields<'_>, BindNegotiation
     })
 }
 
+/// Correlation token from a validated user BIND request. Native user UNBIND
+/// must carry this exact FQPCID when retiring a live session locally.
+pub fn request_fqpcid(data: &[u8]) -> Result<&[u8], BindNegotiationError> {
+    Ok(fields(data, false)?.fqpcid)
+}
+
 /// Validate the native BIND correlation that TCP62 itself does not provide:
 /// the mode, FQPCID, LU 6.2 profile, and negotiated capabilities.
 pub fn validate_positive_response(
