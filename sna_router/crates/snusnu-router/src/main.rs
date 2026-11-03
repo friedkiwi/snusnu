@@ -36,6 +36,8 @@ mod auto_hpr_reverse_runtime;
 #[allow(dead_code)] // Prepared session switch; HPR endpoint remains gated.
 mod auto_hpr_runtime;
 #[cfg(target_os = "linux")]
+mod auto_hpr_standalone;
+#[cfg(target_os = "linux")]
 mod auto_llc;
 #[cfg(target_os = "linux")]
 mod auto_llc_ws;

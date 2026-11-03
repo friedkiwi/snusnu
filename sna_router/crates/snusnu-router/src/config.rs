@@ -1264,10 +1264,10 @@ impl RouterConfig {
             ));
         }
         if !self.ee.is_empty() {
-            if self.ee.len() != 1 || self.remote.len() != 1 {
+            if self.ee.len() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "automatic HPR/IP currently requires one [[hpr_ip]] and one [[concentrator]]",
+                    "automatic HPR/IP currently requires one [[hpr_ip]] attachment",
                 ));
             }
             if self.ee[0].local_cp.is_none() {
@@ -2242,7 +2242,13 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
         let ee = parse("[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n");
         let error = ee.validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("one [[concentrator]]"));
+        assert!(error.to_string().contains("requires local_cp"));
+
+        let standalone = parse(
+            "[[llc]]\nid='local_a'\ninterface='sol5'\nguest_mac='02:00:35:27:23:01'\nlocal_cp='SOLNET.SNAA'\nlus=['SOLNET.SNAA']\n[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SOLNET.RTR'\npeer_lus=['SOLNET.SNAB']\n",
+        );
+        standalone.validate().unwrap();
+        assert!(standalone.automatic());
 
         let with_upstream = parse(
             "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SNUSNU.SVC'\n[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",

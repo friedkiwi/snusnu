@@ -168,7 +168,7 @@ struct ActiveHprSession {
     pending_local_grant: bool,
 }
 
-struct DirectHprRuntime<'a> {
+pub(crate) struct DirectHprRuntime<'a> {
     bootstrap: HprControlBootstrap,
     rtp: HprRtpPort,
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
@@ -194,6 +194,7 @@ struct DirectHprRuntime<'a> {
     bound_user_scopes: Vec<router_core::hpr_session_address::RtpAssociationScope>,
     peer_lus: Option<EePeerLus>,
     ee_attachment_id: Option<String>,
+    ee_peer_ip: Option<std::net::IpAddr>,
     reverse: Option<ReverseRuntime>,
     local_ingress: Option<LocalToHprRuntime>,
     reverse_local_reservation: Option<(String, [u8; 6])>,
@@ -201,7 +202,7 @@ struct DirectHprRuntime<'a> {
 }
 
 impl<'a> DirectHprRuntime<'a> {
-    fn new(bootstrap: HprControlBootstrap) -> Self {
+    pub(crate) fn new(bootstrap: HprControlBootstrap) -> Self {
         let mut switch = SessionSwitch::new();
         switch.register(HPR_ADAPTER);
         switch.register(WS_ADAPTER);
@@ -232,6 +233,7 @@ impl<'a> DirectHprRuntime<'a> {
             bound_user_scopes: Vec::new(),
             peer_lus: None,
             ee_attachment_id: None,
+            ee_peer_ip: None,
             reverse: None,
             local_ingress: None,
             reverse_local_reservation: None,
@@ -239,15 +241,19 @@ impl<'a> DirectHprRuntime<'a> {
         }
     }
 
-    fn configure_peer_lus(&mut self, attachment: &crate::config::EeConfig) -> io::Result<()> {
+    pub(crate) fn configure_peer_lus(
+        &mut self,
+        attachment: &crate::config::EeConfig,
+    ) -> io::Result<()> {
         let mut peer_lus = EePeerLus::from_attachment(attachment)?;
         peer_lus.activate(&self.bootstrap.peer.cp);
         self.peer_lus = Some(peer_lus);
         self.ee_attachment_id = Some(attachment.id.clone());
+        self.ee_peer_ip = Some(attachment.peer_ip);
         self.refresh_ee_directory(&attachment.id)
     }
 
-    fn configure_local_llc(&mut self, config: &RouterConfig) -> io::Result<()> {
+    pub(crate) fn configure_local_llc(&mut self, config: &RouterConfig) -> io::Result<()> {
         if !config.llc.is_empty() {
             self.llc = Some(HprLlcAttachments::new(
                 config,
@@ -258,7 +264,7 @@ impl<'a> DirectHprRuntime<'a> {
         Ok(())
     }
 
-    fn configure_local_ingress(
+    pub(crate) fn configure_local_ingress(
         &mut self,
         config: &RouterConfig,
         attachment: &crate::config::EeConfig,
@@ -299,7 +305,7 @@ impl<'a> DirectHprRuntime<'a> {
         self.local_directory.replace_owner("ee", routes)
     }
 
-    fn configure_local_mptn(&mut self, config: &'a RouterConfig) -> io::Result<()> {
+    pub(crate) fn configure_local_mptn(&mut self, config: &'a RouterConfig) -> io::Result<()> {
         if !config.mptn_gateway.is_empty() {
             self.mptn = Some(HprMptnAttachments::new(config)?);
         }
@@ -358,11 +364,14 @@ impl<'a> DirectHprRuntime<'a> {
 
     fn resolve_target(
         &self,
-        hub: &AutoWsHub,
+        hub: Option<&AutoWsHub>,
         target: &router_core::session::QualifiedName,
     ) -> io::Result<Destination> {
         let local = self.local_directory.resolve_lu(target);
-        let upstream = hub.resolve_lu(&as_wire_name(target))?;
+        let upstream = hub
+            .map(|hub| hub.resolve_lu(&as_wire_name(target)))
+            .transpose()?
+            .flatten();
         match (local, upstream) {
             (Some(_), Some(_)) => Err(protocol(format!(
                 "HPR target {target} is ambiguous between local and upstream routes"
@@ -407,7 +416,93 @@ impl<'a> DirectHprRuntime<'a> {
         Ok(())
     }
 
-    fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
+    pub(crate) fn on_datagram(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        datagram: &transport_ip_sna::ee::Datagram,
+        now_us: u64,
+    ) -> io::Result<()> {
+        let no_user_work = self.sessions.is_empty()
+            && self
+                .pending_rtp
+                .iter()
+                .all(|message| message.kind != RtpIngressKind::User);
+        let replace_route = no_user_work
+            && self.route_reply.is_none()
+            && self.negative_route_reply.is_none()
+            && self
+                .pending_rtp
+                .iter()
+                .all(|message| message.kind != RtpIngressKind::RouteSetup);
+        let replace_cp = no_user_work
+            && self.pending_cp_replies.is_empty()
+            && self.pending_reciprocal_replies.is_empty()
+            && self.pending_rtp.iter().all(|message| {
+                !matches!(
+                    message.kind,
+                    RtpIngressKind::CpSvcMg | RtpIngressKind::CpSvcMgOut
+                )
+            });
+        let old_route_scope = self.rtp.route_setup_scope();
+        let old_cp_scope = self.rtp.cp_scope();
+        let messages = match self
+            .rtp
+            .on_ee_ui(link, datagram, now_us, |kind| match kind {
+                RtpIngressKind::RouteSetup => replace_route,
+                RtpIngressKind::CpSvcMg => replace_cp,
+                RtpIngressKind::CpSvcMgOut => false,
+                RtpIngressKind::User => no_user_work,
+                RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => false,
+            }) {
+            Ok(messages) => messages,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                tracing::warn!(attachment = self.ee_attachment_id.as_deref().unwrap_or("hpr_ip"),
+                    peer_ip = ?self.ee_peer_ip, udp_port = datagram.port,
+                    dsap = datagram.dsap, ssap = datagram.ssap,
+                    generation = link.generation().get(), error = %error,
+                    "discarded invalid HPR datagram");
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+        if old_route_scope.is_some() && self.rtp.route_setup_scope() != old_route_scope {
+            self.route_setup.clear();
+            self.route_targets.clear();
+            self.route_reply = None;
+            self.negative_route_reply = None;
+            self.bound_user_scopes.clear();
+            tracing::info!(
+                attachment = self.ee_attachment_id.as_deref().unwrap_or("hpr_ip"),
+                generation = link.generation().get(),
+                "HPR RouteSetup RTP restarted on active EE link"
+            );
+        }
+        if old_cp_scope.is_some() && self.rtp.cp_scope() != old_cp_scope {
+            self.cp_management = None;
+            self.reciprocal_cp = None;
+            self.rtp.reset_cp_out();
+            tracing::info!(
+                attachment = self.ee_attachment_id.as_deref().unwrap_or("hpr_ip"),
+                generation = link.generation().get(),
+                "HPR CP management RTP restarted on active EE link"
+            );
+        }
+        let live_user_scopes = self.rtp.active_user_scopes();
+        self.bound_user_scopes
+            .retain(|scope| live_user_scopes.contains(scope));
+        self.queue_rtp(messages)
+    }
+
+    pub(crate) fn tick(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
+        self.rtp.tick(link, now_us)
+    }
+
+    pub(crate) fn pump(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        mut hub: Option<&mut AutoWsHub>,
+        now_us: u64,
+    ) -> io::Result<()> {
         self.pump_local_llc()?;
         self.pump_local_mptn()?;
         self.pump_local_ws();
@@ -422,7 +517,9 @@ impl<'a> DirectHprRuntime<'a> {
                             attachment_id: attachment.to_owned(),
                         })
             });
-        self.refresh_local_exports(hub)?;
+        if let Some(hub) = hub.as_deref_mut() {
+            self.refresh_local_exports(hub)?;
+        }
         self.try_local_reverse(link)?;
         self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
@@ -431,8 +528,10 @@ impl<'a> DirectHprRuntime<'a> {
         self.try_external_management_replies(link, now_us)?;
         while let Some(message) = self.pending_rtp.front().cloned() {
             let result = match message.kind {
-                RtpIngressKind::RouteSetup => self.route_message(link, hub, &message, now_us),
-                RtpIngressKind::User => self.user_message(hub, &message),
+                RtpIngressKind::RouteSetup => {
+                    self.route_message(link, hub.as_deref(), &message, now_us)
+                }
+                RtpIngressKind::User => self.user_message(hub.as_deref_mut(), &message),
                 RtpIngressKind::CpSvcMg => self.cp_message(&message),
                 RtpIngressKind::CpSvcMgOut => self.reciprocal_cp_message(&message),
                 RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => self
@@ -823,7 +922,7 @@ impl<'a> DirectHprRuntime<'a> {
     fn route_message(
         &mut self,
         link: &EeLdlcEndpoint,
-        hub: &AutoWsHub,
+        hub: Option<&AutoWsHub>,
         message: &RtpIngress,
         _now_us: u64,
     ) -> io::Result<()> {
@@ -1004,7 +1103,11 @@ impl<'a> DirectHprRuntime<'a> {
         Ok(())
     }
 
-    fn user_message(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
+    fn user_message(
+        &mut self,
+        hub: Option<&mut AutoWsHub>,
+        message: &RtpIngress,
+    ) -> io::Result<()> {
         let fid5 = Fid5WholeBiu::parse_complete(&message.bytes)
             .map_err(|error| protocol(format!("invalid HPR user BIU: {error:?}")))?;
         let bind = fid5
@@ -1229,7 +1332,11 @@ impl<'a> DirectHprRuntime<'a> {
         )
     }
 
-    fn start_user_session(&mut self, hub: &mut AutoWsHub, message: &RtpIngress) -> io::Result<()> {
+    fn start_user_session(
+        &mut self,
+        mut hub: Option<&mut AutoWsHub>,
+        message: &RtpIngress,
+    ) -> io::Result<()> {
         if self.sessions.len() >= MAX_ACTIVE_HPR_SESSIONS {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1299,7 +1406,11 @@ impl<'a> DirectHprRuntime<'a> {
         let identity = ingress
             .identity
             .ok_or_else(|| protocol("HPR user RTP lacks BIND identity"))?;
-        if identity.source_lu.netid != hub.allowed_netid()
+        let allowed_netid = hub
+            .as_deref()
+            .map(AutoWsHub::allowed_netid)
+            .unwrap_or(&self.bootstrap.peer.cp.netid);
+        if identity.source_lu.netid != allowed_netid
             || identity.source_cp.as_ref() != Some(&self.bootstrap.peer.cp)
             || !self.route_setup.contains_key(&identity.target_lu)
             || self.rtp.user_target_for(&message.observation) != Some(&identity.target_lu)
@@ -1317,7 +1428,9 @@ impl<'a> DirectHprRuntime<'a> {
         }
         let source_lu = as_wire_name(&identity.source_lu);
         let target_lu = as_wire_name(&identity.target_lu);
-        self.publish_reachability(hub, Some(&identity))?;
+        if let Some(hub) = hub.as_deref_mut() {
+            self.publish_reachability(hub, Some(&identity))?;
+        }
         let bind_request = match ingress.event {
             SessionEvent::BindRequest(ref unit) => unit.clone(),
             _ => return Err(protocol("HPR first session unit is not BIND")),
@@ -1357,7 +1470,9 @@ impl<'a> DirectHprRuntime<'a> {
             .map_err(|error| protocol(format!("HPR BIND route unavailable: {error:?}")))?;
         let (ws, local, local_attachment_id) = match &destination {
             Destination::Ws { .. } => {
-                let ws = hub.open_session_lu(&target_lu, &source_lu)?;
+                let ws = hub
+                    .ok_or_else(|| protocol("concentrator route unavailable in standalone mode"))?
+                    .open_session_lu(&target_lu, &source_lu)?;
                 if ws.is_some() {
                     self.switch
                         .bind_egress(fabric_id, WS_ADAPTER, handle)
@@ -1490,12 +1605,12 @@ impl<'a> DirectHprRuntime<'a> {
     fn pump_sessions(
         &mut self,
         link: &EeLdlcEndpoint,
-        hub: &mut AutoWsHub,
+        mut hub: Option<&mut AutoWsHub>,
         now_us: u64,
     ) -> io::Result<()> {
         let handles = self.sessions.keys().copied().collect::<Vec<_>>();
         for handle in handles {
-            self.pump_session(handle, link, hub, now_us)?;
+            self.pump_session(handle, link, hub.as_deref_mut(), now_us)?;
         }
         let stale = self
             .sessions
@@ -1522,7 +1637,9 @@ impl<'a> DirectHprRuntime<'a> {
             }
         }
         if !stale.is_empty() {
-            self.publish_reachability(hub, None)?;
+            if let Some(hub) = hub {
+                self.publish_reachability(hub, None)?;
+            }
         }
         Ok(())
     }
@@ -1531,7 +1648,7 @@ impl<'a> DirectHprRuntime<'a> {
         &mut self,
         handle: u64,
         link: &EeLdlcEndpoint,
-        hub: &mut AutoWsHub,
+        hub: Option<&mut AutoWsHub>,
         now_us: u64,
     ) -> io::Result<()> {
         let Some(session) = self.sessions.get_mut(&handle) else {
@@ -1555,6 +1672,8 @@ impl<'a> DirectHprRuntime<'a> {
             if session.ws.is_none() {
                 let target = as_wire_name(&session.identity.target_lu);
                 let source = as_wire_name(&session.identity.source_lu);
+                let hub = hub
+                    .ok_or_else(|| protocol("concentrator route unavailable in standalone mode"))?;
                 if let Some(port) = hub.open_session_lu(&target, &source)? {
                     self.switch
                         .bind_egress(session.fabric_id, WS_ADAPTER, session.handle)
@@ -1899,81 +2018,12 @@ fn run_connected(
         }
         if let Some(datagram) = link.poll(now)? {
             if let Some(runtime) = active.as_mut() {
-                let no_user_work = runtime.sessions.is_empty()
-                    && runtime
-                        .pending_rtp
-                        .iter()
-                        .all(|message| message.kind != RtpIngressKind::User);
-                let replace_route = no_user_work
-                    && runtime.route_reply.is_none()
-                    && runtime.negative_route_reply.is_none()
-                    && runtime
-                        .pending_rtp
-                        .iter()
-                        .all(|message| message.kind != RtpIngressKind::RouteSetup);
-                let replace_cp = no_user_work
-                    && runtime.pending_cp_replies.is_empty()
-                    && runtime.pending_reciprocal_replies.is_empty()
-                    && runtime.pending_rtp.iter().all(|message| {
-                        !matches!(
-                            message.kind,
-                            RtpIngressKind::CpSvcMg | RtpIngressKind::CpSvcMgOut
-                        )
-                    });
-                let old_route_scope = runtime.rtp.route_setup_scope();
-                let old_cp_scope = runtime.rtp.cp_scope();
-                let messages = match runtime.rtp.on_ee_ui(
-                    &link,
-                    &datagram,
-                    clock.elapsed().as_micros() as u64,
-                    |kind| match kind {
-                        RtpIngressKind::RouteSetup => replace_route,
-                        RtpIngressKind::CpSvcMg => replace_cp,
-                        RtpIngressKind::CpSvcMgOut => false,
-                        RtpIngressKind::User => no_user_work,
-                        RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => false,
-                    },
-                ) {
-                    Ok(messages) => messages,
-                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                        tracing::warn!(attachment = %attachment.id, peer_ip = %attachment.peer_ip,
-                            udp_port = datagram.port, dsap = datagram.dsap,
-                            ssap = datagram.ssap, generation = link.generation().get(),
-                            error = %error, "discarded invalid HPR datagram");
-                        Vec::new()
-                    }
-                    Err(error) => return Err(error),
-                };
-                if old_route_scope.is_some() && runtime.rtp.route_setup_scope() != old_route_scope {
-                    runtime.route_setup.clear();
-                    runtime.route_targets.clear();
-                    runtime.route_reply = None;
-                    runtime.negative_route_reply = None;
-                    runtime.bound_user_scopes.clear();
-                    tracing::info!(attachment = %attachment.id,
-                        generation = link.generation().get(),
-                        "HPR RouteSetup RTP restarted on active EE link");
-                }
-                if old_cp_scope.is_some() && runtime.rtp.cp_scope() != old_cp_scope {
-                    runtime.cp_management = None;
-                    runtime.reciprocal_cp = None;
-                    runtime.rtp.reset_cp_out();
-                    tracing::info!(attachment = %attachment.id,
-                        generation = link.generation().get(),
-                        "HPR CP management RTP restarted on active EE link");
-                }
-                let live_user_scopes = runtime.rtp.active_user_scopes();
-                runtime
-                    .bound_user_scopes
-                    .retain(|scope| live_user_scopes.contains(scope));
-                runtime.queue_rtp(messages)?;
+                runtime.on_datagram(&link, &datagram, clock.elapsed().as_micros() as u64)?;
             }
         }
         if let Some(runtime) = active.as_mut() {
-            runtime
-                .rtp
-                .tick(&link, clock.elapsed().as_micros() as u64)?;
-            runtime.pump(&link, hub, clock.elapsed().as_micros() as u64)?;
+            runtime.tick(&link, clock.elapsed().as_micros() as u64)?;
+            runtime.pump(&link, Some(hub), clock.elapsed().as_micros() as u64)?;
         }
         thread::sleep(IDLE_POLL);
     }

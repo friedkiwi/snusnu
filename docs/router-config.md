@@ -230,6 +230,12 @@ local_cp = "SNUSNU.SVC"
 peer_lus = ["SOLNET.SNAB", "SOLNET.APP1"]
 ```
 
+For local routing without a concentrator, omit `[[concentrator]]` and use a
+router-owned `local_cp`. Add an LLC or MPTN attachment with destination LU
+names. The EE peer LU names can be learned from its BINDs; `peer_lus` supplies
+answer-only LUs before their first session. Local routes become active only
+after the adjacent carrier has supplied its required live identity evidence.
+
 In automatic mode, one `[[hpr_ip]]` attachment can share a router with LLC
 attachments and one concentrator. An EE-originated LU session can reach an LLC
 guest when the LLC attachment declares its own CP (`local_cp`) and reachable
@@ -263,8 +269,9 @@ hosting CP. Set the gateway's `peer_cp` as an explicit operator assertion and
 after live management confirms the LU in the asserted CP's NETID. With
 `peer_cp` omitted, it leaves the route unavailable. The gateway lends its
 UDP/397 socket to the selected user session for expedited data and UNBIND.
-MPTN-originated sessions toward the EE attachment are not yet admitted by
-this automatic path.
+MPTN-originated LU 6.2 sessions use SessionV1 toward an EE peer reached through
+the concentrator. Direct local MPTN-to-EE initiation without a concentrator
+still needs a local MPTN ingress selector.
 
 ## Experimental HPR LAN to HPR/IP media route
 

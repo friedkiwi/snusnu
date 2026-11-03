@@ -60,6 +60,9 @@ struct LlcSessionCircuit {
 /// own isolated WebSocket circuit state.
 pub(crate) fn run(config: &RouterConfig) -> io::Result<()> {
     if !config.ee.is_empty() {
+        if config.remote.is_empty() {
+            return crate::auto_hpr_standalone::run_standalone(config);
+        }
         return crate::auto_hpr_runtime::run_hpr(config);
     }
     let proxies = AutoProxyMacs::from_ids(
