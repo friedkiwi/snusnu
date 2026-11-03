@@ -2230,6 +2230,15 @@ impl AutoDirectory {
         }
     }
 
+    /// Server-assigned address ownership is independent of live reachability.
+    pub(crate) fn managed_cp_for_mac(&self, mac: &[u8; 6]) -> Option<wire::SnaName> {
+        self.managed.get(mac).map(|(cp, _)| cp.clone())
+    }
+
+    pub(crate) fn managed_macs(&self) -> Vec<[u8; 6]> {
+        self.managed.keys().copied().collect()
+    }
+
     // The automatic LLC bridge calls this once its runtime branch is wired.
     #[allow(dead_code)]
     pub(crate) fn managed_mac_for_cp(&self, cp: &wire::SnaName) -> io::Result<Option<[u8; 6]>> {
@@ -2527,6 +2536,14 @@ impl AutoWsHub {
             _ => return Err(protocol("managed MAC points to missing CP route")),
         };
         Ok(Some((reference, cp)))
+    }
+
+    pub(crate) fn managed_cp_for_mac(&self, mac: &[u8; 6]) -> Option<wire::SnaName> {
+        self.directory.borrow().managed_cp_for_mac(mac)
+    }
+
+    pub(crate) fn managed_macs(&self) -> Vec<[u8; 6]> {
+        self.directory.borrow().managed_macs()
     }
 
     // Used by the automatic LLC bridge when an upstream CP initiates a circuit.
@@ -4891,6 +4908,29 @@ mod tests {
         let mut short_id = valid;
         short_id.address_id.pop();
         assert!(validate_managed_bindings(&[short_id]).is_err());
+    }
+
+    #[test]
+    fn managed_mac_ownership_survives_absent_live_route() {
+        let mac = [0x02, 0x53, 0x4e, 0, 0, 7];
+        let cp = name("TARGET", "HOSTCP");
+        let mut directory = AutoDirectory::default();
+        directory
+            .replace_managed(&wire::ManagedCpBindingSnapshot {
+                schema_version: 1,
+                recipient_epoch: vec![8; 16],
+                revision: 1,
+                bindings: vec![wire::ManagedCpBinding {
+                    address_id: vec![7; 16],
+                    control_point: Some(cp.clone()),
+                    virtual_mac: mac.to_vec(),
+                    candidates: Vec::new(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(directory.managed_cp_for_mac(&mac), Some(cp));
+        assert_eq!(directory.managed_macs(), vec![mac]);
+        assert!(directory.resolve_mac(&mac).unwrap().is_none());
     }
 
     #[test]

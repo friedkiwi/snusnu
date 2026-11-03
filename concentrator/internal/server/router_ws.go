@@ -797,10 +797,23 @@ func (h *routerHub) refreshBindings(c *routerSession, origins map[string]publish
 	}
 	bindings := make([]*wire.ManagedCpBinding, 0, len(addresses))
 	for _, address := range addresses {
-		refs := candidates[address.ownerID+"\x00"+address.netID+"\x00"+address.cpName]
-		if len(refs) == 0 {
+		if address.ownerID == c.router.OwnerID {
 			continue
 		}
+		if _, blocked := policy.blocks[ownerPair(c.router.OwnerID, address.ownerID)]; blocked {
+			continue
+		}
+		eligible := address.ownerID == serviceOwnerID && h.local != nil
+		for _, router := range policy.routers {
+			if router.ownerID == address.ownerID && !router.paused && router.netID == address.netID {
+				eligible = true
+				break
+			}
+		}
+		if !eligible {
+			continue
+		}
+		refs := candidates[address.ownerID+"\x00"+address.netID+"\x00"+address.cpName]
 		sort.Slice(refs, func(i, j int) bool {
 			return string(refs[i].RouterId) < string(refs[j].RouterId) || string(refs[i].RouterId) == string(refs[j].RouterId) && refs[i].RouteId < refs[j].RouteId
 		})

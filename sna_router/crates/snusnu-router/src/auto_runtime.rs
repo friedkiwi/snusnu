@@ -443,13 +443,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
 
     pub(crate) fn sync_upstream(&mut self, connected: &AutoWsHub) -> io::Result<()> {
         let addresses = connected.advertised_addresses();
-        let next_macs = addresses
-            .iter()
-            .filter_map(|address| match address {
-                RouteAddress::Mac(mac) => Some(*mac),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
+        let next_macs = connected.managed_macs().into_iter().collect::<HashSet<_>>();
         for mac in self.remote_macs.difference(&next_macs) {
             for listener in &mut self.listeners {
                 listener.withdraw_proxy_mac(*mac);
@@ -1110,6 +1104,15 @@ impl<'a> AutoLocalSessionRunner<'a> {
             let destination = RouteAddress::Mac(ingress_proxy);
             let target = match fabric.resolve(&ingress_id, &destination) {
                 Ok(target) => target,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && hub.as_ref().is_some_and(|connected| {
+                            connected.managed_cp_for_mac(&ingress_proxy).is_some()
+                        })
+                        && !config.remote.is_empty() =>
+                {
+                    PortId::new(&config.remote[0].id)
+                }
                 Err(error) if !config.ee.is_empty() && error.kind() == io::ErrorKind::NotFound => {
                     if unhandled_llc.len() < MAX_PENDING_HANDOFFS {
                         unhandled_llc.push((ingress_id.0, offer));
@@ -1192,13 +1195,15 @@ impl<'a> AutoLocalSessionRunner<'a> {
                         offer.peer_cp.as_deref(),
                         connected.allowed_netid(),
                     )?;
-                    let (_, target_cp) =
-                        connected.resolve_mac(&ingress_proxy)?.ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "managed MAC has no current upstream CP route",
-                            )
-                        })?;
+                    let target_cp =
+                        connected
+                            .managed_cp_for_mac(&ingress_proxy)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "managed MAC is no longer assigned to this LLC router",
+                                )
+                            })?;
                     let id = next_id
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("automatic session ID exhausted"))?;
