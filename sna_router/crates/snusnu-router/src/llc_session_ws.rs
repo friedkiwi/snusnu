@@ -4,7 +4,10 @@
 //! bridge. A fresh XID and management exchange uses the source CP published
 //! for this circuit; no previous EE adjacency proof is borrowed.
 
-use std::io;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use router_core::session::{QualifiedName, SessionEvent, SessionIdentity};
 
@@ -18,6 +21,14 @@ use transport_ws::wire::{self, route_export::Resource};
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+const PENDING_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn expired(now: Instant, opened_at: Instant, bound: bool, pending_since: Option<Instant>) -> bool {
+    (!bound && now.duration_since(opened_at) >= SETUP_TIMEOUT)
+        || pending_since.is_some_and(|since| now.duration_since(since) >= PENDING_EVENT_TIMEOUT)
 }
 
 fn control_points(identity: &SessionIdentity) -> io::Result<(&QualifiedName, &QualifiedName)> {
@@ -133,6 +144,9 @@ pub(crate) struct LlcSessionWs {
     probe: Option<HprToLlcProbe>,
     session: Option<HprToLlcSession>,
     pending_ws: Option<(SessionEvent, bool)>,
+    pending_since: Option<Instant>,
+    opened_at: Instant,
+    bound: bool,
     verified: bool,
 }
 
@@ -155,6 +169,9 @@ impl LlcSessionWs {
             probe: Some(probe),
             session: None,
             pending_ws: None,
+            pending_since: None,
+            opened_at: Instant::now(),
+            bound: false,
             verified: false,
         })
     }
@@ -173,12 +190,27 @@ impl LlcSessionWs {
     /// incoming unit remains leased until native LLC accepts it; native output
     /// remains leased until the WebSocket queues it.
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
+        if expired(
+            Instant::now(),
+            self.opened_at,
+            self.bound,
+            self.pending_since,
+        ) {
+            tracing::warn!(attachment = %self.attachment_id,
+                source_lu = %self.identity.source_lu,
+                target_lu = %self.identity.target_lu,
+                bound = self.bound, pending = self.pending_ws.is_some(),
+                "SessionV1 LLC setup or pending event timed out");
+            self.close()?;
+            return Ok(false);
+        }
         if self.pending_ws.is_none() {
             match self.ws.poll()? {
                 Some(SessionWsUpdate::Event(wire)) => {
                     let event = from_session_wire(wire)?;
                     let charged = !matches!(event, SessionEvent::Credit { .. });
                     self.pending_ws = Some((event, charged));
+                    self.pending_since = Some(Instant::now());
                 }
                 Some(SessionWsUpdate::Closed) => {
                     self.close()?;
@@ -186,6 +218,9 @@ impl LlcSessionWs {
                 }
                 Some(SessionWsUpdate::Opened) | None => {}
             }
+        } else if self.ws.poll_control()? {
+            self.close()?;
+            return Ok(false);
         }
 
         if let Some(probe) = self.probe.as_mut() {
@@ -220,6 +255,7 @@ impl LlcSessionWs {
                     self.ws.complete_received(1)?;
                 }
                 self.pending_ws = None;
+                self.pending_since = None;
             }
         }
 
@@ -231,6 +267,14 @@ impl LlcSessionWs {
                 };
                 if self.ws.send(wire)? {
                     session.confirm_polled()?;
+                    if let SessionEvent::BindResult { accepted, .. } = event {
+                        if accepted {
+                            self.bound = true;
+                        } else {
+                            self.close()?;
+                            return Ok(false);
+                        }
+                    }
                 }
             }
         }
@@ -328,6 +372,32 @@ mod tests {
                 &q("SOLNET.OTHER"),
             ),
             Err(wire::OpenFailure::RouteGone)
+        ));
+    }
+
+    #[test]
+    fn setup_and_pending_leases_have_bounded_lifetimes() {
+        let opened = Instant::now();
+        assert!(!expired(
+            opened + SETUP_TIMEOUT - Duration::from_millis(1),
+            opened,
+            false,
+            None
+        ));
+        assert!(expired(opened + SETUP_TIMEOUT, opened, false, None));
+        assert!(!expired(opened + SETUP_TIMEOUT * 2, opened, true, None));
+        let pending = opened + Duration::from_secs(5);
+        assert!(!expired(
+            pending + PENDING_EVENT_TIMEOUT - Duration::from_millis(1),
+            opened,
+            true,
+            Some(pending)
+        ));
+        assert!(expired(
+            pending + PENDING_EVENT_TIMEOUT,
+            opened,
+            true,
+            Some(pending)
         ));
     }
 }
