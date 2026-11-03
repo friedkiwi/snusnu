@@ -108,9 +108,11 @@ EBCDIC `SNASVCMG` constant appears in `VG10.BIN` at offset `0x7236`.
 `0x7244`. This independently supports the fixed portion built by the Go
 candidate; it does not reveal the dynamically generated names or PCID.
 At `VG10.BIN` offset `0x9288`, a basic-conversation FMH-5 template has binary
-TPN `30F0F5F1` and the PIP-present flag set. Another local constant contains
-`30F0F6F3`. Neither is evidence that the controller uses `30F0F6F6`;
-their callers and purposes still need to be traced.
+TPN `30F0F5F1` and the PIP-present flag set. IBM's
+[V5R4 architecture-TP table](https://public.dhe.ibm.com/systems/power/docs/systemi/v5r4/en_US/rzamv.pdf)
+identifies that TPN as DIA Version 2, so this template is not the controller
+Attach. Another local constant contains `30F0F6F3`, whose purpose still needs
+to be traced. No `VG*.BIN` file contains a literal `30F0F6F6`.
 `DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
 observations identify a reverse-engineering lead; they do not establish the
 power-on record or a successful 5494 conversation.
