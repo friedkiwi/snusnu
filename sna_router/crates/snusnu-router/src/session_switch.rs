@@ -12,6 +12,55 @@ use router_core::{
 pub(crate) const HPR_ADAPTER: AdapterId = AdapterId(1);
 pub(crate) const WS_ADAPTER: AdapterId = AdapterId(2);
 pub(crate) const LOCAL_ADAPTER: AdapterId = AdapterId(3);
+
+/// Stable adapter IDs for physical attachments in a process lifetime. The
+/// first three IDs remain reserved for the existing single-link runtime.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CarrierKind {
+    Llc,
+    Mptn,
+    HprIp,
+    Concentrator,
+}
+
+pub(crate) struct AdapterIds {
+    next: u64,
+    assigned: HashMap<(CarrierKind, String), AdapterId>,
+}
+
+impl Default for AdapterIds {
+    fn default() -> Self {
+        Self {
+            next: 4,
+            assigned: HashMap::new(),
+        }
+    }
+}
+
+impl AdapterIds {
+    pub(crate) fn for_attachment(
+        &mut self,
+        carrier: CarrierKind,
+        attachment_id: &str,
+    ) -> Result<AdapterId, SwitchError> {
+        if attachment_id.is_empty() {
+            return Err(SwitchError::InvalidAdapter);
+        }
+        let key = (carrier, attachment_id.to_owned());
+        if let Some(id) = self.assigned.get(&key) {
+            return Ok(*id);
+        }
+        let following = self
+            .next
+            .checked_add(1)
+            .ok_or(SwitchError::AdapterIdsExhausted)?;
+        let id = AdapterId(self.next);
+        self.assigned.insert(key, id);
+        self.next = following;
+        Ok(id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SwitchError {
     Fabric(FabricError),
@@ -20,6 +69,8 @@ pub(crate) enum SwitchError {
     WrongEgress,
     InvalidBind,
     DeliveryNotLeased,
+    InvalidAdapter,
+    AdapterIdsExhausted,
 }
 
 impl From<FabricError> for SwitchError {
@@ -237,6 +288,30 @@ impl SessionSwitch {
 mod tests {
     use super::*;
     use router_core::session::{Flow, QualifiedName};
+
+    #[test]
+    fn adapter_ids_are_stable_per_carrier_and_attachment() {
+        let mut ids = AdapterIds::default();
+        let llc = ids.for_attachment(CarrierKind::Llc, "guest-a").unwrap();
+        assert_eq!(llc, AdapterId(4));
+        assert_eq!(ids.for_attachment(CarrierKind::Llc, "guest-a"), Ok(llc));
+        assert_ne!(
+            ids.for_attachment(CarrierKind::Llc, "guest-b").unwrap(),
+            llc
+        );
+        assert_ne!(
+            ids.for_attachment(CarrierKind::Mptn, "guest-a").unwrap(),
+            llc
+        );
+        assert_eq!(
+            ids.for_attachment(CarrierKind::HprIp, ""),
+            Err(SwitchError::InvalidAdapter)
+        );
+        assert!(ids.for_attachment(CarrierKind::HprIp, "ee-a").is_ok());
+        assert!(ids
+            .for_attachment(CarrierKind::Concentrator, "upstream-a")
+            .is_ok());
+    }
 
     fn q(value: &str) -> QualifiedName {
         value.parse().unwrap()
