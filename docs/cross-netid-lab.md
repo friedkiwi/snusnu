@@ -402,3 +402,23 @@ The QA concentrator was left listening on `0.0.0.0:8081` for inspection. It
 used a persistent QA database so router IDs, tokens and managed MAC bindings
 survived restarts. Private guest screens, router logs and packet captures
 remain outside the repository.
+
+## Standalone automatic TCP62 to LLC, 2026-11-03
+
+At 19:07:34 UTC, V5R4 Bob initiated TCP62 to one standalone Rust router,
+which reached V4R4 Alice through its local LLC2 attachment. Alice's remote
+Sign On (`S1012345`, `QPADEV0001`) appeared on Bob's console. No Go
+concentrator or WebSocket connection participated. The router selected the
+unique verified LLC CP learned from Alice's dialout XID3; it did not require
+an exact LU hint before opening the local call. The exact destination LU was
+added to the local registry only after Alice's positive user BIND. This is a
+live test of automatic local MPTN→LLC selection and of the verified LLC
+carrier lease. It does not establish the reverse local LLC→MPTN path or a
+local MPTN↔MPTN session; those remain separate acceptance tests.
+
+The current Rust tree also has focused tests for short native UNBIND and
+source-close handling. A synchronized live teardown retest is still needed
+to confirm that a normal close retains the idle LLC2 adjacency and route.
+Multiple EE attachments and their bounded session event bridge are
+code-gated, but no two-EE guest session through that bridge has been
+observed yet.

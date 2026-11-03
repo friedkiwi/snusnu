@@ -12,7 +12,7 @@ registry model.
 
 | Component | Implemented responsibility | Current limit |
 | --- | --- | --- |
-| [`ee`](../sna_router/crates/transport-ip-sna/src/ee.rs) and [`auto_hpr_runtime`](../sna_router/crates/snusnu-router/src/auto_hpr_runtime.rs) | Five UDP sockets, bounded LDLC/UI decoding, XID3 adjacency, control/user RTP, RouteSetup and FID5 session events | One automatic EE attachment and a bounded user-session slot |
+| [`ee`](../sna_router/crates/transport-ip-sna/src/ee.rs) and [`auto_hpr_runtime`](../sna_router/crates/snusnu-router/src/auto_hpr_runtime.rs) | Five UDP priority ports per attachment, bounded LDLC/UI decoding, XID3 adjacency, control/user RTP, RouteSetup and FID5 session events | Multiple automatic EE attachments are supported; a two-EE live session is pending |
 | [`hpr_shared_local`](../sna_router/crates/snusnu-router/src/hpr_shared_local.rs) | Shares process-long LLC and TCP62 attachments with EE; accepts verified local offers | Peer proof and active session state remain specific to each carrier |
 | [`route_registry`](../sna_router/crates/router-core/src/route_registry.rs) and [`hpr_destination_directory`](../sna_router/crates/snusnu-router/src/hpr_destination_directory.rs) | Select unambiguous CP/LU next hops from versioned local and upstream owners | Configured identity hints alone do not create an active LU route |
 | [`SessionFabric`](../sna_router/crates/router-core/src/session_fabric.rs) | Bounded LU/CP session selection and event queues | Each ingress and egress adapter must implement its own wire protocol and session lifecycle |
@@ -35,9 +35,9 @@ attachments.
 2. V5R4 EE → Rust → Go concentrator → Rust → V4R4 LLC2 reached the V4R4
    remote Sign On screen. The circuit carried user BIND, information and
    pacing in both directions. Ending the request closed the upstream circuit,
-   but the LLC native UNBIND response parser then rejected an observed
-   variant; the LLC adapter restarted discovery. That teardown still needs a
-   synchronized packet capture and a focused parser fix.
+   but an earlier LLC native UNBIND response variant led the adapter to
+   restart discovery. Short native UNBIND and source-close fixes are now
+   code-gated; a live normal-close and route-retention retest is pending.
 3. The reverse V4R4 LLC2 → Rust → Go → Rust → V5R4 EE path completed EE
    external SNASVCMG management, CNOS/BIS, user BIND and first display
    traffic. At 18:23:36 UTC the V4R4 console displayed the V5R4 remote
@@ -53,16 +53,19 @@ outside the repository.
 
 ## Next test gates
 
-1. Capture the V4R4 native UNBIND response during EE → LLC2 teardown, accept
-   its verified shape, and check that the idle LLC2 adjacency and published
-   route survive a normal close. Also exercise remote reset and peer loss.
+1. Retest EE → LLC2 normal teardown with a synchronized V4R4 capture. Check
+   the short native UNBIND and source-close fixes, and verify that the idle
+   LLC2 adjacency and published route survive. Also exercise remote reset
+   and peer loss.
 2. Repeat the embedded APING test after the reverse-path fixes, then test
    local EE↔LLC and EE↔MPTN without a concentrator. Check routing among
    different local NETIDs, route withdrawal, reconnect and duplicate-route
    ambiguity.
-3. Test repeated and overlapping EE sessions, both initiation directions,
-   normal close and recovery after a guest or concentrator disconnect. The
-   current automatic EE runtime has a bounded user-session slot.
+3. Connect two EE guests to different attachments on one router and verify
+   the bounded `SessionEvent` bridge in both directions. Test repeated and
+   overlapping sessions, normal close and recovery after a guest or
+   concentrator disconnect. The multi-EE implementation is code-gated but
+   has no two-EE live guest result yet.
 4. Keep the configured EE↔EE relay, native LLC↔LLC and MPTN↔LLC live paths
    as regression tests. Run the staged-tree CI gate before each commit and
    push.

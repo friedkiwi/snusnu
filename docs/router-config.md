@@ -236,8 +236,9 @@ names. The EE peer LU names can be learned from its BINDs; `peer_lus` supplies
 answer-only LUs before their first session. Local routes become active only
 after the adjacent carrier has supplied its required live identity evidence.
 
-In automatic mode, one `[[hpr_ip]]` attachment can share a router with LLC
-attachments and one concentrator. An EE-originated LU session can reach an LLC
+In automatic mode, multiple `[[hpr_ip]]` attachments can share a router with LLC
+and MPTN attachments and one concentrator. A two-EE guest session through the
+new shared event bridge still needs a live test. An EE-originated LU session can reach an LLC
 guest when the LLC attachment declares its own CP (`local_cp`) and reachable
 LUs (`lus`). These names are candidate routes until the router verifies that
 CP through XID3 and completes native management on the same LLC association.
