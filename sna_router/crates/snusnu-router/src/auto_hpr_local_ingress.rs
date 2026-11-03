@@ -227,7 +227,7 @@ mod tests {
         assert!(!matches_ee_target(
             &identity, &directory, "other", &target_cp
         ));
-        directory.withdraw_owner("ee");
+        directory.withdraw_owner("ee").unwrap();
         assert!(!matches_ee_target(&identity, &directory, "ee", &target_cp));
     }
 }

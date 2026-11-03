@@ -558,7 +558,7 @@ mod tests {
             &directory
         )
         .is_err());
-        directory.withdraw_owner("ee");
+        directory.withdraw_owner("ee").unwrap();
         assert!(
             trusted_source_identity(source, target, Some(&source_cp), &observed, &directory)
                 .is_err()
