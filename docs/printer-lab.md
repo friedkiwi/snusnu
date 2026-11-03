@@ -428,6 +428,22 @@ That trial was reverted. The QA source BIND now uses the observed 5494
 live response is still required. The LLC router's verbose trace confirms
 the earlier trial PIU and guest response traversed both directions.
 
+On 2026-11-03, changing the QA XID3 role to secondary resolved the source
+management BIND rejection. Through LLC, V5R4 positively answered the
+firmware-shaped source BIND, accepted source CNOS for QRMTWSC (57 total,
+one source winner, 56 target winners), completed the UNBIND handshake, and
+accepted the subsequent controller BIND and QND5MAIN Attach with the
+`30F0F6F6` TPN and `04 D4 07 30` PIP subvector. IBM i then sent its
+controller clock `D822` and a `D824` ACTLU and BIND for address 56, LU7.
+The QA probe answered ACTLU and BIND; the guest followed with a LU7 query.
+The address-01 NMVT Reply PSID was positively acknowledged both before and
+after controller Attach, but `SNUPRT` and its configured 3812-1 device
+`SNUPRT01` remained VARY ON PENDING. No address-01 LU4 BIND or SCS has
+yet arrived. The next diagnostic step is to complete the address-56 LU7
+query and SIGNAL exchanges, then check whether IBM i activates the printer.
+These observations come from `/tmp/snusnu-printer-qa-secondary-3.log` and
+`/tmp/snusnu-printer-qa-secondary-4.log`, with matching router debug logs.
+
 The [TCP62 transport draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00.txt)
 specifies LU 6.2 application conversion, whereas IBM's
 [management-services guide](https://public.dhe.ibm.com/software/network/commserver/publications/cslin_64/czx41100.pdf)

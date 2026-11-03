@@ -26,6 +26,7 @@ type printerProbeCircuit struct {
 	linkReadySent     bool
 	initiated         bool
 	managementPhase   uint8
+	nmvtSent          bool
 	management        *lu62.ManagementSession
 	fqpcid            []byte
 	peerIPR           bool
@@ -169,7 +170,7 @@ func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source Local
 	if !ok || !peer.Valid() || len(p.circuits) >= 64 {
 		return
 	}
-	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Primary)
+	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
 	if err != nil {
 		return
 	}
@@ -188,7 +189,7 @@ func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
 		_ = p.hub.decision(p.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN})
 		return
 	}
-	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Primary)
+	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
 	if err != nil {
 		log.Printf("printer probe XID: %v", err)
 		return
@@ -250,6 +251,9 @@ func (p *localPrinterProbe) type1(id string, c *printerProbeCircuit, input *wire
 				return err
 			}
 			if c.initiated {
+				if os.Getenv("SNUSNU_PRINTER_PROBE_BIND_AFTER_ACTLU") == "1" {
+					return nil
+				}
 				return p.beginManagement(id, c)
 			}
 		}
@@ -276,7 +280,11 @@ func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) e
 	if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC") == "1" {
 		bindDAF = 0 // 5494 first source-assigned LFSID 0200: DAF=SIDL, OAF=SIDH.
 	}
-	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+remoteLU, bindDAF, 2, instance, token)
+	remoteName := c.peer.NetID + "." + remoteLU
+	if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_UNQUALIFIED") == "1" {
+		remoteName = remoteLU
+	}
+	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", remoteName, bindDAF, 2, instance, token)
 	if err != nil {
 		return err
 	}
@@ -373,7 +381,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 		if err := c.management.AckCNOS(); err != nil {
 			return err
 		}
-		if os.Getenv("SNUSNU_PRINTER_PROBE_NMVT") == "1" {
+		if os.Getenv("SNUSNU_PRINTER_PROBE_NMVT") == "1" && os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_ATTACH") != "1" {
 			return p.sendExperimentalNMVT(id)
 		}
 		return nil
@@ -418,6 +426,11 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 		if err := c.management.AckUnbind(); err != nil {
 			return err
 		}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_THEN_SOURCE") == "1" {
+			c.initiated = true
+			c.management = nil
+			return p.beginManagement(id, c)
+		}
 		if os.Getenv("SNUSNU_PRINTER_PROBE_PASSIVE_SOURCE_BIND") == "1" {
 			var pcid [8]byte
 			if _, err := rand.Read(pcid[:]); err != nil {
@@ -461,6 +474,23 @@ func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
 }
 
 func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCircuit, data []byte) error {
+	if c.managementPhase == 0 && len(data) >= 12 && data[6] == 0x6b && data[9] == 0x0d &&
+		os.Getenv("SNUSNU_PRINTER_PROBE_BIND_AFTER_ACTLU") == "1" {
+		responseRU, err := printer.ACTLUResponseRU(data[9:])
+		if err != nil {
+			return err
+		}
+		th := [6]byte{data[0], data[1], data[3], data[2], data[4], data[5]}
+		response, err := (piu.FID2{TH: th, RH: [3]byte{0xeb, data[7], 0}, RU: responseRU}).Bytes()
+		if err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, response); err != nil {
+			return err
+		}
+		log.Printf("printer probe ACTLU response before source BIND: circuit=%s piu=%x", id, response)
+		return p.beginManagement(id, c)
+	}
 	// The first 5494-assigned source LFSID is 0200. On BIND-direction PIUs
 	// its SIDL is DAF=00 and SIDH is OAF=02; responses reverse the pair.
 	sourceDAF := byte(1)
@@ -492,7 +522,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		}
 		c.managementPhase = 2
 	case 2:
-		if len(data) < 13 || data[6] != 3 || data[7] != 0x91 || data[8] != 1 {
+		if len(data) < 13 || data[6] != 3 || data[7]&0xfe != 0x90 || data[8] != 1 {
 			return nil
 		}
 		if _, err := lu62.ParseCNOS(data[9:]); err != nil {
@@ -522,7 +552,8 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		log.Printf("printer probe management BIS accepted: circuit=%s", id)
 		c.managementPhase = 4
 	case 4:
-		if len(data) == 10 && data[6] == 0xeb && data[9] == 0x32 {
+		if len(data) >= 10 && data[6] == 0xeb && data[7]&0xef == 0x80 &&
+			(data[9] == 0x32 || data[len(data)-1] == 0x32) {
 			c.managementPhase = 5
 			log.Printf("printer probe management complete: circuit=%s", id)
 			var pcid [8]byte
@@ -570,6 +601,11 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if err != nil {
 			return nil
 		}
+		if !c.nmvtSent && os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_ATTACH") == "1" &&
+			len(outer.RU) >= 4 && outer.RU[2] == 0xd8 && outer.RU[3] == 0x22 {
+			c.nmvtSent = true
+			return p.sendExperimentalNMVT(id)
+		}
 		if os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && outer.TH[0]&1 != 0 &&
 			outer.RH == [3]byte{0x4b, 0x80, 0} && bytes.Equal(outer.RU, []byte{0xc9, 0, 1, 0, 1}) {
 			th := [6]byte{outer.TH[0], outer.TH[1], outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}
@@ -581,7 +617,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			return p.sendInformation(id, response)
 		}
 		inner, err := printer.ParseControllerDeviceGDS(outer.RU)
-		if err != nil || inner.Address != 56 || len(inner.RU) < 3 {
+		if err != nil || (inner.Address != 56 && inner.Address != 1) || len(inner.RU) < 3 {
 			return nil
 		}
 		var ru []byte
@@ -589,7 +625,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		switch {
 		case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0d:
 			ru, err = printer.ACTLUResponseRU(inner.RU)
-		case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && inner.RU[14] == 7:
+		case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && (inner.RU[14] == 7 || inner.RU[14] == 4):
 			ru = append([]byte(nil), inner.RU...)
 		case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
 			bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 5, 0xd8, 0x20, 2}):

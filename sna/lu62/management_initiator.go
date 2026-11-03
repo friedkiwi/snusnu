@@ -24,6 +24,13 @@ func CandidateManagementBind(localCP, remoteCP string, daf, oaf byte, instance [
 		return nil, ErrManagementRequest
 	}
 	remote, err := encodeLUName(remoteCP)
+	if err != nil && len(remoteCP) <= 8 {
+		// T2.1 permits the network-services SLU name to omit NETID. Its
+		// local component is still an EBCDIC type-A symbol string.
+		if qualified, encodeErr := encodeLUName("N." + remoteCP); encodeErr == nil {
+			remote, err = qualified[2:], nil
+		}
+	}
 	if err != nil || localCP == remoteCP {
 		return nil, ErrManagementRequest
 	}
@@ -34,7 +41,7 @@ func CandidateManagementBind(localCP, remoteCP string, daf, oaf byte, instance [
 	user := []byte{0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7}
 	user = append(user, byte(1+len(local)), 4)
 	user = append(user, local...)
-	piu := []byte{0x2f, 0, daf, oaf, 0, 0, 0x6b, 0x85, 0}
+	piu := []byte{0x2f, 0, daf, oaf, 0, 0, 0x6b, 0x80, 0}
 	piu = append(piu, managementRequestFixed...)
 	piu = append(piu, byte(len(local)))
 	piu = append(piu, local...)
@@ -43,7 +50,6 @@ func CandidateManagementBind(localCP, remoteCP string, daf, oaf byte, instance [
 	piu = append(piu, 0, byte(len(remote)))
 	piu = append(piu, remote...)
 	piu = append(piu, fqpcid...)
-	piu = append(piu, 0x2c, 0x0a, 4, 8, 0x7b, 0xc3, 0xd6, 0xd5, 0xd5, 0xc5, 0xc3, 0xe3)
 	bind, err := ParseBind(piu)
 	if err != nil || bind == nil || !bind.Management || bind.PLU != localCP || bind.SLU != remoteCP {
 		return nil, ErrManagementRequest
