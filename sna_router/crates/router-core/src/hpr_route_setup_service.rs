@@ -61,6 +61,9 @@ pub struct PreparedRouteSetupReply {
 pub struct DirectRouteSetupService {
     bootstrap: HprControlBootstrap,
     local_lu: QualifiedName,
+    /// Present only when a caller has independently verified the adjacent
+    /// CP and its ownership of this LU through local route discovery.
+    verified_external_cp: Option<QualifiedName>,
     lu_nce_label: Vec<u8>,
     lu_nce_instance: [u8; 4],
     tg_number: u8,
@@ -80,8 +83,33 @@ impl DirectRouteSetupService {
         reverse_metrics: ReverseLinkMetrics,
         max_cached_replies: usize,
     ) -> Result<Self, ServiceError> {
-        if local_lu.netid != bootstrap.local.cp.netid
-            || tg_number == 0
+        if local_lu.netid != bootstrap.local.cp.netid {
+            return Err(ServiceError::InvalidLocalLu);
+        }
+        Self::new_scoped(
+            bootstrap,
+            local_lu,
+            None,
+            lu_nce_label,
+            lu_nce_instance,
+            tg_number,
+            reverse_metrics,
+            max_cached_replies,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_scoped(
+        bootstrap: HprControlBootstrap,
+        local_lu: QualifiedName,
+        verified_external_cp: Option<QualifiedName>,
+        lu_nce_label: Vec<u8>,
+        lu_nce_instance: [u8; 4],
+        tg_number: u8,
+        reverse_metrics: ReverseLinkMetrics,
+        max_cached_replies: usize,
+    ) -> Result<Self, ServiceError> {
+        if tg_number == 0
             || !(1..=8).contains(&lu_nce_label.len())
             || lu_nce_label[0] & 0x80 == 0
             || lu_nce_label.contains(&0xff)
@@ -94,6 +122,7 @@ impl DirectRouteSetupService {
         Ok(Self {
             bootstrap,
             local_lu,
+            verified_external_cp,
             lu_nce_label,
             lu_nce_instance,
             tg_number,
@@ -101,6 +130,38 @@ impl DirectRouteSetupService {
             limit: max_cached_replies,
             replies: VecDeque::new(),
         })
+    }
+
+    /// Authorize a route to an LU behind a verified adjacent CP. The caller
+    /// must have observed the CP on the egress attachment and learned that
+    /// this exact LU is hosted by it. A RouteSetup request alone is never
+    /// evidence of either property.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_verified_external(
+        bootstrap: HprControlBootstrap,
+        target_lu: QualifiedName,
+        verified_target_cp: QualifiedName,
+        lu_nce_label: Vec<u8>,
+        lu_nce_instance: [u8; 4],
+        tg_number: u8,
+        reverse_metrics: ReverseLinkMetrics,
+        max_cached_replies: usize,
+    ) -> Result<Self, ServiceError> {
+        if target_lu.netid == bootstrap.local.cp.netid
+            || target_lu.netid != verified_target_cp.netid
+        {
+            return Err(ServiceError::InvalidIdentity);
+        }
+        Self::new_scoped(
+            bootstrap,
+            target_lu,
+            Some(verified_target_cp),
+            lu_nce_label,
+            lu_nce_instance,
+            tg_number,
+            reverse_metrics,
+            max_cached_replies,
+        )
     }
 
     pub fn generation(&self) -> ConnectionGeneration {
@@ -148,9 +209,11 @@ impl DirectRouteSetupService {
             tg_number: self.tg_number,
             reverse_metrics: self.reverse_metrics,
         };
-        let reply = target
-            .encode_positive(&request)
-            .map_err(ServiceError::Reply)?;
+        let reply = match &self.verified_external_cp {
+            Some(cp) => target.encode_positive_for_external(&request, cp),
+            None => target.encode_positive(&request),
+        }
+        .map_err(ServiceError::Reply)?;
         let cos_tpf = request
             .vectors
             .iter()
@@ -220,6 +283,7 @@ impl DirectRouteSetupService {
         Ok(AuthorizedUserRoute {
             generation,
             target_lu: self.local_lu.clone(),
+            verified_external_cp: self.verified_external_cp.clone(),
             local_nce_label: self.lu_nce_label.clone(),
             local_nce_instance: self.lu_nce_instance,
             cos_tpf: cached.cos_tpf.clone(),
@@ -235,7 +299,16 @@ impl DirectRouteSetupService {
         if bootstrap.generation.get() <= self.bootstrap.generation.get() {
             return Err(ServiceError::StaleGeneration);
         }
-        if bootstrap.local.cp.netid != self.local_lu.netid {
+        // The adjacent CP/LU observation belongs to the old association.
+        // Recreate an external service only after the new egress is verified.
+        if self.verified_external_cp.is_some() {
+            return Err(ServiceError::InvalidIdentity);
+        }
+        let expected_netid = self
+            .verified_external_cp
+            .as_ref()
+            .map_or(&bootstrap.local.cp.netid, |cp| &cp.netid);
+        if expected_netid != &self.local_lu.netid {
             return Err(ServiceError::InvalidLocalLu);
         }
         if bootstrap.local.cp != self.bootstrap.local.cp
@@ -320,12 +393,12 @@ mod tests {
         .unwrap()
     }
 
-    fn cross_netid_aping_request() -> Vec<u8> {
+    fn cross_netid_request(lu: &str) -> Vec<u8> {
         // An EN in SOLNET reaches the concentrator-owned NN proxy CP and LU
         // in SNUSNU. The RTP link remains one direct regular TG.
         let mut wire = vec![0, 0, 0x12, 0xce, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut lu_name = vec![0xf3];
-        lu_name.extend_from_slice(&qualified("SNUSNU.PING"));
+        lu_name.extend_from_slice(&qualified(lu));
         wire.extend_from_slice(&[(2 + lu_name.len()) as u8, 0x0e]);
         wire.extend_from_slice(&lu_name);
         let cp_name = qualified("SNUSNU.SVC");
@@ -470,7 +543,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let request = cross_netid_aping_request();
+        let request = cross_netid_request("SNUSNU.PING");
         let parsed = RouteSetupGds::parse(&request).unwrap();
         assert_eq!(parsed.origin_cp_name, "SOLNET.SNAB");
         assert_eq!(parsed.destination_lu_name.as_deref(), Some("SNUSNU.PING"));
@@ -480,5 +553,92 @@ mod tests {
         let reply = RouteSetupGds::parse(&prepared.gds).unwrap();
         assert_eq!(reply.destination_cp_name.as_deref(), Some("SNUSNU.SVC"));
         assert_eq!(reply.pcid, parsed.pcid);
+    }
+
+    #[test]
+    fn external_lu_requires_verified_cp_in_same_netid() {
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            advertisement("SNUSNU.SVC", 2),
+            advertisement("SOLNET.SNAB", 1),
+        )
+        .unwrap();
+        let target_lu: QualifiedName = "QABOB.APP".parse().unwrap();
+        let metrics = ReverseLinkMetrics {
+            transmission_time_us: 276,
+            capacity_kbps: 4300,
+            liveness_seconds: 0,
+        };
+        let request = cross_netid_request("QABOB.APP");
+        assert_eq!(
+            DirectRouteSetupService::new(
+                bootstrap.clone(),
+                target_lu.clone(),
+                vec![0xa4, 0],
+                [0, 0, 0, 4],
+                1,
+                metrics,
+                2,
+            )
+            .unwrap_err(),
+            ServiceError::InvalidLocalLu,
+        );
+        assert_eq!(
+            DirectRouteSetupService::new_verified_external(
+                bootstrap.clone(),
+                target_lu.clone(),
+                "QAEVE.SNAC".parse().unwrap(),
+                vec![0xa4, 0],
+                [0, 0, 0, 4],
+                1,
+                metrics,
+                2,
+            )
+            .unwrap_err(),
+            ServiceError::InvalidIdentity,
+        );
+        let mut service = DirectRouteSetupService::new_verified_external(
+            bootstrap.clone(),
+            target_lu.clone(),
+            "QABOB.SNAB".parse().unwrap(),
+            vec![0xa4, 0],
+            [0, 0, 0, 4],
+            1,
+            metrics,
+            2,
+        )
+        .unwrap();
+        let prepared = service
+            .prepare_reply(bootstrap.generation, &request)
+            .unwrap();
+        let authorized = service
+            .confirm_reply_sent(bootstrap.generation, prepared.pcid, &prepared.gds)
+            .unwrap();
+        assert_eq!(authorized.target_lu, target_lu);
+        assert_eq!(
+            authorized.verified_external_cp,
+            Some("QABOB.SNAB".parse().unwrap())
+        );
+        let replacement = HprControlBootstrap::new(
+            ConnectionGeneration::new(2).unwrap(),
+            advertisement("SNUSNU.SVC", 2),
+            advertisement("SOLNET.SNAB", 1),
+        )
+        .unwrap();
+        assert_eq!(
+            service.reset(replacement),
+            Err(ServiceError::InvalidIdentity)
+        );
+        let mut wrong_request = cross_netid_request("QABOB.OTHER");
+        let pcid_offset = wrong_request
+            .windows(2)
+            .position(|part| part[1] == 0x60 && (14..=28).contains(&part[0]))
+            .unwrap()
+            + 4;
+        wrong_request[pcid_offset] ^= 1;
+        assert_eq!(
+            service.prepare_reply(bootstrap.generation, &wrong_request),
+            Err(ServiceError::Reply(DirectReplyError::WrongDestination)),
+        );
     }
 }

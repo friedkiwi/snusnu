@@ -35,12 +35,24 @@ pub enum PathError {
 pub struct AuthorizedUserRoute {
     pub generation: ConnectionGeneration,
     pub target_lu: QualifiedName,
+    /// Present only for a RouteSetup service whose local egress verified the
+    /// adjacent hosting CP and its binding to this target LU.
+    pub verified_external_cp: Option<QualifiedName>,
     pub local_nce_label: Vec<u8>,
     pub local_nce_instance: [u8; 4],
     pub cos_tpf: Vec<u8>,
     pub tg_number: u8,
     pub return_link_label: Vec<u8>,
     pub maximum_packet_size: u16,
+}
+
+impl AuthorizedUserRoute {
+    pub fn target_netid_authorized(&self, local_cp: &QualifiedName) -> bool {
+        match &self.verified_external_cp {
+            None => self.target_lu.netid == local_cp.netid,
+            Some(cp) => self.target_lu.netid != local_cp.netid && self.target_lu.netid == cp.netid,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,10 +112,10 @@ pub fn validate_inbound_switching_path(
         RtpSetupTopic::User { cos_tpf } => {
             let authorized = user_route.ok_or(PathError::MissingUserAuthorization)?;
             if authorized.generation != bootstrap.generation
-                || authorized.target_lu.netid != bootstrap.local.cp.netid
+                || !authorized.target_netid_authorized(&bootstrap.local.cp)
                 || authorized.tg_number != tg_number
                 || authorized.return_link_label != bootstrap.local.link_label
-                || authorized.maximum_packet_size != bootstrap.max_packet_size
+                || authorized.maximum_packet_size > bootstrap.max_packet_size
             {
                 return Err(PathError::InvalidUserAuthorization);
             }
@@ -402,6 +414,7 @@ mod tests {
         let route = AuthorizedUserRoute {
             generation: bootstrap.generation,
             target_lu: "SNUSNU.PING".parse().unwrap(),
+            verified_external_cp: None,
             local_nce_label: vec![0xa4, 0x81],
             local_nce_instance: [0xff, 0xf2, 0xc4, 0x80],
             cos_tpf: nlp("0c2c01087bc3d6d5d5c5c3e3"),
@@ -417,6 +430,19 @@ mod tests {
         assert_eq!(path.priority, 1);
         assert_eq!(path.peer_nce_label, [0xa4, 0]);
         assert_eq!(path.alive_seconds, 5);
+        let mut external = route.clone();
+        external.target_lu = "QABOB.APP".parse().unwrap();
+        assert_eq!(
+            validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&external)),
+            Err(PathError::InvalidUserAuthorization)
+        );
+        external.verified_external_cp = Some("QAEVE.SNAC".parse().unwrap());
+        assert_eq!(
+            validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&external)),
+            Err(PathError::InvalidUserAuthorization)
+        );
+        external.verified_external_cp = Some("QABOB.SNAB".parse().unwrap());
+        validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&external)).unwrap();
         let mut reserved = bytes.clone();
         let flags = reserved
             .windows(3)
@@ -437,6 +463,42 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_user_cap_may_be_below_adjacency_cap() {
+        let mut local = advertisement("SNUSNU.SVC", 2);
+        local.tower.cp_nce_instance = [0xff, 0xf2, 0xc4, 0x80];
+        let peer = advertisement("SOLNET.SNAB", 1);
+        let bootstrap =
+            HprControlBootstrap::new(ConnectionGeneration::new(1).unwrap(), local, peer).unwrap();
+        let mut route = AuthorizedUserRoute {
+            generation: bootstrap.generation,
+            target_lu: "SNUSNU.PING".parse().unwrap(),
+            verified_external_cp: None,
+            local_nce_label: vec![0xa4, 0x81],
+            local_nce_instance: [0xff, 0xf2, 0xc4, 0x80],
+            cos_tpf: nlp("0c2c01087bc3d6d5d5c5c3e3"),
+            tg_number: 1,
+            return_link_label: bootstrap.local.link_label.clone(),
+            maximum_packet_size: 1200,
+        };
+        let mut bytes = nlp(LIVE_USER);
+        let cv83 = bytes
+            .windows(3)
+            .position(|cv| cv == [0x16, 0x83, 0xb8])
+            .unwrap();
+        bytes[cv83 + 4..cv83 + 8].copy_from_slice(&1200u32.to_be_bytes());
+        let packet = RtpPacket::parse(&bytes).unwrap();
+        let topic = classify_setup_topic(packet).unwrap();
+        assert!(
+            validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&route)).is_ok()
+        );
+        route.maximum_packet_size = bootstrap.max_packet_size + 1;
+        assert_eq!(
+            validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&route)),
+            Err(PathError::InvalidUserAuthorization)
+        );
+    }
+
+    #[test]
     fn direct_v5r4_control_and_user_switching_paths_are_distinct_topics() {
         for (number, packet_hex, topic, authorized) in [
             (14, CONTROL, RtpSetupTopic::RouteSetup, None),
@@ -451,6 +513,7 @@ mod tests {
                 Some(AuthorizedUserRoute {
                     generation: ConnectionGeneration::new(1).unwrap(),
                     target_lu: "SOLNET.SNAB".parse().unwrap(),
+                    verified_external_cp: None,
                     local_nce_label: vec![0xa4, 0],
                     local_nce_instance: [0, 0, 0, 4],
                     cos_tpf: vec![

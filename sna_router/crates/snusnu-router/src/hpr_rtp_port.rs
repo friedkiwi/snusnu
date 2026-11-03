@@ -1085,6 +1085,7 @@ mod tests {
             .authorize_user_route(AuthorizedUserRoute {
                 generation: ConnectionGeneration::new(1).unwrap(),
                 target_lu: "SNUSNU.PING".parse().unwrap(),
+                verified_external_cp: None,
                 local_nce_label: vec![0xb0, 1],
                 local_nce_instance: [0, 0, 0, 9],
                 cos_tpf: vec![4, 0x2c, 1, 0],
@@ -1096,6 +1097,7 @@ mod tests {
         port.authorize_user_route(AuthorizedUserRoute {
             generation: ConnectionGeneration::new(1).unwrap(),
             target_lu: "SNUSNU.PING".parse().unwrap(),
+            verified_external_cp: None,
             local_nce_label: vec![0xb0, 1],
             local_nce_instance: [0, 0, 0, 9],
             cos_tpf: vec![4, 0x2c, 1, 0],
@@ -1111,6 +1113,7 @@ mod tests {
             .authorize_user_route(AuthorizedUserRoute {
                 generation: ConnectionGeneration::new(1).unwrap(),
                 target_lu: "SNUSNU.PING".parse().unwrap(),
+                verified_external_cp: None,
                 local_nce_label: vec![0xb0, 2],
                 local_nce_instance: [0, 0, 0, 10],
                 cos_tpf: vec![4, 0x2c, 1, 0],
@@ -1134,6 +1137,7 @@ mod tests {
         let route = AuthorizedUserRoute {
             generation: ConnectionGeneration::new(1).unwrap(),
             target_lu: "SNUSNU.PING".parse().unwrap(),
+            verified_external_cp: None,
             local_nce_label: vec![0xb0, 1],
             local_nce_instance: [0, 0, 0, 9],
             cos_tpf: vec![4, 0x2c, 1, 0],

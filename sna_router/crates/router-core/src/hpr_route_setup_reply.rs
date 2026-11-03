@@ -2,8 +2,9 @@
 //!
 //! IBM *SNA Formats* GA27-3136-20 pp. 13-67–13-73 defines X'12CE' and its
 //! forward/reverse CV80 and RSCV fields. This builder only accepts a
-//! single-TG request addressed to a caller-authorized local LU, including an
-//! end node in a different NETID from its network-node server.
+//! single-TG request addressed to a caller-authorized LU, including an end
+//! node in a different NETID from its network-node server. External LUs need
+//! an independently verified adjacent CP and LU binding.
 //! It does not forward through an APPN network, grant an RTP connection, or
 //! infer LU reachability from a CP XID3.
 
@@ -50,6 +51,25 @@ impl DirectReplyTarget<'_> {
         &self,
         request: &RouteSetupGds<'_>,
     ) -> Result<Vec<u8>, DirectReplyError> {
+        self.encode_positive_with_route(request, None)
+    }
+
+    /// A route service may answer for an LU behind a separately verified
+    /// adjacent CP. The CP-to-LU binding must come from trusted local route
+    /// discovery; the request itself does not establish that binding.
+    pub(crate) fn encode_positive_for_external(
+        &self,
+        request: &RouteSetupGds<'_>,
+        verified_target_cp: &QualifiedName,
+    ) -> Result<Vec<u8>, DirectReplyError> {
+        self.encode_positive_with_route(request, Some(verified_target_cp))
+    }
+
+    fn encode_positive_with_route(
+        &self,
+        request: &RouteSetupGds<'_>,
+        verified_target_cp: Option<&QualifiedName>,
+    ) -> Result<Vec<u8>, DirectReplyError> {
         if request.kind != RouteSetupKind::Request {
             return Err(DirectReplyError::NotRequest);
         }
@@ -59,8 +79,12 @@ impl DirectReplyTarget<'_> {
         if request.origin_cp_name != self.bootstrap.peer.cp.to_string() {
             return Err(DirectReplyError::WrongOrigin);
         }
+        let valid_lu_scope = match verified_target_cp {
+            None => self.local_lu.netid == self.bootstrap.local.cp.netid,
+            Some(cp) => cp.netid == self.local_lu.netid,
+        };
         if request.destination_lu_name.as_deref() != Some(&self.local_lu.to_string())
-            || self.local_lu.netid != self.bootstrap.local.cp.netid
+            || !valid_lu_scope
         {
             return Err(DirectReplyError::WrongDestination);
         }

@@ -504,6 +504,7 @@ mod tests {
         let route = AuthorizedUserRoute {
             generation,
             target_lu: "SOLNET.SNAB".parse().unwrap(),
+            verified_external_cp: None,
             local_nce_label: config.peer_nce_label.clone(),
             local_nce_instance: config.peer_nce_instance,
             cos_tpf,
