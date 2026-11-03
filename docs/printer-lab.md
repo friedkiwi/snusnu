@@ -183,6 +183,14 @@ rejected a shared-session QRMTWSC Attach with `80050000` after its default
 management session ended, so the source CNOS/session association remains
 the next blocker.
 
+Two further QA-only source CNOS timing probes were removed after capture.
+Sending the QRMTWSC Attach immediately after the guest's SNASVCMG BIND, or
+on receipt of its BIS before answering BIS, caused a host UNBIND of type
+`FE` with sense `20030000` (bracket state error). Sending it after BIS
+completion yielded `80050000` because the session had ended. These traces
+rule out reusing the guest's default-management bracket in those states;
+they do not identify the separate source-session activation sequence.
+
 ### Live V5R4 AnyNet controller trace, 2026-11-03
 
 An isolated V5R4 clone at `10.99.6.2` accepted `QRMTWSC` source CNOS
