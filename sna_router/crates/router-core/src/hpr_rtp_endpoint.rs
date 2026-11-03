@@ -578,6 +578,10 @@ impl RtpInboundEndpoint {
             messages = held;
             self.phase = EndpointPhase::Active;
         }
+        // SOM/EOM with no payload consumes one RTP sequence position and
+        // still needs its STATUS acknowledgement. It carries no SNA BIU for
+        // the upper layer to parse.
+        messages.retain(|message| !message.is_empty());
         self.setup = setup;
         self.send = Some(send);
         self.receive = Some(receive);
@@ -1126,6 +1130,58 @@ mod tests {
         // create a STATUS exchange loop.
         let plain = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], Some((2, 2, 200)));
         assert!(!endpoint.receive(&plain).unwrap().status_due);
+    }
+
+    #[test]
+    fn captured_empty_user_rtp_message_is_acked_without_biu_delivery() {
+        // EE UI + NLP from V5R4 at 09:26:06.129: SOM/EOM, zero data,
+        // BSN=0x2ee. It ended an APING exchange and is valid RTP framing,
+        // but forwarding an empty BIU to FID5 reset the entire adjacency.
+        let captured_ui = [
+            0x04, 0x04, 0x03, 0xc2, 0x08, 0xa4, 0x24, 0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x04, 0x3c, 0x80, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0xee,
+        ];
+        let mut cfg = config();
+        cfg.assigned_tcid = 0x8000_0001_0000_0004;
+        let mut endpoint = RtpInboundEndpoint::new(cfg.clone()).unwrap();
+        let reply = endpoint.prepare_inbound_setup(&setup_packet(&cfg)).unwrap();
+        endpoint.confirm_setup_reply_sent(&reply).unwrap();
+        endpoint
+            .receive(&peer_packet(
+                cfg.assigned_tcid & !ASSIGNOR,
+                107,
+                &[],
+                Some((1, 1, 200)),
+            ))
+            .unwrap();
+        // Reconstruct the live receive cursor after earlier APING BIUs.
+        endpoint.receive = Some(
+            ReliableReceiveWindow::new(
+                cfg.generation,
+                cfg.assigned_tcid & !ASSIGNOR,
+                0x2ee,
+                cfg.max_window_bytes,
+            )
+            .unwrap(),
+        );
+        let empty = endpoint.receive(&captured_ui[3..]).unwrap();
+        assert!(empty.messages.is_empty());
+        assert!(empty.status_due);
+        assert_eq!(endpoint.receive.as_ref().unwrap().status().rseq, 0x2ef);
+        assert!(!endpoint.receive(&captured_ui[3..]).unwrap().status_due);
+
+        // Filtering applies only to zero-length complete messages. A short
+        // nonempty BIU still reaches the upper layer for protocol validation.
+        let nonempty = endpoint
+            .receive(&peer_packet(
+                cfg.assigned_tcid & !ASSIGNOR,
+                0x2ef,
+                b"X",
+                None,
+            ))
+            .unwrap();
+        assert_eq!(nonempty.messages, vec![b"X".to_vec()]);
     }
 
     #[test]
