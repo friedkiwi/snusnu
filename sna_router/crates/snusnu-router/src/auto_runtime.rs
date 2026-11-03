@@ -93,7 +93,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         let mac = proxies.get(&peer.id).expect("local LLC proxy allocated");
         fabric
             .directory_mut()
-            .replace(PortId::new(&peer.id), [RouteAddress::Mac(mac)]);
+            .replace(PortId::new(&peer.id), [RouteAddress::Mac(mac)])?;
         bridge.register(
             PortId::new(&peer.id),
             peer.interface.clone(),
@@ -114,7 +114,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             [RouteAddress::Mac(
                 proxies.get(&gateway.id).expect("MPTN proxy allocated"),
             )],
-        );
+        )?;
     }
     let mut listeners = Vec::with_capacity(config.llc.len());
     for peer in &config.llc {
@@ -170,9 +170,10 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     mptn_exports.clear();
                     mptn_owner.clear();
                     publish_local(&bridge, &mptn_exports, &mut connected)?;
-                    fabric
-                        .directory_mut()
-                        .replace(PortId::new(&remote.id), connected.advertised_addresses());
+                    fabric.directory_mut().replace_upstream(
+                        PortId::new(&remote.id),
+                        connected.advertised_addresses(),
+                    )?;
                     hub = Some(connected);
                     connect_delay = Duration::from_millis(500);
                 }
@@ -288,7 +289,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     hub = None;
                     next_connect = Instant::now() + connect_delay;
                     if let Some(remote) = remote {
-                        fabric.directory_mut().withdraw(&PortId::new(&remote.id));
+                        fabric.directory_mut().withdraw(&PortId::new(&remote.id))?;
                     }
                     for mac in remote_macs.drain() {
                         for listener in &mut listeners {
@@ -320,7 +321,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             remote_macs = next_macs;
             fabric
                 .directory_mut()
-                .replace(PortId::new(&remote.id), addresses);
+                .replace_upstream(PortId::new(&remote.id), addresses)?;
         }
         for id in mptn_ws_sessions.keys().copied().collect::<Vec<_>>() {
             let result = mptn_ws_sessions.get_mut(&id).unwrap().pump();
@@ -402,7 +403,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 hub = None;
                 next_connect = Instant::now() + connect_delay;
                 if let Some(remote) = remote {
-                    fabric.directory_mut().withdraw(&PortId::new(&remote.id));
+                    fabric.directory_mut().withdraw(&PortId::new(&remote.id))?;
                 }
                 for mac in remote_macs.drain() {
                     for listener in &mut listeners {
@@ -469,7 +470,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             learned |= changed;
         }
         if learned {
-            refresh_local_addresses(&mut fabric, &bridge, config, &proxies);
+            refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
             if let Some(connected) = hub.as_mut() {
                 publish_local(&bridge, &mptn_exports, connected)?;
             }
@@ -493,7 +494,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             if let Some(gateway) = gateways.iter_mut().find(|gateway| gateway.id() == target.0) {
                 if let Some(cp) = &offer.peer_cp {
                     if bridge.observe_cp(&ingress_id, cp)? {
-                        refresh_local_addresses(&mut fabric, &bridge, config, &proxies);
+                        refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
                         if let Some(connected) = hub.as_mut() {
                             publish_local(&bridge, &mptn_exports, connected)?;
                         }
@@ -631,7 +632,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 };
             }
             if learned_local {
-                refresh_local_addresses(&mut fabric, &bridge, config, &proxies);
+                refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
                 if let Some(connected) = hub.as_mut() {
                     publish_local(&bridge, &mptn_exports, connected)?;
                 }
@@ -912,15 +913,16 @@ fn refresh_local_addresses(
     bridge: &AutoLlcWsBridge,
     config: &RouterConfig,
     proxies: &AutoProxyMacs,
-) {
+) -> io::Result<()> {
     for peer in &config.llc {
         let id = PortId::new(&peer.id);
         let mut addresses = vec![RouteAddress::Mac(
             proxies.get(&peer.id).expect("LLC proxy allocated"),
         )];
         addresses.extend(bridge.local_addresses(&id));
-        fabric.directory_mut().replace(id, addresses);
+        fabric.directory_mut().replace(id, addresses)?;
     }
+    Ok(())
 }
 
 fn retire_upstream_pairs(

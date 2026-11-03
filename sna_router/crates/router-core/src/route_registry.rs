@@ -390,10 +390,7 @@ impl RouteRegistry {
         target_cp: Option<&QualifiedName>,
         ingress: Option<&AttachmentId>,
     ) -> Result<RouteSelection, RegistryError> {
-        let exact = self.select(ingress, |key| {
-            matches!(key, RouteKey::LogicalUnit { lu: route_lu, hosting_cp }
-                if route_lu == lu && target_cp.is_none_or(|cp| cp == hosting_cp))
-        });
+        let exact = self.resolve_exact_lu(lu, target_cp, ingress);
         if !matches!(exact, Err(RegistryError::NoRoute)) {
             return exact;
         }
@@ -401,6 +398,19 @@ impl RouteRegistry {
             return Err(RegistryError::NoRoute);
         };
         self.resolve_cp(target_cp, ingress)
+    }
+
+    /// Select only an explicitly advertised LU, without CP fallback.
+    pub fn resolve_exact_lu(
+        &self,
+        lu: &QualifiedName,
+        target_cp: Option<&QualifiedName>,
+        ingress: Option<&AttachmentId>,
+    ) -> Result<RouteSelection, RegistryError> {
+        self.select(ingress, |key| {
+            matches!(key, RouteKey::LogicalUnit { lu: route_lu, hosting_cp }
+                if route_lu == lu && target_cp.is_none_or(|cp| cp == hosting_cp))
+        })
     }
 
     pub fn resolve_cp(

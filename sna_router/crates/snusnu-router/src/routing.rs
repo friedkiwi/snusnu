@@ -1,6 +1,12 @@
 //! Transport-neutral SNA routing between registered ports.
 
 use crate::STOP;
+use router_core::{
+    route_registry::{
+        AttachmentId, OwnerId, OwnerVersion, RegistryError, RouteKey, RouteOrigin, RouteRegistry,
+    },
+    session::QualifiedName,
+};
 use std::{
     collections::{HashMap, HashSet},
     fmt, io,
@@ -65,7 +71,9 @@ impl fmt::Display for RouteAddress {
 /// fans a frame out to every matching transport.
 #[derive(Default)]
 pub(crate) struct AutomaticDirectory {
-    attachments: HashMap<PortId, HashSet<RouteAddress>>,
+    registry: RouteRegistry,
+    snapshots: HashMap<PortId, (RouteOrigin, HashSet<RouteAddress>)>,
+    revisions: HashMap<PortId, u64>,
 }
 
 impl AutomaticDirectory {
@@ -73,18 +81,77 @@ impl AutomaticDirectory {
         &mut self,
         attachment: PortId,
         addresses: impl IntoIterator<Item = RouteAddress>,
-    ) {
-        self.attachments.insert(
-            attachment,
-            addresses
-                .into_iter()
-                .filter(|address| !matches!(address, RouteAddress::UnboundManagedMac))
-                .collect(),
-        );
+    ) -> io::Result<()> {
+        self.replace_with_origin(attachment, RouteOrigin::Local, addresses)
     }
 
-    pub(crate) fn withdraw(&mut self, attachment: &PortId) {
-        self.attachments.remove(attachment);
+    pub(crate) fn replace_upstream(
+        &mut self,
+        attachment: PortId,
+        addresses: impl IntoIterator<Item = RouteAddress>,
+    ) -> io::Result<()> {
+        self.replace_with_origin(attachment, RouteOrigin::Upstream, addresses)
+    }
+
+    fn replace_with_origin(
+        &mut self,
+        attachment: PortId,
+        origin: RouteOrigin,
+        addresses: impl IntoIterator<Item = RouteAddress>,
+    ) -> io::Result<()> {
+        let addresses = addresses
+            .into_iter()
+            .filter(|address| !matches!(address, RouteAddress::UnboundManagedMac))
+            .collect::<HashSet<_>>();
+        if self.snapshots.get(&attachment) == Some(&(origin, addresses.clone())) {
+            return Ok(());
+        }
+        let mut routes = HashSet::new();
+        for address in &addresses {
+            if let Some(route) = route_key(address)? {
+                routes.insert(route);
+            }
+        }
+        let revision = self.next_revision(&attachment)?;
+        self.registry
+            .replace_owner(
+                owner_id(&attachment)?,
+                attachment_id(&attachment)?,
+                origin,
+                OwnerVersion::new(1, revision).map_err(registry_error)?,
+                routes.into_iter().collect(),
+            )
+            .map_err(registry_error)?;
+        self.revisions.insert(attachment.clone(), revision);
+        self.snapshots.insert(attachment, (origin, addresses));
+        Ok(())
+    }
+
+    pub(crate) fn withdraw(&mut self, attachment: &PortId) -> io::Result<()> {
+        let Some((origin, _)) = self.snapshots.get(attachment) else {
+            return Ok(());
+        };
+        let origin = *origin;
+        let revision = self.next_revision(attachment)?;
+        self.registry
+            .withdraw_owner(
+                &owner_id(attachment)?,
+                origin,
+                OwnerVersion::new(1, revision).map_err(registry_error)?,
+            )
+            .map_err(registry_error)?;
+        self.revisions.insert(attachment.clone(), revision);
+        self.snapshots.remove(attachment);
+        Ok(())
+    }
+
+    fn next_revision(&self, attachment: &PortId) -> io::Result<u64> {
+        self.revisions
+            .get(attachment)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("automatic route revision exhausted"))
     }
 
     pub(crate) fn resolve(
@@ -92,53 +159,70 @@ impl AutomaticDirectory {
         ingress: &PortId,
         destination: &RouteAddress,
     ) -> io::Result<PortId> {
-        let mut matches = self
-            .attachments
-            .iter()
-            .filter_map(|(attachment, addresses)| {
-                (attachment != ingress
-                    && addresses
-                        .iter()
-                        .any(|address| address_matches(destination, address)))
-                .then_some(attachment)
-            });
-        let Some(first) = matches.next() else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no reachable destination {destination} from {}", ingress.0),
-            ));
-        };
-        if let Some(second) = matches.next() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "ambiguous destination {destination} from {}: {} and {}",
-                    ingress.0, first.0, second.0
-                ),
-            ));
+        let ingress = attachment_id(ingress)?;
+        let selected = match destination {
+            RouteAddress::Mac(mac) => self.registry.resolve_mac(*mac, Some(&ingress)),
+            RouteAddress::ControlPoint { netid, name } => self.registry.resolve_cp(
+                &QualifiedName::new(netid, name).map_err(route_name_error)?,
+                Some(&ingress),
+            ),
+            RouteAddress::LogicalUnit { netid, cp, name } => {
+                let lu = QualifiedName::new(netid, name).map_err(route_name_error)?;
+                let cp = cp
+                    .as_ref()
+                    .map(|cp| QualifiedName::new(netid, cp).map_err(route_name_error))
+                    .transpose()?;
+                self.registry
+                    .resolve_exact_lu(&lu, cp.as_ref(), Some(&ingress))
+            }
+            RouteAddress::UnboundManagedMac => Err(RegistryError::NoRoute),
         }
-        Ok(first.clone())
+        .map_err(registry_error)?;
+        Ok(PortId::new(selected.attachment.as_str()))
     }
 }
 
-fn address_matches(destination: &RouteAddress, advertised: &RouteAddress) -> bool {
-    match (destination, advertised) {
-        (
-            RouteAddress::LogicalUnit { netid, cp, name },
-            RouteAddress::LogicalUnit {
-                netid: advertised_netid,
-                cp: advertised_cp,
-                name: advertised_name,
-            },
-        ) => {
-            netid == advertised_netid
-                && name == advertised_name
-                && cp
-                    .as_ref()
-                    .is_none_or(|cp| advertised_cp.as_ref() == Some(cp))
-        }
-        _ => destination == advertised,
-    }
+fn route_key(address: &RouteAddress) -> io::Result<Option<RouteKey>> {
+    Ok(match address {
+        RouteAddress::Mac(mac) => Some(RouteKey::ProxyMac(*mac)),
+        RouteAddress::ControlPoint { netid, name } => Some(RouteKey::ControlPoint(
+            QualifiedName::new(netid, name).map_err(route_name_error)?,
+        )),
+        RouteAddress::LogicalUnit {
+            netid,
+            cp: Some(cp),
+            name,
+        } => Some(RouteKey::LogicalUnit {
+            lu: QualifiedName::new(netid, name).map_err(route_name_error)?,
+            hosting_cp: QualifiedName::new(netid, cp).map_err(route_name_error)?,
+        }),
+        RouteAddress::LogicalUnit { cp: None, .. } | RouteAddress::UnboundManagedMac => None,
+    })
+}
+
+fn owner_id(attachment: &PortId) -> io::Result<OwnerId> {
+    OwnerId::new(format!("automatic:{}", attachment.0)).map_err(registry_error)
+}
+
+fn attachment_id(attachment: &PortId) -> io::Result<AttachmentId> {
+    AttachmentId::new(&attachment.0).map_err(registry_error)
+}
+
+fn route_name_error(error: router_core::session::SessionError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid route name: {error:?}"),
+    )
+}
+
+fn registry_error(error: RegistryError) -> io::Error {
+    let kind = match error {
+        RegistryError::NoRoute => io::ErrorKind::NotFound,
+        RegistryError::AmbiguousRoute => io::ErrorKind::AlreadyExists,
+        RegistryError::Capacity => io::ErrorKind::OutOfMemory,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
 }
 
 /// Owns the private route-port pair for each automatically selected circuit.
@@ -1542,18 +1626,18 @@ mod tests {
             cp: None,
             name: "LUB".into(),
         };
-        directory.replace(bob.clone(), [lu.clone()]);
+        directory.replace(bob.clone(), [lu.clone()]).unwrap();
         assert_eq!(directory.resolve(&alice, &unqualified).unwrap(), bob);
         assert_eq!(
             directory.resolve(&bob, &lu).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
-        directory.replace(carol.clone(), [lu.clone()]);
+        directory.replace(carol.clone(), [lu.clone()]).unwrap();
         assert_eq!(
             directory.resolve(&alice, &unqualified).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        directory.withdraw(&carol);
+        directory.withdraw(&carol).unwrap();
         assert_eq!(directory.resolve(&alice, &lu).unwrap(), bob);
     }
 
@@ -1565,7 +1649,8 @@ mod tests {
         let destination = RouteAddress::Mac([2, 83, 78, 0, 0, 1]);
         fabric
             .directory_mut()
-            .replace(bob.clone(), [destination.clone()]);
+            .replace(bob.clone(), [destination.clone()])
+            .unwrap();
         let left1 = Rc::new(RefCell::new(State {
             free_slots: 1,
             ..State::default()
@@ -1632,7 +1717,8 @@ mod tests {
         };
         fabric
             .directory_mut()
-            .replace(egress.clone(), [destination.clone()]);
+            .replace(egress.clone(), [destination.clone()])
+            .unwrap();
         let closed = Rc::new(RefCell::new(State {
             free_slots: 1,
             next_event: Some(RouterEvent::Closed),
@@ -1684,7 +1770,8 @@ mod tests {
         };
         fabric
             .directory_mut()
-            .replace(egress.clone(), [destination.clone()]);
+            .replace(egress.clone(), [destination.clone()])
+            .unwrap();
         let source = Rc::new(RefCell::new(State {
             free_slots: 1,
             observations: vec![IdentityObservation::ControlPoint("NETA.CPA".into())],
@@ -1726,7 +1813,8 @@ mod tests {
         };
         fabric
             .directory_mut()
-            .replace(target.clone(), [destination.clone()]);
+            .replace(target.clone(), [destination.clone()])
+            .unwrap();
         let failed = Rc::new(RefCell::new(State {
             poll_failures_remaining: 1,
             shared_failure: true,
