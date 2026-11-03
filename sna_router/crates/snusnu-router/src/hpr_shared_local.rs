@@ -31,6 +31,10 @@ pub(crate) struct HprSharedLocal {
 }
 
 impl HprSharedLocal {
+    pub(crate) fn ee_proxy_mac(&self) -> Option<[u8; 6]> {
+        self.llc_proxy.as_ref().map(|(_, mac)| *mac)
+    }
+
     pub(crate) fn new(config: &RouterConfig) -> io::Result<Self> {
         let mptn = config
             .mptn_gateway
