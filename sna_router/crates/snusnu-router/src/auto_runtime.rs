@@ -10,6 +10,7 @@ use crate::{
     hpr_local_llc_ingress::LocalLlcIngress,
     hpr_mptn_session_source::MptnToHprSession,
     hpr_session_source::{SessionSource, SourceUpdate},
+    llc_local_mptn_session::LlcLocalMptnSession,
     llc_proof_registry::{AssociationId, LlcProofRegistry},
     llc_session_ws::LlcSessionWs,
     llc_source_ws::LlcSourceWs,
@@ -190,6 +191,35 @@ fn local_llc_hosting_cp(
     Ok(cp)
 }
 
+fn local_llc_to_mptn_identity(
+    fabric: &AutomaticFabric,
+    learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
+    ingress: &PortId,
+    gateway_id: &str,
+    offered: &SessionIdentity,
+) -> io::Result<SessionIdentity> {
+    let selected = fabric.directory().resolve_lu(ingress, &offered.target_lu)?;
+    if selected.0 != gateway_id {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "local LLC user BIND selected a different attachment",
+        ));
+    }
+    let target_cp = learned
+        .get(gateway_id)
+        .and_then(|routes| routes.get(&offered.target_lu))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "local TCP62 target LU has no hosting CP proof",
+            )
+        })?
+        .clone();
+    SessionIdentity::new(offered.source_lu.clone(), offered.target_lu.clone())
+        .with_control_points(offered.source_cp.clone(), Some(target_cp))
+        .map_err(io::Error::other)
+}
+
 fn require_session_v1_target(route: &wire::RouteExport) -> io::Result<()> {
     if matches!(route.resource.as_ref(), Some(wire::route_export::Resource::LogicalUnit(lu))
         if lu.supported_types.contains(&(wire::LuType::LuType62 as i32)))
@@ -242,6 +272,7 @@ struct PendingUpstreamLlc {
     target_cp: QualifiedName,
     source: Option<LocalLlcIngress>,
     reject_pending: bool,
+    local_mptn: Option<String>,
 }
 
 struct ActiveUpstreamLlc {
@@ -356,6 +387,7 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     mptn_ws_sessions: HashMap<u64, MptnSessionWs>,
     mptn_local_sessions: HashMap<u64, MptnLocalSession>,
     mptn_local_llc_sessions: HashMap<u64, MptnLocalLlcSession>,
+    llc_local_mptn_sessions: HashMap<u64, LlcLocalMptnSession>,
     next_mptn_ws_id: u64,
     mptn_target_sessions: HashMap<u64, MptnTargetWs>,
     next_mptn_target_id: u64,
@@ -482,6 +514,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_ws_sessions: HashMap::new(),
             mptn_local_sessions: HashMap::new(),
             mptn_local_llc_sessions: HashMap::new(),
+            llc_local_mptn_sessions: HashMap::new(),
             next_mptn_ws_id: 0,
             mptn_target_sessions: HashMap::new(),
             next_mptn_target_id: 0,
@@ -915,6 +948,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 listener: active.listener,
                                 proxy_mac: active.proxy_mac,
                                 reject_pending: false,
+                                local_mptn: None,
                             },
                         );
                         continue;
@@ -950,6 +984,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                     native, target_cp,
                                 )),
                                 reject_pending: false,
+                                local_mptn: None,
                             },
                         );
                         continue;
@@ -1016,6 +1051,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_ws_sessions,
             mptn_local_sessions,
             mptn_local_llc_sessions,
+            llc_local_mptn_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
             pending_llc_upstream,
@@ -1059,6 +1095,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                     target_cp: source.target_cp().clone(),
                                     source: Some(source),
                                     reject_pending: false,
+                                    local_mptn: None,
                                 },
                             );
                             continue;
@@ -1072,6 +1109,52 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 listeners[active.listener].release(active.proxy_mac);
                 if proofs.withdraw(&active.attachment, &association("llc_upstream", id)) {
                     changed_proofs.insert(active.attachment);
+                }
+            }
+        }
+        for id in llc_local_mptn_sessions.keys().copied().collect::<Vec<_>>() {
+            let (retired, failed) = match llc_local_mptn_sessions.get_mut(&id).unwrap().pump() {
+                Ok(true) => (false, false),
+                Ok(false) => (true, false),
+                Err(error) => {
+                    tracing::warn!(carrier = id, error = %error,
+                        "local LLC to TCP62 SessionEvent bridge failed");
+                    (true, true)
+                }
+            };
+            if retired {
+                let mut session = llc_local_mptn_sessions.remove(&id).unwrap();
+                let gateway_id = session.gateway_id().to_owned();
+                let mut carrier = leased_llc
+                    .remove(&id)
+                    .expect("local LLC session owns its carrier lease");
+                let returned = if failed {
+                    let _ = session.close();
+                    Err(io::Error::other("local LLC to TCP62 session failed"))
+                } else {
+                    session.into_idle_source()
+                };
+                match returned {
+                    Ok(source) => {
+                        carrier.source = Some(source);
+                        pending_llc_upstream.insert(id, carrier);
+                        tracing::info!(carrier = id, gateway = %gateway_id,
+                            "local LLC2 dialout association returned to discovery");
+                    }
+                    Err(error) => {
+                        tracing::warn!(carrier = id, error = %error,
+                            "local LLC2 dialout association could not return to discovery");
+                        listeners[carrier.listener].release(carrier.proxy_mac);
+                        if proofs.withdraw(&carrier.attachment, &association("llc_upstream", id)) {
+                            changed_proofs.insert(carrier.attachment);
+                        }
+                    }
+                }
+                if let Some(gateway) = gateways
+                    .iter_mut()
+                    .find(|gateway| gateway.id() == gateway_id)
+                {
+                    gateway.release_udp();
                 }
             }
         }
@@ -1109,6 +1192,141 @@ impl<'a> AutoLocalSessionRunner<'a> {
             );
             if matches!(update, Ok(None)) {
                 pending_llc_upstream.insert(id, pending);
+                continue;
+            }
+            if let Some(local_gateway_id) = pending.local_mptn.clone() {
+                let mut udp_leased = false;
+                let result = (|| -> io::Result<LlcLocalMptnSession> {
+                    let bind = match update.as_ref() {
+                        Ok(Some(SourceUpdate::Event(
+                            router_core::session::SessionEvent::BindRequest(bind),
+                        ))) => bind,
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "local LLC carrier closed before user BIND",
+                            ))
+                        }
+                        Err(error) => return Err(io::Error::new(error.kind(), error.to_string())),
+                    };
+                    let identity =
+                        pending.source.as_ref().unwrap().identity().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "local LLC user BIND has no verified LU identity",
+                            )
+                        })?;
+                    if identity.target_cp.as_ref() != Some(&pending.target_cp) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "local LLC BIND names a different router CP",
+                        ));
+                    }
+                    let source_cp = identity
+                        .source_cp
+                        .as_ref()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "local LLC source CP is unverified",
+                            )
+                        })?
+                        .clone();
+                    if proofs
+                        .snapshot(&pending.attachment)
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.cp != source_cp)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "local LLC source CP differs from live XID3 proof",
+                        ));
+                    }
+                    let corrected = local_llc_to_mptn_identity(
+                        fabric,
+                        learned_mptn_lus,
+                        &pending.attachment,
+                        &local_gateway_id,
+                        identity,
+                    )?;
+                    let gateway = gateways
+                        .iter_mut()
+                        .find(|gateway| gateway.id() == local_gateway_id)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "local TCP62 gateway disappeared",
+                            )
+                        })?;
+                    let udp = gateway.lease_udp()?;
+                    udp_leased = true;
+                    let target = crate::hpr_local_mptn::HprToMptnSession::new(
+                        gateway.outbound_endpoint(),
+                        udp,
+                        &corrected,
+                        bind,
+                        Duration::from_secs(600),
+                    )?;
+                    proofs.observe_cp(
+                        &pending.attachment,
+                        association("llc_upstream", id),
+                        &source_cp.to_string(),
+                    )?;
+                    proofs.observe_lu62(
+                        &pending.attachment,
+                        &association("llc_upstream", id),
+                        &identity.source_lu.to_string(),
+                    )?;
+                    changed_proofs.insert(pending.attachment.clone());
+                    Ok(LlcLocalMptnSession::new(
+                        pending.source.take().unwrap(),
+                        target,
+                        local_gateway_id.clone(),
+                        id,
+                    ))
+                })();
+                match result {
+                    Ok(session) => {
+                        tracing::info!(carrier = id, ingress = %pending.attachment.0,
+                            gateway = %local_gateway_id,
+                            "local LLC to TCP62 SessionEvent bridge installed");
+                        leased_llc.insert(id, pending);
+                        llc_local_mptn_sessions.insert(id, session);
+                        if reconcile_proofs(proofs, bridge, changed_proofs.drain())? {
+                            refresh_local_addresses(fabric, bridge, config, proxies)?;
+                            exports_changed = true;
+                        }
+                    }
+                    Err(error) => {
+                        if udp_leased {
+                            if let Some(gateway) = gateways
+                                .iter_mut()
+                                .find(|gateway| gateway.id() == local_gateway_id)
+                            {
+                                gateway.release_udp();
+                            }
+                        }
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+                        ) {
+                            pending.reject_pending = true;
+                            pending_llc_upstream.insert(id, pending);
+                        } else {
+                            if let Some(source) = pending.source.as_mut() {
+                                let _ = source.close();
+                            }
+                            listeners[pending.listener].release(pending.proxy_mac);
+                            if proofs
+                                .withdraw(&pending.attachment, &association("llc_upstream", id))
+                            {
+                                changed_proofs.insert(pending.attachment);
+                            }
+                        }
+                        tracing::warn!(carrier = id, gateway = %local_gateway_id,
+                            error = %error, "local LLC to TCP62 user BIND rejected");
+                    }
+                }
                 continue;
             }
             let result = if ready {
@@ -1420,6 +1638,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                         native, target_cp,
                                     )),
                                     reject_pending: false,
+                                    local_mptn: None,
                                 },
                             );
                             tracing::info!(session = id, carrier = carrier_id,
@@ -1578,6 +1797,53 @@ impl<'a> AutoLocalSessionRunner<'a> {
                             )
                         })
                     });
+                if config.remote.is_empty() {
+                    let result = target_cp.and_then(|cp| -> io::Result<u64> {
+                        if pending_llc_upstream.len() >= MAX_PENDING_HANDOFFS {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "local LLC carrier registry is full",
+                            ));
+                        }
+                        let cp =
+                            QualifiedName::new(&cp.netid, &cp.name).map_err(io::Error::other)?;
+                        let source = LocalLlcIngress::from_offer(offer, cp.clone(), &ingress_id.0)?;
+                        let id = next_id
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("local LLC carrier ID exhausted"))?;
+                        if let Some(peer_cp) = offered_cp.as_deref() {
+                            proofs.observe_cp(
+                                &ingress_id,
+                                association("llc_upstream", id),
+                                peer_cp,
+                            )?;
+                            changed_proofs.insert(ingress_id.clone());
+                        }
+                        pending_llc_upstream.insert(
+                            id,
+                            PendingUpstreamLlc {
+                                attachment: ingress_id.clone(),
+                                listener: ingress,
+                                proxy_mac: ingress_proxy,
+                                target_cp: cp,
+                                source: Some(source),
+                                reject_pending: false,
+                                local_mptn: Some(gateway.id().to_owned()),
+                            },
+                        );
+                        next_id = id;
+                        tracing::info!(carrier = id, ingress = %ingress_id.0,
+                            gateway = gateway.id(),
+                            "local LLC dialout association parked for TCP62 routing");
+                        Ok(id)
+                    });
+                    if let Err(error) = result {
+                        listeners[ingress].release(ingress_proxy);
+                        tracing::warn!(ingress = %ingress_id.0, gateway = gateway.id(),
+                            error = %error, "local LLC carrier admission failed");
+                    }
+                    continue;
+                }
                 let result = target_cp.and_then(|cp| {
                     local_dispatch.start(
                         &ingress_id.0,
@@ -1681,6 +1947,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 target_cp: target_cp.clone(),
                                 source: Some(source),
                                 reject_pending: false,
+                                local_mptn: None,
                             },
                         );
                         next_id = id;
@@ -2288,6 +2555,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_ws_sessions,
             mptn_local_sessions,
             mptn_local_llc_sessions,
+            llc_local_mptn_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
             pending_llc_upstream,
@@ -2329,6 +2597,20 @@ impl<'a> AutoLocalSessionRunner<'a> {
             let gateway_id = circuit.gateway_id().to_owned();
             let carrier_id = circuit.carrier_id();
             let _ = circuit.close();
+            if let Some(carrier) = leased_llc.remove(&carrier_id) {
+                listeners[carrier.listener].release(carrier.proxy_mac);
+            }
+            if let Some(gateway) = gateways
+                .iter_mut()
+                .find(|gateway| gateway.id() == gateway_id)
+            {
+                gateway.release_udp();
+            }
+        }
+        for (_, mut session) in llc_local_mptn_sessions.drain() {
+            let carrier_id = session.carrier_id();
+            let gateway_id = session.gateway_id().to_owned();
+            let _ = session.close();
             if let Some(carrier) = leased_llc.remove(&carrier_id) {
                 listeners[carrier.listener].release(carrier.proxy_mac);
             }
@@ -3043,6 +3325,48 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn standalone_llc_to_mptn_uses_observed_target_cp_not_proxy_cp() {
+        let ingress = PortId::new("llc-a");
+        let target = PortId::new("mptn-b");
+        let source_lu: QualifiedName = "QAALICE.USERA".parse().unwrap();
+        let target_lu: QualifiedName = "QABOB.USERB".parse().unwrap();
+        let source_cp: QualifiedName = "QAALICE.SNAA".parse().unwrap();
+        let proxy_cp: QualifiedName = "QABOB.RTRCP".parse().unwrap();
+        let target_cp: QualifiedName = "QABOB.SNAB".parse().unwrap();
+        let offered = SessionIdentity::new(source_lu.clone(), target_lu.clone())
+            .with_control_points(Some(source_cp.clone()), Some(proxy_cp))
+            .unwrap();
+        let mut fabric = AutomaticFabric::new();
+        fabric
+            .directory_mut()
+            .replace_local_records(
+                target.clone(),
+                vec![RouteRecord {
+                    key: RouteKey::LogicalUnit {
+                        lu: target_lu.clone(),
+                        hosting_cp: target_cp.clone(),
+                    },
+                    supported_types: vec![LuType::Lu62],
+                }],
+            )
+            .unwrap();
+        let learned = HashMap::from([(
+            "mptn-b".to_owned(),
+            HashMap::from([(target_lu.clone(), target_cp.clone())]),
+        )]);
+        let selected =
+            local_llc_to_mptn_identity(&fabric, &learned, &ingress, "mptn-b", &offered).unwrap();
+        assert_eq!(selected.source_cp, Some(source_cp));
+        assert_eq!(selected.target_cp, Some(target_cp));
+        assert_eq!(
+            local_llc_to_mptn_identity(&fabric, &learned, &ingress, "mptn-c", &offered)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn local_llc_target_requires_lu62_and_preserves_hosting_cp() {

@@ -68,6 +68,26 @@ impl LocalLlcIngress {
             && self.native.port.reverse_link_available()
     }
 
+    /// Finish a correlated user UNBIND and keep the dialout LLC2 carrier for
+    /// later reverse sessions. The native transmit queue must be empty first.
+    pub(crate) fn return_idle_after_user(&mut self) -> io::Result<bool> {
+        if self.closed || self.pending.is_some() || self.pending_grant.is_some() {
+            return Ok(false);
+        }
+        if let Some(codec) = self.codec.as_ref() {
+            if !codec.is_closed() || !self.native.port.retire_converter_user()? {
+                return Ok(false);
+            }
+            self.codec = None;
+            self.identity = None;
+            self.candidate = None;
+            return Ok(self.can_lease_reverse());
+        }
+        self.native.port.tick()?;
+        self.native.port.poll(true)?;
+        Ok(self.can_lease_reverse())
+    }
+
     pub(crate) fn into_verified_port(self) -> io::Result<NativePeerPort> {
         if !self.can_lease_reverse() {
             return Err(invalid(

@@ -100,6 +100,7 @@ mod ip_ports;
 mod lab;
 #[cfg(all(test, target_os = "linux"))]
 mod llc_discovery_regression_tests;
+mod llc_local_mptn_session;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Activated when the automatic runtime adopts association-scoped proofs.
 mod llc_proof_registry;
