@@ -284,7 +284,7 @@ func TestRouterWebSocketManagedBindingsAndRevocation(t *testing.T) {
 	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/router/v1/ws"
 	llc, wl := connectTestRouter(t, url, recipientToken)
 	initial := readTestEnvelope(t, llc).GetManagedCpBindings()
-	if initial == nil || initial.SchemaVersion != 1 || len(initial.Bindings) != 0 {
+	if initial == nil || initial.SchemaVersion != 1 || len(initial.Bindings) != 1 || len(initial.Bindings[0].Candidates) != 0 {
 		t.Fatalf("initial bindings %+v", initial)
 	}
 	source, ws := connectTestRouter(t, url, originToken)

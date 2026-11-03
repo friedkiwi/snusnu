@@ -45,6 +45,50 @@ func (s *Store) BuildManagedBindingSnapshot(ctx context.Context, recipientID, re
 	if currentEpoch != recipientEpoch {
 		return result, ErrStaleEpoch
 	}
+	// Address ownership survives a temporary loss of all live CP routes.
+	// Candidates below describe reachability, not whether this recipient may
+	// answer XID on the server-assigned MAC.
+	addressRows, err := s.Query(ctx, `SELECT DISTINCT m.id,m.owner_id,m.netid,m.cp_name,m.mac_suffix,o.id
+		FROM managed_cp_addresses m JOIN routers o ON o.owner_id=m.owner_id AND o.paused=0
+		WHERE m.enabled=1 AND m.retired_at=0 AND m.owner_id<>? AND o.id<>?
+		ORDER BY m.id,o.id`, recipient.OwnerID, recipientID)
+	if err != nil {
+		return result, err
+	}
+	type address struct {
+		addressID, ownerID, netid, cpName, originID string
+		suffix                                      int64
+	}
+	var available []address
+	for addressRows.Next() {
+		var x address
+		if err = addressRows.Scan(&x.addressID, &x.ownerID, &x.netid, &x.cpName, &x.suffix, &x.originID); err != nil {
+			addressRows.Close()
+			return result, err
+		}
+		available = append(available, x)
+	}
+	if err = addressRows.Err(); err != nil {
+		addressRows.Close()
+		return result, err
+	}
+	addressRows.Close()
+	index := map[string]int{}
+	for _, x := range available {
+		if _, exists := index[x.addressID]; exists {
+			continue
+		}
+		allowed, checkErr := s.CanForward(ctx, recipientID, x.originID)
+		if checkErr != nil {
+			return result, checkErr
+		}
+		if !allowed {
+			continue
+		}
+		index[x.addressID] = len(result.Bindings)
+		cp := ManagedCP{Suffix: x.suffix}
+		result.Bindings = append(result.Bindings, ManagedBinding{AddressID: x.addressID, OwnerID: x.ownerID, NetID: x.netid, CPName: x.cpName, MAC: cp.MACBytes()})
+	}
 	type candidate struct {
 		addressID, ownerID, netid, cpName, originID, epoch string
 		suffix, routeID, generation                        int64
@@ -73,21 +117,17 @@ func (s *Store) BuildManagedBindingSnapshot(ctx context.Context, recipientID, re
 	if err != nil {
 		return result, err
 	}
-	index := map[string]int{}
 	for _, x := range candidates {
+		i, ok := index[x.addressID]
+		if !ok {
+			continue
+		}
 		allowed, err := s.CanForward(ctx, recipientID, x.originID)
 		if err != nil {
 			return result, err
 		}
 		if !allowed {
 			continue
-		}
-		i, ok := index[x.addressID]
-		if !ok {
-			i = len(result.Bindings)
-			index[x.addressID] = i
-			cp := ManagedCP{Suffix: x.suffix}
-			result.Bindings = append(result.Bindings, ManagedBinding{AddressID: x.addressID, OwnerID: x.ownerID, NetID: x.netid, CPName: x.cpName, MAC: cp.MACBytes()})
 		}
 		result.Bindings[i].Candidates = append(result.Bindings[i].Candidates, ManagedRouteReference{RouterID: x.originID, Epoch: x.epoch, RouteID: x.routeID, Generation: x.generation})
 	}

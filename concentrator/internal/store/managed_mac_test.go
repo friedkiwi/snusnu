@@ -182,8 +182,8 @@ func TestManagedBindingAuthorizationAndPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err = s.BuildManagedBindingSnapshot(ctx, recipient.ID, recipientEpoch, 5)
-	if err != nil || len(result.Bindings) != 0 {
-		t.Fatalf("withdrawn binding published: %+v %v", result, err)
+	if err != nil || len(result.Bindings) != 1 || len(result.Bindings[0].Candidates) != 0 {
+		t.Fatalf("address ownership disappeared or retained a withdrawn route: %+v %v", result, err)
 	}
 	still, err := s.ManagedCPByID(ctx, cp.ID)
 	if err != nil || still.Suffix != cp.Suffix || still.RetiredAt != 0 {
