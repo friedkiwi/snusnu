@@ -30,7 +30,7 @@ func testApp(t *testing.T) *App {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.DB.Close() })
-	a, err := NewApp(db, Config{Origin: "http://localhost:8080", Development: true, MFAKey: bytes.Repeat([]byte{1}, 32)})
+	a, err := NewApp(db, Config{Origin: "http://localhost:8080", Development: true, MFAKey: bytes.Repeat([]byte{1}, 32), DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}

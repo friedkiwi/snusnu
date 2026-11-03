@@ -299,7 +299,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8, schemaV9, schemaV10, schemaV11} {
+	for i, statements := range [][]string{schema, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8, schemaV9, schemaV10, schemaV11, schemaV12} {
 		version := i + 1
 		var found int
 		err := s.DB.QueryRowContext(ctx, s.Q("SELECT version FROM schema_migrations WHERE version=?"), version).Scan(&found)
@@ -413,6 +413,11 @@ var schemaV11 = []string{
 	`CREATE INDEX idx_sna_circuit_history_target_closed_id ON sna_circuit_history(target_owner_id,closed_at,id)`,
 	`CREATE INDEX idx_sna_circuit_history_source_router ON sna_circuit_history(source_router_id)`,
 	`CREATE INDEX idx_sna_circuit_history_target_router ON sna_circuit_history(target_router_id)`,
+}
+
+var schemaV12 = []string{
+	`CREATE TABLE print_jobs (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, source_router_id TEXT NOT NULL, source_netid TEXT NOT NULL, source_cp TEXT NOT NULL, source_lu TEXT NOT NULL, device_name TEXT NOT NULL, title TEXT NOT NULL, byte_count BIGINT NOT NULL, page_count BIGINT NOT NULL, created_at BIGINT NOT NULL)`,
+	`CREATE INDEX idx_print_jobs_owner_time ON print_jobs(owner_id,created_at DESC,id DESC)`,
 }
 
 var ErrNotFound = errors.New("not found")

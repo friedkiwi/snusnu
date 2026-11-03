@@ -34,7 +34,7 @@ func TestUpgradeFromVersionOne(t *testing.T) {
 	}
 	defer s.DB.Close()
 	var version int
-	if err = s.Row(ctx, "SELECT version FROM schema_migrations WHERE version=11").Scan(&version); err != nil || version != 11 {
+	if err = s.Row(ctx, "SELECT version FROM schema_migrations WHERE version=12").Scan(&version); err != nil || version != 12 {
 		t.Fatalf("migration version: %d %v", version, err)
 	}
 	var count int

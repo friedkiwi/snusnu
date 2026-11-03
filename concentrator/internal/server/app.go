@@ -18,6 +18,8 @@ import (
 	"net/mail"
 	"net/smtp"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +34,7 @@ type Config struct {
 	Origin, SMTPAddr, SMTPFrom, SMTPUser, SMTPPassword string
 	MetricsKey                                         string
 	CaptchaSiteKey, CaptchaSecret                      string
+	DataDir                                            string
 	MFAKey                                             []byte
 	Development                                        bool
 }
@@ -55,6 +58,7 @@ type App struct {
 	heartbeatFailures atomic.Uint64
 	lastHeartbeat     atomic.Int64
 	fatal             chan error
+	printDir          string
 	historyMu         sync.Mutex
 	historyPending    map[string]pendingCircuitHistory
 	historyArchived   atomic.Uint64
@@ -64,6 +68,17 @@ type App struct {
 }
 
 func NewApp(db *store.Store, cfg Config) (*App, error) {
+	if cfg.DataDir == "" {
+		return nil, errors.New("data directory is required")
+	}
+	dataDir, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	printDir := filepath.Join(dataDir, "prints")
+	if err := os.MkdirAll(printDir, 0700); err != nil {
+		return nil, err
+	}
 	u, err := url.Parse(cfg.Origin)
 	if err != nil || u.Hostname() == "" || (u.Scheme != "https" && !(cfg.Development && u.Scheme == "http")) {
 		return nil, errors.New("origin must be an HTTPS URL (HTTP only in development)")
@@ -81,7 +96,7 @@ func NewApp(db *store.Store, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: newDynamicQueue[circuitHistoryRecord](4096, 0, nil), routerLogs: newDynamicQueue[store.LogEntry](65536, 64<<20, func(x store.LogEntry) int { return len(x.Summary) + len(x.DetailsJSON) + 256 }), fatal: make(chan error, 1), historyPending: make(map[string]pendingCircuitHistory)}
+	a := &App{DB: db, Config: cfg, webauthn: w, client: &http.Client{Timeout: 5 * time.Second}, circuitHistory: newDynamicQueue[circuitHistoryRecord](4096, 0, nil), routerLogs: newDynamicQueue[store.LogEntry](65536, 64<<20, func(x store.LogEntry) int { return len(x.Summary) + len(x.DetailsJSON) + 256 }), fatal: make(chan error, 1), historyPending: make(map[string]pendingCircuitHistory), printDir: printDir}
 	a.hub = newRouterHub(a)
 	a.maintenance = newMaintenanceManager(a)
 	return a, nil
@@ -132,6 +147,9 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /llc-macs/{id}/retire", http.NotFound)
 	m.HandleFunc("GET /admin/llc-macs", a.admin(a.adminManagedCPPage))
 	m.HandleFunc("GET /flows", a.full(a.flows))
+	m.HandleFunc("GET /prints", a.full(a.printJobs))
+	m.HandleFunc("GET /prints/{id}", a.full(a.printJob))
+	m.HandleFunc("GET /prints/{id}/pdf", a.full(a.printJobPDF))
 	m.HandleFunc("GET /circuits", a.full(a.snaCircuits))
 	m.HandleFunc("POST /circuits/{id}/reset", a.full(a.resetSNACircuit))
 	m.HandleFunc("GET /blocks", a.full(a.blocks))
@@ -658,7 +676,7 @@ func dbError(w http.ResponseWriter, err error) {
 func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 	pageLayout := strings.Replace(layout, `<a class="nav-link" href="/llc-macs">LLC MACs</a>`, "", 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/clients">API clients</a>`, "", 1)
-	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/flows">Flows</a>`, `<a class="nav-link" href="/flows">Flows</a><a class="nav-link" href="/circuits">SNA circuits</a>`, 1)
+	pageLayout = strings.Replace(pageLayout, `<a class="nav-link" href="/flows">Flows</a>`, `<a class="nav-link" href="/flows">Flows</a><a class="nav-link" href="/circuits">SNA circuits</a><a class="nav-link" href="/prints">Prints</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `>All MACs</a>`, `>LLC allocations</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/admin/routers">All routers</a>`, `<a class="dropdown-item" href="/admin/routers">All routers</a><a class="dropdown-item" href="/admin/router-sessions">Router sessions</a><a class="dropdown-item" href="/admin/circuits">All SNA circuits</a><a class="dropdown-item" href="/admin/operations">Operations</a>`, 1)
 	pageLayout = strings.Replace(pageLayout, `<a class="dropdown-item" href="/settings">Settings</a>`, `<a class="dropdown-item" href="/settings">Settings</a><a class="dropdown-item" href="/clients">API keys</a>`, 1)
@@ -667,7 +685,7 @@ func (a *App) render(w http.ResponseWriter, name string, data map[string]any) {
 			return "Never"
 		}
 		return time.Unix(unix, 0).UTC().Format(time.RFC3339)
-	}, "prettyJSON": prettyJSON}).Parse(pageLayout + nodeAddressTemplate + pages[name])
+	}, "prettyJSON": prettyJSON, "add": func(a, b int) int { return a + b }}).Parse(pageLayout + nodeAddressTemplate + pages[name])
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "template error", 500)

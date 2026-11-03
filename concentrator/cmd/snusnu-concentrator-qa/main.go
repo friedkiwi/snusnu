@@ -48,7 +48,7 @@ func main() {
 	if _, err = rand.Read(key); err != nil {
 		log.Fatal(err)
 	}
-	app, err := server.NewApp(db, server.Config{Origin: *origin, Development: true, MFAKey: key})
+	app, err := server.NewApp(db, server.Config{Origin: *origin, Development: true, MFAKey: key, DataDir: filepath.Dir(path)})
 	if err != nil {
 		log.Fatal(err)
 	}
