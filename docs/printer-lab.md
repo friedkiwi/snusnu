@@ -95,6 +95,20 @@ session, including `QRMTWSC` application records.
 
 ## Remaining acceptance work
 
+The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
+provide a direct source for the missing controller sender code. In
+`5494_Base.zip`, `VG*.BIN` contains 16-bit x86 code. `VG1C.BIN` is the only
+module with the EBCDIC `QRMTWSC` constant (`D8 D9 D4 E3 E6 E2 C3` at file
+offset `0x2032`), near its `5494CONFDEFHOST` configuration strings. The
+EBCDIC `SNASVCMG` constant appears in `VG10.BIN` at offset `0x7236`.
+`VG10.BIN` also contains the fixed controller BIND prefix
+`6B 80 00 31 00 13 07 B0 B0 D0 B3 00 00 86 86 80 00 06 02` at offset
+`0x7244`. This independently supports the fixed portion built by the Go
+candidate; it does not reveal the dynamically generated names or PCID.
+`DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
+observations identify a reverse-engineering lead; they do not establish the
+power-on record or a successful 5494 conversation.
+
 1. Capture the actual V5R4 `QRMTWSC` control and printer sessions against a
    compatible 5494 or APPC printer peer. IBM documents the inner LU 4 protocol
    but omits the controller power-on announcement and its correlation with the
