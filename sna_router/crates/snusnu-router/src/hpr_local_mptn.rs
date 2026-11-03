@@ -641,11 +641,20 @@ impl Drop for HprToMptnSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hpr_local_session::HprLocalSession;
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
     };
     use transport_ip_sna::mptn_session::connect_template_for_route;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
 
     fn session(udp: UdpSocket, phase: Phase, tcp: Option<TcpSession>) -> HprToMptnSession {
         udp.set_nonblocking(true).unwrap();
@@ -727,6 +736,139 @@ mod tests {
         assert_eq!(session.poll().unwrap(), Some(event));
         session.confirm_polled().unwrap();
         assert!(matches!(session.phase, Phase::Closed));
+    }
+
+    #[test]
+    fn ee_to_mptn_dispatch_preserves_bind_data_credit_and_unbind() {
+        // Sanitized reduced BIND pair captured from an AnyNet LU 6.2 peer.
+        const REQUEST: &str = "00006b800031001307b0b0513303838c8c8303060200000000000000944300000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301238ff2ee2700000c04e2d6d3d5c5e34be2d5c1c10a1300b0238ff2ee270000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e3";
+        const RESPONSE: &str = "0000eb800031001307b0b0513303038c8c830306020000000000000094430000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b0238ff4f5c3000000006014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1";
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(tcp_listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = tcp_listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let local_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_udp_addr = local_udp.local_addr().unwrap();
+        let remote_udp = UdpSocket::bind("127.0.0.2:0").unwrap();
+        remote_udp
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut session = session(
+            local_udp,
+            Phase::Ready,
+            Some(TcpSession::new(client).unwrap()),
+        );
+        session.peer_udp_port = remote_udp.local_addr().unwrap().port();
+        session.bind = SessionUnit::from_reduced(&hex(REQUEST)).unwrap();
+        session
+            .connect
+            .options
+            .iter_mut()
+            .find(|option| option.kind == 0x0a)
+            .unwrap()
+            .value = hex(REQUEST);
+        let mut egress = HprLocalSession::Mptn {
+            session: Box::new(session),
+            gateway_id: "anynet".into(),
+        };
+        assert_eq!(egress.mptn_gateway_id(), Some("anynet"));
+        let bind = match &egress {
+            HprLocalSession::Mptn { session, .. } => session.bind.clone(),
+            _ => unreachable!(),
+        };
+        assert!(egress.send(&SessionEvent::BindRequest(bind)).unwrap());
+        assert_eq!(egress.poll().unwrap(), None);
+
+        let mut length = [0u8; 4];
+        peer.read_exact(&mut length).unwrap();
+        let mut request = vec![0u8; u32::from_be_bytes(length) as usize];
+        request[..4].copy_from_slice(&length);
+        peer.read_exact(&mut request[4..]).unwrap();
+        let request = Connect::decode(&request).unwrap();
+        let mut response = request.clone();
+        response.direction = Direction::PositiveResponse;
+        response.processing = 0x8a;
+        response
+            .options
+            .iter_mut()
+            .find(|option| option.kind == 0x0a)
+            .unwrap()
+            .value = hex(RESPONSE);
+        peer.write_all(&response.encode().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let bind_result = loop {
+            if let Some(result) = egress.poll().unwrap() {
+                break result;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert!(matches!(
+            bind_result,
+            SessionEvent::BindResult { accepted: true, .. }
+        ));
+        assert_eq!(egress.poll().unwrap(), Some(bind_result));
+        egress.confirm_polled().unwrap();
+
+        let outbound = SessionEvent::Information {
+            flow: Flow::Normal,
+            unit: SessionUnit::from_reduced(&[0, 1, 0x03, 0, 0x20, 0xc9]).unwrap(),
+        };
+        assert!(egress.send(&outbound).unwrap());
+        assert_eq!(egress.poll().unwrap(), None);
+        peer.read_exact(&mut length).unwrap();
+        let mut wire = vec![0u8; u32::from_be_bytes(length) as usize];
+        wire[..4].copy_from_slice(&length);
+        peer.read_exact(&mut wire[4..]).unwrap();
+        assert_eq!(TcpRecord::decode(wire).unwrap().kind, TcpKind::Normal);
+
+        let inbound = SessionUnit::from_reduced(&[0, 2, 0x03, 0, 0x20, 0xca]).unwrap();
+        peer.write_all(&unit_to_normal_record(&inbound).unwrap().bytes)
+            .unwrap();
+        let received = loop {
+            if let Some(event) = egress.poll().unwrap() {
+                break event;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert_eq!(
+            received,
+            SessionEvent::Information {
+                flow: Flow::Normal,
+                unit: inbound
+            }
+        );
+        assert_eq!(egress.poll().unwrap(), Some(received));
+        egress.confirm_polled().unwrap();
+        assert!(egress
+            .send(&SessionEvent::Credit {
+                normal: 4,
+                expedited: 1
+            })
+            .unwrap());
+
+        let unbind = SessionUnit::from_reduced(&[0, 3, 0x6b, 0x80, 0, 0x32]).unwrap();
+        assert!(egress.send(&SessionEvent::Unbind(unbind)).unwrap());
+        let mut packet = [0u8; 256];
+        let (size, from) = remote_udp.recv_from(&mut packet).unwrap();
+        let abort = Datagram::decode(&packet[..size]).unwrap();
+        assert_eq!(abort.compensation, Some(Compensation::Abort));
+        remote_udp
+            .send_to(&abort.positive_response().unwrap(), from)
+            .unwrap();
+        let unbind_result = loop {
+            if let Some(event) = egress.poll().unwrap() {
+                break event;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert!(matches!(unbind_result, SessionEvent::Unbind(_)));
+        egress.confirm_polled().unwrap();
+        egress.close().unwrap();
+        drop(egress);
+        UdpSocket::bind(local_udp_addr).unwrap();
     }
 
     #[test]
