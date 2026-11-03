@@ -258,9 +258,9 @@ impl ManagementInitiator {
             || response.connection_data().len() != 63 + self.request.destination.node.len() + self.fqpcid.len()
             || response.connection_data()[5..32] != RESPONSE_FIXED
             || response.connection_data()[50 + self.request.destination.node.len()..54 + self.request.destination.node.len()] != [10, 0x13, 0, 0xb0]
-            // V5R4 has issued X'23', X'24', and X'25' for fresh response
-            // instances. FQPCID and the request correlator remain mandatory.
-            || !matches!(response.connection_data()[54 + self.request.destination.node.len()], 0x23..=0x25)
+            // V5R4 advanced its response session instance through X'26'.
+            // This field is dynamic; FQPCID and the request correlator bind
+            // the response to the initiated management session.
             // Both the direct V5R4 response and B's reply to our minted
             // instance end X'13' in zero; its preceding dynamic flag was
             // X'80' in the former and X'00' in the latter.
@@ -457,6 +457,36 @@ mod tests {
         );
         assert_eq!(peer.accept_connect_response(&positive).unwrap().len(), 47);
         assert_eq!(peer.phase(), Phase::AwaitCnosReply);
+    }
+
+    #[test]
+    fn accepts_live_response_session_instance_26_with_correlator() {
+        let local = name("QAALICE.SNAA").unwrap();
+        let mut fqpcid = vec![0x60, (9 + local.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(local.len() as u8);
+        fqpcid.extend_from_slice(&local);
+        let mut peer = ManagementInitiator::new(
+            "QAALICE.SNAA",
+            "QABOB.SNAB",
+            fqpcid,
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let request = Connect::decode(peer.connect_request()).unwrap();
+        let mut response = Connect::decode(&positive(&request)).unwrap();
+        response.options[1].value[54 + request.destination.node.len()] = 0x26;
+        let mut stale = response.clone();
+        stale.correlator[0] ^= 1;
+        assert!(peer
+            .accept_connect_response(&stale.encode().unwrap())
+            .is_err());
+        assert!(peer
+            .accept_connect_response(&response.encode().unwrap())
+            .is_ok());
     }
 
     fn reply() -> Vec<u8> {
