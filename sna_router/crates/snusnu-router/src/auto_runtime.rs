@@ -1404,7 +1404,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                         Ok(_) => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "EE LLC carrier closed before user BIND",
+                                "EE LLC parked carrier closed without a new user BIND",
                             ))
                         }
                         Err(error) => return Err(io::Error::new(error.kind(), error.to_string())),
@@ -1464,7 +1464,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                     }
                     Err(error) => {
                         tracing::warn!(carrier = id, ee = %local_ee_id, error = %error,
-                            "EE LLC user BIND rejected");
+                            "EE LLC parked carrier offer ended");
                         if ready
                             && matches!(
                                 error.kind(),

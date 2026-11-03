@@ -547,8 +547,8 @@ impl HprToLlcSession<NativePeerPort> {
     }
 
     pub(crate) fn into_verified_port(self) -> io::Result<NativePeerPort> {
-        let mut native = self.port.into_verified_inner()?;
-        native.end_reverse_user_mode()?;
+        let (mut native, management) = self.port.into_verified_inner()?;
+        native.end_reverse_user_mode(management)?;
         Ok(native)
     }
 }

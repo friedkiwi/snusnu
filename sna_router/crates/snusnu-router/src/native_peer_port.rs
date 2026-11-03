@@ -525,15 +525,30 @@ impl NativePeerPort {
                 .is_some_and(|bind| bind.request_addresses().0 < u8::MAX)
     }
 
-    pub(crate) fn end_reverse_user_mode(&mut self) -> io::Result<()> {
+    pub(crate) fn end_reverse_user_mode(
+        &mut self,
+        completed_management: Option<router_core::fid2_session_control::ManagementBind>,
+    ) -> io::Result<()> {
         if !self.reverse_user_mode || self.reverse_completed != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "native reverse user mode has pending LLC completion",
             ));
         }
+        if completed_management.is_some() && self.management.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native LLC management proof already present",
+            ));
+        }
         self.reverse_user_mode = false;
         if self.management.is_none() {
+            let bind = completed_management.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "completed native management proof missing at LLC carrier return",
+                )
+            })?;
             let peer_cp = self
                 .type1
                 .peer_name()
@@ -545,9 +560,19 @@ impl NativePeerPort {
                 })?
                 .to_owned();
             let local_cp = self.local_xid.cp_name().map_err(management_error)?;
-            self.management = Some(ManagementSession::new(peer_cp.clone(), local_cp.clone()));
+            if bind.plu() != local_cp || bind.slu() != peer_cp {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "returned native management CPs differ from live XID3 proof",
+                ));
+            }
+            self.management = Some(ManagementSession::from_completed_initiator(
+                peer_cp.clone(),
+                local_cp.clone(),
+                bind,
+            ));
             self.converter_policy = Some((peer_cp, local_cp));
-            self.reached_management_bind = false;
+            self.reached_management_bind = self.management_complete();
         }
         Ok(())
     }
