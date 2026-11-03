@@ -31,7 +31,9 @@ needs both paths before a writer can send spool data.
 The transport-independent Go `sna/services/printer` package now parses the
 IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds
 candidate ACTLU and printer BIND responses, and renders common SCS fixed-pitch
-text. Its LU 4 device state advances through ACTLU and BIND only after each
+text. It also parses and emits the observed private `D824` controller GDS
+around one complete inner PIU, rejecting mismatched lengths and keys. Its LU 4
+device state advances through ACTLU and BIND only after each
 prepared response is acknowledged by the transport. The outer device-session
 envelope remains outside that state machine. The package also encodes the
 short, hardware-only NMVT Reply Product Set ID used
@@ -252,6 +254,14 @@ Varying `SNUPRT` off and on cleared that state.
 
 With the controller active, the host sent a private `D822` record, then a
 `D824` GDS carrying an inner FID3 ACTLU:
+
+The captured `D822` is a controller clock update. In `VG0F.BIN`, image
+`0x1D2A` recognizes GDS key `D822` with subtype zero and calls `0x1F37`;
+that routine reads six EBCDIC digits at record offsets `0x46` and `0x4C`
+and invokes BIOS clock interrupts `1A/05` and `1A/03`. In this run those
+fields decode to `261103` and `153227`, matching the guest date and time.
+This record supplies no printer address, so the probe must continue looking
+for the address-01 announcement after the clock update.
 
 ```text
 00 0C D8 24 3D 78 6B 80 00 0D 01 01

@@ -522,13 +522,10 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		return p.sendInformation(id, attach)
 	case 6:
 		outer, err := piu.ParseFID2(data)
-		if err != nil || len(outer.RU) < 9 || outer.RU[2] != 0xd8 || outer.RU[3] != 0x24 {
+		if err != nil {
 			return nil
 		}
-		if int(outer.RU[0])<<8|int(outer.RU[1]) != len(outer.RU) {
-			return nil
-		}
-		inner, err := printer.ParseLU4PIU(outer.RU[4:])
+		inner, err := printer.ParseControllerDeviceGDS(outer.RU)
 		if err != nil || inner.Address != 56 || len(inner.RU) < 3 {
 			return nil
 		}
@@ -548,12 +545,10 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if err != nil {
 			return err
 		}
-		encoded, err := response.Encode()
+		gds, err := printer.EncodeControllerDeviceGDS(response)
 		if err != nil {
 			return err
 		}
-		gds := append([]byte{0, 0, 0xd8, 0x24}, encoded...)
-		gds[0], gds[1] = byte(len(gds)>>8), byte(len(gds))
 		reply := piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}
 		packet, err := reply.Bytes()
 		if err != nil {
