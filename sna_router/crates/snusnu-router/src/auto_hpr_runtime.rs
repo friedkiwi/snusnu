@@ -1615,8 +1615,21 @@ impl<'a> DirectHprRuntime<'a> {
             } => (hosting_cp.clone(), attachment_id.clone()),
             _ => return Ok(None),
         };
+        tracing::debug!(
+            bind_plu = %bind.plu,
+            bind_slu = %bind.slu,
+            bind_class = ?bind.class,
+            route_target = %target_lu,
+            hosting_cp = %hosting_cp,
+            "classified SNASVCMG BIND against authorized HPR route"
+        );
+        // IBM i also uses SNASVCMG for service-directed LU 6.2 BINDs,
+        // including APING. Only a BIND to the CP itself is an external CP
+        // management leg; a service LU follows the ordinary session route.
+        if target_lu != hosting_cp {
+            return Ok(None);
+        }
         if bind.plu != self.bootstrap.peer.cp.to_string()
-            || target_lu != hosting_cp
             || self.rtp.user_target_for(&message.observation) != Some(&target_lu)
         {
             return Err(protocol(
@@ -2700,6 +2713,67 @@ mod tests {
                 route_setup_nce_label: vec![0xa4, id],
             },
         }
+    }
+
+    #[test]
+    fn service_directed_snasvcmg_bind_skips_external_cp_management() {
+        use router_core::fid2_bind::BindIdentity;
+
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let bootstrap = HprControlBootstrap::new(
+            generation,
+            advertisement("SNUSNU.SVC", 1),
+            advertisement("QABOB.SNAB", 2),
+        )
+        .unwrap();
+        let mut runtime = DirectHprRuntime::new(bootstrap);
+        runtime.route_targets.insert(
+            q("SNUSNU.PING"),
+            Destination::Ws {
+                hosting_cp: q("SNUSNU.SVC"),
+                attachment_id: "concentrator".into(),
+            },
+        );
+        let message = RtpIngress {
+            kind: RtpIngressKind::User,
+            observation: RtpObservation {
+                generation,
+                tcid: 0x8020_8fd9_2700_0038,
+            },
+            bytes: Vec::new(),
+        };
+        let bind = BindIdentity {
+            class: BindClass::Management {
+                mode: "SNASVCMG".into(),
+            },
+            plu: "QABOB.SNAB".into(),
+            slu: "SNUSNU.PING".into(),
+        };
+        assert!(runtime
+            .external_management_start(None, &message, &bind)
+            .unwrap()
+            .is_none());
+
+        // A CP-addressed BIND still enters the strict external CP checks.
+        runtime.route_targets.insert(
+            q("SNUSNU.SVC"),
+            Destination::Ws {
+                hosting_cp: q("SNUSNU.SVC"),
+                attachment_id: "concentrator".into(),
+            },
+        );
+        let bind_to_cp = BindIdentity {
+            slu: "SNUSNU.SVC".into(),
+            ..bind
+        };
+        assert_eq!(
+            runtime
+                .external_management_start(None, &message, &bind_to_cp)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
