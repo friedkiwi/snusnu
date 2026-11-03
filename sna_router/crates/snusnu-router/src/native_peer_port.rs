@@ -56,6 +56,8 @@ pub(crate) struct NativePeerPort {
     converter_negative_bind_pending: bool,
     converter_bind_response_acked: bool,
     converter_first_attach_seen: bool,
+    reverse_user_mode: bool,
+    reverse_completed: usize,
 }
 
 struct PacingProbePolicy {
@@ -155,6 +157,8 @@ impl NativePeerPort {
             converter_negative_bind_pending: false,
             converter_bind_response_acked: false,
             converter_first_attach_seen: false,
+            reverse_user_mode: false,
+            reverse_completed: 0,
         })
     }
 
@@ -246,6 +250,10 @@ impl NativePeerPort {
         (self.converter_dynamic && self.activation_announced)
             .then(|| self.type1.peer_name())
             .flatten()
+    }
+
+    pub(crate) fn local_xid(&self) -> &Xid3 {
+        &self.local_xid
     }
 
     /// The native BIND response must use the negotiated management profile;
@@ -380,6 +388,58 @@ impl NativePeerPort {
         self.management.as_ref().and_then(ManagementSession::bind)
     }
 
+    /// Lease the already authenticated LLC2 association for a remotely
+    /// initiated user BIND. The V4R4 management pair allocates address two
+    /// for the first user session in both directions after its UNBIND.
+    pub(crate) fn begin_reverse_user_mode(
+        &mut self,
+    ) -> io::Result<transport_ip_sna::mptn_reverse_user_bind::NativeAddress> {
+        if !self.reverse_idle_ready() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "verified native LLC adjacency is not idle for reverse user BIND",
+            ));
+        }
+        let bind = self.converter_management_bind().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "native management BIND missing")
+        })?;
+        let (management_daf, management_oaf) = bind.request_addresses();
+        let address = transport_ip_sna::mptn_reverse_user_bind::NativeAddress {
+            daf: management_oaf,
+            oaf: management_daf.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "native user address exhausted")
+            })?,
+            odai: true,
+        };
+        self.reverse_user_mode = true;
+        self.reverse_completed = 0;
+        Ok(address)
+    }
+
+    pub(crate) fn reverse_idle_ready(&self) -> bool {
+        !self.reverse_user_mode
+            && self.link_established()
+            && self.management.as_ref().map(ManagementSession::phase)
+                == Some(ManagementPhase::Closed)
+            && self.converter_offer.is_none()
+            && !self.converter_bind_response_pending
+            && self.converter_events.is_empty()
+            && self
+                .converter_management_bind()
+                .is_some_and(|bind| bind.request_addresses().0 < u8::MAX)
+    }
+
+    pub(crate) fn end_reverse_user_mode(&mut self) -> io::Result<()> {
+        if !self.reverse_user_mode || self.reverse_completed != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native reverse user mode has pending LLC completion",
+            ));
+        }
+        self.reverse_user_mode = false;
+        Ok(())
+    }
+
     pub(crate) fn reached_management_bind(&self) -> bool {
         self.reached_management_bind
     }
@@ -387,7 +447,9 @@ impl NativePeerPort {
     fn process(&mut self, events: Vec<Event>) -> io::Result<Vec<RouterEvent>> {
         if let Some(management) = self.management.as_mut() {
             let completed = self.endpoint.take_completed_information_count();
-            if self.converter_bind_response_pending && exclusive_bind_ack(completed)? {
+            if self.reverse_user_mode {
+                self.reverse_completed = self.reverse_completed.saturating_add(completed);
+            } else if self.converter_bind_response_pending && exclusive_bind_ack(completed)? {
                 self.converter_bind_response_pending = false;
                 if self.converter_negative_bind_pending {
                     self.converter_negative_bind_pending = false;
@@ -458,6 +520,7 @@ impl NativePeerPort {
                 }
             }
         }
+        let mut routed = Vec::new();
         for event in events {
             match event {
                 Event::Type1(pdu) => {
@@ -517,6 +580,10 @@ impl NativePeerPort {
                     tracing::info!(peer_cp = ?self.type1.peer_name(), "native APPN LLC2 contact established; awaiting management BIND");
                 }
                 Event::Information(piu) => {
+                    if self.reverse_user_mode {
+                        routed.push(RouterEvent::Unit(RoutedUnit::SnaInformation(piu)));
+                        continue;
+                    }
                     if self.management.is_some() {
                         if let Err(error) = self.process_management_piu(piu) {
                             self.endpoint.disconnect()?;
@@ -554,6 +621,13 @@ impl NativePeerPort {
                     self.endpoint.disconnect()?;
                 }
                 Event::Disconnected | Event::TimedOut => {
+                    if self.reverse_user_mode {
+                        routed.push(match event {
+                            Event::TimedOut => RouterEvent::TimedOut,
+                            _ => RouterEvent::Closed,
+                        });
+                        continue;
+                    }
                     if self.converter_policy.is_some() {
                         self.converter_events.push_back(NativeLlcEvent::Closed);
                         return Ok(Vec::new());
@@ -574,7 +648,7 @@ impl NativePeerPort {
         }
         // The native port is not ready for user traffic until management
         // BIND/CNOS and a gateway session are implemented.
-        Ok(Vec::new())
+        Ok(routed)
     }
 
     fn process_management_piu(&mut self, piu: Vec<u8>) -> io::Result<()> {
@@ -1009,7 +1083,10 @@ fn publish_pending_converter_bind(
 impl RoutePort for NativePeerPort {
     fn poll(&mut self, can_accept_information: bool) -> io::Result<Option<Vec<RouterEvent>>> {
         self.endpoint
-            .poll(self.converter_policy.is_none() || can_accept_information)?
+            .poll(
+                (!self.reverse_user_mode && self.converter_policy.is_none())
+                    || can_accept_information,
+            )?
             .map(|events| self.process(events))
             .transpose()
     }
@@ -1019,15 +1096,28 @@ impl RoutePort for NativePeerPort {
         self.process(events)
     }
 
-    fn send(&mut self, _: RoutedUnit) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native APPN session gateway is not implemented",
-        ))
+    fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> {
+        match unit {
+            RoutedUnit::SnaInformation(piu) if self.reverse_user_mode => {
+                self.endpoint.queue_information(piu)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native APPN session gateway is not active",
+            )),
+        }
     }
 
     fn has_capacity(&self) -> bool {
-        !self.reached_management_bind
+        self.reverse_user_mode && self.endpoint.has_capacity() || !self.reached_management_bind
+    }
+
+    fn available_receive_slots(&self) -> usize {
+        self.endpoint.available_receive_slots()
+    }
+
+    fn take_completed_information_count(&mut self) -> usize {
+        std::mem::take(&mut self.reverse_completed)
     }
 
     fn set_ingress_busy(&mut self, busy: bool) -> io::Result<()> {

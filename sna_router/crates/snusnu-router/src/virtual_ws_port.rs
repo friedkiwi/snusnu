@@ -59,6 +59,7 @@ pub(crate) struct VirtualWsPort<P: RoutePort> {
     local_cp: String,
     peer_cp: String,
     initial_xid_sent: bool,
+    inherited_management_address: Option<NativeAddress>,
     management: Option<NativeManagementInitiator>,
     reciprocal_management: Option<ManagementSession>,
     management_egress: VecDeque<ManagementEgress>,
@@ -117,6 +118,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
             local_cp: local_cp.to_owned(),
             peer_cp: peer_cp.to_owned(),
             initial_xid_sent: false,
+            inherited_management_address: None,
             management: None,
             reciprocal_management: None,
             management_egress: VecDeque::new(),
@@ -154,7 +156,45 @@ impl<P: RoutePort> VirtualWsPort<P> {
     }
 
     pub(crate) fn ready(&self) -> bool {
-        self.cp.ready()
+        self.inherited_management_address.is_some() || self.cp.ready()
+    }
+
+    pub(crate) fn verified_user_closed(&self) -> bool {
+        self.inherited_management_address.is_some()
+            && self.user_closed
+            && self.native_user_input.is_none()
+            && self.native_user_output.is_none()
+            && !self.native_user_output_queued
+            && self.tcp_user_output.is_none()
+            && self.udp_abort_output.is_none()
+    }
+
+    pub(crate) fn into_verified_inner(self) -> io::Result<P> {
+        if !self.verified_user_closed() {
+            return Err(protocol(
+                "verified native user session has not completed teardown",
+            ));
+        }
+        Ok(self.inner)
+    }
+
+    /// The inner native port has already verified XID3 and completed
+    /// SNASVCMG on this exact LLC2 association. Reuse its link for one user
+    /// session without repeating Type1 or opening another packet socket.
+    pub(crate) fn from_verified_native(
+        inner: P,
+        local_xid: Xid3,
+        local_cp: &str,
+        peer_cp: &str,
+        address: NativeAddress,
+    ) -> io::Result<Self> {
+        if address.daf == 0 || address.oaf == 0 {
+            return Err(protocol("verified native user address is invalid"));
+        }
+        let mut port = Self::new(inner, local_xid, local_cp, peer_cp)?;
+        port.inherited_management_address = Some(address);
+        port.initial_xid_sent = true;
+        Ok(port)
     }
 
     pub(crate) fn attach_management(
@@ -226,13 +266,15 @@ impl<P: RoutePort> VirtualWsPort<P> {
     }
 
     pub(crate) fn management_complete(&self) -> bool {
-        self.management
-            .as_ref()
-            .is_some_and(|management| management.phase() == ManagementPhase::Complete)
-            && self
-                .reciprocal_management
+        self.inherited_management_address.is_some()
+            || self
+                .management
                 .as_ref()
-                .is_none_or(|management| management.phase() == ResponderPhase::Closed)
+                .is_some_and(|management| management.phase() == ManagementPhase::Complete)
+                && self
+                    .reciprocal_management
+                    .as_ref()
+                    .is_none_or(|management| management.phase() == ResponderPhase::Closed)
     }
 
     pub(crate) fn management_phases(&self) -> (Option<ManagementPhase>, Option<ResponderPhase>) {
@@ -253,6 +295,9 @@ impl<P: RoutePort> VirtualWsPort<P> {
     pub(crate) fn first_user_address(&self) -> io::Result<NativeAddress> {
         if !self.management_complete() || self.user_bind.is_some() || self.user_address.is_some() {
             return Err(protocol("native user address requires idle managed link"));
+        }
+        if let Some(address) = self.inherited_management_address {
+            return Ok(address);
         }
         let (management_daf, management_oaf) = self
             .management
@@ -734,7 +779,18 @@ impl<P: RoutePort> VirtualWsPort<P> {
     }
 
     fn drive_management(&mut self) -> io::Result<()> {
-        if !self.cp.ready() || !self.inner.has_capacity() {
+        if !self.ready() || !self.inner.has_capacity() {
+            return Ok(());
+        }
+        if self.inherited_management_address.is_some() {
+            if let Some(user_bind) = self.user_bind.as_mut() {
+                if user_bind.phase() == UserBindPhase::NativeBindPrepared {
+                    let piu = user_bind.native_bind().to_vec();
+                    if self.inner.send(RoutedUnit::SnaInformation(piu.clone()))? {
+                        user_bind.mark_native_bind_enqueued(&piu)?;
+                    }
+                }
+            }
             return Ok(());
         }
         let Some(management) = self.management.as_mut() else {
@@ -1027,6 +1083,30 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 }
                 RouterEvent::Unit(RoutedUnit::SnaInformation(piu)) => {
                     let mut observed = false;
+                    if self.inherited_management_address.is_some() {
+                        if self.user_flow.is_some() {
+                            if self.native_user_input.replace(piu).is_some() {
+                                return Err(protocol("verified native user ingress queue full"));
+                            }
+                        } else if self
+                            .user_bind
+                            .as_ref()
+                            .is_some_and(|bind| bind.phase() == UserBindPhase::AwaitNativeBind)
+                        {
+                            if self.user_bind_native_completed {
+                                self.accept_user_response(&piu)?;
+                                observed = true;
+                            } else if self.early_user_response.replace(piu).is_some() {
+                                return Err(protocol("multiple early native user BIND responses"));
+                            }
+                        } else {
+                            return Err(protocol("verified native user PIU without BIND"));
+                        }
+                        if observed {
+                            self.inner.on_downstream_completed(1)?;
+                        }
+                        continue;
+                    }
                     if self.user_bind.is_none()
                         && !self.management_complete()
                         && piu.len() >= 9
@@ -1308,6 +1388,39 @@ mod tests {
         })
         .unwrap();
         ingress.receive(&connect.encode().unwrap()).unwrap().clone()
+    }
+
+    #[test]
+    fn inherited_llc_link_sends_user_bind_without_second_xid_or_management() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        let mut port = VirtualWsPort::from_verified_native(
+            inner,
+            xid("QABOB.SNAB", Role::Secondary),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            address,
+        )
+        .unwrap();
+        assert!(port.ready());
+        assert!(port.management_complete());
+        assert_eq!(port.first_user_address().unwrap(), address);
+        port.begin_user_bind(&user_offer(), address).unwrap();
+        port.poll(true).unwrap();
+        assert!(port.inner.sent.is_empty(), "second XID was sent");
+        assert_eq!(port.inner.information.len(), 1);
+        assert_eq!(&port.inner.information[0][..9], &hex("2f00020200006b8500"));
     }
 
     fn fresh_management(marker: u8) -> NativeManagementInitiator {

@@ -60,6 +60,39 @@ impl LocalLlcIngress {
         &self.target_cp
     }
 
+    pub(crate) fn can_lease_reverse(&self) -> bool {
+        !self.closed
+            && self.pending.is_none()
+            && self.codec.is_none()
+            && self.native.pending.is_none()
+            && self.native.port.reverse_idle_ready()
+    }
+
+    pub(crate) fn into_verified_port(self) -> io::Result<NativePeerPort> {
+        if !self.can_lease_reverse() {
+            return Err(invalid(
+                "native LLC adjacency still has an active user session",
+            ));
+        }
+        Ok(self.native.port)
+    }
+
+    pub(crate) fn from_verified_port(port: NativePeerPort, target_cp: QualifiedName) -> Self {
+        Self {
+            native: LocalLlcNative {
+                port,
+                pending: None,
+            },
+            target_cp,
+            identity: None,
+            codec: None,
+            candidate: None,
+            pending: None,
+            pending_grant: None,
+            closed: false,
+        }
+    }
+
     /// Release a failed user BIND while retaining the carrier-owned LLC2
     /// association and its CP/LU discovery proof. The caller retries when
     /// the native transmit queue has no room yet.
