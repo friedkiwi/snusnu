@@ -36,6 +36,60 @@ fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
+fn matches_native_unbind(
+    piu: &[u8],
+    address: NativeAddress,
+    fqpcid: &[u8],
+    destination: &[u8],
+) -> bool {
+    let prefix = [
+        0x2d | (u8::from(address.odai) << 1),
+        0,
+        address.oaf,
+        address.daf,
+        0,
+        0,
+        0x6b,
+        0x80,
+        0,
+        0x32,
+    ];
+    if !piu.starts_with(&prefix) {
+        return false;
+    }
+    let body = &piu[prefix.len()..];
+    let short_prefix = [1, 0, 0, 0, 0];
+    if body.starts_with(&short_prefix) && body[short_prefix.len()..] == *fqpcid {
+        return true;
+    }
+    // V4R4 can also send the extended X'0f08' image when its local
+    // controller is varied off. Its destination length fields count the
+    // name itself, unlike the TCP62 Abort image prepared below.
+    let extended_prefix = [0x0f, 0x08, 1, 0, 0];
+    if destination.len() > 17
+        || !body.starts_with(&extended_prefix)
+        || body.len() != extended_prefix.len() + fqpcid.len() + 10 + destination.len()
+        || body[extended_prefix.len()..extended_prefix.len() + fqpcid.len()] != *fqpcid
+    {
+        return false;
+    }
+    let tail = &body[extended_prefix.len() + fqpcid.len()..];
+    tail[..9]
+        == [
+            0x35,
+            (destination.len() + 8) as u8,
+            0x08,
+            1,
+            0,
+            0,
+            destination.len() as u8,
+            0,
+            destination.len() as u8,
+        ]
+        && tail[9..9 + destination.len()] == *destination
+        && tail[9 + destination.len()] == 0
+}
+
 impl NativeUserClose {
     pub fn from_user_offer(offer: &IngressOffer, address: NativeAddress) -> io::Result<Self> {
         if !matches!(offer.kind(), IngressKind::User { .. }) || address.daf == 0 || address.oaf == 0
@@ -59,27 +113,8 @@ impl NativeUserClose {
     }
 
     pub fn accept_native_unbind(&mut self, piu: &[u8]) -> io::Result<&TcpRecord> {
-        let prefix = [
-            0x2d | (u8::from(self.address.odai) << 1),
-            0,
-            self.address.oaf,
-            self.address.daf,
-            0,
-            0,
-            0x6b,
-            0x80,
-            0,
-            0x32,
-            1,
-            0,
-            0,
-            0,
-            0,
-        ];
         if self.phase != Phase::Active
-            || piu.len() != prefix.len() + self.fqpcid.len()
-            || piu.get(..prefix.len()) != Some(prefix.as_slice())
-            || piu.get(prefix.len()..) != Some(self.fqpcid.as_slice())
+            || !matches_native_unbind(piu, self.address, &self.fqpcid, &self.destination)
         {
             self.close();
             return Err(invalid(
@@ -251,6 +286,68 @@ mod tests {
         .concat();
         native[16] ^= 1;
         assert!(close.accept_native_unbind(&native).is_err());
+        assert_eq!(close.phase(), Phase::Closed);
+    }
+
+    #[test]
+    fn captured_v4_extended_unbind_requires_exact_fqpcid_and_destination() {
+        let fqpcid = hex("6013e8e772dd2409213b0ad8c1c2d6c24be2d5c1c2");
+        let destination = hex("d8c1c1d3c9c3c54be2d5c1c1");
+        let captured = hex("2f00020200006b8000320f080100006013e8e772dd2409213b0ad8c1c2d6c24be2d5c1c23514080100000c000cd8c1c1d3c9c3c54be2d5c1c100");
+        let address = NativeAddress {
+            daf: 2,
+            oaf: 2,
+            odai: true,
+        };
+        assert!(matches_native_unbind(
+            &captured,
+            address,
+            &fqpcid,
+            &destination
+        ));
+        let mut wrong_fqpcid = captured.clone();
+        wrong_fqpcid[16] ^= 1;
+        assert!(!matches_native_unbind(
+            &wrong_fqpcid,
+            address,
+            &fqpcid,
+            &destination
+        ));
+        let mut wrong_destination = captured.clone();
+        wrong_destination[captured.len() - 2] ^= 1;
+        assert!(!matches_native_unbind(
+            &wrong_destination,
+            address,
+            &fqpcid,
+            &destination
+        ));
+        let mut wrong_length = captured.clone();
+        wrong_length[42] += 1;
+        assert!(!matches_native_unbind(
+            &wrong_length,
+            address,
+            &fqpcid,
+            &destination
+        ));
+    }
+
+    #[test]
+    fn extended_native_unbind_reaches_correlated_tcp_abort() {
+        let mut close = fixture();
+        let mut native = hex("2f00010200006b8000320f08010000");
+        native.extend_from_slice(&hex("6014cec37477b5dc29a10be2d6d3d5c5e34be2d5c1c1"));
+        native.extend_from_slice(&hex("3513080100000b000be2d6d3d5c5e34be2d5c1c200"));
+        assert!(matches_native_unbind(
+            &native,
+            close.address,
+            &close.fqpcid,
+            &close.destination
+        ));
+        let abort = close.accept_native_unbind(&native).unwrap().clone();
+        assert_eq!(abort.bytes, hex(ABORT));
+        let response = close.mark_tcp_abort_written(&abort).unwrap().to_vec();
+        assert_eq!(response, hex("2f0002010000eb800032"));
+        close.mark_native_response_enqueued(&response).unwrap();
         assert_eq!(close.phase(), Phase::Closed);
     }
 
