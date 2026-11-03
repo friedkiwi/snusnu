@@ -431,6 +431,23 @@ impl SessionWsPort {
         Ok(None)
     }
 
+    /// Advance circuit control while the destination still holds an earlier
+    /// session event. This keeps the event in the receive queue and allows a
+    /// later CircuitClose or CircuitReset to retire the circuit promptly.
+    pub(crate) fn poll_control(&mut self) -> io::Result<bool> {
+        self.inner.maybe_open()?;
+        let result = RoutePort::poll(&mut self.inner, false)?;
+        let closed = result.as_ref().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RouterEvent::Closed))
+        });
+        if closed {
+            self.opened_reported = false;
+        }
+        Ok(closed)
+    }
+
     /// False means the circuit is not ready or its byte allowance is full.
     /// Pacing-credit events consume no circuit byte allowance.
     pub(crate) fn send(&mut self, event: wire::SessionEvent) -> io::Result<bool> {
@@ -3407,6 +3424,24 @@ mod tests {
                 }),
                 Some(wire::session_event::Event::Unbind(unit)) if unit == &[0, 0, 0x6b, 0x80, 0, 0x32]
             ));
+            // The destination is still working on an earlier unit. A queued
+            // pacing event must not hide the subsequent reset.
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::CircuitEvent(wire::CircuitEvent {
+                    circuit_id: server_id.clone(),
+                    event: Some(wire::circuit_event::Event::SessionEvent(
+                        wire::SessionEvent {
+                            event: Some(wire::session_event::Event::PacingCredit(
+                                wire::SessionPacingCredit {
+                                    normal: 1,
+                                    expedited: 0,
+                                },
+                            )),
+                        },
+                    )),
+                }),
+            );
             send(
                 &mut socket,
                 wire::ws_envelope::Body::CircuitReset(wire::CircuitReset {
@@ -3487,12 +3522,19 @@ mod tests {
                 ])),
             })
             .unwrap());
+        let mut closed = false;
+        let mut queued_while_blocked = false;
         for _ in 0..1000 {
-            if matches!(port.poll().unwrap(), Some(SessionWsUpdate::Closed)) {
+            let just_closed = port.poll_control().unwrap();
+            queued_while_blocked |= !port.inner.pending_session.is_empty();
+            if just_closed {
+                closed = true;
                 break;
             }
             thread::sleep(Duration::from_millis(1));
         }
+        assert!(queued_while_blocked);
+        assert!(closed);
         assert!(!port.is_open());
         server.join().unwrap();
     }
