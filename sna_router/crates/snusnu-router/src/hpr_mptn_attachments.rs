@@ -470,8 +470,10 @@ impl HprMptnPeerState {
         if self.check_gateway(gateway).is_err() {
             return;
         }
-        self.active_user = false;
-        gateway.release_udp();
+        if self.active_user {
+            self.active_user = false;
+            gateway.release_udp();
+        }
     }
 
     pub(crate) fn reject_offer(
