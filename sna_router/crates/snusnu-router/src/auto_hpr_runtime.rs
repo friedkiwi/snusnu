@@ -40,7 +40,10 @@ use crate::{
     publication::EeOwnerExport,
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
     runtime::LlcPeer,
-    session_switch::{SessionSwitch, SwitchError, HPR_ADAPTER, LOCAL_ADAPTER, WS_ADAPTER},
+    session_switch::{
+        ee_bridge as ee_session_bridge, SessionSwitch, SwitchError, HPR_ADAPTER, LOCAL_ADAPTER,
+        WS_ADAPTER,
+    },
     STOP,
 };
 use router_core::{
@@ -264,6 +267,7 @@ pub(crate) struct DirectHprRuntime<'a> {
     pending_reciprocal_reply_bytes: usize,
     switch: SessionSwitch,
     sessions: BTreeMap<u64, ActiveHprSession>,
+    ee_handoffs: VecDeque<ReadyLocalHpr>,
     pending_rtp: std::collections::VecDeque<RtpIngress>,
     pending_rtp_bytes: usize,
     next_handle: u64,
@@ -307,6 +311,7 @@ impl<'a> DirectHprRuntime<'a> {
             pending_reciprocal_reply_bytes: 0,
             switch,
             sessions: BTreeMap::new(),
+            ee_handoffs: VecDeque::new(),
             pending_rtp: std::collections::VecDeque::new(),
             pending_rtp_bytes: 0,
             next_handle: 1,
@@ -366,6 +371,17 @@ impl<'a> DirectHprRuntime<'a> {
         let routes = shared.trusted_mptn_routes(runner)?;
         self.local_directory.replace_owner("mptn", routes)?;
         Ok(())
+    }
+
+    pub(crate) fn replace_other_ee_routes(
+        &mut self,
+        routes: Vec<(router_core::session::QualifiedName, Destination)>,
+    ) -> io::Result<()> {
+        self.local_directory.replace_owner("other_ee", routes)
+    }
+
+    pub(crate) fn take_ee_handoffs(&mut self) -> Vec<ReadyLocalHpr> {
+        self.ee_handoffs.drain(..).collect()
     }
 
     pub(crate) fn configure_peer_lus(
@@ -1223,6 +1239,7 @@ impl<'a> DirectHprRuntime<'a> {
         enum Reservation {
             Llc(String, [u8; 6]),
             Mptn(String),
+            Ee,
         }
         let (identity, mut source, target_ee_id, reservation, ordinal) = match ready {
             ReadyLocalHpr::Llc(ready) => (
@@ -1239,6 +1256,11 @@ impl<'a> DirectHprRuntime<'a> {
                 Reservation::Mptn(ready.gateway_id),
                 125,
             ),
+            ReadyLocalHpr::Ee {
+                target_ee_id,
+                identity,
+                source,
+            } => (identity, source, target_ee_id, Reservation::Ee, 124),
         };
         let setup = (|| -> io::Result<(u8, Vec<u8>, [u8; 4], u64)> {
             if self.reverse.is_some()
@@ -1286,6 +1308,7 @@ impl<'a> DirectHprRuntime<'a> {
                 match reservation {
                     Reservation::Llc(id, mac) => shared.release_llc(runner, &id, mac)?,
                     Reservation::Mptn(id) => shared.release_mptn(runner, &id)?,
+                    Reservation::Ee => {}
                 }
                 return Err(error);
             }
@@ -1302,6 +1325,11 @@ impl<'a> DirectHprRuntime<'a> {
                     source_lu = %identity.source_lu, target_lu = %identity.target_lu,
                     handle, "shared MPTN session admitted to EE peer");
                 self.reverse_mptn_reservation = Some(id);
+            }
+            Reservation::Ee => {
+                tracing::info!(target = %target_ee_id,
+                    source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+                    handle, "local EE session admitted to EE peer");
             }
         }
         self.reverse = Some(ReverseRuntime::with_source(
@@ -1602,7 +1630,13 @@ impl<'a> DirectHprRuntime<'a> {
                 }
                 Destination::Ws { hosting_cp, .. }
                 | Destination::Llc { hosting_cp, .. }
-                | Destination::Mptn { hosting_cp, .. } => {
+                | Destination::Mptn { hosting_cp, .. }
+                | Destination::Ee { hosting_cp, .. } => {
+                    if matches!(&destination, Destination::Ee { attachment_id, .. }
+                        if self.ee_attachment_id.as_deref() == Some(attachment_id.as_str()))
+                    {
+                        return Err(protocol("HPR route loops to same EE attachment"));
+                    }
                     DirectRouteSetupService::new_verified_external(
                         self.bootstrap.clone(),
                         target.clone(),
@@ -1614,7 +1648,6 @@ impl<'a> DirectHprRuntime<'a> {
                         16,
                     )
                 }
-                Destination::Ee { .. } => return Err(protocol("HPR route loops to EE carrier")),
             }
             .map_err(|error| protocol(format!("HPR RouteSetup service: {error:?}")))?;
             self.route_setup.insert(target.clone(), service);
@@ -1654,13 +1687,12 @@ impl<'a> DirectHprRuntime<'a> {
             return Ok(false);
         };
         let live = match destination {
-            Destination::Llc { .. } | Destination::Mptn { .. } => {
+            Destination::Llc { .. } | Destination::Mptn { .. } | Destination::Ee { .. } => {
                 self.local_directory.resolve_lu(&target) == Some(destination.clone())
             }
             Destination::Ws { .. } => {
                 self.resolve_route_setup_target(hub, &target).ok().as_ref() == Some(destination)
             }
-            Destination::Ee { .. } => false,
         };
         if !live {
             tracing::warn!(target_lu = %target, pcid = ?request.pcid,
@@ -1706,8 +1738,11 @@ impl<'a> DirectHprRuntime<'a> {
         let Some((target, reply, kind)) = self.route_reply.as_ref() else {
             return Ok(());
         };
-        if let Some(destination @ (Destination::Llc { .. } | Destination::Mptn { .. })) =
-            self.route_targets.get(target)
+        if let Some(
+            destination @ (Destination::Llc { .. }
+            | Destination::Mptn { .. }
+            | Destination::Ee { .. }),
+        ) = self.route_targets.get(target)
         {
             let active_local = self
                 .sessions
@@ -2152,8 +2187,9 @@ impl<'a> DirectHprRuntime<'a> {
         };
         let egress = match &destination {
             Destination::Ws { .. } => WS_ADAPTER,
-            Destination::Llc { .. } | Destination::Mptn { .. } => LOCAL_ADAPTER,
-            Destination::Ee { .. } => return Err(protocol("HPR route loops to EE carrier")),
+            Destination::Llc { .. } | Destination::Mptn { .. } | Destination::Ee { .. } => {
+                LOCAL_ADAPTER
+            }
         };
         self.switch
             .replace_routes(
@@ -2310,7 +2346,24 @@ impl<'a> DirectHprRuntime<'a> {
                     Some(attachment_id.clone()),
                 )
             }
-            Destination::Ee { .. } => unreachable!(),
+            Destination::Ee { attachment_id, .. } => {
+                if self.ee_attachment_id.as_deref() == Some(attachment_id) {
+                    self.switch
+                        .discard_unopened(HPR_ADAPTER, handle)
+                        .map_err(|error| protocol(format!("HPR EE loop rollback: {error:?}")))?;
+                    return Err(protocol("HPR route loops to same EE attachment"));
+                }
+                let (ingress, source) = ee_session_bridge::pair();
+                self.switch
+                    .bind_egress(fabric_id, LOCAL_ADAPTER, handle)
+                    .map_err(|error| protocol(format!("HPR EE bridge bind: {error:?}")))?;
+                self.ee_handoffs.push_back(ReadyLocalHpr::Ee {
+                    target_ee_id: attachment_id.clone(),
+                    identity: identity.clone(),
+                    source: Box::new(source),
+                });
+                (None, Some(HprLocalSession::Ee(ingress)), None)
+            }
         };
         tracing::info!(source_lu = %identity.source_lu, target_lu = %identity.target_lu,
             peer_cp = %self.bootstrap.peer.cp, target_cp = %destination.hosting_cp(),

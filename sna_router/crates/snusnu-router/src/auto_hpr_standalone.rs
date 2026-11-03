@@ -145,7 +145,20 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                     local.replace_ee_records(&export.owner, export.records)?;
                 }
             }
-            directory.replace_owner("ee", ee_routes)?;
+            directory.replace_owner("ee", ee_routes.clone())?;
+            for slot in &mut slots {
+                if let Some(runtime) = slot.active.as_mut() {
+                    runtime.replace_other_ee_routes(
+                        ee_routes
+                            .iter()
+                            .filter(|(_, destination)| {
+                                destination.attachment_id() != slot.attachment.id
+                            })
+                            .cloned()
+                            .collect(),
+                    )?;
+                }
+            }
             let can_accept = slots.iter().any(|slot| {
                 slot.active
                     .as_ref()
@@ -155,6 +168,7 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                 let target = match &ready {
                     ReadyLocalHpr::Llc(source) => &source.target_ee_id,
                     ReadyLocalHpr::Mptn(source) => &source.target_ee_id,
+                    ReadyLocalHpr::Ee { target_ee_id, .. } => target_ee_id,
                 };
                 if let Some(slot) = slots.iter_mut().find(|slot| slot.attachment.id == *target) {
                     if let Some(runtime) = slot.active.as_mut() {
@@ -170,6 +184,7 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                     }
                 }
             }
+            let mut handoffs = Vec::new();
             for slot in &mut slots {
                 if let Some(runtime) = slot.active.as_mut() {
                     let now_us = clock.elapsed().as_micros() as u64;
@@ -180,6 +195,28 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                         config,
                     };
                     runtime.pump(slot.link.link(), None, now_us, Some(&mut access))?;
+                    handoffs.extend(runtime.take_ee_handoffs());
+                }
+            }
+            for ready in handoffs {
+                let ReadyLocalHpr::Ee { target_ee_id, .. } = &ready else {
+                    continue;
+                };
+                if let Some(slot) = slots
+                    .iter_mut()
+                    .find(|slot| slot.attachment.id == *target_ee_id)
+                {
+                    if let Some(runtime) = slot.active.as_mut() {
+                        if let Err(error) = runtime.accept_shared_source(
+                            ready,
+                            slot.link.link(),
+                            &mut shared,
+                            &mut local,
+                        ) {
+                            tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                                "EE bridge source could not enter destination EE session");
+                        }
+                    }
                 }
             }
             thread::sleep(IDLE_POLL);
