@@ -272,7 +272,11 @@ func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) e
 	if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC") == "1" {
 		remoteLU = c.peer.LU
 	}
-	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+remoteLU, 1, 2, instance, token)
+	bindDAF := byte(1)
+	if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC") == "1" {
+		bindDAF = 0 // 5494 first source-assigned LFSID 0200: DAF=SIDL, OAF=SIDH.
+	}
+	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+remoteLU, bindDAF, 2, instance, token)
 	if err != nil {
 		return err
 	}
@@ -457,9 +461,15 @@ func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
 }
 
 func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCircuit, data []byte) error {
+	// The first 5494-assigned source LFSID is 0200. On BIND-direction PIUs
+	// its SIDL is DAF=00 and SIDH is OAF=02; responses reverse the pair.
+	sourceDAF := byte(1)
+	if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_QRMTWSC") == "1" {
+		sourceDAF = 0
+	}
 	switch c.managementPhase {
 	case 1:
-		if len(data) < 37 || data[6] != 0xeb || data[9] != 0x31 || data[2] != 2 || data[3] != 1 {
+		if len(data) < 37 || data[6] != 0xeb || data[9] != 0x31 || data[2] != 2 || data[3] != sourceDAF {
 			return nil
 		}
 		cnos := lu62.CNOS{Service: 2, SessionLimit: 8, SourceWinners: 4, TargetWinners: 4, ModeWidth: 8}
@@ -474,7 +484,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if err != nil {
 			return err
 		}
-		attach := []byte{0x2e, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20, 12, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}
+		attach := []byte{0x2e, 0, sourceDAF, 2, 0, 1, 0x0b, 0x91, 0x20, 12, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}
 		attach = append(attach, gds...)
 		log.Printf("printer probe management CNOS: circuit=%s piu=%x", id, attach)
 		if err := p.sendInformation(id, attach); err != nil {
@@ -488,10 +498,10 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if _, err := lu62.ParseCNOS(data[9:]); err != nil {
 			return err
 		}
-		if err := p.sendInformation(id, []byte{0x2e, 0, 1, 2, 0, 0, 0x83, 1, 0}); err != nil {
+		if err := p.sendInformation(id, []byte{0x2e, 0, sourceDAF, 2, 0, 0, 0x83, 1, 0}); err != nil {
 			return err
 		}
-		if err := p.sendInformation(id, []byte{0x2e, 0, 1, 2, 0, 2, 0x4b, 0x91, 0, 0x70}); err != nil {
+		if err := p.sendInformation(id, []byte{0x2e, 0, sourceDAF, 2, 0, 2, 0x4b, 0x91, 0, 0x70}); err != nil {
 			return err
 		}
 		log.Printf("printer probe management CNOS accepted: circuit=%s", id)
@@ -504,7 +514,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if len(data) != 10 || data[6] != 0x4b || data[9] != 0x70 || !c.peerIPR {
 			return nil
 		}
-		runbind := []byte{0x2f, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}
+		runbind := []byte{0x2f, 0, sourceDAF, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0}
 		runbind = append(runbind, c.fqpcid...)
 		if err := p.sendInformation(id, runbind); err != nil {
 			return err

@@ -176,7 +176,7 @@ must not be counted as evidence that the printer controller session advanced.
 
 A subsequent concentrator-originated source-management BIND reached the
 guest, but was rejected before QRMTWSC CNOS. FID2 address pair `(2,1)` and
-`(2,3)` returned `80040000` (unrecognized destination); `(2,2)` returned
+`(2,3)` returned `80040000` (unknown or missing SLU name); `(2,2)` returned
 `08090000` (mode inconsistency), including with PLU `SNUSNU.PRINTER` and
 SLU `SOLNET.S1054504`. The equal address pair is valid as a wire shape:
 the guest itself sent a BIND using `(2,2)`. These responses do not establish
@@ -408,12 +408,25 @@ QA flag, `SNUSNU_PRINTER_PROBE_PASSIVE_QRMTWSC=1`, accepts that CNOS
 without injecting a controller BIND.
 
 Repeating the post-UNBIND `(2,2)` controller BIND in this confirmed `SVC`
-mode state changed the negative sense to `80040000` (unrecognized
-destination). This indicates that the host did not recognize the BIND's
-destination address after the management UNBIND. The 5494 source
+mode state changed the negative sense to `80040000` (unknown or missing
+SLU name under IBM's Type 2.1 ASM rules). This does not establish that the
+FID2 destination address was wrong. The 5494 source
 SNASVCMG/CNOS session must be
 activated separately; a successful target-side CNOS does not by itself
 allocate its FID2 address. The probe has still received no LU4 BIND or SCS.
+
+The [IBM Type 2.1 format and protocol reference](https://bitsavers.org/pdf/ibm/sna/SC30-3422-0_SNA_Format_and_Protocol_Reference_Manual_-_Architecture_Logic_for_Type_2.1_Nodes_198612.pdf)
+specifies first 5494 source-assigned LFSID `0200`; the BIND-direction TH uses
+DAF `00` and OAF `02`. After sending that address pair, QA still received
+`80040000`. A firmware disassembly check at VG10 image `0x64B3..0x64C2`
+shows why the original 27-byte variable boundary was correct: VG10 copies
+28 template bytes, then overwrites the last template byte with the PLU name
+length at RU offset 27. A trial that incorrectly inserted a 28th fixed wire
+byte returned `08350027`, IBM's invalid BIND parameter at offset `0x27`.
+That trial was reverted. The QA source BIND now uses the observed 5494
+`D0 B3` fixed profile and shorter firmware-shaped user data, but a fresh
+live response is still required. The LLC router's verbose trace confirms
+the earlier trial PIU and guest response traversed both directions.
 
 The [TCP62 transport draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00.txt)
 specifies LU 6.2 application conversion, whereas IBM's

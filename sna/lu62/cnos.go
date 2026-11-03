@@ -110,7 +110,7 @@ func EncodeCNOS(c CNOS) ([]byte, error) {
 // control-operator FMH-5 Attach observed in the 5494 firmware. The caller must have an active management
 // session and must handle pacing, CONFIRM, and the accepted-pending reply.
 func CandidateCNOSAttach(daf, oaf byte, sequence uint16, c CNOS) ([]byte, error) {
-	if daf == 0 || oaf == 0 || daf == oaf || sequence == 0 {
+	if oaf == 0 || sequence == 0 {
 		return nil, ErrCNOS
 	}
 	gds, err := EncodeCNOS(c)
@@ -195,7 +195,7 @@ func (r *CNOSResponder) AcceptAttach(data []byte) ([]byte, error) {
 	p, err := piu.ParseFID2(data)
 	attachLength := cnosAttachLength(p.RU)
 	if err != nil || attachLength == 0 || (p.TH[0] != 0x2c && p.TH[0] != 0x2e) || p.TH[1] != 0 ||
-		p.TH[2] == 0 || p.TH[3] == 0 || p.TH[2] == p.TH[3] ||
+		p.TH[3] == 0 ||
 		p.RH != [3]byte{0x0b, 0x91, 0x20} {
 		return nil, ErrCNOS
 	}

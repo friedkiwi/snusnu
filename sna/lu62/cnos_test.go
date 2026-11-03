@@ -72,3 +72,25 @@ func TestOutboundQRMTWSCCNOSReply(t *testing.T) {
 		t.Fatal("expanded session limit accepted")
 	}
 }
+
+func TestFirst5494SourceCNOSAddress(t *testing.T) {
+	limits, err := New5494ControllerCNOS(56)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := CandidateCNOSAttach(0, 2, 1, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responder, err := NewCNOSResponder("QRMTWSC", 57)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := responder.AcceptAttach(request)
+	if err != nil || reply[2] != 2 || reply[3] != 0 {
+		t.Fatalf("first 5494 source CNOS reply: %x %v", reply, err)
+	}
+	if _, err := ValidateCNOSReply(request, reply); err != nil {
+		t.Fatalf("first 5494 source CNOS validation: %v", err)
+	}
+}
