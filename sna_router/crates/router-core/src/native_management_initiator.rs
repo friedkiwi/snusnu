@@ -75,6 +75,7 @@ pub struct NativeManagementInitiator {
     pending: Vec<u8>,
     peer_cnos_ipr: bool,
     peer_bis_ipr: bool,
+    hpr_response_shape: bool,
 }
 
 fn name(value: &str) -> Result<Vec<u8>, InitiatorError> {
@@ -187,7 +188,15 @@ impl NativeManagementInitiator {
             pending: bind_request,
             peer_cnos_ipr: false,
             peer_bis_ipr: false,
+            hpr_response_shape: false,
         })
+    }
+
+    /// HPR peers can return the negotiated BIND image and an assigned FID5
+    /// session address instead of the fixed FID2 response image. The caller
+    /// must still validate the FID5 address and the response correlation.
+    pub fn accept_hpr_response_shape(&mut self) {
+        self.hpr_response_shape = true;
     }
 
     pub fn phase(&self) -> Phase {
@@ -275,7 +284,7 @@ impl NativeManagementInitiator {
                 self.bind
                     .correlate_positive_response(piu)
                     .map_err(|_| InitiatorError::WrongPeerPiu)?;
-                if piu.get(9..36) != Some(&RESPONSE_FIXED) {
+                if !self.hpr_response_shape && piu.get(9..36) != Some(&RESPONSE_FIXED) {
                     return Err(InitiatorError::WrongPeerPiu);
                 }
                 self.pending = self.build_cnos()?;

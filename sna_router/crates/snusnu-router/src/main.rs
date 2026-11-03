@@ -79,6 +79,8 @@ mod hpr_local_mptn;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Shared local carrier session wrapper.
 mod hpr_local_session;
+#[allow(dead_code)] // Wired into reverse HPR admission in the next change.
+mod hpr_management_initiator;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Live MPTN gateway routes for the EE switch.
 mod hpr_mptn_attachments;
