@@ -37,6 +37,60 @@ pub(crate) struct AuthorizedEeIdentity {
     tower: ControlFlowsTower,
 }
 
+/// A CP owned by this router for an EE adjacency without a concentrator.
+/// Its XID node ID is derived from the configured CP, attachment ID and
+/// local IP, so restarting the process does not change the adjacent node.
+/// Unlike an authenticated upstream assignment, there is no account NETID
+/// restriction on the peer; the peer CP is learned from its validated XID.
+#[derive(Clone, Debug)]
+pub(crate) struct StandaloneEeIdentity {
+    pub(crate) local_cp: QualifiedName,
+    node_id: [u8; 4],
+    link_label: [u8; 2],
+    tower: ControlFlowsTower,
+}
+
+impl StandaloneEeIdentity {
+    pub(crate) fn from_attachment(attachment: &EeConfig) -> io::Result<Self> {
+        let configured = attachment
+            .local_cp
+            .as_deref()
+            .ok_or_else(|| invalid("standalone EE requires local_cp"))?;
+        let local_cp: QualifiedName = configured
+            .parse()
+            .map_err(|_| invalid("invalid standalone EE CP name"))?;
+        let node_id = standalone_node_id(&local_cp, attachment);
+        let label_suffix = label_suffix(node_id);
+        Ok(Self {
+            local_cp,
+            node_id,
+            link_label: [0x80, label_suffix],
+            tower: control_flows_tower(node_id, label_suffix),
+        })
+    }
+
+    pub(crate) fn build_xids(
+        &self,
+        peer_xid: &Xid3,
+        network_node: bool,
+    ) -> io::Result<LocalEeXids> {
+        let peer_cp: QualifiedName = peer_xid
+            .cp_name()
+            .map_err(|_| invalid("invalid EE peer CP"))?
+            .parse()
+            .map_err(|_| invalid("invalid EE peer CP"))?;
+        build_local_xids(
+            &self.local_cp,
+            &peer_cp,
+            self.node_id,
+            self.link_label,
+            &self.tower,
+            peer_xid,
+            network_node,
+        )
+    }
+}
+
 impl AuthorizedEeIdentity {
     /// Returns None until the authenticated concentrator has published the
     /// configured CP. Ambiguous or stale directory entries fail closed.
@@ -64,17 +118,7 @@ impl AuthorizedEeIdentity {
         let router_id = hub.router_id_bytes()?;
         let node_id = stable_node_id(router_id, attachment.id.as_bytes());
         let label_suffix = label_suffix(node_id);
-        let tower = ControlFlowsTower {
-            max_send_packet_size: MAX_SEND_PACKET_SIZE,
-            path_switch_time_ms: 0,
-            mobile: false,
-            multilink_tg: false,
-            arb_mode: ArbMode::Base,
-            cp_nce_instance: node_id,
-            route_setup_nce_instance: node_id,
-            cp_nce_label: vec![0xa4, label_suffix],
-            route_setup_nce_label: vec![0xa4, label_suffix],
-        };
+        let tower = control_flows_tower(node_id, label_suffix);
         Ok(Some(Self {
             local_cp,
             cp_route: reference,
@@ -115,22 +159,88 @@ impl AuthorizedEeIdentity {
                 "EE peer NETID differs from authenticated router NETID",
             ));
         }
-        let tg_number = peer_xid
-            .encode()
-            .map_err(|_| invalid("invalid EE peer XID"))?[16];
-        // Avoid a rare 20-bit node-ID collision with the adjacent guest.
-        // The adjustment is deterministic for this authenticated peer.
-        let node_id = node_id_for_peer(self.node_id, peer_xid.node_id());
-        LocalEeXids::build(
+        build_local_xids(
             &self.local_cp,
             &peer_cp,
-            node_id,
-            tg_number,
+            self.node_id,
             self.link_label,
             &self.tower,
+            peer_xid,
             network_node,
         )
     }
+}
+
+fn control_flows_tower(node_id: [u8; 4], label_suffix: u8) -> ControlFlowsTower {
+    ControlFlowsTower {
+        max_send_packet_size: MAX_SEND_PACKET_SIZE,
+        path_switch_time_ms: 0,
+        mobile: false,
+        multilink_tg: false,
+        arb_mode: ArbMode::Base,
+        cp_nce_instance: node_id,
+        route_setup_nce_instance: node_id,
+        cp_nce_label: vec![0xa4, label_suffix],
+        route_setup_nce_label: vec![0xa4, label_suffix],
+    }
+}
+
+fn build_local_xids(
+    local_cp: &QualifiedName,
+    peer_cp: &QualifiedName,
+    node_id: [u8; 4],
+    link_label: [u8; 2],
+    tower: &ControlFlowsTower,
+    peer_xid: &Xid3,
+    network_node: bool,
+) -> io::Result<LocalEeXids> {
+    let tg_number = peer_xid
+        .encode()
+        .map_err(|_| invalid("invalid EE peer XID"))?[16];
+    let (node_id, tower) = local_profile_for_peer(node_id, tower, peer_xid.node_id());
+    LocalEeXids::build(
+        local_cp,
+        peer_cp,
+        node_id,
+        tg_number,
+        link_label,
+        &tower,
+        network_node,
+    )
+}
+
+fn local_profile_for_peer(
+    node_id: [u8; 4],
+    tower: &ControlFlowsTower,
+    peer_node_id: [u8; 4],
+) -> ([u8; 4], ControlFlowsTower) {
+    // The XID node ID and the two CV61 NCE instances must remain identical
+    // even when avoiding a rare 20-bit collision with the adjacent guest.
+    let node_id = node_id_for_peer(node_id, peer_node_id);
+    let mut tower = tower.clone();
+    tower.cp_nce_instance = node_id;
+    tower.route_setup_nce_instance = node_id;
+    (node_id, tower)
+}
+
+fn standalone_node_id(local_cp: &QualifiedName, attachment: &EeConfig) -> [u8; 4] {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let cp_name = local_cp.to_string();
+    let local_ip = attachment.local_ip.to_string();
+    for byte in b"snusnu-standalone-ee-node-v1"
+        .iter()
+        .chain([0].iter())
+        .chain(cp_name.as_bytes().iter())
+        .chain([0].iter())
+        .chain(attachment.id.as_bytes())
+        .chain([0].iter())
+        .chain(local_ip.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let node = 0xfff0_0000u32 | ((hash as u32 & 0x000f_ffff).max(1));
+    node.to_be_bytes()
 }
 
 /// FNV-1a with a fixed domain tag avoids process-random hash seeds. The XID3
@@ -170,6 +280,13 @@ fn node_id_for_peer(local: [u8; 4], peer: [u8; 4]) -> [u8; 4] {
 mod tests {
     use super::*;
     use router_core::xid3::{ControlVector, Xid3};
+    fn attachment(id: &str, local_cp: Option<&str>) -> EeConfig {
+        let mut source = format!("id = '{id}'\nlocal_ip = '192.0.2.1'\npeer_ip = '192.0.2.2'\n");
+        if let Some(cp) = local_cp {
+            source.push_str(&format!("local_cp = '{cp}'\n"));
+        }
+        toml::from_str(&source).unwrap()
+    }
 
     fn peer_xid(cp: &str, node_id: [u8; 4]) -> Xid3 {
         let mut fixed = [0u8; 29];
@@ -239,9 +356,34 @@ mod tests {
         let identity = identity();
         let peer = peer_xid("SOLNET.SNAB", identity.node_id);
         assert!(identity.build_xids(&peer, true).is_ok());
-        assert_eq!(
-            node_id_for_peer(identity.node_id, peer.node_id()),
-            [0xff, 0xf0, 0, 2]
+        let (node_id, tower) =
+            local_profile_for_peer(identity.node_id, &identity.tower, peer.node_id());
+        assert_eq!(node_id, [0xff, 0xf0, 0, 2]);
+        assert_eq!(tower.cp_nce_instance, node_id);
+        assert_eq!(tower.route_setup_nce_instance, node_id);
+    }
+
+    #[test]
+    fn standalone_identity_is_stable_and_accepts_validated_foreign_netid_peer() {
+        let first =
+            StandaloneEeIdentity::from_attachment(&attachment("ee-a", Some("SOLNET.RTR"))).unwrap();
+        let second =
+            StandaloneEeIdentity::from_attachment(&attachment("ee-a", Some("SOLNET.RTR"))).unwrap();
+        let other =
+            StandaloneEeIdentity::from_attachment(&attachment("ee-b", Some("SOLNET.RTR"))).unwrap();
+        assert_eq!(first.node_id, second.node_id);
+        assert_eq!(first.link_label, second.link_label);
+        assert_ne!(first.node_id, other.node_id);
+        assert!(first
+            .build_xids(&peer_xid("QAALICE.SNAB", [0xff, 0xf0, 0, 2]), true)
+            .is_ok());
+    }
+
+    #[test]
+    fn standalone_identity_requires_explicit_valid_cp() {
+        assert!(StandaloneEeIdentity::from_attachment(&attachment("ee-a", None)).is_err());
+        assert!(
+            StandaloneEeIdentity::from_attachment(&attachment("ee-a", Some("INVALID"))).is_err()
         );
     }
 }
