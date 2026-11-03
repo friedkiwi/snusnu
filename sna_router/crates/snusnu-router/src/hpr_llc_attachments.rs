@@ -33,6 +33,7 @@ struct Attachment {
     probe: Option<HprToLlcProbe>,
     active_user: bool,
     active_cp: Option<QualifiedName>,
+    ready_logged: bool,
     retry_at: Instant,
 }
 
@@ -65,6 +66,7 @@ impl HprLlcAttachments {
                     probe: None,
                     active_user: false,
                     active_cp: None,
+                    ready_logged: false,
                     retry_at: Instant::now(),
                 })
             })
@@ -111,12 +113,22 @@ impl HprLlcAttachments {
                 }
             }
             if let Some(probe) = attachment.probe.as_mut() {
-                if let Err(error) = probe.pump() {
-                    attachment.probe = None;
-                    attachment.retry_at = now + RETRY_DELAY;
-                    tracing::warn!(attachment = %attachment.id, interface = %attachment.interface,
-                        guest_mac = %mac(attachment.guest_mac), expected_cp = %target_cp,
-                        error = %error, "LLC probe lost XID or management proof");
+                match probe.pump() {
+                    Ok(true) if !attachment.ready_logged => {
+                        attachment.ready_logged = true;
+                        tracing::info!(attachment = %attachment.id, interface = %attachment.interface,
+                            guest_mac = %mac(attachment.guest_mac), verified_cp = %target_cp,
+                            "LLC attachment verified for HPR local routes");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        attachment.probe = None;
+                        attachment.ready_logged = false;
+                        attachment.retry_at = now + RETRY_DELAY;
+                        tracing::warn!(attachment = %attachment.id, interface = %attachment.interface,
+                            guest_mac = %mac(attachment.guest_mac), expected_cp = %target_cp,
+                            error = %error, "LLC probe lost XID or management proof");
+                    }
                 }
             }
         }
@@ -212,6 +224,7 @@ impl HprLlcAttachments {
         if let Some(attachment) = self.attachments.iter_mut().find(|a| a.id == attachment_id) {
             attachment.active_user = false;
             attachment.active_cp = None;
+            attachment.ready_logged = false;
             attachment.probe = None;
             attachment.retry_at = Instant::now() + RETRY_DELAY;
         }

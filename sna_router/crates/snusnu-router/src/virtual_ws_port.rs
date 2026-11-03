@@ -236,6 +236,17 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 .is_none_or(|management| management.phase() == ResponderPhase::Closed)
     }
 
+    pub(crate) fn management_phases(&self) -> (Option<ManagementPhase>, Option<ResponderPhase>) {
+        (
+            self.management
+                .as_ref()
+                .map(NativeManagementInitiator::phase),
+            self.reciprocal_management
+                .as_ref()
+                .map(ManagementSession::phase),
+        )
+    }
+
     /// Allocate the first user address on this private native association
     /// from the active management BIND address pair. The observed V4R4
     /// profile accepts the next remote address with the same local address;

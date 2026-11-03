@@ -16,7 +16,11 @@ use crate::{
     runtime::{LlcPeer, LlcPort},
     virtual_ws_port::VirtualWsPort,
 };
-use router_core::session::{Flow, QualifiedName, SessionEvent, SessionUnit};
+use router_core::{
+    native_management::Phase as ResponderPhase,
+    native_management_initiator::Phase as ManagementPhase,
+    session::{Flow, QualifiedName, SessionEvent, SessionUnit},
+};
 use transport_ip_sna::{
     anynet::{TcpKind, TcpRecord},
     mptn_compensations::{CompensationSet, TCP62_REQUIRED},
@@ -121,6 +125,7 @@ pub(crate) struct HprToLlcProbe {
     port: VirtualWsPort<LlcPort>,
     source_cp: QualifiedName,
     target_cp: QualifiedName,
+    last_progress: Option<(bool, Option<ManagementPhase>, Option<ResponderPhase>)>,
 }
 
 impl HprToLlcProbe {
@@ -149,12 +154,22 @@ impl HprToLlcProbe {
             port,
             source_cp: source_cp.clone(),
             target_cp: target_cp.clone(),
+            last_progress: None,
         })
     }
 
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
         pump_virtual(&mut self.port)?;
-        Ok(self.port.ready() && self.port.management_complete())
+        let ready = self.port.ready();
+        let phases = self.port.management_phases();
+        let progress = (ready, phases.0, phases.1);
+        if self.last_progress != Some(progress) {
+            tracing::debug!(source_cp = %self.source_cp, target_cp = %self.target_cp,
+                link_ready = ready, management = ?phases.0, reciprocal = ?phases.1,
+                "LLC probe state changed");
+            self.last_progress = Some(progress);
+        }
+        Ok(ready && self.port.management_complete())
     }
 
     pub(crate) fn verified_target_cp(&self) -> Option<&QualifiedName> {
