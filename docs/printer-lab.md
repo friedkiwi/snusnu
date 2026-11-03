@@ -13,8 +13,8 @@ requires an APPC controller and a separate remote workstation controller on
 IBM i. Its LU 6.2 sessions use mode `QRMTWSC`, with a controller-management
 session and printer sessions. A printer device can be `3812` model `1` with
 class `*RMT`, attached to the remote workstation controller. The host sends
-SCS in printer records; [RFC 2877 section 10](https://datatracker.ietf.org/doc/html/rfc2877#section-10)
-documents the related GDS `12A0` pass-through record shape and a print
+SCS in printer records; [RFC 4777 section 11](https://www.rfc-editor.org/rfc/rfc4777.html#section-11)
+documents the related TN5250E GDS `12A0` pass-through record shape and a print
 completion response. [Microsoft's APPC printing documentation](https://learn.microsoft.com/en-us/host-integration-server/core/as-400-appc-printing1)
 describes SCS and optional Host Print Transform. The first implementation
 target is SCS text; an HPT or IPDS stream needs a separate renderer.
@@ -28,12 +28,15 @@ LU 6.2 device session. The service therefore needs both session directions
 and the controller notification before a writer can send spool data.
 
 The transport-independent Go `sna/services/printer` package now parses the
-RFC 2877 printer pass-through record shape and renders common SCS fixed-pitch
+RFC 4777 printer pass-through record shape and renders common SCS fixed-pitch
 text. The pass-through shape has not yet been verified against an actual 5494
 device session; the 5494's encapsulated LU 4 data may require a different
 envelope. The package does not perform APPC session management, store jobs, or
-produce a PDF. The renderer retains no information about font, forms, or
-graphics orders, so raw SCS must be stored with any preview.
+produce a PDF. The concentrator now has owner-scoped durable raw SCS storage,
+a searchable print list, a monospace preview, and a greenbar PDF writer. These
+are not connected to a live 5494 printer conversation yet. The renderer
+retains no information about font, forms, or graphics orders, so raw SCS is
+stored with each preview.
 
 ## V5R4 guest setup and probe
 
@@ -91,7 +94,6 @@ session, including `QRMTWSC` application records.
 3. Add a reusable Go printer conversation in `sna`, then an embedded
    concentrator adapter that stamps the authenticated owner and source CP/LU,
    persists the raw stream, and acknowledges only durably accepted data.
-4. Add per-owner spool listing, monospace preview, and greenbar PDF download.
-5. Print from the guest through AnyNet and LLC separately, capturing each
+4. Print from the guest through AnyNet and LLC separately, capturing each
    router-to-concentrator circuit and confirming the received spool and both
    renderings. Passing APING or `VFYAPPCCNN` alone is insufficient.

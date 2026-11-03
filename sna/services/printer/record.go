@@ -1,5 +1,5 @@
 // Package printer parses SCS and the 5250 printer pass-through records
-// described by RFC 2877. A 5494 uses additional LU 6.2 controller and
+// described by RFC 4777. A 5494 uses additional LU 6.2 controller and
 // device-session protocols; this package does not implement those sessions.
 package printer
 
@@ -26,7 +26,7 @@ const (
 )
 
 // ParseRecord validates the steady-state 5250 printer header documented in
-// RFC 2877 section 10. It accepts one record, not an arbitrary byte stream.
+// RFC 4777 section 11. It accepts one record, not an arbitrary byte stream.
 func ParseRecord(gds []byte) (Record, error) {
 	if len(gds) < 10 || len(gds) > 65535 || int(binary.BigEndian.Uint16(gds[:2])) != len(gds) ||
 		gds[2] != 0x12 || gds[3] != 0xa0 {

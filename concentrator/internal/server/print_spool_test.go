@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/friedkiwi/snusnu/concentrator/internal/store"
@@ -45,5 +47,33 @@ func TestPrintJobStorageUsesAuthenticatedOwner(t *testing.T) {
 	jobs, err = a.DB.ListPrintJobs(context.Background(), other, "", 50, 0)
 	if err != nil || len(jobs) != 0 {
 		t.Fatalf("other owner list: %+v %v", jobs, err)
+	}
+	ownerToken, _, err := a.DB.NewSession(context.Background(), owner, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherToken, _, err := a.DB.NewSession(context.Background(), other, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerCookie := &http.Cookie{Name: "snusnu_session", Value: ownerToken}
+	otherCookie := &http.Cookie{Name: "snusnu_session", Value: otherToken}
+	list := uiGet(t, a, "/prints?q=report", ownerCookie)
+	if list.Code != 200 || !strings.Contains(list.Body.String(), "Guest report") || !strings.Contains(list.Body.String(), "PEERNET.HOST / PRT1") {
+		t.Fatalf("print list: %d %s", list.Code, list.Body.String())
+	}
+	preview := uiGet(t, a, "/prints/"+job.ID, ownerCookie)
+	if preview.Code != 200 || !strings.Contains(preview.Body.String(), "ABC") || !strings.Contains(preview.Body.String(), "Download greenbar PDF") {
+		t.Fatalf("print preview: %d %s", preview.Code, preview.Body.String())
+	}
+	pdf := uiGet(t, a, "/prints/"+job.ID+"/pdf", ownerCookie)
+	if pdf.Code != 200 || !bytes.HasPrefix(pdf.Body.Bytes(), []byte("%PDF-1.4")) {
+		t.Fatalf("print PDF: %d %s", pdf.Code, pdf.Body.String())
+	}
+	for _, path := range []string{"/prints", "/prints/" + job.ID, "/prints/" + job.ID + "/pdf"} {
+		response := uiGet(t, a, path, otherCookie)
+		if strings.Contains(response.Body.String(), "Guest report") || strings.Contains(response.Body.String(), "ABC") || (path != "/prints" && response.Code != 404) {
+			t.Fatalf("other owner path %s: %d %s", path, response.Code, response.Body.String())
+		}
 	}
 }
