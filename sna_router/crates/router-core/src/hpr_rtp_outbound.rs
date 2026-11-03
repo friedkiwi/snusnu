@@ -3,7 +3,7 @@
 
 use crate::{
     hpr_control_bootstrap::HprControlBootstrap,
-    hpr_rtp::RtpPacket,
+    hpr_rtp::{RtpOptionalSegment, RtpPacket},
     hpr_rtp_endpoint::{
         encode_data_nlp, encode_status_nlp, BaseArb, EndpointError, EndpointPath, EndpointReceive,
     },
@@ -44,6 +44,8 @@ pub struct RtpOutboundEndpoint {
     setup_nlp: Option<Vec<u8>>,
     setup_last_sent_us: Option<u64>,
     setup_next_bsn: u32,
+    setup_switching_information: Option<Vec<u8>>,
+    setup_arb: Option<Vec<u8>>,
     pending_status: Option<Vec<u8>>,
     sent_initial_status: Option<Vec<u8>>,
     pending_data: Option<Vec<u8>>,
@@ -59,6 +61,17 @@ pub struct RtpOutboundEndpoint {
 }
 
 impl RtpOutboundEndpoint {
+    fn switching_replay_valid(&self, segments: &[RtpOptionalSegment<'_>]) -> bool {
+        let mut switching = segments.iter().filter(|segment| segment.key == 0x14);
+        match switching.next() {
+            None => true,
+            Some(segment) => {
+                switching.next().is_none()
+                    && self.setup_switching_information.as_deref() == Some(segment.data)
+            }
+        }
+    }
+
     pub fn new(
         bootstrap: HprControlBootstrap,
         tg_number: u8,
@@ -87,6 +100,8 @@ impl RtpOutboundEndpoint {
             setup_nlp: None,
             setup_last_sent_us: None,
             setup_next_bsn: 0,
+            setup_switching_information: None,
+            setup_arb: None,
             pending_status: None,
             sent_initial_status: None,
             pending_data: None,
@@ -190,13 +205,22 @@ impl RtpOutboundEndpoint {
             return Err(EndpointError::TooLarge);
         }
         let packet = RtpPacket::parse(&nlp).map_err(EndpointError::InvalidRtp)?;
-        let segment = packet
+        let segments = packet
             .optional_segments()
-            .map_err(EndpointError::InvalidRtp)?
+            .map_err(EndpointError::InvalidRtp)?;
+        let mut switching = segments.iter().filter(|segment| segment.key == 0x14);
+        let switching_information = switching.next().ok_or(EndpointError::UnsupportedSegment)?;
+        if switching.next().is_some() {
+            return Err(EndpointError::UnsupportedSegment);
+        }
+        let switching_information = switching_information.data.to_vec();
+        let segment = segments
             .into_iter()
             .find(|segment| segment.key == 0x22)
             .ok_or(EndpointError::InvalidArb)?;
         self.arb = Some(BaseArb::from_setup(segment)?);
+        self.setup_arb = Some(segment.data.to_vec());
+        self.setup_switching_information = Some(switching_information);
         self.setup_next_bsn = packet.next_byte_sequence_number();
         self.setup_nlp = Some(nlp.clone());
         Ok(nlp)
@@ -432,7 +456,8 @@ impl RtpOutboundEndpoint {
             .map_err(EndpointError::InvalidRtp)?;
         if segments
             .iter()
-            .any(|s| !matches!(s.key, 0x0e | 0x10 | 0x22))
+            .any(|s| !matches!(s.key, 0x0e | 0x10 | 0x14 | 0x22))
+            || !self.switching_replay_valid(&segments)
             || packet
                 .connection_identifier_exchange()
                 .map_err(EndpointError::InvalidRtp)?
@@ -440,9 +465,19 @@ impl RtpOutboundEndpoint {
         {
             return Err(EndpointError::UnsupportedSegment);
         }
+        let switching_replay = segments.iter().any(|segment| segment.key == 0x14);
         let mut arb = self.arb.unwrap();
-        for segment in segments.iter().filter(|segment| segment.key == 0x22) {
-            arb.observe(*segment)?;
+        if switching_replay {
+            let mut setup_arb = segments.iter().filter(|segment| segment.key == 0x22);
+            if setup_arb.next().map(|segment| segment.data) != self.setup_arb.as_deref()
+                || setup_arb.next().is_some()
+            {
+                return Err(EndpointError::UnsupportedSegment);
+            }
+        } else {
+            for segment in segments.iter().filter(|segment| segment.key == 0x22) {
+                arb.observe(*segment)?;
+            }
         }
         let mut send = self.send.as_ref().unwrap().clone();
         let has_status = segments.iter().any(|segment| segment.key == 0x0e);
@@ -465,7 +500,7 @@ impl RtpOutboundEndpoint {
                 .iter()
                 .any(|fragment| !fragment.data.is_empty() || fragment.end_of_message),
             ReceiveResult::Duplicate => false,
-        };
+        } || (status.is_some() && switching_replay);
         let mut assembly = self.assembly.clone();
         let messages = match delivered {
             ReceiveResult::Delivered(fragments) => assembly
@@ -831,6 +866,94 @@ mod tests {
         nlp.extend_from_slice(&PEER_ASSIGNED.to_be_bytes());
         nlp.extend_from_slice(data);
         nlp
+    }
+
+    fn replay_setup_segments(mut nlp: Vec<u8>, setup: &[u8]) -> Vec<u8> {
+        let setup = RtpPacket::parse(setup).unwrap();
+        let mut replay = Vec::new();
+        for segment in setup.optional_segments().unwrap() {
+            if !matches!(segment.key, 0x14 | 0x22) {
+                continue;
+            }
+            replay.push(((segment.data.len() + 2) / 4) as u8);
+            replay.push(segment.key);
+            replay.extend_from_slice(segment.data);
+        }
+        let packet = RtpPacket::parse(&nlp).unwrap();
+        let nhdr_len = packet.nhdr.len();
+        let offset = packet.thdr.len();
+        nlp.splice(nhdr_len + offset..nhdr_len + offset, replay.iter().copied());
+        nlp[nhdr_len + 9] |= 4;
+        nlp[nhdr_len + 10..nhdr_len + 12]
+            .copy_from_slice(&((offset + replay.len()) as u16 / 4).to_be_bytes());
+        nlp
+    }
+
+    #[test]
+    fn established_switching_status_requires_exact_setup_replay_and_replies_once() {
+        let (mut endpoint, bind) = fixture();
+        let setup = endpoint.prepare_setup(&bind).unwrap();
+        endpoint.confirm_setup_sent(&setup, 10_000).unwrap();
+        let reply = peer_reply(endpoint.setup_next_bsn);
+        let status = endpoint.prepare_reply_status(&reply).unwrap();
+        endpoint.confirm_status_sent(&status).unwrap();
+
+        let ack = encode_status_nlp(
+            ORIGIN & !ASSIGNOR,
+            &EndpointPath {
+                peer_anr_label: vec![0xa4, 0x80],
+                priority: 3,
+            },
+            0,
+            1,
+            0,
+            &crate::hpr_rtp_receive::ReceiveStatus {
+                rseq: endpoint.setup_next_bsn,
+                spans: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+        let replay = replay_setup_segments(ack, &setup);
+        let packet = RtpPacket::parse(&replay).unwrap();
+        assert_eq!(
+            packet
+                .optional_segments()
+                .unwrap()
+                .iter()
+                .filter(|s| s.key == 0x14)
+                .count(),
+            1
+        );
+
+        let mut altered = replay.clone();
+        let switching = altered
+            .windows(2)
+            .position(|window| window == [14, 0x14])
+            .unwrap();
+        altered[switching + 4] ^= 1;
+        assert_eq!(
+            endpoint.receive(&altered),
+            Err(EndpointError::UnsupportedSegment)
+        );
+        let mut altered_arb = replay.clone();
+        let arb = altered_arb
+            .windows(2)
+            .position(|window| window == [5, 0x22])
+            .unwrap();
+        altered_arb[arb + 4] ^= 1;
+        assert_eq!(
+            endpoint.receive(&altered_arb),
+            Err(EndpointError::UnsupportedSegment)
+        );
+        let duplicated = replay_setup_segments(replay.clone(), &setup);
+        assert_eq!(
+            endpoint.receive(&duplicated),
+            Err(EndpointError::UnsupportedSegment)
+        );
+
+        assert!(endpoint.receive(&replay).unwrap().status_due);
+        assert!(!endpoint.receive(&replay).unwrap().status_due);
     }
 
     #[test]
