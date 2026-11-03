@@ -61,6 +61,7 @@ pub fn encode_route_setup_setup(
             topic,
             priority: 3,
             user: false,
+            maximum_packet_size: bootstrap.max_packet_size,
         },
     )
 }
@@ -78,6 +79,8 @@ pub struct UserSetupConfig {
     /// Complete LT-encoded COS/TPF X'2C' vector from the validated route.
     pub cos_tpf: Vec<u8>,
     pub target_lu: String,
+    /// Maximum NLP size granted by the positive RouteSetup reverse path.
+    pub maximum_packet_size: u16,
 }
 
 impl UserSetupConfig {
@@ -107,6 +110,7 @@ struct SetupWire<'a> {
     topic: Vec<u8>,
     priority: u8,
     user: bool,
+    maximum_packet_size: u16,
 }
 
 /// Encode the first RTP NLP, beginning at NHDR, with BSN zero and the whole
@@ -148,6 +152,7 @@ pub fn encode_cp_setup(
             topic,
             priority: 3,
             user: false,
+            maximum_packet_size: bootstrap.max_packet_size,
         },
     )
 }
@@ -199,6 +204,7 @@ pub fn encode_user_setup(
             topic,
             priority,
             user: true,
+            maximum_packet_size: config.maximum_packet_size,
         },
     )
 }
@@ -212,6 +218,9 @@ fn encode_setup(
 ) -> Result<Vec<u8>, OutboundSetupError> {
     if tg_number == 0 {
         return Err(OutboundSetupError::InvalidTg);
+    }
+    if wire.maximum_packet_size == 0 || wire.maximum_packet_size > bootstrap.max_packet_size {
+        return Err(OutboundSetupError::InvalidIdentity);
     }
     if origin_tcid & (ASSIGNOR | RESERVED) != ASSIGNOR || origin_tcid & !(ASSIGNOR | RESERVED) == 0
     {
@@ -242,7 +251,7 @@ fn encode_setup(
 
     let mut si = vec![0, 0x14, 0, 0];
     let mut cv83 = vec![if wire.user { 0xb8 } else { 0xa8 }, 0];
-    cv83.extend_from_slice(&u32::from(bootstrap.max_packet_size).to_be_bytes());
+    cv83.extend_from_slice(&u32::from(wire.maximum_packet_size).to_be_bytes());
     cv83.extend_from_slice(&bootstrap.local.tower.path_switch_time_ms.to_be_bytes());
     cv83.extend_from_slice(&180u32.to_be_bytes());
     cv83.extend_from_slice(&[
@@ -297,7 +306,7 @@ fn encode_setup(
     nlp.extend_from_slice(&[0xff, 0]);
     nlp.extend_from_slice(&thdr);
     nlp.extend_from_slice(bind);
-    if nlp.len() > usize::from(bootstrap.max_packet_size) {
+    if nlp.len() > usize::from(wire.maximum_packet_size) {
         return Err(OutboundSetupError::TooLarge);
     }
     Ok(nlp)
@@ -465,12 +474,25 @@ mod tests {
             peer_link_label: guest.link_label.clone(),
             cos_tpf: cos_tpf.clone(),
             target_lu: "SOLNET.SNAB".into(),
+            maximum_packet_size: bootstrap.max_packet_size,
         };
         // APPN can route a source LU in a different NETID through this CP.
         let bind = user_bind("QAALICE.PING", "SOLNET.SNAB");
         let bytes = encode_user_setup(&bootstrap, 1, ASSIGNOR | 0x1234, &bind, &config).unwrap();
         let packet = RtpPacket::parse(&bytes).unwrap();
         assert_eq!(packet.data, bind);
+        let mut too_small = config.clone();
+        too_small.maximum_packet_size = 100;
+        assert_eq!(
+            encode_user_setup(&bootstrap, 1, ASSIGNOR | 0x1234, &bind, &too_small),
+            Err(OutboundSetupError::TooLarge)
+        );
+        let mut too_large = config.clone();
+        too_large.maximum_packet_size = bootstrap.max_packet_size + 1;
+        assert_eq!(
+            encode_user_setup(&bootstrap, 1, ASSIGNOR | 0x1234, &bind, &too_large),
+            Err(OutboundSetupError::InvalidIdentity)
+        );
         assert_eq!((packet.nhdr[0] >> 1) & 3, 1);
         assert_eq!(
             classify_setup_topic(packet).unwrap(),

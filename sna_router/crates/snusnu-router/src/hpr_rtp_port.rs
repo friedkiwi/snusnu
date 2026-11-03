@@ -1191,6 +1191,7 @@ mod tests {
                     peer_link_label: vec![0x80, 2],
                     cos_tpf: vec![4, 0x2c, 1, 0],
                     target_lu: "SOLNET.APP".into(),
+                    maximum_packet_size: 1461,
                 },
             )
             .unwrap(),

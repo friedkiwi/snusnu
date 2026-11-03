@@ -39,6 +39,7 @@ pub struct RtpOutboundEndpoint {
     local_nce_label: Vec<u8>,
     user_setup: Option<UserSetupConfig>,
     route_setup: bool,
+    max_nlp_bytes: usize,
     phase: OutboundPhase,
     setup_nlp: Option<Vec<u8>>,
     setup_last_sent_us: Option<u64>,
@@ -71,6 +72,7 @@ impl RtpOutboundEndpoint {
             priority: 3,
         };
         let local_nce_label = bootstrap.local.tower.cp_nce_label.clone();
+        let max_nlp_bytes = usize::from(bootstrap.max_packet_size);
         Ok(Self {
             bootstrap,
             tg_number,
@@ -80,6 +82,7 @@ impl RtpOutboundEndpoint {
             local_nce_label,
             user_setup: None,
             route_setup: false,
+            max_nlp_bytes,
             phase: OutboundPhase::Idle,
             setup_nlp: None,
             setup_last_sent_us: None,
@@ -111,6 +114,12 @@ impl RtpOutboundEndpoint {
             .priority()
             .map_err(|_| EndpointError::InvalidConfig)?;
         let mut endpoint = Self::new(bootstrap, tg_number, origin_tcid)?;
+        if config.maximum_packet_size == 0
+            || usize::from(config.maximum_packet_size) > endpoint.max_nlp_bytes
+        {
+            return Err(EndpointError::InvalidConfig);
+        }
+        endpoint.max_nlp_bytes = usize::from(config.maximum_packet_size);
         endpoint.path = EndpointPath {
             peer_anr_label: config.peer_nce_label.clone(),
             priority,
@@ -177,8 +186,7 @@ impl RtpOutboundEndpoint {
             }
         }
         .map_err(|_| EndpointError::InvalidConfig)?;
-        if nlp.len() > usize::from(self.bootstrap.max_packet_size) || first_biu.len() > MAX_MESSAGE
-        {
+        if nlp.len() > self.max_nlp_bytes || first_biu.len() > MAX_MESSAGE {
             return Err(EndpointError::TooLarge);
         }
         let packet = RtpPacket::parse(&nlp).map_err(EndpointError::InvalidRtp)?;
@@ -516,7 +524,7 @@ impl RtpOutboundEndpoint {
             return Err(EndpointError::WrongPhase);
         }
         self.arb.unwrap().check_send_time(now_us)?;
-        if message.is_empty() || message.len() + 38 > usize::from(self.bootstrap.max_packet_size) {
+        if message.is_empty() || message.len() + 38 > self.max_nlp_bytes {
             return Err(EndpointError::TooLarge);
         }
         let nlp = encode_data_nlp(
@@ -527,6 +535,9 @@ impl RtpOutboundEndpoint {
             self.arb.unwrap().measurement_us(now_us),
             None,
         )?;
+        if nlp.len() > self.max_nlp_bytes {
+            return Err(EndpointError::TooLarge);
+        }
         let mut preview = self.send.as_ref().unwrap().clone();
         preview
             .record_transmitted(
@@ -660,7 +671,7 @@ mod tests {
         )
     }
 
-    fn user_fixture() -> (RtpOutboundEndpoint, Vec<u8>) {
+    fn user_fixture_with_limit(maximum_packet_size: u16) -> (RtpOutboundEndpoint, Vec<u8>) {
         let bootstrap = HprControlBootstrap::new(
             ConnectionGeneration::new(1).unwrap(),
             advertisement("SNUSNU.SVC", 2, &[0x80, 0x80], &[0xa4, 0x80]),
@@ -677,6 +688,7 @@ mod tests {
                 0x0c, 0x2c, 1, 8, 0x7b, 0xc3, 0xd6, 0xd5, 0xd5, 0xc5, 0xc3, 0xe3,
             ],
             target_lu: "SOLNET.SNAB".into(),
+            maximum_packet_size,
         };
         let encode_name = |netid: &str, name: &str| {
             let mut result = encode_network_name_component(netid).unwrap();
@@ -706,6 +718,10 @@ mod tests {
             RtpOutboundEndpoint::new_user(bootstrap, 1, ORIGIN, config).unwrap(),
             bind,
         )
+    }
+
+    fn user_fixture() -> (RtpOutboundEndpoint, Vec<u8>) {
+        user_fixture_with_limit(1461)
     }
 
     fn peer_reply(rseq: u32) -> Vec<u8> {
@@ -761,6 +777,38 @@ mod tests {
         assert_eq!(&status[..4], &[0xc2, 8, 0xa4, 1]);
         endpoint.confirm_status_sent(&status).unwrap();
         assert_eq!(endpoint.phase(), OutboundPhase::Active);
+    }
+
+    #[test]
+    fn user_connection_enforces_route_packet_cap_below_xid_cap() {
+        let (mut endpoint, bind) = user_fixture_with_limit(512);
+        let setup = endpoint.prepare_setup(&bind).unwrap();
+        assert!(setup.len() <= 512);
+        endpoint.confirm_setup_sent(&setup, 10_000).unwrap();
+        let reply = encode_setup_reply(
+            ORIGIN,
+            PEER_ASSIGNED,
+            ReplyPath {
+                anr_label: &[0xa4, 0x81],
+                priority: 1,
+            },
+            CallerStatus {
+                sync: 0,
+                echo: 0,
+                rseq: RtpPacket::parse(&setup)
+                    .unwrap()
+                    .next_byte_sequence_number(),
+                outbound_bsn: 0,
+            },
+        )
+        .unwrap();
+        let status = endpoint.prepare_reply_status(&reply).unwrap();
+        endpoint.confirm_status_sent(&status).unwrap();
+        assert_eq!(
+            endpoint.prepare_message(&[0; 500], 20_000),
+            Err(EndpointError::TooLarge)
+        );
+        assert!(endpoint.prepare_message(&[0; 32], 20_000).is_ok());
     }
 
     fn peer_data(data: &[u8]) -> Vec<u8> {
