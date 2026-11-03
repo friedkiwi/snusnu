@@ -1104,6 +1104,13 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 .first()
                 .is_some_and(|remote| remote.id == target.0)
             {
+                if pending_llc_upstream.len() >= MAX_PENDING_HANDOFFS {
+                    tracing::warn!(ingress = %ingress_id.0,
+                        pending = pending_llc_upstream.len(),
+                        "LLC upstream bootstrap queue full; rejecting offer");
+                    listeners[ingress].release(ingress_proxy);
+                    continue;
+                }
                 let result = (|| -> io::Result<()> {
                     let connected = hub.as_deref_mut().ok_or_else(|| {
                         io::Error::new(
