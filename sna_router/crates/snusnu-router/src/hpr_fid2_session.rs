@@ -223,8 +223,17 @@ impl NativeFid2Session {
                 {
                     return Err(invalid("HPR BIND result is not positive"));
                 }
-                validate_positive_response(self.bind_request.as_reduced(), unit.as_reduced())
-                    .map_err(io::Error::other)?;
+                if let Err(error) =
+                    validate_positive_response(self.bind_request.as_reduced(), unit.as_reduced())
+                {
+                    tracing::debug!(
+                        error = %error,
+                        request = format_args!("{:02x?}", self.bind_request.as_reduced()),
+                        response = format_args!("{:02x?}", unit.as_reduced()),
+                        "local FID2 positive BIND negotiation rejected"
+                    );
+                    return Err(io::Error::other(error));
+                }
                 let piu =
                     fixed_bind_response.ok_or_else(|| invalid("native BIND reply missing"))?;
                 if piu.len() < 10
@@ -364,6 +373,28 @@ mod tests {
         reduced[5 + 8..5 + 14].copy_from_slice(&[3, 3, 0x8c, 0x8c, 0x83, 3]);
         reduced[5 + 25] = 0;
         unit(&reduced).unwrap()
+    }
+
+    #[test]
+    fn captured_v4_to_ee_positive_bind_opens_local_fid2_session() {
+        let native = unhex("2d00020200006b800031001307b0b051330383c7c78303060200000000000000944340000cd8c1c1d3c9c3c54be2d5c1c12e0009024040404040404040090301262d1483ba00000d04d8c1c1d3c9c3c54be2d5c1c10a1300b0262d1483ba0000000ad8c1c2d6c24be2d5c1c26015d8e7221f0a553c960cd8c1c1d3c9c3c54be2d5c1c12c0a01087bc3d6d5d5c5c3e3");
+        let (codec, _, _) = NativeFid2Session::from_user_bind(
+            &native,
+            &"QAALICE.SNAA".parse().unwrap(),
+            Some("QABOB.SNAB".parse().unwrap()),
+        )
+        .unwrap();
+        let response = unit(&unhex("0000eb800031001307b0b0513303038c8c830306020000000000000094434000002500090240404040404040400203020b05d8c1c2d6c24be2d5c1c20a1300b0262d1598d5800000006015d8e7221f0a553c960cd8c1c1d3c9c3c54be2d5c1c1")).unwrap();
+        let native_reply = unhex("2d0002020000eb800031");
+        assert!(codec
+            .preview_event(
+                &SessionEvent::BindResult {
+                    accepted: true,
+                    unit: response,
+                },
+                Some(&native_reply),
+            )
+            .is_ok());
     }
 
     #[test]
