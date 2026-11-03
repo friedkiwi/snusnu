@@ -265,7 +265,8 @@ func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) e
 	copy(instance[:], random[:8])
 	var token [7]byte
 	token[0] = 0x23
-	copy(token[1:], random[8:])
+	copy(token[1:5], random[8:12])
+	token[5] = 0x80
 	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+c.peer.CP, 1, 2, instance, token)
 	if err != nil {
 		return err

@@ -13,7 +13,8 @@ var managementRequestFixed = []byte{
 // FID2 association. The caller must generate fresh instance and token bytes,
 // await a correlated positive response, and complete CNOS before user traffic.
 func CandidateManagementBind(localCP, remoteCP string, daf, oaf byte, instance [8]byte, token [7]byte) ([]byte, error) {
-	if daf == 0 || oaf == 0 || instance == [8]byte{} || token[0] != 0x23 || token == [7]byte{0x23} {
+	if daf == 0 || oaf == 0 || instance == [8]byte{} || token[0] != 0x23 || token[5] != 0x80 || token[6] != 0 ||
+		token[1] == 0 && token[2] == 0 && token[3] == 0 && token[4] == 0 {
 		return nil, ErrManagementRequest
 	}
 	local, err := encodeLUName(localCP)

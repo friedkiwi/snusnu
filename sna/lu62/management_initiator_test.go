@@ -4,7 +4,7 @@ import "testing"
 
 func TestCandidateManagementBindCarriesSeparateCPAndLUIdentity(t *testing.T) {
 	instance := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	token := [7]byte{0x23, 9, 10, 11, 12, 13, 14}
+	token := [7]byte{0x23, 9, 10, 11, 12, 0x80, 0}
 	request, err := CandidateManagementBind("SNUSNU.SVC", "SOLNET.PRTGUEST", 1, 2, instance, token)
 	if err != nil {
 		t.Fatal(err)
@@ -19,5 +19,10 @@ func TestCandidateManagementBindCarriesSeparateCPAndLUIdentity(t *testing.T) {
 	}
 	if _, err := CandidateManagementBind("SNUSNU.SVC", "SOLNET.PRTGUEST", 1, 2, [8]byte{}, token); err == nil {
 		t.Fatal("accepted a reused zero instance")
+	}
+	bad := token
+	bad[5] = 0
+	if _, err := CandidateManagementBind("SNUSNU.SVC", "SOLNET.PRTGUEST", 1, 2, instance, bad); err == nil {
+		t.Fatal("accepted a token without the V5R4 source marker")
 	}
 }
