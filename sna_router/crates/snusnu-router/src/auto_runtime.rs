@@ -899,7 +899,14 @@ impl<'a> AutoLocalSessionRunner<'a> {
                     destination_lu = %format!("{}.{}", destination.netid, destination.name),
                     "TCP62 management disclosed local LU reachability");
             }
-            if !management.is_empty() {
+            if !config.ee.is_empty() && !management.is_empty() {
+                if mptn_management.len() == MAX_PENDING_HANDOFFS {
+                    mptn_management.remove(0);
+                    tracing::warn!(
+                        gateway = gateway.id(),
+                        "MPTN management handoff queue full; dropping oldest observation"
+                    );
+                }
                 mptn_management.push((gateway.id().to_owned(), management));
             }
             if let Some(snapshot) = gateway.take_discovery_snapshot() {
