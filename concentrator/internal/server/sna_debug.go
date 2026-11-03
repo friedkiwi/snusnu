@@ -32,6 +32,10 @@ func (h *routerHub) debugCircuitEvent(id string, side int, event *wire.CircuitEv
 	switch value := event.Event.(type) {
 	case *wire.CircuitEvent_Type1:
 		v := value.Type1
+		if v == nil {
+			h.a.debugSNA("circuit=%s side=%d type1=nil", id, side)
+			return
+		}
 		h.a.debugSNA("circuit=%s side=%d type1 kind=%s response=%t poll_final=%t dsap=%d ssap=%d data=%x",
 			id, side, v.Kind, v.Response, v.PollFinal, v.Dsap, v.Ssap, v.Information)
 	case *wire.CircuitEvent_LinkReady:
@@ -44,7 +48,9 @@ func (h *routerHub) debugCircuitEvent(id string, side int, event *wire.CircuitEv
 			h.a.debugSNA("circuit=%s side=%d fid2 th=%x rh=%x ru=%x", id, side, parsed.TH, parsed.RH, parsed.RU)
 		}
 	case *wire.CircuitEvent_SessionEvent:
-		h.a.debugSNA("circuit=%s side=%d session_event=%s", id, side, value.SessionEvent)
+		h.a.debugSNA("circuit=%s side=%d session_event=%v", id, side, value.SessionEvent)
+	default:
+		h.a.debugSNA("circuit=%s side=%d unsupported_event=%T", id, side, event.Event)
 	}
 }
 

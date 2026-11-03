@@ -374,6 +374,7 @@ func (h *routerHub) event(sender *routerSession, event *wire.CircuitEvent) error
 		}
 		return err
 	}
+	h.debugCircuitEvent(id, side, event)
 	if !h.routeValid(c) || !h.allowed(c.source, c.target) {
 		h.resetCircuitValue(id, c, wire.ResetReason_RESET_REASON_ROUTE_GONE, "system", "")
 		c.mu.Unlock()
@@ -441,7 +442,6 @@ func (h *routerHub) event(sender *routerSession, event *wire.CircuitEvent) error
 	c.sent[side] += uint64(cost)
 	c.events[side]++
 	c.lastActivityAt = time.Now()
-	h.debugCircuitEvent(id, side, event)
 	h.debugCircuitState(id, "event_forwarded", c)
 	peer.mu.Lock()
 	queued := uint64(peer.queued[id])
