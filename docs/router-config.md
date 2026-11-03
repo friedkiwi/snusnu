@@ -214,6 +214,22 @@ HPR/IP↔HPR/IP relays EE datagrams. The loader rejects LLC↔HPR/IP routes and 
 
 The [V5R4 EE lab](ee-lab.md) records a complete OS/400 pass-through through this HPR/IP configuration on two isolated TAPs.
 
+For a router that terminates an EE link, `peer_lus` is an optional list of
+qualified LU names hosted by an answer-only peer. It lets the router advertise
+those destinations before that peer initiates a session. Leave it out when the
+peer dials out: a validated BIND identifies its LU. The router checks each
+configured LU's NETID against the peer CP learned from the live XID3 exchange
+before publishing it. XID3 itself identifies the CP but does not list its LUs.
+
+```toml
+[[hpr_ip]]
+id = "ee_a"
+local_ip = "192.0.2.1"
+peer_ip = "192.0.2.11"
+local_cp = "SNUSNU.SVC"
+peer_lus = ["SOLNET.SNAB", "SOLNET.APP1"]
+```
+
 ## Experimental HPR LAN to HPR/IP media route
 
 `[[hpr_lan]]` describes one HPR-capable OS/400 Ethernet peer through AF_PACKET. Its `proxy_mac` is the remote adapter address configured on that guest. Pair it with one `[[hpr_ip]]` port on an IP address assigned to the host. The media adapter code translates HPR LAN UI framing and EE UDP framing while preserving HPR NLP bytes. **The runtime currently rejects this configuration as unsupported** until it can validate XID3 transmission-group agreement across both media before SETMODE. The example records the intended configuration shape for that integration test.

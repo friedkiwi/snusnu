@@ -21,6 +21,7 @@ use crate::{
     auto_hpr_identity::AuthorizedEeIdentity,
     config::RouterConfig,
     ee_ldlc_endpoint::EeLdlcEndpoint,
+    ee_peer_lus::EePeerLus,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
     STOP,
@@ -125,6 +126,7 @@ struct DirectHprRuntime {
     next_handle: u64,
     bound_user_scope: Option<router_core::hpr_session_address::RtpAssociationScope>,
     user_route_authorized: bool,
+    peer_lus: Option<EePeerLus>,
 }
 
 impl DirectHprRuntime {
@@ -151,7 +153,15 @@ impl DirectHprRuntime {
             next_handle: 1,
             bound_user_scope: None,
             user_route_authorized: false,
+            peer_lus: None,
         }
+    }
+
+    fn configure_peer_lus(&mut self, attachment: &crate::config::EeConfig) -> io::Result<()> {
+        let mut peer_lus = EePeerLus::from_attachment(attachment)?;
+        peer_lus.activate(&self.bootstrap.peer.cp);
+        self.peer_lus = Some(peer_lus);
+        Ok(())
     }
 
     fn queue_rtp(&mut self, messages: Vec<RtpIngress>) -> io::Result<()> {
@@ -573,17 +583,31 @@ impl DirectHprRuntime {
         hub: &mut AutoWsHub,
         extra: Option<&SessionIdentity>,
     ) -> io::Result<()> {
-        let identities = self
-            .sessions
-            .values()
-            .map(|session| &session.identity)
-            .chain(extra);
-        let mut cps = HashSet::new();
-        let mut lus = HashSet::new();
-        for identity in identities {
-            if let Some(cp) = identity.source_cp.as_ref() {
-                cps.insert(cp.clone());
-                lus.insert((identity.source_lu.clone(), cp.clone()));
+        let peer_cp = self
+            .peer_lus
+            .as_ref()
+            .and_then(EePeerLus::peer_cp)
+            .cloned()
+            .unwrap_or_else(|| self.bootstrap.peer.cp.clone());
+        let mut cps = HashSet::from([peer_cp.clone()]);
+        let mut lus = self
+            .peer_lus
+            .as_ref()
+            .into_iter()
+            .flat_map(EePeerLus::advertised)
+            .map(|lu| (lu, peer_cp.clone()))
+            .collect::<HashSet<_>>();
+        if self.peer_lus.is_none() {
+            for identity in self
+                .sessions
+                .values()
+                .map(|session| &session.identity)
+                .chain(extra)
+            {
+                if let Some(cp) = identity.source_cp.as_ref() {
+                    cps.insert(cp.clone());
+                    lus.insert((identity.source_lu.clone(), cp.clone()));
+                }
             }
         }
         let mut cps = cps.into_iter().collect::<Vec<_>>();
@@ -654,6 +678,9 @@ impl DirectHprRuntime {
             return Err(protocol(
                 "HPR BIND identity conflicts with authenticated route",
             ));
+        }
+        if let Some(peer_lus) = self.peer_lus.as_mut() {
+            peer_lus.observe(&identity);
         }
         let source_lu = as_wire_name(&identity.source_lu);
         let target_lu = as_wire_name(&identity.target_lu);
@@ -926,11 +953,17 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                 let bootstrap = link
                     .control_bootstrap()?
                     .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
-                active = Some(DirectHprRuntime::new(bootstrap));
+                let mut runtime = DirectHprRuntime::new(bootstrap);
+                runtime.configure_peer_lus(attachment)?;
+                runtime.publish_reachability(hub, None)?;
+                active = Some(runtime);
                 tracing::info!(attachment = %attachment.id, generation = link.generation().get(),
                     peer_cp = ?link.peer_cp(), "HPR EE link activated");
             }
-        } else if active.take().is_some() {
+        } else if let Some(mut runtime) = active.take() {
+            if let Some(peer_lus) = runtime.peer_lus.as_mut() {
+                peer_lus.deactivate();
+            }
             hub.publish_local(&[], &[])?;
             tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
         }

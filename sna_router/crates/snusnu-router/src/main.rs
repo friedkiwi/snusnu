@@ -43,6 +43,8 @@ mod config;
 #[allow(dead_code)] // The EE endpoint is gated until control RTP and APPN are available.
 mod ee_ldlc_endpoint;
 #[cfg(target_os = "linux")]
+mod ee_peer_lus;
+#[cfg(target_os = "linux")]
 mod endpoint;
 #[cfg(target_os = "linux")]
 mod hpr_lan_port;

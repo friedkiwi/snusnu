@@ -123,6 +123,10 @@ pub(crate) struct EeConfig {
     /// be verified against the received directory before XID3 is sent.
     #[serde(default)]
     pub(crate) local_cp: Option<String>,
+    /// Optional LUs hosted by an answer-only peer. A dial-out BIND can teach
+    /// the router other LUs without preconfiguring them here.
+    #[serde(default)]
+    pub(crate) peer_lus: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,6 +685,22 @@ impl RouterConfig {
             kinds.insert(&peer.id, "hpr_ip");
             if let Some(local_cp) = &peer.local_cp {
                 parse_cp(local_cp)?;
+            }
+            if peer.peer_lus.len() > 64 {
+                return Err(invalid(format!(
+                    "HPR/IP peer {} advertises more than 64 LUs",
+                    peer.id
+                )));
+            }
+            let mut peer_lus = HashSet::new();
+            for lu in &peer.peer_lus {
+                let qualified = parse_cp(lu)?;
+                if !peer_lus.insert(qualified) {
+                    return Err(invalid(format!(
+                        "duplicate HPR/IP peer LU {lu} for {}",
+                        peer.id
+                    )));
+                }
             }
             if peer.local_ip == peer.peer_ip
                 || peer.local_ip.is_ipv4() != peer.peer_ip.is_ipv4()
@@ -2255,5 +2275,39 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
         let error = relay.validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("MPTN relay attachments"));
+    }
+
+    #[test]
+    fn optional_hpr_peer_lus_are_qualified_unique_and_bounded() {
+        let ee = "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SNUSNU.SVC'\n";
+        let upstream = "[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n";
+        let configured = parse(&format!(
+            "{ee}peer_lus=['SOLNET.SNAB','SOLNET.APP1']\n{upstream}"
+        ));
+        configured.validate().unwrap();
+        assert_eq!(configured.ee[0].peer_lus.len(), 2);
+
+        let duplicate = parse(&format!(
+            "{ee}peer_lus=['SOLNET.APP1','SOLNET.APP1']\n{upstream}"
+        ));
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate HPR/IP peer LU"));
+
+        let malformed = parse(&format!("{ee}peer_lus=['BAD']\n{upstream}"));
+        assert!(malformed.validate().is_err());
+
+        let many = (0..65)
+            .map(|number| format!("'SOLNET.L{number}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let over_limit = parse(&format!("{ee}peer_lus=[{many}]\n{upstream}"));
+        assert!(over_limit
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("more than 64 LUs"));
     }
 }
