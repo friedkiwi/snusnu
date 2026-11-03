@@ -686,6 +686,14 @@ power-on record would be unsupported.
    The library already has the Reply PSID FID2 encoder and an LU4 actor for
    ACTLU, printer BIND and durably accepted FMD chains. The private outer
    device-session record and a reliable spool completion signal remain open.
+
+The QA-only address-01 handler now uses that LU4 actor, assembles FID3 print
+chains inside `D824`, syncs their SCS bytes to a private partial spool, and
+publishes an owner-scoped job before answering a completed chain with CD.
+Exception-response chains are accepted without an unnecessary positive inner
+response. CD is a candidate job boundary for this probe, not a verified
+separator between two consecutive IBM i spool files. No address-01 chain has
+arrived from the guest yet; the live acceptance result above is unchanged.
 4. Print from the guest through AnyNet and LLC separately, capturing each
    router-to-concentrator circuit and confirming the received spool and both
    renderings. Passing APING or `VFYAPPCCNN` alone is insufficient.

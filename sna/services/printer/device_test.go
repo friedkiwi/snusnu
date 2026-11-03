@@ -105,4 +105,15 @@ func TestLU4DeviceMultiPIUPrintChainWaitsForDurableWrite(t *testing.T) {
 			t.Fatalf("chain response send: phase=%d err=%v", d.Phase(), err)
 		}
 	}
+	// An exception-response chain asks for a response only on failure. It
+	// still has to reach durable storage before the device accepts it.
+	exception := []byte{0x3c, 0xc1, 0x03, 0x90, 0x20, 0xc3, 0x0c}
+	if _, err := d.PrepareFMD(exception, func([]byte) error { return ErrSCS }); err != ErrSCS || d.Phase() != DeviceBound {
+		t.Fatalf("exception-response write failure: phase=%d err=%v", d.Phase(), err)
+	}
+	var stored []byte
+	response, err := d.PrepareFMD(exception, func(data []byte) error { stored = append(stored, data...); return nil })
+	if err != nil || len(response) != 0 || !bytes.Equal(stored, []byte{0xc3, 0x0c}) || d.Phase() != DeviceBound {
+		t.Fatalf("exception-response acceptance: response=%x stored=%x phase=%d err=%v", response, stored, d.Phase(), err)
+	}
 }

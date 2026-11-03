@@ -77,3 +77,40 @@ func TestPrintJobStorageUsesAuthenticatedOwner(t *testing.T) {
 		}
 	}
 }
+
+func TestPrinterSpoolPublishesOnlyAfterCompleteTurn(t *testing.T) {
+	a := testApp(t)
+	owner := store.RandomUUID()
+	if _, err := a.DB.Exec(context.Background(), "INSERT INTO users(id,email,password_hash,role,verified_at,netid) VALUES(?,?,?,'user',?,?)", owner, owner+"@example.test", "unused", store.Now(), ""); err != nil {
+		t.Fatal(err)
+	}
+	source := LocalPeer{RouterID: store.RandomUUID(), OwnerID: owner, NetID: "PEERNET", CP: "HOST", LU: "PRT1"}
+	var spool probePrinterSpool
+	t.Cleanup(spool.close)
+	first := []byte{0x34, 0xc4, 1, 0xc1}
+	last := []byte{0xc2, 0xc3, 0x0c}
+	if err := spool.append(a.printDir, first); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := a.DB.ListPrintJobs(context.Background(), owner, "", 50, 0)
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("incomplete spool published: %+v %v", jobs, err)
+	}
+	if err := spool.append(a.printDir, last); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.finish(context.Background(), a, source); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err = a.DB.ListPrintJobs(context.Background(), owner, "", 50, 0)
+	if err != nil || len(jobs) != 1 || jobs[0].DeviceName != "SNUPRT01" || jobs[0].SourceLU != "PRT1" {
+		t.Fatalf("completed spool metadata: %+v %v", jobs, err)
+	}
+	_, raw, err := a.readPrintJob(context.Background(), owner, jobs[0].ID)
+	if err != nil || !bytes.Equal(raw, append(first, last...)) {
+		t.Fatalf("assembled spool: %x %v", raw, err)
+	}
+	if spool.path != "" || spool.file != nil || spool.size != 0 {
+		t.Fatalf("partial spool retained: %+v", spool)
+	}
+}

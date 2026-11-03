@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"log"
@@ -20,6 +21,7 @@ import (
 
 type printerProbeCircuit struct {
 	peer              sna.Peer
+	source            LocalPeer
 	xid               *xid3.Activation
 	profile           wire.CircuitProfile
 	allowance         uint64
@@ -31,6 +33,9 @@ type printerProbeCircuit struct {
 	management        *lu62.ManagementSession
 	fqpcid            []byte
 	peerIPR           bool
+	device            *printer.LU4Device
+	chain             *printer.ChainAssembler
+	spool             probePrinterSpool
 }
 
 type localPrinterProbe struct {
@@ -112,6 +117,7 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 	defer func() { p.hub.a.debugSNA("printer probe circuit=%s after_event state=%+v xid=%+v", id, c, c.xid) }()
 	if envelope.GetCircuitClose() != nil || envelope.GetCircuitReset() != nil {
 		log.Printf("printer probe circuit closed: %s", id)
+		c.spool.close()
 		delete(p.circuits, id)
 		return
 	}
@@ -155,6 +161,7 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 	}
 	if err != nil {
 		log.Printf("printer probe circuit %s error: %v", id, err)
+		c.spool.close()
 		delete(p.circuits, id)
 		p.hub.resetCircuit(id, wire.ResetReason_RESET_REASON_PROTOCOL)
 	}
@@ -179,7 +186,7 @@ func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source Local
 	if err != nil {
 		return
 	}
-	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC, allowance: 1500, initiated: true}
+	p.circuits[id] = &printerProbeCircuit{peer: peer, source: source, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC, allowance: 1500, initiated: true}
 }
 
 func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
@@ -200,7 +207,7 @@ func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
 		log.Printf("printer probe activation: %v", err)
 		return
 	}
-	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: open.Profile, allowance: 1500}
+	p.circuits[id] = &printerProbeCircuit{peer: peer, source: source, xid: xid, profile: open.Profile, allowance: 1500}
 	if err := p.hub.decision(p.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Accept: true, ReceiveAllowanceBytes: 1500}); err != nil {
 		delete(p.circuits, id)
 		return
@@ -641,7 +648,13 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			return p.sendInformation(id, response)
 		}
 		inner, err := printer.ParseControllerDeviceGDS(outer.RU)
-		if err != nil || (inner.Address != 56 && inner.Address != 1) || len(inner.RU) < 3 {
+		if err != nil || (inner.Address != 56 && inner.Address != 1) || len(inner.RU) == 0 {
+			return nil
+		}
+		if inner.Address == 1 {
+			return p.printerDeviceInformation(id, c, outer, inner)
+		}
+		if len(inner.RU) < 3 {
 			return nil
 		}
 		var ru []byte
@@ -695,4 +708,64 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		return p.sendInformation(id, packet)
 	}
 	return nil
+}
+
+func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeCircuit, outer piu.FID2, inner printer.LU4PIU) error {
+	if c.device == nil {
+		device, err := printer.NewLU4Device(1, 0x86)
+		if err != nil {
+			return err
+		}
+		c.device = device
+	}
+	var responseBytes []byte
+	var err error
+	if c.device.Phase() == printer.DeviceBound {
+		if c.chain == nil {
+			c.chain, err = printer.NewChainAssembler(printer.MaxJobBytes)
+			if err != nil {
+				return err
+			}
+		}
+		scs, complete, err := c.chain.Feed(inner)
+		if err != nil || !complete {
+			return err
+		}
+		responseBytes, err = c.device.PrepareFMDChain(outer.RU[4:], scs, func(data []byte) error {
+			if err := c.spool.append(p.hub.a.printDir, data); err != nil {
+				return err
+			}
+			if inner.RH[2]&0x20 != 0 {
+				return c.spool.finish(context.Background(), p.hub.a, c.source)
+			}
+			return nil
+		})
+	} else {
+		responseBytes, err = c.device.Prepare(outer.RU[4:])
+	}
+	if err != nil {
+		return err
+	}
+	if len(responseBytes) == 0 {
+		log.Printf("printer probe LU4 chain accepted without positive response: circuit=%s", id)
+		return nil
+	}
+	response, err := printer.ParseLU4PIU(responseBytes)
+	if err != nil {
+		return err
+	}
+	gds, err := printer.EncodeControllerDeviceGDS(response)
+	if err != nil {
+		return err
+	}
+	reply := piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}
+	packet, err := reply.Bytes()
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe LU4 response: circuit=%s phase=%d piu=%x", id, c.device.Phase(), packet)
+	if err := p.sendInformation(id, packet); err != nil {
+		return err
+	}
+	return c.device.MarkSent(responseBytes)
 }

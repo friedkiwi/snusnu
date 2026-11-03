@@ -30,7 +30,7 @@ type LU4Device struct {
 	pending []byte
 }
 
-// PrepareFMD accepts a one-PIU, definite-response printer data chain.
+// PrepareFMD accepts a one-PIU printer data chain.
 // For a multi-PIU chain, use ChainAssembler and PrepareFMDChain.
 func (d *LU4Device) PrepareFMD(input []byte, appendSCS func([]byte) error) ([]byte, error) {
 	p, err := ParseLU4PIU(input)
@@ -43,6 +43,7 @@ func (d *LU4Device) PrepareFMD(input []byte, appendSCS func([]byte) error) ([]by
 // PrepareFMDChain accepts a completed printer data chain. last is its final
 // FID3 PIU and scs is the RU assembled by ChainAssembler. appendSCS must
 // durably accept the raw bytes before a positive response can be returned.
+// For exception-response requests, it returns no response after acceptance.
 // The caller owns LU 6.2 sequence deduplication and spool-job boundaries.
 func (d *LU4Device) PrepareFMDChain(last, scs []byte, appendSCS func([]byte) error) ([]byte, error) {
 	if d == nil || d.phase != DeviceBound || len(d.pending) != 0 || appendSCS == nil {
@@ -57,16 +58,22 @@ func (d *LU4Device) PrepareFMDChain(last, scs []byte, appendSCS func([]byte) err
 		(p.RH[0]&3 == 1 && len(scs) <= len(p.RU)) {
 		return nil, ErrDeviceState
 	}
-	response, err := PositiveLU4Response(p, nil)
-	if err != nil {
-		return nil, err
-	}
-	encoded, err := response.Encode()
-	if err != nil {
-		return nil, err
+	var encoded []byte
+	if p.RH[1]&0x10 == 0 {
+		response, err := PositiveLU4Response(p, nil)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err = response.Encode()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := appendSCS(append([]byte(nil), scs...)); err != nil {
 		return nil, err
+	}
+	if len(encoded) == 0 {
+		return nil, nil
 	}
 	d.pending = encoded
 	d.phase = DeviceAwaitDataAck
