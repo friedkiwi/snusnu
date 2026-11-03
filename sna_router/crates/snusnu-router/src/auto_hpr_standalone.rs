@@ -110,7 +110,7 @@ fn run_link<'a>(
             if let Some(runtime) = active.as_mut() {
                 let now_us = clock.elapsed().as_micros() as u64;
                 runtime.tick(link.link(), now_us)?;
-                runtime.pump(link.link(), None, now_us)?;
+                runtime.pump(link.link(), None, now_us, None)?;
             } else {
                 local.poll_idle()?;
             }

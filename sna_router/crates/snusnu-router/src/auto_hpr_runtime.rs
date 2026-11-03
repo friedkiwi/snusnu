@@ -24,6 +24,7 @@ use crate::{
     auto_hpr_identity::AuthorizedEeIdentity,
     auto_hpr_local_ingress::LocalToHprRuntime,
     auto_hpr_reverse_runtime::ReverseRuntime,
+    auto_runtime::AutoLocalSessionRunner,
     config::RouterConfig,
     ee_ldlc_endpoint::EeLdlcEndpoint,
     ee_peer_lus::EePeerLus,
@@ -33,6 +34,7 @@ use crate::{
     hpr_local_session_runner::HprLocalSessionRunner,
     hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
+    hpr_shared_local::{HprSharedLocal, ReadyLocalHpr},
     llc_session_ws::LlcSessionWs,
     publication::EeOwnerExport,
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
@@ -191,6 +193,11 @@ struct ActiveHprSession {
     pending_local_grant: bool,
 }
 
+pub(crate) struct SharedLocalAccess<'a, 'b> {
+    shared: &'a mut HprSharedLocal,
+    runner: &'a mut AutoLocalSessionRunner<'b>,
+}
+
 pub(crate) struct DirectHprRuntime<'a> {
     bootstrap: HprControlBootstrap,
     rtp: HprRtpPort,
@@ -223,6 +230,7 @@ pub(crate) struct DirectHprRuntime<'a> {
     reverse_local_reservation: Option<(String, [u8; 6])>,
     reverse_mptn_reservation: Option<String>,
     local_ws: Vec<LlcSessionWs>,
+    shared_publication: bool,
 }
 
 impl<'a> DirectHprRuntime<'a> {
@@ -263,7 +271,12 @@ impl<'a> DirectHprRuntime<'a> {
             reverse_local_reservation: None,
             reverse_mptn_reservation: None,
             local_ws: Vec::new(),
+            shared_publication: false,
         }
+    }
+
+    fn use_shared_publication(&mut self) {
+        self.shared_publication = true;
     }
 
     pub(crate) fn configure_peer_lus(
@@ -638,6 +651,7 @@ impl<'a> DirectHprRuntime<'a> {
         link: &EeLdlcEndpoint,
         mut hub: Option<&mut AutoWsHub>,
         now_us: u64,
+        mut shared: Option<&mut SharedLocalAccess<'_, '_>>,
     ) -> io::Result<()> {
         self.pump_local_llc()?;
         self.pump_local_mptn(link)?;
@@ -686,7 +700,9 @@ impl<'a> DirectHprRuntime<'a> {
                 RtpIngressKind::RouteSetup => {
                     self.route_message(link, hub.as_deref(), &message, now_us)
                 }
-                RtpIngressKind::User => self.user_message(hub.as_deref_mut(), &message),
+                RtpIngressKind::User => {
+                    self.user_message(hub.as_deref_mut(), &message, shared.as_deref_mut())
+                }
                 RtpIngressKind::CpSvcMg => self.cp_message(&message),
                 RtpIngressKind::CpSvcMgOut => self.reciprocal_cp_message(&message),
                 RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => self
@@ -709,18 +725,24 @@ impl<'a> DirectHprRuntime<'a> {
             self.try_reciprocal_replies(link, now_us)?;
             self.try_external_management_replies(link, now_us)?;
         }
-        self.pump_sessions(link, hub, now_us)?;
+        self.pump_sessions(link, hub, now_us, shared.as_deref_mut())?;
         if let Some(reverse) = self.reverse.as_mut() {
             reverse.pump(link, &mut self.rtp, &mut self.switch, now_us)?;
             if reverse.is_done() {
                 self.reverse = None;
                 if let Some((ingress_id, proxy_mac)) = self.reverse_local_reservation.take() {
-                    if let Some(local_ingress) = self.local_ingress.as_mut() {
+                    if let Some(access) = shared.as_deref_mut() {
+                        access
+                            .shared
+                            .release_llc(access.runner, &ingress_id, proxy_mac)?;
+                    } else if let Some(local_ingress) = self.local_ingress.as_mut() {
                         local_ingress.release(&ingress_id, proxy_mac)?;
                     }
                 }
                 if let Some(gateway_id) = self.reverse_mptn_reservation.take() {
-                    if let Some(mptn) = self.mptn.as_mut() {
+                    if let Some(access) = shared {
+                        access.shared.release_mptn(access.runner, &gateway_id)?;
+                    } else if let Some(mptn) = self.mptn.as_mut() {
                         mptn.release(&gateway_id);
                     }
                 }
@@ -906,6 +928,118 @@ impl<'a> DirectHprRuntime<'a> {
         self.reverse = Some(ReverseRuntime::with_source(
             ready.identity,
             ready.source,
+            LOCAL_ADAPTER,
+            self.bootstrap.clone(),
+            handle,
+            tg,
+            reciprocal_nonce().to_be_bytes(),
+            label,
+            instance,
+            router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            },
+        ));
+        Ok(())
+    }
+
+    /// Admit one source selected by the shared LLC/TCP62 socket owner. Its
+    /// reservation is released on every failed admission path.
+    pub(crate) fn accept_shared_source(
+        &mut self,
+        ready: ReadyLocalHpr,
+        link: &EeLdlcEndpoint,
+        shared: &mut HprSharedLocal,
+        runner: &mut AutoLocalSessionRunner<'_>,
+    ) -> io::Result<()> {
+        enum Reservation {
+            Llc(String, [u8; 6]),
+            Mptn(String),
+        }
+        let (identity, mut source, target_ee_id, reservation, ordinal) = match ready {
+            ReadyLocalHpr::Llc(ready) => (
+                ready.identity,
+                ready.source,
+                ready.target_ee_id,
+                Reservation::Llc(ready.ingress_id, ready.proxy_mac),
+                126,
+            ),
+            ReadyLocalHpr::Mptn(ready) => (
+                ready.identity,
+                ready.source,
+                ready.target_ee_id,
+                Reservation::Mptn(ready.gateway_id),
+                125,
+            ),
+        };
+        let setup = (|| -> io::Result<(u8, Vec<u8>, [u8; 4], u64)> {
+            if self.reverse.is_some()
+                || !self
+                    .reciprocal_cp
+                    .as_ref()
+                    .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "EE reverse route busy",
+                ));
+            }
+            if self.ee_attachment_id.as_deref() != Some(&target_ee_id) {
+                return Err(protocol("local source selected another EE attachment"));
+            }
+            let tg = link
+                .tg_number()
+                .ok_or_else(|| protocol("active EE link has no TG"))?;
+            let (label, instance) = target_nce(
+                &self.bootstrap.local.tower.route_setup_nce_label,
+                self.bootstrap.local.tower.route_setup_nce_instance,
+                ordinal,
+            )?;
+            self.switch
+                .replace_routes(
+                    HPR_ADAPTER,
+                    vec![Reachability {
+                        lu: Some(identity.target_lu.clone()),
+                        cp: identity.target_cp.clone(),
+                    }],
+                )
+                .map_err(|error| protocol(format!("local EE route admission: {error:?}")))?;
+            let handle = self.next_handle;
+            self.next_handle = self
+                .next_handle
+                .checked_add(1)
+                .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+            Ok((tg, label, instance, handle))
+        })();
+        let (tg, label, instance, handle) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = source.close();
+                match reservation {
+                    Reservation::Llc(id, mac) => shared.release_llc(runner, &id, mac)?,
+                    Reservation::Mptn(id) => shared.release_mptn(runner, &id)?,
+                }
+                return Err(error);
+            }
+        };
+        match reservation {
+            Reservation::Llc(id, mac) => {
+                tracing::info!(ingress = %id, target = %target_ee_id,
+                    source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+                    handle, "shared LLC session admitted to EE peer");
+                self.reverse_local_reservation = Some((id, mac));
+            }
+            Reservation::Mptn(id) => {
+                tracing::info!(gateway = %id, target = %target_ee_id,
+                    source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+                    handle, "shared MPTN session admitted to EE peer");
+                self.reverse_mptn_reservation = Some(id);
+            }
+        }
+        self.reverse = Some(ReverseRuntime::with_source(
+            identity,
+            source,
             LOCAL_ADAPTER,
             self.bootstrap.clone(),
             handle,
@@ -1341,6 +1475,7 @@ impl<'a> DirectHprRuntime<'a> {
         &mut self,
         hub: Option<&mut AutoWsHub>,
         message: &RtpIngress,
+        shared: Option<&mut SharedLocalAccess<'_, '_>>,
     ) -> io::Result<()> {
         let fid5 = Fid5WholeBiu::parse_complete(&message.bytes)
             .map_err(|error| protocol(format!("invalid HPR user BIU: {error:?}")))?;
@@ -1399,7 +1534,7 @@ impl<'a> DirectHprRuntime<'a> {
                     "conflicting HPR BIND peer session address={peer_sa:016x}"
                 )));
             }
-            self.start_user_session(hub, message)?;
+            self.start_user_session(hub, message, shared)?;
             return Ok(());
         }
         let handle = u64::from_be_bytes(fid5.session_address);
@@ -1554,6 +1689,9 @@ impl<'a> DirectHprRuntime<'a> {
         hub: &mut AutoWsHub,
         extra: Option<&SessionIdentity>,
     ) -> io::Result<()> {
+        if self.shared_publication {
+            return Ok(());
+        }
         let mut cps = HashSet::new();
         let mut lus = HashSet::new();
         for record in self.ee_owner_export().records {
@@ -1607,6 +1745,7 @@ impl<'a> DirectHprRuntime<'a> {
         &mut self,
         mut hub: Option<&mut AutoWsHub>,
         message: &RtpIngress,
+        mut shared: Option<&mut SharedLocalAccess<'_, '_>>,
     ) -> io::Result<()> {
         if self.sessions.len() >= MAX_ACTIVE_HPR_SESSIONS {
             return Err(io::Error::new(
@@ -1803,16 +1942,25 @@ impl<'a> DirectHprRuntime<'a> {
                 )
             }
             Destination::Mptn { attachment_id, .. } => {
-                let session = self
-                    .mptn
-                    .as_mut()
-                    .ok_or_else(|| protocol("HPR local MPTN attachments unavailable"))?
-                    .take_session(
+                let session = if let Some(access) = shared.as_deref_mut() {
+                    access.shared.take_mptn_session(
+                        access.runner,
                         attachment_id,
                         &identity,
                         &bind_request,
                         Duration::from_secs(10),
-                    );
+                    )
+                } else {
+                    self.mptn
+                        .as_mut()
+                        .ok_or_else(|| protocol("HPR local MPTN attachments unavailable"))?
+                        .take_session(
+                            attachment_id,
+                            &identity,
+                            &bind_request,
+                            Duration::from_secs(10),
+                        )
+                };
                 let session =
                     match session {
                         Ok(Some(session)) => session,
@@ -1833,7 +1981,11 @@ impl<'a> DirectHprRuntime<'a> {
                         }
                     };
                 if let Err(error) = self.switch.bind_egress(fabric_id, LOCAL_ADAPTER, handle) {
-                    self.mptn.as_mut().unwrap().release(attachment_id);
+                    if let Some(access) = shared {
+                        access.shared.release_mptn(access.runner, attachment_id)?;
+                    } else {
+                        self.mptn.as_mut().unwrap().release(attachment_id);
+                    }
                     self.switch
                         .discard_unopened(HPR_ADAPTER, handle)
                         .map_err(|failure| {
@@ -1887,6 +2039,7 @@ impl<'a> DirectHprRuntime<'a> {
         link: &EeLdlcEndpoint,
         mut hub: Option<&mut AutoWsHub>,
         now_us: u64,
+        mut shared: Option<&mut SharedLocalAccess<'_, '_>>,
     ) -> io::Result<()> {
         let handles = self.sessions.keys().copied().collect::<Vec<_>>();
         for handle in handles {
@@ -1904,7 +2057,9 @@ impl<'a> DirectHprRuntime<'a> {
                     let mptn_gateway = local.mptn_gateway_id().map(str::to_owned);
                     let close_result = local.close();
                     if let Some(gateway_id) = mptn_gateway {
-                        if let Some(mptn) = self.mptn.as_mut() {
+                        if let Some(access) = shared.as_deref_mut() {
+                            access.shared.release_mptn(access.runner, &gateway_id)?;
+                        } else if let Some(mptn) = self.mptn.as_mut() {
                             mptn.release(&gateway_id);
                         }
                     } else if let Some(attachment_id) = session.local_attachment_id.as_deref() {
@@ -2324,7 +2479,7 @@ fn run_connected(
             if let Some(runtime) = active.as_mut() {
                 runtime.tick(ee.link(), ee.elapsed().as_micros() as u64)?;
                 let started = Instant::now();
-                runtime.pump(ee.link(), Some(hub), ee.elapsed().as_micros() as u64)?;
+                runtime.pump(ee.link(), Some(hub), ee.elapsed().as_micros() as u64, None)?;
                 let elapsed = started.elapsed();
                 if elapsed > Duration::from_millis(500) {
                     tracing::warn!(attachment = %attachment.id,
