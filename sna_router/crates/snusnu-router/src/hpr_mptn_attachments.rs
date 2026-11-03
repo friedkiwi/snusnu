@@ -431,8 +431,12 @@ impl Attachment<'_> {
         let worker = thread::Builder::new()
             .name("sna-mptn-management-probe".into())
             .spawn(move || {
-                let result =
-                    endpoint.establish_v5_management(Duration::from_secs(5), &source, &target);
+                let result = endpoint.establish_v5_management(
+                    Duration::from_secs(5),
+                    &source,
+                    &target,
+                    None,
+                );
                 let _ = sender.send(result);
             })?;
         self.probe_result = Some(receiver);

@@ -219,6 +219,7 @@ pub(crate) fn run_once(config: &ReverseLlcConfig) -> io::Result<()> {
         config.timeout.min(Duration::from_secs(5)),
         &config.source_lu,
         &config.destination_lu,
+        None,
     )?;
     tracing::debug!(peer_ip = %config.endpoint.peer_ip, source_lu = %config.source_lu, destination_lu = %config.destination_lu, "MPTN management complete");
     let xid = config
@@ -397,6 +398,7 @@ pub(crate) fn run_with_native(
         timeout.min(Duration::from_secs(5)),
         &management_plu,
         &management_slu,
+        None,
     )?;
     tracing::info!(interface, peer_ip = %endpoint.peer_ip, management_plu, management_slu,
         "automatic LLC to MPTN management established");

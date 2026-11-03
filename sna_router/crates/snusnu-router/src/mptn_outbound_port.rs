@@ -321,6 +321,7 @@ impl OutboundEndpoint {
         timeout: Duration,
         local_lu: &str,
         remote_lu: &str,
+        mode: Option<&str>,
     ) -> io::Result<()> {
         let mut entropy = [0u8; 20];
         File::open("/dev/urandom")?.read_exact(&mut entropy)?;
@@ -338,8 +339,8 @@ impl OutboundEndpoint {
             fqpcid,
             entropy[8..16].try_into().expect("eight random bytes"),
             bind_token,
-            "",
-            8,
+            mode.unwrap_or(""),
+            if mode == Some("QRMTWSC") { 57 } else { 8 },
         )?;
         let mut stream = self.dial_stream(397, timeout)?;
         stream.set_read_timeout(Some(timeout))?;

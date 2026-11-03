@@ -159,10 +159,10 @@ fn decode_mode(bytes: &[u8]) -> Result<String, CnosError> {
             return Err(CnosError::InvalidStructure);
         }
         let character = match byte {
-            0xc1..=0xc9 => b'A' + byte - 0xc1,
-            0xd1..=0xd9 => b'J' + byte - 0xd1,
-            0xe2..=0xe9 => b'S' + byte - 0xe2,
-            0xf0..=0xf9 => b'0' + byte - 0xf0,
+            0xc1..=0xc9 => b'A' + (byte - 0xc1),
+            0xd1..=0xd9 => b'J' + (byte - 0xd1),
+            0xe2..=0xe9 => b'S' + (byte - 0xe2),
+            0xf0..=0xf9 => b'0' + (byte - 0xf0),
             0x7c => b'@',
             0x7b => b'#',
             0x5b => b'$',
@@ -302,6 +302,20 @@ mod tests {
         responder.mark_completed().unwrap();
         assert_eq!(responder.state(), ExchangeState::Complete);
         assert_eq!(responder.mark_completed(), Err(CnosError::UnexpectedState));
+    }
+
+    #[test]
+    fn qrmtwsc_round_trip_preserves_named_mode_and_5494_limits() {
+        let request = CnosGds {
+            service: Service::Request,
+            modifier: 0,
+            session_limit: 57,
+            source_winners: 1,
+            target_winners: 56,
+            mode: "QRMTWSC".into(),
+            mode_field_length: 8,
+        };
+        assert_eq!(CnosGds::decode(&request.encode().unwrap()), Ok(request));
     }
 
     #[test]

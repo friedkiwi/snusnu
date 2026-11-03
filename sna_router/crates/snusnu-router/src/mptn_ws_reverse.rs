@@ -282,6 +282,7 @@ impl AutoReverseWsSession {
                     self.config.timeout.min(Duration::from_secs(5)),
                     &self.config.source_lu,
                     &self.config.hosted_lu,
+                    self.config.user_mode.as_deref(),
                 )?;
                 let bridge = Bridge::new_dynamic_tp(
                     BindPolicy {
@@ -461,6 +462,7 @@ pub(crate) fn run_from_open(
         config.timeout.min(Duration::from_secs(5)),
         &config.source_lu,
         &config.hosted_lu,
+        config.user_mode.as_deref(),
     )?;
     let policy = BindPolicy {
         plu: config.source_lu.clone(),

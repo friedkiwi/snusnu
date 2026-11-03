@@ -119,19 +119,24 @@ impl ManagementInitiator {
             || bind_token[0] != 0x23
             || bind_token[1..5].iter().all(|&byte| byte == 0)
             || bind_token[5..] != [0x80, 0]
-            || !(2..=8).contains(&session_limit)
-            || !session_limit.is_multiple_of(2)
+            || (!(2..=8).contains(&session_limit) || !session_limit.is_multiple_of(2))
+                && !(mode == "QRMTWSC" && session_limit == 57)
         {
             return Err(invalid(
                 "unsupported V5R4 management identity or session policy",
             ));
         }
+        let (source_winners, target_winners) = if mode == "QRMTWSC" {
+            (1, session_limit - 1)
+        } else {
+            (session_limit / 2, session_limit / 2)
+        };
         let cnos = CnosGds {
             service: Service::Request,
             modifier: 0,
             session_limit,
-            source_winners: session_limit / 2,
-            target_winners: session_limit / 2,
+            source_winners,
+            target_winners,
             mode: mode.to_owned(),
             mode_field_length: 8,
         };
@@ -367,6 +372,30 @@ mod tests {
             8,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn qrmtwsc_requests_one_controller_and_fifty_six_host_sessions() {
+        let local = name("SNUSNU.PRINTER").unwrap();
+        let mut fqpcid = vec![0x60, (9 + local.len()) as u8];
+        fqpcid.extend_from_slice(&[0x11; 8]);
+        fqpcid.push(local.len() as u8);
+        fqpcid.extend_from_slice(&local);
+        let peer = ManagementInitiator::new(
+            "SNUSNU.PRINTER",
+            "SOLNET.S1054504",
+            fqpcid,
+            [0x22; 8],
+            [0x23, 1, 2, 3, 4, 0x80, 0],
+            "QRMTWSC",
+            57,
+        )
+        .unwrap();
+        assert_eq!(peer.cnos.session_limit, 57);
+        assert_eq!(
+            (peer.cnos.source_winners, peer.cnos.target_winners),
+            (1, 56)
+        );
     }
 
     fn positive(request: &Connect) -> Vec<u8> {
