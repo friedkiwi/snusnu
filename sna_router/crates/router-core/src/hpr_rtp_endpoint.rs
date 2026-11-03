@@ -223,6 +223,8 @@ pub struct RtpInboundEndpoint {
     origin_tcid: Option<u64>,
     source_nce_id: Option<Vec<u8>>,
     initial_setup_nlp: Option<Vec<u8>>,
+    initial_switching_information: Option<Vec<u8>>,
+    initial_arb_setup: Option<Vec<u8>>,
     sent_setup_reply: Option<Vec<u8>>,
     pending_setup_reply: Option<Vec<u8>>,
     pending_data: Option<Vec<u8>>,
@@ -277,6 +279,8 @@ impl RtpInboundEndpoint {
             origin_tcid: None,
             source_nce_id: None,
             initial_setup_nlp: None,
+            initial_switching_information: None,
+            initial_arb_setup: None,
             sent_setup_reply: None,
             pending_setup_reply: None,
             pending_data: None,
@@ -369,6 +373,15 @@ impl RtpInboundEndpoint {
         let segments = packet
             .optional_segments()
             .map_err(EndpointError::InvalidRtp)?;
+        let mut switching = segments.iter().filter(|segment| segment.key == 0x14);
+        let switching_information = switching
+            .next()
+            .ok_or(EndpointError::UnsupportedSegment)?
+            .data
+            .to_vec();
+        if switching.next().is_some() {
+            return Err(EndpointError::UnsupportedSegment);
+        }
         let mut arb_segments = segments.iter().filter(|segment| segment.key == 0x22);
         let arb_segment = arb_segments.next().ok_or(EndpointError::InvalidArb)?;
         if arb_segments.next().is_some() {
@@ -417,6 +430,8 @@ impl RtpInboundEndpoint {
         self.origin_tcid = Some(packet.tcid);
         self.source_nce_id = Some(qualifier.nce_id.to_vec());
         self.initial_setup_nlp = Some(nlp.to_vec());
+        self.initial_switching_information = Some(switching_information);
+        self.initial_arb_setup = Some(arb_segment.data.to_vec());
         self.receive = Some(receive);
         self.arb = Some(arb);
         self.pending_messages = initial_messages;
@@ -497,13 +512,33 @@ impl RtpInboundEndpoint {
         let segments = packet
             .optional_segments()
             .map_err(EndpointError::InvalidRtp)?;
-        if segments.iter().any(|s| !matches!(s.key, 0x0e | 0x22)) {
+        if segments
+            .iter()
+            .any(|s| !matches!(s.key, 0x0e | 0x14 | 0x22))
+        {
             return Err(EndpointError::UnsupportedSegment);
         }
+        let mut switching = segments.iter().filter(|segment| segment.key == 0x14);
+        let switching_status = if let Some(segment) = switching.next() {
+            if switching.next().is_some()
+                || self.initial_switching_information.as_deref() != Some(segment.data)
+            {
+                return Err(EndpointError::UnsupportedSegment);
+            }
+            true
+        } else {
+            false
+        };
         let mut arb = self.arb.unwrap();
         let mut arb_segments = segments.iter().filter(|segment| segment.key == 0x22);
         if let Some(segment) = arb_segments.next() {
-            arb.observe(*segment)?;
+            if switching_status && segment.data.len() == 18 {
+                if self.initial_arb_setup.as_deref() != Some(segment.data) {
+                    return Err(EndpointError::InvalidArb);
+                }
+            } else {
+                arb.observe(*segment)?;
+            }
         }
         if arb_segments.next().is_some() {
             return Err(EndpointError::InvalidArb);
@@ -540,7 +575,7 @@ impl RtpInboundEndpoint {
         let delivered = receive
             .observe(self.config.generation, packet)
             .map_err(EndpointError::Receive)?;
-        let status_due = (idle_status && status.is_some())
+        let status_due = ((idle_status || switching_status) && status.is_some())
             || match &delivered {
                 ReceiveResult::Buffered => true,
                 ReceiveResult::Delivered(fragments) => fragments
@@ -1130,6 +1165,52 @@ mod tests {
         // create a STATUS exchange loop.
         let plain = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], Some((2, 2, 200)));
         assert!(!endpoint.receive(&plain).unwrap().status_due);
+    }
+
+    #[test]
+    fn established_path_switch_probe_replays_only_validated_setup_vectors() {
+        let cfg = config();
+        let mut endpoint = RtpInboundEndpoint::new(cfg.clone()).unwrap();
+        let setup = setup_packet(&cfg);
+        let setup_packet = RtpPacket::parse(&setup).unwrap();
+        let segments = setup_packet.optional_segments().unwrap();
+        let switching = segments.iter().find(|segment| segment.key == 0x14).unwrap();
+        let arb = segments.iter().find(|segment| segment.key == 0x22).unwrap();
+        let mut probe = peer_packet(ASSIGNED & !ASSIGNOR, 107, &[], Some((2, 1, 200)));
+        let mut replay = segment(0x14, switching.data);
+        replay.extend_from_slice(&segment(0x22, arb.data));
+        probe[6 + 8] = 0x0c;
+        probe[6 + 10..6 + 12].copy_from_slice(&(((40 + replay.len()) / 4) as u16).to_be_bytes());
+        probe.extend_from_slice(&replay);
+
+        let reply = endpoint.prepare_inbound_setup(&setup).unwrap();
+        endpoint.confirm_setup_reply_sent(&reply).unwrap();
+        endpoint
+            .receive(&peer_packet(
+                ASSIGNED & !ASSIGNOR,
+                107,
+                &[],
+                Some((1, 1, 200)),
+            ))
+            .unwrap();
+        let mut wrong_path = probe.clone();
+        wrong_path[6 + 40 + 8] ^= 1;
+        assert_eq!(
+            endpoint.receive(&wrong_path),
+            Err(EndpointError::UnsupportedSegment)
+        );
+        let mut wrong_arb = probe.clone();
+        wrong_arb[6 + 40 + segment(0x14, switching.data).len() + 8] ^= 1;
+        assert_eq!(endpoint.receive(&wrong_arb), Err(EndpointError::InvalidArb));
+
+        let accepted = endpoint.receive(&probe).unwrap();
+        assert!(accepted.messages.is_empty());
+        assert!(accepted.status_due);
+        let status = endpoint.prepare_status().unwrap();
+        let parsed = parse_peer_status(RtpPacket::parse(&status).unwrap()).unwrap();
+        assert_eq!(parsed.echo, 2);
+        endpoint.confirm_status_sent(&status).unwrap();
+        assert!(!endpoint.receive(&probe).unwrap().status_due);
     }
 
     #[test]
