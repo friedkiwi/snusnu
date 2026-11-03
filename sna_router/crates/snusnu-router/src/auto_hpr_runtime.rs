@@ -178,6 +178,9 @@ impl DirectHprRuntime {
                 RtpIngressKind::User => self.user_message(hub, &message),
                 RtpIngressKind::CpSvcMg => self.cp_message(&message),
                 RtpIngressKind::CpSvcMgOut => self.reciprocal_cp_message(&message),
+                RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => {
+                    Err(protocol("unsolicited outbound HPR RTP message"))
+                }
             };
             if result
                 .as_ref()
@@ -966,6 +969,7 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                         RtpIngressKind::CpSvcMg => replace_cp,
                         RtpIngressKind::CpSvcMgOut => false,
                         RtpIngressKind::User => no_user_work,
+                        RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => false,
                     },
                 ) {
                     Ok(messages) => messages,

@@ -18,6 +18,7 @@ use router_core::{
         EndpointError, EndpointPath, EndpointPeer, InboundEndpointConfig, RtpInboundEndpoint,
     },
     hpr_rtp_outbound::{OutboundPhase, RtpOutboundEndpoint},
+    hpr_rtp_outbound_setup::UserSetupConfig,
     hpr_rtp_setup::{classify_setup_topic, RtpLocalTarget, RtpSetupTopic},
     hpr_session_address::{RtpAssociationScope, RtpObservation},
     hpr_switching_path::{validate_inbound_switching_path, AuthorizedUserRoute, TrustedReturnPath},
@@ -44,9 +45,11 @@ fn endpoint_error(error: EndpointError) -> io::Error {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RtpIngressKind {
     RouteSetup,
+    RouteSetupOut,
     CpSvcMg,
     CpSvcMgOut,
     User,
+    UserOut,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,9 +62,11 @@ pub(crate) struct RtpIngress {
 pub(crate) struct HprRtpPort {
     bootstrap: HprControlBootstrap,
     route_setup: Option<RtpInboundEndpoint>,
+    route_setup_out: Option<RtpOutboundEndpoint>,
     cp_svc_mg: Option<RtpInboundEndpoint>,
     cp_svc_mg_out: Option<RtpOutboundEndpoint>,
     user: Option<RtpInboundEndpoint>,
+    user_out: Option<RtpOutboundEndpoint>,
     authorized_user_route: Option<AuthorizedUserRoute>,
 }
 
@@ -70,9 +75,11 @@ impl HprRtpPort {
         Self {
             bootstrap,
             route_setup: None,
+            route_setup_out: None,
             cp_svc_mg: None,
             cp_svc_mg_out: None,
             user: None,
+            user_out: None,
             authorized_user_route: None,
         }
     }
@@ -112,7 +119,18 @@ impl HprRtpPort {
     }
 
     pub(crate) fn cp_out_scope(&self) -> Option<RtpAssociationScope> {
-        let endpoint = self.cp_svc_mg_out.as_ref()?;
+        self.outbound_scope(self.cp_svc_mg_out.as_ref()?)
+    }
+
+    pub(crate) fn route_out_scope(&self) -> Option<RtpAssociationScope> {
+        self.outbound_scope(self.route_setup_out.as_ref()?)
+    }
+
+    pub(crate) fn user_out_scope(&self) -> Option<RtpAssociationScope> {
+        self.outbound_scope(self.user_out.as_ref()?)
+    }
+
+    fn outbound_scope(&self, endpoint: &RtpOutboundEndpoint) -> Option<RtpAssociationScope> {
         if endpoint.phase() != OutboundPhase::Active {
             return None;
         }
@@ -133,6 +151,15 @@ impl HprRtpPort {
     /// reciprocal CP connection. The caller first retires its CP session.
     pub(crate) fn reset_cp_out(&mut self) {
         self.cp_svc_mg_out = None;
+    }
+
+    pub(crate) fn reset_route_out(&mut self) {
+        self.route_setup_out = None;
+        self.user_out = None;
+    }
+
+    pub(crate) fn reset_user_out(&mut self) {
+        self.user_out = None;
     }
 
     /// Originate the reciprocal CPSVCMG RTP connection on the same EE TG.
@@ -167,17 +194,110 @@ impl HprRtpPort {
         Ok(true)
     }
 
+    /// Start a locally originated RouteSetup RTP connection. Repeated calls
+    /// retry the same setup NLP and TCID after transient UDP backpressure.
+    pub(crate) fn open_route_out(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        request_gds: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.check_link(ee)?;
+        if self.route_setup_out.is_none() {
+            let tg = ee.tg_number().ok_or_else(|| invalid("EE TG not active"))?;
+            let id = allocate_tcid(self.bootstrap.generation.get())?;
+            let mut endpoint = RtpOutboundEndpoint::new_route_setup(self.bootstrap.clone(), tg, id)
+                .map_err(endpoint_error)?;
+            endpoint
+                .prepare_setup(request_gds)
+                .map_err(endpoint_error)?;
+            self.route_setup_out = Some(endpoint);
+        }
+        self.send_pending_outbound_setup(ee, RtpIngressKind::RouteSetupOut, now_us)
+    }
+
+    /// Start the shared locally originated user RTP with its first BIND.
+    /// Later sessions use `send_user_out` on the established connection.
+    pub(crate) fn open_user_out(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        first_bind: &[u8],
+        route: UserSetupConfig,
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.check_link(ee)?;
+        if self.user_out.is_none() {
+            let tg = ee.tg_number().ok_or_else(|| invalid("EE TG not active"))?;
+            let id = allocate_tcid(self.bootstrap.generation.get())?;
+            let mut endpoint = RtpOutboundEndpoint::new_user(self.bootstrap.clone(), tg, id, route)
+                .map_err(endpoint_error)?;
+            endpoint.prepare_setup(first_bind).map_err(endpoint_error)?;
+            self.user_out = Some(endpoint);
+        }
+        self.send_pending_outbound_setup(ee, RtpIngressKind::UserOut, now_us)
+    }
+
+    fn send_pending_outbound_setup(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        kind: RtpIngressKind,
+        now_us: u64,
+    ) -> io::Result<bool> {
+        let endpoint = self
+            .outbound_endpoint_mut(kind)
+            .ok_or_else(|| invalid("outbound HPR RTP not started"))?;
+        let Some(packet) = endpoint.pending_setup_nlp().map(ToOwned::to_owned) else {
+            return Ok(true);
+        };
+        let port = priority_port(packet[0])?;
+        match ee.send_nlp(port, &packet) {
+            Ok(()) => endpoint
+                .confirm_setup_sent(&packet, now_us)
+                .map_err(endpoint_error)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        Ok(true)
+    }
+
     pub(crate) fn send_cp(
         &mut self,
         ee: &EeLdlcEndpoint,
         message: &[u8],
         now_us: u64,
     ) -> io::Result<bool> {
+        self.send_outbound(ee, RtpIngressKind::CpSvcMgOut, message, now_us)
+    }
+
+    pub(crate) fn send_route_out(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        message: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.send_outbound(ee, RtpIngressKind::RouteSetupOut, message, now_us)
+    }
+
+    pub(crate) fn send_user_out(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        message: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.send_outbound(ee, RtpIngressKind::UserOut, message, now_us)
+    }
+
+    fn send_outbound(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        kind: RtpIngressKind,
+        message: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
         self.check_link(ee)?;
         let endpoint = self
-            .cp_svc_mg_out
-            .as_mut()
-            .ok_or_else(|| invalid("outbound CP RTP not started"))?;
+            .outbound_endpoint_mut(kind)
+            .ok_or_else(|| invalid("outbound HPR RTP not started"))?;
         if endpoint.phase() != OutboundPhase::Active {
             return Ok(false);
         }
@@ -192,7 +312,8 @@ impl HprRtpPort {
             ) => return Ok(false),
             Err(error) => return Err(endpoint_error(error)),
         };
-        match ee.send_nlp(12001, &packet) {
+        let port = priority_port(packet[0])?;
+        match ee.send_nlp(port, &packet) {
             Ok(()) => endpoint
                 .confirm_message_sent(&packet, now_us)
                 .map_err(endpoint_error)?,
@@ -242,7 +363,21 @@ impl HprRtpPort {
             .as_ref()
             .is_some_and(|endpoint| endpoint.origin_tcid() & !ASSIGNOR == packet.tcid)
         {
-            return self.on_outbound_cp(ee, datagram, packet);
+            return self.on_outbound(ee, datagram, packet, RtpIngressKind::CpSvcMgOut);
+        }
+        if self
+            .route_setup_out
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.origin_tcid() & !ASSIGNOR == packet.tcid)
+        {
+            return self.on_outbound(ee, datagram, packet, RtpIngressKind::RouteSetupOut);
+        }
+        if self
+            .user_out
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.origin_tcid() & !ASSIGNOR == packet.tcid)
+        {
+            return self.on_outbound(ee, datagram, packet, RtpIngressKind::UserOut);
         }
         self.on_established_packet(ee, datagram, packet)
     }
@@ -322,20 +457,32 @@ impl HprRtpPort {
                 .confirm_retransmission_sent(&packet, now_us)
                 .map_err(endpoint_error)?;
         }
-        self.tick_outbound_cp(ee, now_us)?;
+        for kind in [
+            RtpIngressKind::CpSvcMgOut,
+            RtpIngressKind::RouteSetupOut,
+            RtpIngressKind::UserOut,
+        ] {
+            self.tick_outbound(ee, kind, now_us)?;
+        }
         Ok(())
     }
 
-    fn tick_outbound_cp(&mut self, ee: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
-        let Some(endpoint) = self.cp_svc_mg_out.as_mut() else {
+    fn tick_outbound(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        kind: RtpIngressKind,
+        now_us: u64,
+    ) -> io::Result<()> {
+        let Some(endpoint) = self.outbound_endpoint_mut(kind) else {
             return Ok(());
         };
+        let port = 12004 - u16::from(endpoint.priority());
         if let Some(packet) = endpoint
             .setup_retransmit_due(now_us)
             .map_err(endpoint_error)?
         {
             let packet = packet.to_vec();
-            match ee.send_nlp(12001, &packet) {
+            match ee.send_nlp(port, &packet) {
                 Ok(()) => endpoint
                     .confirm_setup_retransmitted(&packet, now_us)
                     .map_err(endpoint_error)?,
@@ -345,7 +492,7 @@ impl HprRtpPort {
         }
         if let Some(packet) = endpoint.pending_status_nlp() {
             let packet = packet.to_vec();
-            match ee.send_nlp(12001, &packet) {
+            match ee.send_nlp(port, &packet) {
                 Ok(()) => endpoint
                     .confirm_status_sent(&packet)
                     .map_err(endpoint_error)?,
@@ -363,7 +510,7 @@ impl HprRtpPort {
         } else {
             return Ok(());
         };
-        match ee.send_nlp(12001, &packet) {
+        match ee.send_nlp(port, &packet) {
             Ok(()) => endpoint
                 .confirm_retransmission_sent(&packet, now_us)
                 .map_err(endpoint_error)?,
@@ -373,16 +520,21 @@ impl HprRtpPort {
         Ok(())
     }
 
-    fn on_outbound_cp(
+    fn on_outbound(
         &mut self,
         ee: &EeLdlcEndpoint,
         datagram: &Datagram,
         packet: RtpPacket<'_>,
+        kind: RtpIngressKind,
     ) -> io::Result<Vec<RtpIngress>> {
-        if datagram.port != 12001 || (packet.nhdr[0] >> 1) & 3 != 3 {
-            return Err(invalid("outbound CP RTP on wrong EE priority port"));
+        let endpoint = self
+            .outbound_endpoint_mut(kind)
+            .ok_or_else(|| invalid("unknown outbound HPR RTP connection"))?;
+        let priority = endpoint.priority();
+        if datagram.port != 12004 - u16::from(priority) || (packet.nhdr[0] >> 1) & 3 != priority {
+            return Err(invalid("outbound HPR RTP on wrong EE priority port"));
         }
-        let endpoint = self.cp_svc_mg_out.as_mut().unwrap();
+        let port = datagram.port;
         if endpoint.phase() == OutboundPhase::AwaitReply
             || endpoint.phase() == OutboundPhase::AwaitStatusSent
         {
@@ -400,7 +552,7 @@ impl HprRtpPort {
             let reply = endpoint
                 .prepare_reply_status(&datagram.payload[3..])
                 .map_err(endpoint_error)?;
-            match ee.send_nlp(12001, &reply) {
+            match ee.send_nlp(port, &reply) {
                 Ok(()) => endpoint
                     .confirm_status_sent(&reply)
                     .map_err(endpoint_error)?,
@@ -411,7 +563,7 @@ impl HprRtpPort {
             for held in endpoint.take_pre_status_nlps() {
                 let received = endpoint.receive(&held).map_err(endpoint_error)?;
                 ingress.extend(received.messages.into_iter().map(|bytes| RtpIngress {
-                    kind: RtpIngressKind::CpSvcMgOut,
+                    kind,
                     observation: RtpObservation {
                         generation: received.generation,
                         tcid: received.inbound_tcid,
@@ -422,7 +574,7 @@ impl HprRtpPort {
             return Ok(ingress);
         }
         if let Some(reply) = endpoint.reply_to_duplicate_cie(&datagram.payload[3..]) {
-            ee.send_nlp(12001, reply)?;
+            ee.send_nlp(port, reply)?;
             return Ok(Vec::new());
         }
         let received = endpoint
@@ -434,7 +586,7 @@ impl HprRtpPort {
             } else {
                 endpoint.prepare_status().map_err(endpoint_error)?
             };
-            match ee.send_nlp(12001, &reply) {
+            match ee.send_nlp(port, &reply) {
                 Ok(()) => endpoint
                     .confirm_status_sent(&reply)
                     .map_err(endpoint_error)?,
@@ -446,7 +598,7 @@ impl HprRtpPort {
             .messages
             .into_iter()
             .map(|bytes| RtpIngress {
-                kind: RtpIngressKind::CpSvcMgOut,
+                kind,
                 observation: RtpObservation {
                     generation: received.generation,
                     tcid: received.inbound_tcid,
@@ -600,9 +752,9 @@ impl HprRtpPort {
         let local_nce_instance = match kind {
             RtpIngressKind::RouteSetup => self.bootstrap.local.tower.route_setup_nce_instance,
             RtpIngressKind::CpSvcMg => self.bootstrap.local.tower.cp_nce_instance,
-            RtpIngressKind::CpSvcMgOut => {
-                return Err(invalid("outbound CP RTP has separate setup"))
-            }
+            RtpIngressKind::RouteSetupOut
+            | RtpIngressKind::CpSvcMgOut
+            | RtpIngressKind::UserOut => return Err(invalid("outbound RTP has separate setup")),
             RtpIngressKind::User => {
                 self.authorized_user_route
                     .as_ref()
@@ -615,7 +767,9 @@ impl HprRtpPort {
                 Some(self.bootstrap.peer.tower.route_setup_nce_label.clone())
             }
             RtpIngressKind::CpSvcMg => Some(self.bootstrap.peer.tower.cp_nce_label.clone()),
-            RtpIngressKind::CpSvcMgOut => return Err(invalid("outbound CP RTP has separate peer")),
+            RtpIngressKind::RouteSetupOut
+            | RtpIngressKind::CpSvcMgOut
+            | RtpIngressKind::UserOut => return Err(invalid("outbound RTP has separate peer")),
             RtpIngressKind::User => None,
         };
         let id = allocate_tcid(self.bootstrap.generation.get())?;
@@ -657,15 +811,28 @@ impl HprRtpPort {
         match kind {
             RtpIngressKind::RouteSetup => self.route_setup.as_ref(),
             RtpIngressKind::CpSvcMg => self.cp_svc_mg.as_ref(),
-            RtpIngressKind::CpSvcMgOut => None,
             RtpIngressKind::User => self.user.as_ref(),
+            RtpIngressKind::RouteSetupOut
+            | RtpIngressKind::CpSvcMgOut
+            | RtpIngressKind::UserOut => None,
         }
     }
 
     fn endpoint_mut(&mut self, kind: RtpIngressKind) -> Option<&mut RtpInboundEndpoint> {
         match kind {
-            RtpIngressKind::CpSvcMgOut => None,
+            RtpIngressKind::RouteSetupOut
+            | RtpIngressKind::CpSvcMgOut
+            | RtpIngressKind::UserOut => None,
             _ => self.slot_mut(kind).as_mut(),
+        }
+    }
+
+    fn outbound_endpoint_mut(&mut self, kind: RtpIngressKind) -> Option<&mut RtpOutboundEndpoint> {
+        match kind {
+            RtpIngressKind::RouteSetupOut => self.route_setup_out.as_mut(),
+            RtpIngressKind::CpSvcMgOut => self.cp_svc_mg_out.as_mut(),
+            RtpIngressKind::UserOut => self.user_out.as_mut(),
+            _ => None,
         }
     }
 
@@ -673,7 +840,9 @@ impl HprRtpPort {
         match kind {
             RtpIngressKind::RouteSetup => &mut self.route_setup,
             RtpIngressKind::CpSvcMg => &mut self.cp_svc_mg,
-            RtpIngressKind::CpSvcMgOut => panic!("outbound CP RTP has its own slot"),
+            RtpIngressKind::RouteSetupOut
+            | RtpIngressKind::CpSvcMgOut
+            | RtpIngressKind::UserOut => panic!("outbound RTP has its own slot"),
             RtpIngressKind::User => &mut self.user,
         }
     }
@@ -714,6 +883,7 @@ mod tests {
         hpr_cv61::{ArbMode, ControlFlowsTower},
         ConnectionGeneration,
     };
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn advertisement(cp: &str, id: u8) -> ControlAdvertisement {
         ControlAdvertisement {
@@ -863,5 +1033,46 @@ mod tests {
         assert!(port.authorized_user_route.is_none());
         assert!(port.config_for(RtpIngressKind::User, &path()).is_err());
         port.authorize_user_route(route).unwrap();
+    }
+
+    #[test]
+    fn outbound_user_priority_rejects_wrong_ee_udp_port() {
+        let mut port = HprRtpPort::new(bootstrap());
+        port.user_out = Some(
+            RtpOutboundEndpoint::new_user(
+                port.bootstrap.clone(),
+                1,
+                ASSIGNOR | 8,
+                UserSetupConfig {
+                    local_nce_label: vec![0xb0, 1],
+                    local_nce_instance: [0, 0, 0, 9],
+                    peer_nce_label: vec![0xb4, 2],
+                    peer_nce_instance: [0, 0, 0, 10],
+                    peer_link_label: vec![0x80, 2],
+                    cos_tpf: vec![4, 0x2c, 1, 0],
+                    target_lu: "SOLNET.APP".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let ee = EeLdlcEndpoint::bind_dynamic(
+            IpAddr::V4(Ipv4Addr::new(127, 84, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 84, 0, 2)),
+            |_| Err(invalid("unused XID resolver")),
+        )
+        .unwrap();
+        let mut nlp = vec![0xc2, 0, 0xb0, 1, 0xff, 0];
+        let mut thdr = [0u8; 20];
+        thdr[..8].copy_from_slice(&8u64.to_be_bytes());
+        thdr[10..12].copy_from_slice(&5u16.to_be_bytes());
+        nlp.extend_from_slice(&thdr);
+        let mut ui = vec![4, 4, 3];
+        ui.extend_from_slice(&nlp);
+        let wrong_port = Datagram::decode(12001, ui).unwrap();
+        let packet = RtpPacket::parse(&nlp).unwrap();
+        assert!(port
+            .on_outbound(&ee, &wrong_port, packet, RtpIngressKind::UserOut)
+            .is_err());
+        assert_eq!(port.user_out.as_ref().unwrap().phase(), OutboundPhase::Idle);
     }
 }
