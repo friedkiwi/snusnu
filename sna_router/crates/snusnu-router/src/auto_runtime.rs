@@ -645,18 +645,30 @@ impl<'a> AutoLocalSessionRunner<'a> {
             }
         }
         let mut changed = HashSet::new();
-        for (id, mut pending) in self.pending_llc_upstream.drain() {
-            let _ = pending.source.as_mut().unwrap().close();
-            self.listeners[pending.listener].release(pending.proxy_mac);
-            if self
-                .proofs
-                .withdraw(&pending.attachment, &association("llc_upstream", id))
-            {
-                changed.insert(pending.attachment);
-            }
-        }
+        // Local LLC discovery belongs to the live carrier. Losing the
+        // concentrator does not invalidate XID3 or its verified CP/LU proof.
         for (id, mut active) in self.active_llc_upstream.drain() {
-            let _ = active.bridge.close();
+            if active.bridge.can_return_idle() {
+                match active.bridge.into_idle_source() {
+                    Ok(source) => {
+                        self.pending_llc_upstream.insert(
+                            id,
+                            PendingUpstreamLlc {
+                                target_cp: source.target_cp().clone(),
+                                source: Some(source),
+                                attachment: active.attachment,
+                                listener: active.listener,
+                                proxy_mac: active.proxy_mac,
+                            },
+                        );
+                        continue;
+                    }
+                    Err(error) => tracing::warn!(session = id, error = %error,
+                        "LLC user circuit could not return to idle after concentrator loss"),
+                }
+            } else {
+                let _ = active.bridge.close();
+            }
             self.listeners[active.listener].release(active.proxy_mac);
             if self
                 .proofs
@@ -740,7 +752,29 @@ impl<'a> AutoLocalSessionRunner<'a> {
             };
             if retired {
                 let mut active = active_llc_upstream.remove(&id).unwrap();
-                let _ = active.bridge.close();
+                if active.bridge.can_return_idle() {
+                    match active.bridge.into_idle_source() {
+                        Ok(source) => {
+                            tracing::info!(session = id, attachment = %active.attachment.0,
+                                "LLC user circuit ended; verified adjacency remains available");
+                            pending_llc_upstream.insert(
+                                id,
+                                PendingUpstreamLlc {
+                                    attachment: active.attachment,
+                                    listener: active.listener,
+                                    proxy_mac: active.proxy_mac,
+                                    target_cp: source.target_cp().clone(),
+                                    source: Some(source),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(error) => tracing::warn!(session = id, error = %error,
+                            "LLC user circuit could not return to the live adjacency"),
+                    }
+                } else {
+                    let _ = active.bridge.close();
+                }
                 listeners[active.listener].release(active.proxy_mac);
                 if proofs.withdraw(&active.attachment, &association("llc_upstream", id)) {
                     changed_proofs.insert(active.attachment);
@@ -878,6 +912,27 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 Err(error) => {
                     tracing::warn!(session = id, attachment = %pending.attachment.0,
                         error = %error, "automatic LLC upstream BIND rejected");
+                    if ready
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::NotConnected | io::ErrorKind::NotFound
+                        )
+                    {
+                        match pending.source.as_mut().unwrap().reject_user_bind() {
+                            Ok(true) => {
+                                tracing::info!(session = id, attachment = %pending.attachment.0,
+                                    "remote LU unavailable; LLC adjacency remains available");
+                                pending_llc_upstream.insert(id, pending);
+                                continue;
+                            }
+                            Ok(false) => tracing::warn!(
+                                session = id,
+                                "native negative BIND response queue is full"
+                            ),
+                            Err(reject_error) => tracing::warn!(session = id,
+                                error = %reject_error, "native user BIND could not be rejected"),
+                        }
+                    }
                     let _ = pending.source.as_mut().unwrap().close();
                     listeners[pending.listener].release(pending.proxy_mac);
                     if proofs.withdraw(&pending.attachment, &association("llc_upstream", id)) {

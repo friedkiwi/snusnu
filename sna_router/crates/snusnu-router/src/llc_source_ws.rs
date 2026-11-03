@@ -31,6 +31,8 @@ pub(crate) struct LlcSourceWs {
     opened_at: Instant,
     bind_sent_at: Option<Instant>,
     bound: bool,
+    user_rejected: bool,
+    source_closed: bool,
 }
 
 impl LlcSourceWs {
@@ -49,6 +51,8 @@ impl LlcSourceWs {
             opened_at: Instant::now(),
             bind_sent_at: None,
             bound: false,
+            user_rejected: false,
+            source_closed: false,
         }
     }
 
@@ -93,16 +97,31 @@ impl LlcSourceWs {
                     self.pending_ws = Some((event, charged, Instant::now()));
                 }
                 Some(SessionWsUpdate::Closed) => {
-                    self.close()?;
                     return Ok(false);
                 }
                 Some(SessionWsUpdate::Opened) | None => {}
             }
         } else if self.ws.poll_control()? {
-            self.close()?;
             return Ok(false);
         }
         if let Some((event, charged, _)) = &self.pending_ws {
+            if matches!(
+                event,
+                SessionEvent::BindResult {
+                    accepted: false,
+                    ..
+                }
+            ) {
+                if !self.source.reject_user_bind()? {
+                    return Ok(true);
+                }
+                if *charged {
+                    self.ws.complete_received(1)?;
+                }
+                self.user_rejected = true;
+                self.pending_ws = None;
+                return Ok(false);
+            }
             if self.source.send(event)? {
                 if *charged {
                     self.ws.complete_received(1)?;
@@ -129,7 +148,7 @@ impl LlcSourceWs {
                     }
                 }
                 SourceUpdate::Closed => {
-                    self.close()?;
+                    self.source_closed = true;
                     return Ok(false);
                 }
             }
@@ -141,6 +160,29 @@ impl LlcSourceWs {
     pub(crate) fn close(&mut self) -> io::Result<()> {
         self.source.close()?;
         self.ws.close()
+    }
+
+    /// Return the carrier link after an unsuccessful user circuit. Its CP/LU
+    /// proof and LLC2 reservation remain owned by the surrounding runtime.
+    pub(crate) fn into_idle_source(mut self) -> io::Result<LocalLlcIngress> {
+        if self.bound || self.source_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LLC user circuit cannot return a closed or bound link",
+            ));
+        }
+        if !self.user_rejected && !self.source.reject_user_bind()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native negative BIND response queue is full",
+            ));
+        }
+        self.ws.close()?;
+        Ok(self.source)
+    }
+
+    pub(crate) fn can_return_idle(&self) -> bool {
+        !self.bound && !self.source_closed
     }
 }
 

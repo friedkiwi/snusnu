@@ -55,6 +55,26 @@ impl LocalLlcIngress {
     pub(crate) fn identity(&self) -> Option<&SessionIdentity> {
         self.identity.as_ref()
     }
+
+    pub(crate) fn target_cp(&self) -> &QualifiedName {
+        &self.target_cp
+    }
+
+    /// Release a failed user BIND while retaining the carrier-owned LLC2
+    /// association and its CP/LU discovery proof. The caller retries when
+    /// the native transmit queue has no room yet.
+    pub(crate) fn reject_user_bind(&mut self) -> io::Result<bool> {
+        if !self.native.reject_user_bind()? {
+            return Ok(false);
+        }
+        self.native.discard_pending();
+        self.identity = None;
+        self.codec = None;
+        self.candidate = None;
+        self.pending = None;
+        self.pending_grant = None;
+        Ok(true)
+    }
 }
 
 impl SessionSource for LocalLlcIngress {
@@ -244,12 +264,21 @@ impl LocalLlcNative {
         Ok(())
     }
 
+    fn discard_pending(&mut self) {
+        self.pending = None;
+    }
+
     pub(crate) fn send_piu(&mut self, piu: &[u8]) -> io::Result<bool> {
         self.port.enqueue_converter_piu(piu)
     }
 
     pub(crate) fn positive_bind_response(&self) -> io::Result<Vec<u8>> {
         self.port.converter_positive_bind_response()
+    }
+
+    pub(crate) fn reject_user_bind(&mut self) -> io::Result<bool> {
+        // X'08A00002': the selected remote LU session is unavailable.
+        self.port.reject_converter_user_bind([0x08, 0xa0, 0, 2])
     }
 
     pub(crate) fn close(&mut self) -> io::Result<()> {
