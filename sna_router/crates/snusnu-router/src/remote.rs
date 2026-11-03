@@ -3050,6 +3050,81 @@ mod tests {
     }
 
     #[test]
+    fn ee_remote_host_selection_uses_authenticated_directory_origin() {
+        let lu = name("TARGET", "APP1");
+        let cp = name("TARGET", "CPA");
+        let cp_export = wire::RouteExport {
+            id: 30,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::ControlPoint(cp.clone())),
+        };
+        let lu_export = wire::RouteExport {
+            id: 31,
+            generation: 1,
+            resource: Some(wire::route_export::Resource::LogicalUnit(
+                wire::LuReachability {
+                    lu: Some(lu.clone()),
+                    hosting_cp: Some(cp.clone()),
+                    supported_types: vec![wire::LuType::LuType62 as i32],
+                },
+            )),
+        };
+        let origin = |router_id: u8, revision: u64, routes: Vec<wire::RouteExport>| {
+            wire::OriginRouteSnapshot {
+                router_id: vec![router_id; 16],
+                snapshot: Some(wire::RouteSnapshot {
+                    epoch: vec![9; 16],
+                    revision,
+                    routes,
+                }),
+            }
+        };
+        let mut directory = AutoDirectory::default();
+        directory
+            .replace_origin(&origin(1, 1, vec![cp_export.clone(), lu_export.clone()]))
+            .unwrap();
+        let lu_route = directory.resolve_lu(&lu).unwrap().unwrap();
+        let cp_route = directory.resolve_cp(&cp).unwrap().unwrap();
+        let target = "TARGET.APP1".parse().unwrap();
+        let proxy = "SNUSNU.SVC".parse().unwrap();
+        assert_eq!(
+            crate::auto_hpr_runtime::verified_upstream_host(
+                &target,
+                &proxy,
+                &lu_route,
+                &cp,
+                Some(&cp_route),
+            )
+            .unwrap()
+            .to_string(),
+            "TARGET.CPA"
+        );
+
+        // The concentrator can withdraw a CP without withdrawing its LU;
+        // RouteSetup must stop accepting that stale ownership claim.
+        directory
+            .replace_origin(&origin(1, 2, vec![lu_export]))
+            .unwrap();
+        assert!(directory.resolve_cp(&cp).unwrap().is_none());
+        assert!(crate::auto_hpr_runtime::verified_upstream_host(
+            &target, &proxy, &lu_route, &cp, None,
+        )
+        .is_err());
+        directory
+            .replace_origin(&origin(2, 1, vec![cp_export]))
+            .unwrap();
+        let other_owner = directory.resolve_cp(&cp).unwrap().unwrap();
+        assert!(crate::auto_hpr_runtime::verified_upstream_host(
+            &target,
+            &proxy,
+            &lu_route,
+            &cp,
+            Some(&other_owner),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn automatic_directory_resolves_unique_lu_and_fences_withdrawal_epoch() {
         let mut directory = AutoDirectory::default();
         let route = wire::RouteExport {
