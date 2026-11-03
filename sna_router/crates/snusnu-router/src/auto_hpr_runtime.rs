@@ -80,18 +80,24 @@ fn reciprocal_nonce() -> u64 {
     ((u128::from(seed) + u128::from(serial)) % u128::from(span)) as u64 + 1
 }
 
-fn user_nce_label(control: &[u8]) -> io::Result<Vec<u8>> {
+fn target_nce(
+    control: &[u8],
+    base_instance: [u8; 4],
+    ordinal: usize,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
+    if ordinal >= 128 {
+        return Err(protocol("HPR target NCE allocation exhausted"));
+    }
     let mut label = control.to_vec();
-    let last = label
+    let suffix = label
         .last_mut()
         .ok_or_else(|| protocol("empty HPR NCE label"))?;
-    // 0xff is reserved. Rotate through the other 255 suffixes, including
-    // when the control label already ends in 0xfe or 0xff.
-    *last = if *last >= 0xfe { 0 } else { *last + 1 };
-    if label == control {
-        return Err(protocol("HPR LU NCE label space exhausted"));
-    }
-    Ok(label)
+    *suffix = ((*suffix as usize + ordinal + 1) % 255) as u8;
+    let instance = u32::from_be_bytes(base_instance)
+        .checked_add(ordinal as u32 + 1)
+        .ok_or_else(|| protocol("HPR NCE instance exhausted"))?
+        .to_be_bytes();
+    Ok((label, instance))
 }
 
 struct ActiveHprSession {
@@ -112,8 +118,8 @@ struct ActiveHprSession {
 struct DirectHprRuntime {
     bootstrap: HprControlBootstrap,
     rtp: HprRtpPort,
-    route_setup: Option<DirectRouteSetupService>,
-    route_reply: Option<PreparedRouteSetupReply>,
+    route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
+    route_reply: Option<(router_core::session::QualifiedName, PreparedRouteSetupReply)>,
     negative_route_reply: Option<Vec<u8>>,
     cp_management: Option<CpManagementResponder>,
     pending_cp_replies: VecDeque<Vec<u8>>,
@@ -127,7 +133,6 @@ struct DirectHprRuntime {
     pending_rtp_bytes: usize,
     next_handle: u64,
     bound_user_scopes: Vec<router_core::hpr_session_address::RtpAssociationScope>,
-    user_route_authorized: bool,
     peer_lus: Option<EePeerLus>,
     reverse: Option<ReverseRuntime>,
 }
@@ -141,7 +146,7 @@ impl DirectHprRuntime {
             rtp: HprRtpPort::new(bootstrap.clone()),
             cp_management: None,
             bootstrap,
-            route_setup: None,
+            route_setup: HashMap::new(),
             route_reply: None,
             negative_route_reply: None,
             pending_cp_replies: VecDeque::new(),
@@ -155,7 +160,6 @@ impl DirectHprRuntime {
             pending_rtp_bytes: 0,
             next_handle: 1,
             bound_user_scopes: Vec::new(),
-            user_route_authorized: false,
             peer_lus: None,
             reverse: None,
         }
@@ -431,16 +435,23 @@ impl DirectHprRuntime {
                 "HPR RouteSetup target is not hosted by EE proxy CP",
             ));
         }
-        if self.route_setup.is_none() {
+        if !self.route_setup.contains_key(&target) {
             let tg = link
                 .tg_number()
                 .ok_or_else(|| protocol("HPR route has no active TG"))?;
-            let user_label = user_nce_label(&self.bootstrap.local.tower.route_setup_nce_label)?;
+            if self.route_setup.len() >= MAX_ACTIVE_HPR_SESSIONS {
+                return Err(protocol("HPR target route limit reached"));
+            }
+            let (user_label, instance) = target_nce(
+                &self.bootstrap.local.tower.route_setup_nce_label,
+                self.bootstrap.local.tower.route_setup_nce_instance,
+                self.route_setup.len(),
+            )?;
             let service = DirectRouteSetupService::new(
                 self.bootstrap.clone(),
                 target.clone(),
                 user_label,
-                self.bootstrap.local.tower.route_setup_nce_instance,
+                instance,
                 tg,
                 ReverseLinkMetrics {
                     transmission_time_us: 1000,
@@ -450,18 +461,16 @@ impl DirectHprRuntime {
                 16,
             )
             .map_err(|error| protocol(format!("HPR RouteSetup service: {error:?}")))?;
-            self.route_setup = Some(service);
+            self.route_setup.insert(target.clone(), service);
         }
-        if self.route_setup.as_ref().unwrap().local_lu() != &target {
-            return Err(protocol("second HPR RouteSetup target on one direct TG"));
-        }
-        self.route_reply = Some(
+        self.route_reply = Some((
+            target.clone(),
             self.route_setup
-                .as_mut()
+                .get_mut(&target)
                 .unwrap()
                 .prepare_reply(self.bootstrap.generation, &message.bytes)
                 .map_err(|error| protocol(format!("HPR RouteSetup rejected: {error:?}")))?,
-        );
+        ));
         Ok(())
     }
 
@@ -479,7 +488,7 @@ impl DirectHprRuntime {
             }
             return Ok(());
         }
-        let Some(reply) = self.route_reply.as_ref() else {
+        let Some((_, reply)) = self.route_reply.as_ref() else {
             return Ok(());
         };
         if !self
@@ -488,18 +497,15 @@ impl DirectHprRuntime {
         {
             return Ok(());
         }
-        let reply = self.route_reply.take().unwrap();
+        let (target, reply) = self.route_reply.take().unwrap();
         let authorized = self
             .route_setup
-            .as_mut()
+            .get_mut(&target)
             .unwrap()
             .confirm_reply_sent(self.bootstrap.generation, reply.pcid, &reply.gds)
             .map_err(|error| protocol(format!("HPR RouteSetup confirmation: {error:?}")))?;
-        if !self.user_route_authorized {
-            self.rtp.authorize_user_route(authorized)?;
-            self.user_route_authorized = true;
-        }
-        tracing::info!(target_lu = %self.route_setup.as_ref().unwrap().local_lu(),
+        self.rtp.authorize_user_route(authorized)?;
+        tracing::info!(target_lu = %target,
             generation = self.bootstrap.generation.get(),
             "HPR direct RouteSetup reply transmitted and user route authorized");
         Ok(())
@@ -679,7 +685,8 @@ impl DirectHprRuntime {
             .ok_or_else(|| protocol("HPR user RTP lacks BIND identity"))?;
         if identity.source_lu.netid != hub.allowed_netid()
             || identity.source_cp.as_ref() != Some(&self.bootstrap.peer.cp)
-            || self.route_setup.as_ref().map(|route| route.local_lu()) != Some(&identity.target_lu)
+            || !self.route_setup.contains_key(&identity.target_lu)
+            || self.rtp.user_target_for(&message.observation) != Some(&identity.target_lu)
         {
             return Err(protocol(
                 "HPR BIND identity conflicts with authenticated route",
@@ -998,8 +1005,11 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                     let tg = link
                         .tg_number()
                         .ok_or_else(|| protocol("active EE link has no TG"))?;
-                    let label =
-                        user_nce_label(&runtime.bootstrap.local.tower.route_setup_nce_label)?;
+                    let (label, instance) = target_nce(
+                        &runtime.bootstrap.local.tower.route_setup_nce_label,
+                        runtime.bootstrap.local.tower.route_setup_nce_instance,
+                        127,
+                    )?;
                     let advertised = Reachability {
                         lu: Some(route_identity.target_lu.clone()),
                         cp: route_identity.target_cp.clone(),
@@ -1022,7 +1032,7 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                         tg,
                         reciprocal_nonce().to_be_bytes(),
                         label,
-                        runtime.bootstrap.local.tower.route_setup_nce_instance,
+                        instance,
                         router_core::hpr_route_setup_initiator::DirectLinkMetrics {
                             transmission_time_us: 1000,
                             capacity_kbps: 100_000,
@@ -1080,10 +1090,9 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                     Err(error) => return Err(error),
                 };
                 if old_route_scope.is_some() && runtime.rtp.route_setup_scope() != old_route_scope {
-                    runtime.route_setup = None;
+                    runtime.route_setup.clear();
                     runtime.route_reply = None;
                     runtime.negative_route_reply = None;
-                    runtime.user_route_authorized = false;
                     runtime.bound_user_scopes.clear();
                     tracing::info!(attachment = %attachment.id,
                         generation = link.generation().get(),
@@ -1442,6 +1451,17 @@ mod tests {
     }
 
     #[test]
+    fn target_nce_allocations_are_distinct_and_bounded() {
+        let allocations = (0..MAX_ACTIVE_HPR_SESSIONS)
+            .map(|ordinal| target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], ordinal).unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(allocations.len(), MAX_ACTIVE_HPR_SESSIONS);
+        let reverse = target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], 127).unwrap();
+        assert!(!allocations.contains(&reverse));
+        assert!(target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], 128).is_err());
+    }
+
+    #[test]
     fn cp_reply_backpressure_keeps_setup_ingress_and_route_setup_unopened() {
         let generation = ConnectionGeneration::new(1).unwrap();
         let bootstrap = HprControlBootstrap::new(
@@ -1470,8 +1490,7 @@ mod tests {
         assert_eq!(runtime.pending_cp_replies.len(), 1);
         assert_eq!(runtime.pending_cp_reply_bytes, 2);
         assert!(!runtime.reciprocal_cp_ready());
-        assert!(runtime.route_setup.is_none());
-        assert!(!runtime.user_route_authorized);
+        assert!(runtime.route_setup.is_empty());
     }
 
     #[test]
@@ -1487,11 +1506,11 @@ mod tests {
     #[test]
     fn user_nce_avoids_control_label_and_reserved_suffix_at_boundary() {
         for control in [[0xa4, 0xfd], [0xa4, 0xfe], [0xa4, 0xff]] {
-            let user = user_nce_label(&control).unwrap();
+            let user = target_nce(&control, [0, 0, 0, 1], 0).unwrap().0;
             assert_ne!(user, control);
             assert_ne!(user[1], 0xff);
         }
-        assert!(user_nce_label(&[]).is_err());
+        assert!(target_nce(&[], [0, 0, 0, 1], 0).is_err());
     }
 
     fn switch() -> SessionSwitch {
