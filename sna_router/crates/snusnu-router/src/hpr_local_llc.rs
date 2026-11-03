@@ -138,24 +138,37 @@ impl HprToLlcProbe {
         target_cp: &QualifiedName,
         seed: &[u8],
     ) -> io::Result<Self> {
+        Self::new_with_management(peer, source_cp, target_cp, source_cp, seed)
+    }
+
+    /// XID names the router's adjacent CP; management negotiates the routed
+    /// source CP's session limits with the destination CP. They differ when
+    /// the source LU belongs to another NETID.
+    pub(crate) fn new_with_management(
+        peer: LlcPeer<'_>,
+        adjacent_cp: &QualifiedName,
+        target_cp: &QualifiedName,
+        management_source_cp: &QualifiedName,
+        seed: &[u8],
+    ) -> io::Result<Self> {
         let cp = wire::SnaName {
-            netid: source_cp.netid.clone(),
-            name: source_cp.name.clone(),
+            netid: adjacent_cp.netid.clone(),
+            name: adjacent_cp.name.clone(),
         };
         let xid = virtual_xid(&cp, seed, None, None, 1)?;
         let mut port = VirtualWsPort::new(
             LlcPort::open(peer)?,
             xid,
-            &source_cp.to_string(),
+            &adjacent_cp.to_string(),
             &target_cp.to_string(),
         )?;
         port.attach_management(fresh_management(
-            &source_cp.to_string(),
+            &management_source_cp.to_string(),
             &target_cp.to_string(),
         )?)?;
         Ok(Self {
             port,
-            source_cp: source_cp.clone(),
+            source_cp: adjacent_cp.clone(),
             target_cp: target_cp.clone(),
             last_progress: None,
         })

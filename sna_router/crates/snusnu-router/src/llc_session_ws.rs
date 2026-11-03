@@ -145,8 +145,9 @@ impl LlcSessionWs {
         adjacent_cp: &QualifiedName,
         seed: &[u8],
     ) -> io::Result<Self> {
-        let (_, target_cp) = control_points(&identity)?;
-        let probe = HprToLlcProbe::new(peer, adjacent_cp, target_cp, seed)?;
+        let (source_cp, target_cp) = control_points(&identity)?;
+        let probe =
+            HprToLlcProbe::new_with_management(peer, adjacent_cp, target_cp, source_cp, seed)?;
         Ok(Self {
             identity,
             attachment_id,
