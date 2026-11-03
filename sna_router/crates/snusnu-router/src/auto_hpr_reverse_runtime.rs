@@ -284,7 +284,7 @@ impl ReverseRuntime {
                     self.early_user.push_back(message);
                     return Ok(());
                 }
-                self.management.as_mut().unwrap().observe(&message.bytes)
+                self.observe_management(&message.bytes)
             }
             RtpIngressKind::UserOut if self.phase == Phase::AwaitUserCie => {
                 if self.early_user.len() >= MAX_EARLY_USER_BIUS
@@ -368,14 +368,17 @@ impl ReverseRuntime {
             let Some(message) = self.early_user.front().cloned() else {
                 break;
             };
-            self.management.as_mut().unwrap().observe(&message.bytes)?;
+            self.observe_management(&message.bytes)?;
             self.early_user.pop_front();
             self.early_user_bytes -= message.bytes.len();
         }
         if self.phase == Phase::ManagementActive {
             if let Some(prepared) = self.management.as_ref().unwrap().prepared()? {
+                let stage = self.management.as_ref().unwrap().phase();
                 if rtp.send_user_out(link, &prepared, now_us)? {
                     self.management.as_mut().unwrap().confirm_sent(&prepared)?;
+                    tracing::info!(handle = self.handle, stage = ?stage,
+                        "reverse HPR CP management BIU transmitted");
                 }
             }
             if self.management.as_ref().unwrap().complete() {
@@ -440,6 +443,15 @@ impl ReverseRuntime {
         if self.phase == Phase::Done {
             self.finish(rtp)?;
         }
+        Ok(())
+    }
+
+    fn observe_management(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let management = self.management.as_mut().unwrap();
+        let before = management.phase();
+        management.observe(bytes)?;
+        tracing::info!(handle = self.handle, before = ?before,
+            after = ?management.phase(), "reverse HPR CP management peer BIU accepted");
         Ok(())
     }
 
