@@ -7,8 +7,9 @@ import "errors"
 // from its actual controller/device state rather than inventing defaults.
 var ErrPSID = errors.New("invalid 5494 printer Product Set ID")
 
-// HardwarePSID identifies one attached hardware printer. Values are EBCDIC
-// bytes as supplied by twinax VPD, not host-side spool metadata.
+// HardwarePSID identifies one attached hardware printer. MachineType is
+// converted to EBCDIC decimal digits by the 5494; the remaining fields are
+// copied from twinax VPD bytes, not host-side spool metadata.
 type HardwarePSID struct {
 	MachineType [4]byte
 	Model       [3]byte
@@ -37,9 +38,8 @@ func (p ReplyPSID) EncodeNMVT() ([]byte, error) {
 	if p.ProcedureID == 0 || p.Address == 0 || p.Address > 63 || p.Port > 63 ||
 		p.Station == 0 || p.Station > 7 ||
 		(p.Address == 1 && (p.Port != 0 || p.Station != 1)) ||
-		!ebcdicDigits(p.VPD.MachineType[:]) ||
-		!ebcdicVPD(p.VPD.Model[:]) || !ebcdicVPD(p.VPD.Plant[:]) ||
-		!ebcdicVPD(p.VPD.Serial[:]) {
+		!ebcdicDigits(p.VPD.MachineType[:]) || p.VPD.Model == [3]byte{} ||
+		p.VPD.Plant == [2]byte{} || p.VPD.Serial == [7]byte{} {
 		return nil, ErrPSID
 	}
 	ru := []byte{0x41, 0x03, 0x8d, 0, 0, byte(p.ProcedureID >> 8), byte(p.ProcedureID),
@@ -63,17 +63,6 @@ func (p ReplyPSID) EncodeNMVT() ([]byte, error) {
 func ebcdicDigits(b []byte) bool {
 	for _, x := range b {
 		if x < 0xf0 || x > 0xf9 {
-			return false
-		}
-	}
-	return true
-}
-
-func ebcdicVPD(b []byte) bool {
-	for _, x := range b {
-		if x != 0x40 && !(x >= 0xc1 && x <= 0xc9) &&
-			!(x >= 0xd1 && x <= 0xd9) && !(x >= 0xe2 && x <= 0xe9) &&
-			!(x >= 0xf0 && x <= 0xf9) {
 			return false
 		}
 	}

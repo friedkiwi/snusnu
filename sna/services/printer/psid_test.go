@@ -27,6 +27,10 @@ func TestReplyPSIDAddress01FirmwareLayout(t *testing.T) {
 		t.Fatal("wrong address-01 port/station accepted")
 	}
 	p.Station = 1
+	p.VPD.Model = [3]byte{1, 2, 3}
+	if raw, err := p.EncodeNMVT(); err != nil || !bytes.Equal(raw[44:47], []byte{1, 2, 3}) {
+		t.Fatalf("runtime model VPD not preserved: %x %v", raw, err)
+	}
 	p.VPD.Serial = [7]byte{}
 	if _, err := p.EncodeNMVT(); err == nil {
 		t.Fatal("missing device VPD accepted")
