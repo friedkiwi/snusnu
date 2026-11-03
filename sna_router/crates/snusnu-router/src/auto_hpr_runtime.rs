@@ -316,7 +316,15 @@ impl<'a> DirectHprRuntime<'a> {
 
     fn pump_local_llc(&mut self) -> io::Result<()> {
         if let Some(llc) = self.llc.as_mut() {
+            let started = Instant::now();
             llc.pump();
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_millis(500) {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    "local LLC probe delayed HPR router loop"
+                );
+            }
             self.local_directory
                 .replace_owner("llc", llc.verified_routes())?;
         }
@@ -2161,7 +2169,14 @@ fn run_connected(
         }
         if let Some(runtime) = active.as_mut() {
             runtime.tick(&link, clock.elapsed().as_micros() as u64)?;
+            let started = Instant::now();
             runtime.pump(&link, Some(hub), clock.elapsed().as_micros() as u64)?;
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_millis(500) {
+                tracing::warn!(attachment = %attachment.id,
+                    elapsed_ms = elapsed.as_millis(),
+                    "HPR router pump delayed concentrator keepalive");
+            }
         }
         thread::sleep(IDLE_POLL);
     }
