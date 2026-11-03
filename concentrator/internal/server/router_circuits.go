@@ -173,6 +173,10 @@ func sourceLUSupports62(route *wire.RouteExport) bool {
 	return false
 }
 func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
+	if req != nil {
+		h.a.debugSNA("open request router=%s request=%d source_route=%v target_route=%v profile=%s receive_allowance=%d",
+			source.router.ID, req.RequestId, req.SourceRoute, req.Target, req.Profile, req.ReceiveAllowanceBytes)
+	}
 	if req == nil || req.RequestId == 0 || req.Target == nil || req.ReceiveAllowanceBytes == 0 || req.ReceiveAllowanceBytes > 1<<20 {
 		return errors.New("invalid open request")
 	}
@@ -242,6 +246,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 					candidate.pending = true
 					candidate.allowance[1] = req.ReceiveAllowanceBytes
 					h.circuits.Store(id, candidate)
+					h.debugCircuitState(id, "open_pending", candidate)
 					requestOwnedByCircuit = true
 					if h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_IncomingOpen{IncomingOpen: &wire.IncomingOpen{CircuitId: uuidBytes(id), SourceRouterId: uuidBytes(source.router.ID), Target: candidate.targetRef, SourceReceiveAllowanceBytes: req.ReceiveAllowanceBytes, SourceRoute: candidate.sourceRef, Profile: candidate.profile}}}, "", 0) {
 						return nil
@@ -256,6 +261,7 @@ func (h *routerHub) open(source *routerSession, req *wire.OpenRequest) error {
 		}
 	}
 	h.send(source, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenResult{OpenResult: &wire.OpenResult{RequestId: req.RequestId, Accepted: false, Reason: reason}}}, "", 0)
+	h.a.debugSNA("open rejected router=%s request=%d reason=%s", source.router.ID, req.RequestId, reason)
 	return nil
 }
 func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision) error {
@@ -299,6 +305,7 @@ func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision)
 		c.lastActivityAt = c.activatedAt
 		c.allowance[0] = decision.ReceiveAllowanceBytes
 		h.circuits.Store(id, c)
+		h.debugCircuitState(id, "open_accepted", c)
 		// The target must receive OpenReady before the source can send data.
 		h.send(target, &wire.WsEnvelope{Body: &wire.WsEnvelope_OpenReady{OpenReady: &wire.OpenReady{CircuitId: decision.CircuitId}}}, "", 0)
 	}
@@ -307,6 +314,7 @@ func (h *routerHub) decision(target *routerSession, decision *wire.OpenDecision)
 		reason = wire.OpenFailure_OPEN_FAILURE_PROTOCOL
 	}
 	if !accepted {
+		h.debugCircuitState(id, "open_rejected", c)
 		c.discardQueued.Store(true)
 		c.closed = true
 		releaseCircuitValue(c)
@@ -433,6 +441,8 @@ func (h *routerHub) event(sender *routerSession, event *wire.CircuitEvent) error
 	c.sent[side] += uint64(cost)
 	c.events[side]++
 	c.lastActivityAt = time.Now()
+	h.debugCircuitEvent(id, side, event)
+	h.debugCircuitState(id, "event_forwarded", c)
 	peer.mu.Lock()
 	queued := uint64(peer.queued[id])
 	peer.mu.Unlock()
@@ -466,6 +476,7 @@ func (h *routerHub) credit(sender *routerSession, credit *wire.CircuitCredit) er
 	}
 	c.allowance[other] = credit.AllowanceBytes
 	c.lastActivityAt = time.Now()
+	h.debugCircuitState(id, "credit", c)
 	peer := c.target
 	if side == 1 {
 		peer = c.source
@@ -497,6 +508,7 @@ func (h *routerHub) endCircuit(sender *routerSession, idBytes []byte, reset bool
 		}
 		return "normal close"
 	}(), "router", sender.router.ID)
+	h.debugCircuitState(id, "end", c)
 	c.closed = true
 	releaseCircuitValue(c)
 	h.retireCircuit(id, c)
@@ -525,6 +537,7 @@ func (h *routerHub) resetCircuitValue(id string, c *wsCircuit, reason wire.Reset
 	}
 	c.closed = true
 	c.discardQueued.Store(true)
+	h.debugCircuitState(id, "reset_"+reason.String(), c)
 	releaseCircuitValue(c)
 	for _, peer := range []*routerSession{c.source, c.target} {
 		h.send(peer, &wire.WsEnvelope{Body: &wire.WsEnvelope_CircuitReset{CircuitReset: &wire.CircuitReset{CircuitId: uuidBytes(id), Reason: reason}}}, "", 0)

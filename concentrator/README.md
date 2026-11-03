@@ -39,6 +39,7 @@ If a user loses every MFA factor, an operator with database access can run `go r
 | `SNUSNU_MFA_KEY` | Persistent 64-character hex key for TOTP secret encryption |
 | `SNUSNU_METRICS_KEY` | Optional bearer key for `GET /metrics`; the endpoint is disabled when unset |
 | `SNUSNU_DEV` | Set to `1` for local HTTP and verification-code logging |
+| `SNUSNU_SNA_DEBUG` | Set to `1` to write full SNA PIUs, circuit state and local service state to stderr; these records can include application data |
 | `SNUSNU_SMTP_ADDR` | SMTP host and port with STARTTLS, required outside development |
 | `SNUSNU_SMTP_FROM` | Verified sender address, required outside development |
 | `SNUSNU_SMTP_USER`, `SNUSNU_SMTP_PASSWORD` | SMTP credentials, when required by the server |

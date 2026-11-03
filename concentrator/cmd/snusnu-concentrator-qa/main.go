@@ -26,6 +26,8 @@ func main() {
 	addr := flag.String("listen", listenDefault, "QA HTTP listen address (host:port or :port for all interfaces)")
 	origin := flag.String("origin", "http://localhost:8081", "QA public origin")
 	aliceNetID := flag.String("alice-netid", "QAALICE", "NETID for the isolated Alice QA fixture")
+	printerProbe := flag.Bool("printer-probe", false, "advertise a QA-only SNUSNU.PRINTER wire trace endpoint")
+	snaDebug := flag.Bool("sna-debug", false, "log SNA circuit state and protocol data to stderr")
 	flag.Parse()
 	if !store.ValidNetID(*aliceNetID) {
 		log.Fatal("invalid Alice QA NETID")
@@ -48,14 +50,19 @@ func main() {
 	if _, err = rand.Read(key); err != nil {
 		log.Fatal(err)
 	}
-	app, err := server.NewApp(db, server.Config{Origin: *origin, Development: true, MFAKey: key, DataDir: filepath.Dir(path)})
+	app, err := server.NewApp(db, server.Config{Origin: *origin, Development: true, SNADebug: *snaDebug, MFAKey: key, DataDir: filepath.Dir(path)})
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := app.InitializeRouterPolicy(ctx); err != nil {
 		log.Fatal(err)
 	}
-	if err := app.StartLocalSNA(ctx); err != nil {
+	if *printerProbe {
+		err = app.StartLocalSNAPrinterProbe(ctx)
+	} else {
+		err = app.StartLocalSNA(ctx)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("QA database: %s", path)

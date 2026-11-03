@@ -62,6 +62,21 @@ func (a *App) StartLocalSNA(ctx context.Context) error {
 	})
 }
 
+// StartLocalSNAPrinterProbe is for the QA binary's wire investigation. It
+// publishes PRINTER and records its first native/session events without
+// presenting an incomplete printer service in production.
+func (a *App) StartLocalSNAPrinterProbe(ctx context.Context) error {
+	aping := newLocalSNAService(a.hub)
+	probe := newLocalPrinterProbe(a.hub)
+	return a.hub.registerLocalServices(ctx,
+		localService{LU: "PING", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
+			AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
+			Handle:       aping.handle},
+		localService{LU: "PRINTER", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
+			AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
+			Handle:       probe.handle})
+}
+
 func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {
 	if envelope == nil {
 		return
@@ -93,6 +108,8 @@ func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {
 	if c == nil {
 		return
 	}
+	s.debugState(c, "before_event")
+	defer s.debugState(c, "after_event")
 	if envelope.GetCircuitClose() != nil || envelope.GetCircuitReset() != nil {
 		delete(s.circuits, id)
 		return
@@ -149,6 +166,7 @@ func (s *localSNAService) open(open *wire.IncomingOpen, source LocalPeer) {
 	}
 	c := &localSNACircuit{id: id, peer: peer, profile: open.Profile, xid: activation, management: management, inboundAllowance: 1500, outboundBase: open.SourceReceiveAllowanceBytes}
 	s.circuits[id] = c
+	s.debugState(c, "open")
 	if err := s.hub.decision(s.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Accept: true, ReceiveAllowanceBytes: c.inboundAllowance}); err != nil {
 		delete(s.circuits, id)
 	}

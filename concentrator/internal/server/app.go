@@ -37,6 +37,7 @@ type Config struct {
 	DataDir                                            string
 	MFAKey                                             []byte
 	Development                                        bool
+	SNADebug                                           bool
 }
 type App struct {
 	DB                *store.Store

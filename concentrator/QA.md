@@ -11,6 +11,14 @@ It serves the same Go application and WebSocket protocol as the normal binary on
 
 For an isolated guest that already uses another NETID, `-alice-netid SOLNET` changes only the Alice QA account's NETID in the new temporary database. Its router token stays the same. Use a separate `-listen` and `-origin` to keep this lab separate from another QA run.
 
+For the 5494 printer wire investigation, `-printer-probe` advertises
+`SNUSNU.PRINTER` only in that QA instance. It completes native link XID and
+logs incoming FID2 PIUs or session events. The probe does not acknowledge
+printer BIND or store output, so use it only to capture the first guest
+exchange before enabling the embedded printer service.
+Use `-sna-debug` to log full SNA PIUs, circuit credit and internal service
+state to stderr in the QA process.
+
 Every launch creates a new private directory under the OS temporary directory and a new `qa.sqlite` database in it. The database path is printed at startup. The QA binary **ignores** `SNUSNU_DB_DRIVER` and `SNUSNU_DB_DSN`, does not accept a database path flag, and creates the file exclusively. It cannot open or overwrite the normal concentrator's configured database. Previous QA databases are retained until removed by the operator or the OS temporary-directory cleanup.
 
 ## Accounts
