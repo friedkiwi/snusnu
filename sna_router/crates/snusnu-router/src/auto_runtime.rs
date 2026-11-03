@@ -19,7 +19,7 @@ use crate::{
     STOP,
 };
 use router_core::{
-    route_registry::{LuType, RouteKey, RouteRecord},
+    route_registry::{LuType, RouteKey, RouteRecord, RouteSelection},
     session::{QualifiedName, SessionIdentity},
 };
 use std::{
@@ -170,6 +170,7 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     unhandled_llc: Vec<(String, LlcIngressOffer)>,
     unhandled_mptn: Vec<(String, u64, IngressOffer)>,
     mptn_management: Vec<(String, Vec<(String, String)>)>,
+    ee_snapshots: HashMap<String, Vec<RouteRecord>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -288,7 +289,46 @@ impl<'a> AutoLocalSessionRunner<'a> {
             unhandled_llc: Vec::new(),
             unhandled_mptn: Vec::new(),
             mptn_management: Vec::new(),
+            ee_snapshots: HashMap::new(),
         })
+    }
+
+    /// Replace one verified EE attachment's route proof in the shared selector.
+    /// The returned flag lets the coordinator publish only when it changed.
+    pub(crate) fn replace_ee_records(
+        &mut self,
+        id: &str,
+        mut records: Vec<RouteRecord>,
+    ) -> io::Result<bool> {
+        if !self.config.ee.iter().any(|attachment| attachment.id == id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "EE attachment is absent",
+            ));
+        }
+        records.sort_by_key(|record| format!("{:?}", record.key));
+        if self.ee_snapshots.get(id) == Some(&records) {
+            return Ok(false);
+        }
+        self.fabric
+            .directory_mut()
+            .replace_local_records(PortId::new(id), records.clone())?;
+        self.ee_snapshots.insert(id.to_owned(), records);
+        Ok(true)
+    }
+
+    pub(crate) fn withdraw_ee_records(&mut self, id: &str) -> io::Result<bool> {
+        if !self.ee_snapshots.contains_key(id) {
+            return Ok(false);
+        }
+        self.fabric.directory_mut().withdraw(&PortId::new(id))?;
+        self.ee_snapshots.remove(id);
+        Ok(true)
+    }
+
+    /// Includes EE proofs, with duplicate identities withheld by the registry.
+    pub(crate) fn local_exports(&self, netid: &str) -> Vec<RouteSelection> {
+        self.fabric.directory().local_exports(netid)
     }
 
     pub(crate) fn take_unhandled_llc_offers(&mut self) -> Vec<(String, LlcIngressOffer)> {
@@ -318,6 +358,11 @@ impl<'a> AutoLocalSessionRunner<'a> {
 
     pub(crate) fn allow_llc_proxy_mac(&mut self, id: &str, mac: [u8; 6]) -> io::Result<()> {
         self.llc_listener(id)?.allow_native_proxy_mac(mac)
+    }
+
+    pub(crate) fn withdraw_llc_proxy_mac(&mut self, id: &str, mac: [u8; 6]) -> io::Result<()> {
+        self.llc_listener(id)?.withdraw_proxy_mac(mac);
+        Ok(())
     }
 
     pub(crate) fn reserve_llc(&mut self, id: &str, mac: [u8; 6]) -> io::Result<bool> {
@@ -967,97 +1012,119 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 continue;
             };
             active = true;
-            if !config.ee.is_empty() {
-                if let Ok((_, target)) = AutoMptnGateway::offer_lus(&offer) {
-                    if let Ok(target) = config::parse_cp(&target) {
-                        let local_missing = matches!(bridge.select_lu(&target),
-                            Err(ref error) if error.kind() == io::ErrorKind::NotFound);
-                        let upstream_missing = match hub.as_ref() {
-                            Some(connected) => connected.resolve_lu(&target)?.is_none(),
-                            None => true,
-                        };
-                        if local_missing && upstream_missing {
-                            if unhandled_mptn.len() < MAX_PENDING_HANDOFFS {
-                                unhandled_mptn.push((gateway.id().to_owned(), association, offer));
-                            } else {
-                                tracing::warn!(
-                                    gateway = gateway.id(),
-                                    association,
-                                    "MPTN offer handoff queue full; rejecting offer"
-                                );
-                                gateway.reject_offer(association, "router offer queue is full")?;
-                            }
-                            continue;
-                        }
+            let selection = AutoMptnGateway::offer_lus(&offer)
+                .and_then(|(_, target)| config::parse_cp(&target))
+                .and_then(|target| {
+                    QualifiedName::new(&target.netid, &target.name).map_err(io::Error::other)
+                })
+                .and_then(|target| {
+                    fabric
+                        .directory()
+                        .resolve_lu(&PortId::new(gateway.id()), &target)
+                        .map_err(|error| {
+                            tracing::warn!(gateway = gateway.id(), target_lu = %target,
+                                error = %error, "MPTN destination route unresolved");
+                            error
+                        })
+                });
+            let target_id = match selection {
+                Ok(id) => id,
+                Err(error) if !config.ee.is_empty() && error.kind() == io::ErrorKind::NotFound => {
+                    if unhandled_mptn.len() < MAX_PENDING_HANDOFFS {
+                        unhandled_mptn.push((gateway.id().to_owned(), association, offer));
+                    } else {
+                        tracing::warn!(
+                            gateway = gateway.id(),
+                            association,
+                            "MPTN offer handoff queue full; rejecting offer"
+                        );
+                        gateway.reject_offer(association, "router offer queue is full")?;
                     }
+                    continue;
                 }
+                Err(error) => {
+                    gateway.reject_offer(association, &error.to_string())?;
+                    continue;
+                }
+            };
+            if config
+                .ee
+                .iter()
+                .any(|attachment| attachment.id == target_id.0)
+            {
+                if unhandled_mptn.len() < MAX_PENDING_HANDOFFS {
+                    unhandled_mptn.push((gateway.id().to_owned(), association, offer));
+                } else {
+                    tracing::warn!(
+                        gateway = gateway.id(),
+                        association,
+                        "MPTN offer handoff queue full; rejecting offer"
+                    );
+                    gateway.reject_offer(association, "router offer queue is full")?;
+                }
+                continue;
             }
             let mut detached_for_session = false;
             let result = (|| -> io::Result<()> {
                 let (source, destination) = AutoMptnGateway::offer_lus(&offer)?;
                 let source = config::parse_cp(&source)?;
                 let destination = config::parse_cp(&destination)?;
-                match bridge.select_lu(&destination) {
-                    Ok(target_id) => {
-                        let target_cp = bridge
-                            .observed_cp(&target_id)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "local LLC target CP is not observed",
-                                )
-                            })?
-                            .clone();
-                        let index = config
-                            .llc
-                            .iter()
-                            .position(|peer| peer.id == target_id.0)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "local LLC target attachment is absent",
-                                )
-                            })?;
-                        let proxy = proxies.get(gateway.id()).expect("gateway proxy allocated");
-                        if !gateway.udp_available() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                "MPTN gateway is busy",
-                            ));
-                        }
-                        if !listeners[index].reserve(proxy)? {
-                            return Err(io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                "local LLC target is busy",
-                            ));
-                        }
-                        let seed = format!("{}:{}.{}", gateway.id(), source.netid, source.name);
-                        let local_cp =
-                            gateway.configured_local_cp()?.map(Ok).unwrap_or_else(|| {
-                                virtual_cp_for_source(&source, seed.as_bytes(), None)
-                            })?;
-                        let local = AutoLlcPort::open_outbound(
-                            &config.llc[index].interface,
-                            config::parse_mac(&config.llc[index].guest_mac)?,
-                            proxy,
-                        )?;
-                        let result = gateway.start_to_local(
-                            association,
-                            offer,
-                            Box::new(local),
-                            &target_id.0,
-                            &local_cp,
-                            &target_cp,
-                            seed.as_bytes(),
-                            Duration::from_secs(600),
-                        );
-                        if result.is_err() {
-                            listeners[index].release(proxy);
-                        }
-                        return result;
+                if let Some(index) = config.llc.iter().position(|peer| peer.id == target_id.0) {
+                    let target_cp = bridge
+                        .observed_cp(&target_id)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "local LLC target CP is not observed",
+                            )
+                        })?
+                        .clone();
+                    let proxy = proxies.get(gateway.id()).expect("gateway proxy allocated");
+                    if !gateway.udp_available() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "MPTN gateway is busy",
+                        ));
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
+                    if !listeners[index].reserve(proxy)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "local LLC target is busy",
+                        ));
+                    }
+                    let seed = format!("{}:{}.{}", gateway.id(), source.netid, source.name);
+                    let local_cp = gateway
+                        .configured_local_cp()?
+                        .map(Ok)
+                        .unwrap_or_else(|| virtual_cp_for_source(&source, seed.as_bytes(), None))?;
+                    let local = AutoLlcPort::open_outbound(
+                        &config.llc[index].interface,
+                        config::parse_mac(&config.llc[index].guest_mac)?,
+                        proxy,
+                    )?;
+                    let result = gateway.start_to_local(
+                        association,
+                        offer,
+                        Box::new(local),
+                        &target_id.0,
+                        &local_cp,
+                        &target_cp,
+                        seed.as_bytes(),
+                        Duration::from_secs(600),
+                    );
+                    if result.is_err() {
+                        listeners[index].release(proxy);
+                    }
+                    return result;
+                }
+                let remote = config.remote.first().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "concentrator attachment is absent")
+                })?;
+                if target_id.0 != remote.id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "MPTN destination carrier is not available",
+                    ));
                 }
                 let connected = hub.as_deref_mut().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "concentrator is unavailable")
@@ -1809,6 +1876,99 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn mptn_lu_selection_rejects_ee_upstream_and_llc_collisions() {
+        let config: RouterConfig = toml::from_str(
+            "[[hpr_ip]]\nid='ee'\nlocal_ip='127.0.0.1'\npeer_ip='127.0.0.2'\n\
+             [[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router'\n",
+        )
+        .unwrap();
+        let mut runner = AutoLocalSessionRunner::new(&config).unwrap();
+        let lu = QualifiedName::new("NETA", "TARGET").unwrap();
+        let ee_cp = QualifiedName::new("NETA", "EECP").unwrap();
+        let llc_cp = QualifiedName::new("NETA", "LLCCP").unwrap();
+        let route = |cp: &QualifiedName| RouteRecord {
+            key: RouteKey::LogicalUnit {
+                lu: lu.clone(),
+                hosting_cp: cp.clone(),
+            },
+            supported_types: vec![LuType::Lu62],
+        };
+        let ingress = PortId::new("mptn-source");
+        runner
+            .fabric
+            .directory_mut()
+            .replace_upstream(
+                PortId::new("upstream"),
+                [RouteAddress::LogicalUnit {
+                    netid: "NETA".into(),
+                    cp: Some("REMOTE".into()),
+                    name: "TARGET".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            runner.fabric.directory().resolve_lu(&ingress, &lu).unwrap(),
+            PortId::new("upstream")
+        );
+        assert!(runner
+            .replace_ee_records(
+                "ee",
+                vec![
+                    RouteRecord::from(RouteKey::ControlPoint(ee_cp.clone())),
+                    route(&ee_cp)
+                ],
+            )
+            .unwrap());
+        assert_eq!(
+            runner
+                .fabric
+                .directory()
+                .resolve_lu(&ingress, &lu)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(runner.local_exports("NETA").iter().all(|entry| {
+            !matches!(&entry.key, RouteKey::LogicalUnit { lu: entry_lu, .. } if entry_lu == &lu)
+        }));
+        assert!(runner.withdraw_ee_records("ee").unwrap());
+        assert_eq!(
+            runner.fabric.directory().resolve_lu(&ingress, &lu).unwrap(),
+            PortId::new("upstream")
+        );
+
+        runner
+            .fabric
+            .directory_mut()
+            .replace_local_records(
+                PortId::new("llc-target"),
+                vec![
+                    RouteRecord::from(RouteKey::ControlPoint(llc_cp.clone())),
+                    route(&llc_cp),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            runner
+                .fabric
+                .directory()
+                .resolve_lu(&ingress, &lu)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        runner
+            .fabric
+            .directory_mut()
+            .withdraw(&PortId::new("llc-target"))
+            .unwrap();
+        assert_eq!(
+            runner.fabric.directory().resolve_lu(&ingress, &lu).unwrap(),
+            PortId::new("upstream")
+        );
+    }
 
     #[test]
     fn hub_loss_withdraws_upstream_but_keeps_local_discovery() {
