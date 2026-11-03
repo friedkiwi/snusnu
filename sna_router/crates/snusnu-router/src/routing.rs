@@ -3,7 +3,8 @@
 use crate::STOP;
 use router_core::{
     route_registry::{
-        AttachmentId, OwnerId, OwnerVersion, RegistryError, RouteKey, RouteOrigin, RouteRegistry,
+        AttachmentId, OwnerId, OwnerVersion, RegistryError, RouteKey, RouteOrigin, RouteRecord,
+        RouteRegistry, RouteSelection,
     },
     session::QualifiedName,
 };
@@ -72,7 +73,7 @@ impl fmt::Display for RouteAddress {
 #[derive(Default)]
 pub(crate) struct AutomaticDirectory {
     registry: RouteRegistry,
-    snapshots: HashMap<PortId, (RouteOrigin, HashSet<RouteAddress>)>,
+    snapshots: HashMap<PortId, (RouteOrigin, Vec<RouteRecord>)>,
     revisions: HashMap<PortId, u64>,
 }
 
@@ -99,32 +100,57 @@ impl AutomaticDirectory {
         origin: RouteOrigin,
         addresses: impl IntoIterator<Item = RouteAddress>,
     ) -> io::Result<()> {
-        let addresses = addresses
+        let records = addresses
             .into_iter()
             .filter(|address| !matches!(address, RouteAddress::UnboundManagedMac))
-            .collect::<HashSet<_>>();
-        if self.snapshots.get(&attachment) == Some(&(origin, addresses.clone())) {
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|address| route_key(&address))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(RouteRecord::from)
+            .collect();
+        self.replace_snapshot(attachment, origin, records)
+    }
+
+    /// A carrier adapter supplies its complete verified snapshot, including
+    /// LU session capabilities. The registry is the publication source.
+    pub(crate) fn replace_local_records(
+        &mut self,
+        attachment: PortId,
+        records: Vec<RouteRecord>,
+    ) -> io::Result<()> {
+        self.replace_snapshot(attachment, RouteOrigin::Local, records)
+    }
+
+    fn replace_snapshot(
+        &mut self,
+        attachment: PortId,
+        origin: RouteOrigin,
+        mut records: Vec<RouteRecord>,
+    ) -> io::Result<()> {
+        records.sort_by_key(|record| format!("{:?}", record.key));
+        if self.snapshots.get(&attachment) == Some(&(origin, records.clone())) {
             return Ok(());
-        }
-        let mut routes = HashSet::new();
-        for address in &addresses {
-            if let Some(route) = route_key(address)? {
-                routes.insert(route);
-            }
         }
         let revision = self.next_revision(&attachment)?;
         self.registry
-            .replace_owner(
+            .replace_records(
                 owner_id(&attachment)?,
                 attachment_id(&attachment)?,
                 origin,
                 OwnerVersion::new(1, revision).map_err(registry_error)?,
-                routes.into_iter().collect(),
+                records.clone(),
             )
             .map_err(registry_error)?;
         self.revisions.insert(attachment.clone(), revision);
-        self.snapshots.insert(attachment, (origin, addresses));
+        self.snapshots.insert(attachment, (origin, records));
         Ok(())
+    }
+
+    pub(crate) fn local_exports(&self, netid: &str) -> Vec<RouteSelection> {
+        self.registry.local_exports(netid)
     }
 
     pub(crate) fn withdraw(&mut self, attachment: &PortId) -> io::Result<()> {
@@ -249,6 +275,10 @@ impl AutomaticFabric {
 
     pub(crate) fn directory_mut(&mut self) -> &mut AutomaticDirectory {
         &mut self.directory
+    }
+
+    pub(crate) fn directory(&self) -> &AutomaticDirectory {
+        &self.directory
     }
 
     pub(crate) fn resolve(
