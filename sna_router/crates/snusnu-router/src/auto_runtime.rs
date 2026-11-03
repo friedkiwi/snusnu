@@ -835,7 +835,12 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 "published LLC source LU or remote target route is unavailable",
                             )
                         })?;
-                    Ok(LlcSourceWs::new(pending.source.take().unwrap(), ws))
+                    Ok(LlcSourceWs::new(
+                        pending.source.take().unwrap(),
+                        ws,
+                        pending.attachment.0.clone(),
+                        id,
+                    ))
                 })()
             } else {
                 Err(match update {
