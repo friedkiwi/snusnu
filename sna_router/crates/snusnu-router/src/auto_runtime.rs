@@ -8,6 +8,7 @@ use crate::{
     auto_local_dispatch::AutoLocalDispatch,
     config::{self, RouterConfig},
     hpr_mptn_session_source::MptnToHprSession,
+    llc_proof_registry::{AssociationId, LlcProofRegistry},
     llc_session_ws::LlcSessionWs,
     local_status::LocalProxyMacStatus,
     mptn_session_ws::MptnSessionWs,
@@ -92,6 +93,7 @@ pub(crate) fn run(config: &RouterConfig) -> io::Result<()> {
 fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<()> {
     let mut fabric = AutomaticFabric::new();
     let mut bridge = AutoLlcWsBridge::default();
+    let mut proofs = LlcProofRegistry::default();
     for peer in &config.llc {
         let mac = proxies.get(&peer.id).expect("local LLC proxy allocated");
         fabric
@@ -167,6 +169,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         "automatic routing started"
     );
     while !STOP.load(Ordering::Relaxed) {
+        let mut changed_proofs = HashSet::<PortId>::new();
         if let Some(remote) = remote.filter(|_| hub.is_none() && Instant::now() >= next_connect) {
             match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
                 Ok(mut connected) => {
@@ -295,7 +298,13 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(error = %error, "automatic concentrator directory disconnected");
-                    retire_upstream_pairs(&mut fabric, &mut sessions, &mut listeners)?;
+                    changed_proofs.extend(retire_upstream_pairs(
+                        &mut fabric,
+                        &mut sessions,
+                        &mut listeners,
+                        &mut proofs,
+                        config,
+                    )?);
                     hub = None;
                     next_connect = Instant::now() + connect_delay;
                     if let Some(remote) = remote {
@@ -384,6 +393,13 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             let result = circuit.bridge.pump();
             if result.is_ok() && !circuit.verified_logged {
                 if let Some(cp) = circuit.bridge.verified_target_cp() {
+                    let attachment = PortId::new(circuit.bridge.attachment_id());
+                    proofs.observe_cp(
+                        &attachment,
+                        association("session_v1", id),
+                        &format!("{}.{}", cp.netid, cp.name),
+                    )?;
+                    changed_proofs.insert(attachment);
                     tracing::info!(session = id, attachment = circuit.bridge.attachment_id(),
                         target_cp = %cp, "automatic LLC SessionV1 target verified by XID");
                     circuit.verified_logged = true;
@@ -400,6 +416,10 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             };
             if retired {
                 let mut circuit = llc_ws_sessions.remove(&id).unwrap();
+                let attachment = PortId::new(circuit.bridge.attachment_id());
+                if proofs.withdraw(&attachment, &association("session_v1", id)) {
+                    changed_proofs.insert(attachment);
+                }
                 let _ = circuit.bridge.close();
                 listeners[circuit.listener].release(circuit.proxy_mac);
             }
@@ -409,7 +429,13 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             Err(error) if remote.is_some() => {
                 tracing::warn!(error = %error,
                     "automatic upstream circuit failed; retaining local routes");
-                retire_upstream_pairs(&mut fabric, &mut sessions, &mut listeners)?;
+                changed_proofs.extend(retire_upstream_pairs(
+                    &mut fabric,
+                    &mut sessions,
+                    &mut listeners,
+                    &mut proofs,
+                    config,
+                )?);
                 hub = None;
                 next_connect = Instant::now() + connect_delay;
                 if let Some(remote) = remote {
@@ -424,13 +450,36 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             }
             Err(error) => return Err(error),
         };
-        for closed in fabric.take_closed_sessions() {
+        let closed_sessions = fabric.take_closed_sessions();
+        for observation in fabric.take_identity_observations() {
+            let Some(session) = sessions.get(&observation.session_id) else {
+                continue;
+            };
+            let attachment = match observation.side {
+                SessionSide::Ingress => session.ingress.map(|(index, _)| index),
+                SessionSide::Egress => session.egress.map(|(index, _)| index),
+            };
+            let Some(index) = attachment else { continue };
+            let id = PortId::new(&config.llc[index].id);
+            let owner = association("fabric", observation.session_id);
+            observe_proof(&mut proofs, &id, owner, observation.identity)?;
+            changed_proofs.insert(id);
+        }
+        for closed in closed_sessions {
             if let Some(session) = sessions.remove(&closed) {
                 if let Some((ingress, proxy)) = session.ingress {
                     listeners[ingress].release(proxy);
+                    let id = PortId::new(&config.llc[ingress].id);
+                    if proofs.withdraw(&id, &association("fabric", closed)) {
+                        changed_proofs.insert(id);
+                    }
                 }
                 if let Some((egress, proxy)) = session.egress {
                     listeners[egress].release(proxy);
+                    let id = PortId::new(&config.llc[egress].id);
+                    if proofs.withdraw(&id, &association("fabric", closed)) {
+                        changed_proofs.insert(id);
+                    }
                 }
                 if let Some(status) = crate::status() {
                     status.remove_circuit(&format!("auto-{closed}"));
@@ -439,6 +488,10 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             }
         }
         for completed in local_dispatch.poll_completed() {
+            let id = PortId::new(&completed.ingress_id);
+            if proofs.withdraw(&id, &association("local_dispatch", completed.id)) {
+                changed_proofs.insert(id);
+            }
             if let Some(gateway) = gateways
                 .iter_mut()
                 .find(|gateway| gateway.id() == completed.gateway_id)
@@ -458,28 +511,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             }
             active = true;
         }
-        let mut learned = false;
-        for observation in fabric.take_identity_observations() {
-            let Some(session) = sessions.get(&observation.session_id) else {
-                continue;
-            };
-            let attachment = match observation.side {
-                SessionSide::Ingress => session.ingress.map(|(index, _)| index),
-                SessionSide::Egress => session.egress.map(|(index, _)| index),
-            };
-            let Some(index) = attachment else { continue };
-            let id = PortId::new(&config.llc[index].id);
-            let changed = match observation.identity {
-                IdentityObservation::ControlPoint(cp) => bridge.observe_cp(&id, &cp)?,
-                IdentityObservation::LogicalUnit(lu) => bridge.observe_bound_lu(&id, &lu)?,
-                // The shared registry aggregates evidence by association.
-                // This legacy bridge cannot withdraw one association without
-                // hiding another live one on the same attachment.
-                IdentityObservation::Withdraw => false,
-            };
-            learned |= changed;
-        }
-        if learned {
+        if reconcile_proofs(&proofs, &mut bridge, changed_proofs.drain())? {
             refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
             if let Some(connected) = hub.as_mut() {
                 publish_local(fabric.directory(), connected)?;
@@ -502,13 +534,8 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 }
             };
             if let Some(gateway) = gateways.iter_mut().find(|gateway| gateway.id() == target.0) {
+                let offered_cp = offer.peer_cp.clone();
                 if let Some(cp) = &offer.peer_cp {
-                    if bridge.observe_cp(&ingress_id, cp)? {
-                        refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
-                        if let Some(connected) = hub.as_mut() {
-                            publish_local(fabric.directory(), connected)?;
-                        }
-                    }
                     observe_native_llc_peer(&offer, cp);
                 }
                 let seed = format!("{}:{}", ingress_id.0, gateway.id());
@@ -530,10 +557,22 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                         Duration::from_secs(600),
                     )
                 });
-                if let Err(error) = result {
-                    listeners[ingress].release(ingress_proxy);
-                    tracing::warn!(ingress = %ingress_id.0, gateway = gateway.id(),
-                        error = %error, "automatic LLC to TCP62 session rejected");
+                match result {
+                    Ok(worker_id) => {
+                        if let Some(cp) = offered_cp {
+                            proofs.observe_cp(
+                                &ingress_id,
+                                association("local_dispatch", worker_id),
+                                &cp,
+                            )?;
+                            changed_proofs.insert(ingress_id.clone());
+                        }
+                    }
+                    Err(error) => {
+                        listeners[ingress].release(ingress_proxy);
+                        tracing::warn!(ingress = %ingress_id.0, gateway = gateway.id(),
+                            error = %error, "automatic LLC to TCP62 session rejected");
+                    }
                 }
                 continue;
             }
@@ -627,22 +666,28 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     }
                 }
             }
-            for attachment in gateway.take_closed_local_attachments() {
+            let gateway_origin = format!("gateway:{}", gateway.id());
+            for (association_id, attachment, identity) in gateway.take_identity_observations() {
+                let id = PortId::new(attachment);
+                observe_proof(
+                    &mut proofs,
+                    &id,
+                    association(&gateway_origin, association_id),
+                    identity,
+                )?;
+                changed_proofs.insert(id);
+            }
+            for (association_id, attachment) in gateway.take_closed_local_attachments() {
                 if let Some(index) = config.llc.iter().position(|peer| peer.id == attachment) {
                     listeners[index]
                         .release(proxies.get(gateway.id()).expect("gateway proxy allocated"));
                 }
-            }
-            let mut learned_local = false;
-            for (_association, attachment, identity) in gateway.take_identity_observations() {
                 let id = PortId::new(attachment);
-                learned_local |= match identity {
-                    IdentityObservation::ControlPoint(cp) => bridge.observe_cp(&id, &cp)?,
-                    IdentityObservation::LogicalUnit(lu) => bridge.observe_bound_lu(&id, &lu)?,
-                    IdentityObservation::Withdraw => false,
-                };
+                if proofs.withdraw(&id, &association(&gateway_origin, association_id)) {
+                    changed_proofs.insert(id);
+                }
             }
-            if learned_local {
+            if reconcile_proofs(&proofs, &mut bridge, changed_proofs.drain())? {
                 refresh_local_addresses(&mut fabric, &bridge, config, &proxies)?;
                 if let Some(connected) = hub.as_mut() {
                     publish_local(fabric.directory(), connected)?;
@@ -1030,26 +1075,93 @@ fn retire_upstream_pairs(
     fabric: &mut AutomaticFabric,
     sessions: &mut HashMap<u64, LlcSession>,
     listeners: &mut [LlcAutoListener],
-) -> io::Result<()> {
+    proofs: &mut LlcProofRegistry,
+    config: &RouterConfig,
+) -> io::Result<HashSet<PortId>> {
+    let mut changed = HashSet::new();
     let upstream = sessions
         .iter()
         .filter_map(|(id, session)| session.upstream.then_some(*id))
         .collect::<Vec<_>>();
-    for id in upstream {
-        fabric.abort_pair(id)?;
-        if let Some(session) = sessions.remove(&id) {
+    for session_id in upstream {
+        fabric.abort_pair(session_id)?;
+        if let Some(session) = sessions.remove(&session_id) {
             if let Some((index, mac)) = session.ingress {
                 listeners[index].release(mac);
+                let id = PortId::new(&config.llc[index].id);
+                if proofs.withdraw(&id, &association("fabric", session_id)) {
+                    changed.insert(id);
+                }
             }
             if let Some((index, mac)) = session.egress {
                 listeners[index].release(mac);
+                let id = PortId::new(&config.llc[index].id);
+                if proofs.withdraw(&id, &association("fabric", session_id)) {
+                    changed.insert(id);
+                }
             }
         }
         if let Some(status) = crate::status() {
-            status.remove_circuit(&format!("auto-{id}"));
+            status.remove_circuit(&format!("auto-{session_id}"));
         }
     }
-    Ok(())
+    Ok(changed)
+}
+
+fn association(origin: &str, id: u64) -> AssociationId {
+    AssociationId {
+        origin: origin.into(),
+        id,
+    }
+}
+
+fn observe_proof(
+    proofs: &mut LlcProofRegistry,
+    attachment: &PortId,
+    owner: AssociationId,
+    identity: IdentityObservation,
+) -> io::Result<()> {
+    match identity {
+        IdentityObservation::ControlPoint(cp) => proofs.observe_cp(attachment, owner, &cp),
+        IdentityObservation::LogicalUnit(lu) => proofs.observe_lu(attachment, &owner, &lu),
+        IdentityObservation::Withdraw => {
+            proofs.withdraw(attachment, &owner);
+            Ok(())
+        }
+    }
+}
+
+fn reconcile_proofs(
+    proofs: &LlcProofRegistry,
+    bridge: &mut AutoLlcWsBridge,
+    attachments: impl Iterator<Item = PortId>,
+) -> io::Result<bool> {
+    let mut changed = false;
+    for attachment in attachments {
+        let before = bridge.route_records(&attachment)?;
+        bridge.withdraw(&attachment)?;
+        if let Some(snapshot) = proofs.snapshot(&attachment) {
+            bridge.observe_cp(
+                &attachment,
+                &format!("{}.{}", snapshot.cp.netid, snapshot.cp.name),
+            )?;
+            for lu in snapshot.lus {
+                bridge.observe_bound_lu(&attachment, &format!("{}.{}", lu.netid, lu.name))?;
+            }
+        }
+        let after = bridge.route_records(&attachment)?;
+        let normalize = |records: Vec<RouteRecord>| -> HashMap<RouteKey, Vec<LuType>> {
+            records
+                .into_iter()
+                .map(|mut record| {
+                    record.supported_types.sort();
+                    (record.key, record.supported_types)
+                })
+                .collect()
+        };
+        changed |= normalize(before) != normalize(after);
+    }
+    Ok(changed)
 }
 
 fn observe_circuit(id: u64, ingress: &str, egress: &str) {
@@ -1389,6 +1501,35 @@ fn open_incoming_llc_session(
 #[cfg(test)]
 mod session_profile_tests {
     use super::*;
+
+    #[test]
+    fn llc_route_survives_one_association_closing_and_withdraws_on_last() {
+        let attachment = PortId::new("llc-a");
+        let mut bridge = AutoLlcWsBridge::default();
+        bridge
+            .register(attachment.clone(), "tap0".into(), [2, 0, 0, 0, 0, 1])
+            .unwrap();
+        let mut proofs = LlcProofRegistry::default();
+        for session in [1, 2] {
+            proofs
+                .observe_cp(&attachment, association("fabric", session), "LOCAL.CPA")
+                .unwrap();
+        }
+        assert!(
+            reconcile_proofs(&proofs, &mut bridge, std::iter::once(attachment.clone())).unwrap()
+        );
+        assert_eq!(bridge.observed_cp(&attachment).unwrap().name, "CPA");
+        proofs.withdraw(&attachment, &association("fabric", 1));
+        assert!(
+            !reconcile_proofs(&proofs, &mut bridge, std::iter::once(attachment.clone())).unwrap()
+        );
+        assert_eq!(bridge.observed_cp(&attachment).unwrap().name, "CPA");
+        proofs.withdraw(&attachment, &association("fabric", 2));
+        assert!(
+            reconcile_proofs(&proofs, &mut bridge, std::iter::once(attachment.clone())).unwrap()
+        );
+        assert!(bridge.observed_cp(&attachment).is_none());
+    }
 
     #[test]
     fn local_publication_preserves_lu7_and_excludes_other_netids_and_upstream() {

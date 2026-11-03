@@ -174,7 +174,7 @@ pub(crate) struct AutoMptnGateway<'a> {
     reverse_status_id: Option<String>,
     udp_leased: bool,
     identity_observations: Vec<(u64, String, IdentityObservation)>,
-    closed_local_attachments: Vec<String>,
+    closed_local_attachments: Vec<(u64, String)>,
     management_lus: Vec<(String, String)>,
     discovery: MptnDiscovery,
 }
@@ -254,7 +254,7 @@ impl<'a> AutoMptnGateway<'a> {
     }
 
     #[allow(dead_code)] // The mixed runtime releases reserved LLC proxy MACs through this queue.
-    pub(crate) fn take_closed_local_attachments(&mut self) -> Vec<String> {
+    pub(crate) fn take_closed_local_attachments(&mut self) -> Vec<(u64, String)> {
         std::mem::take(&mut self.closed_local_attachments)
     }
 
@@ -599,7 +599,7 @@ impl<'a> AutoMptnGateway<'a> {
     fn retire_session(&mut self, id: u64) {
         if let Some(session) = self.sessions.remove(&id) {
             if let Some(attachment) = session.target_attachment {
-                self.closed_local_attachments.push(attachment);
+                self.closed_local_attachments.push((id, attachment));
             }
             if let Some(status) = crate::status() {
                 status.remove_circuit(&session.status_id);
