@@ -570,6 +570,22 @@ library rejected it and the trial reset its circuit. That trial did not
 test printer activation. The next printer probe should focus on the
 NMVT/VPD to remote-device transition.
 
+A fresh LLC trial kept the controller job alive and deferred the corrected
+address-01 NMVT until after the final address-56 WSF fragment and the
+second `D823/02` response. QA sent `2C 00 ... 41 03 8D` with zero procedure
+ID and a current binary timestamp at 20:41:32; the router relayed IBM i's
+positive `8B 80 00 41 03 8D` response to QA. `SNUPRT` and `SNUPRT01`
+remained `VARY ON PENDING`, and no address-01 BIND followed. This rules out
+the immediate-after-Attach timing of the earlier corrected NMVT as the sole
+cause. In a preceding live trial, `WRKACTJOB` showed the controller's
+`QUSER/SVC` job active, its call stack was `QND5MAIN` under `QWTPIPPP`, and
+its job log said it was running for `SNUPRT` without an error. The delayed
+trial again showed a new `QUSER/SVC` job in the same call stack. These
+observations establish that the Attach starts the IBM i controller TP, but
+not why its address-01 device state remains pending. The verbose trial logs
+are `/tmp/snusnu-printer-qa-late-nmvt-corrected.log` and
+`/tmp/snusnu-printer-router-late-nmvt-corrected.log`.
+
 A later LLC trial corrected the experimental Reply-PSID FID2 TH byte 1
 from `FF` to `00`, matching the reserved byte in the 5494 reference and
 firmware. The verbose router log shows the corrected `2C 00 ... 41 03 8D`
