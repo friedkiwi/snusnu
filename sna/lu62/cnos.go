@@ -17,6 +17,19 @@ type CNOS struct {
 	ModeWidth                                  byte
 }
 
+// New5494ControllerCNOS requests one 5494-controlled controller session and
+// host-controlled device sessions. VG10's source-CNOS builder uses this
+// contention-winner direction for QRMTWSC; the eight-byte mode field includes
+// the EBCDIC space following its seven letters.
+func New5494ControllerCNOS(deviceSessions uint16) (CNOS, error) {
+	if deviceSessions == 0 || deviceSessions > 56 {
+		return CNOS{}, ErrCNOS
+	}
+	return CNOS{Service: 2, SessionLimit: deviceSessions + 1,
+		SourceWinners: 1, TargetWinners: deviceSessions,
+		Mode: "QRMTWSC", ModeWidth: 8}, nil
+}
+
 func ParseCNOS(data []byte) (CNOS, error) {
 	var c CNOS
 	if len(data) < 17 || len(data) > 25 || int(binary.BigEndian.Uint16(data[:2])) != len(data) ||

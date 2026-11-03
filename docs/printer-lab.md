@@ -44,7 +44,9 @@ retains no information about font, forms, or graphics orders, so raw SCS is
 stored with each preview.
 
 The reusable `sna/lu62` package also constructs candidate `QRMTWSC` CNOS and
-controller BIND requests with dynamic LU names, CP name, and FQPCID. Its
+controller BIND requests with dynamic LU names, CP name, and FQPCID. The 5494
+CNOS helper requests one source-controlled controller session and up to 56
+target-controlled device sessions, matching the firmware's count direction. Its
 CNOS reply validator checks the accepted-pending service, mode, session limits,
 and reversed FID2 addresses before the controller can proceed. Its
 binary architecture-TP Attach parser can retain the controller TPN

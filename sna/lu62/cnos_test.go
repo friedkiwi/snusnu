@@ -29,7 +29,10 @@ func TestCapturedCNOSSetLimits(t *testing.T) {
 }
 
 func TestOutboundQRMTWSCCNOSReply(t *testing.T) {
-	want := CNOS{Service: 2, SessionLimit: 57, SourceWinners: 56, TargetWinners: 1, Mode: "QRMTWSC", ModeWidth: 8}
+	want, err := New5494ControllerCNOS(56)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request, err := CandidateCNOSAttach(1, 2, 1, want)
 	if err != nil {
 		t.Fatal(err)
@@ -43,8 +46,14 @@ func TestOutboundQRMTWSCCNOSReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := ValidateCNOSReply(request, reply)
-	if err != nil || got.SessionLimit != 57 || got.SourceWinners != 56 || got.TargetWinners != 1 || got.Mode != "QRMTWSC" {
+	if err != nil || got.SessionLimit != 57 || got.SourceWinners != 1 || got.TargetWinners != 56 || got.Mode != "QRMTWSC" {
 		t.Fatalf("CNOS acceptance: %+v %v", got, err)
+	}
+	if got.Service != 0x0a || got.ModeWidth != 8 || !bytes.Equal(request[21:38], []byte{0, 0x19, 0x12, 0x10, 2, 0, 0, 0, 0, 0, 57, 0, 1, 0, 56, 0, 8}) {
+		t.Fatalf("5494 source CNOS fields: %x %+v", request, got)
+	}
+	if _, err := New5494ControllerCNOS(57); err == nil {
+		t.Fatal("more than 56 device sessions accepted")
 	}
 	badRoute := append([]byte(nil), reply...)
 	badRoute[2] = 3
