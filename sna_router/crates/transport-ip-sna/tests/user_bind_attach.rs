@@ -831,7 +831,7 @@ fn tcp_expedited_signal_is_delivered_and_acked_before_later_data() {
         edge.poll_tcp_once().unwrap();
         std::thread::yield_now();
     }
-    let native_signal = edge.native_mut().sent.last().unwrap();
+    let native_signal = edge.native_mut().sent.last().unwrap().clone();
     assert_eq!(native_signal[0] & 1, 1); // FID2 expedited flow.
     assert_eq!(&native_signal[6..], &signal[7..]);
     edge.flush_tcp().unwrap();
@@ -840,6 +840,36 @@ fn tcp_expedited_signal_is_delivered_and_acked_before_later_data() {
         .events
         .push_back(NativeEvent::EgressAck(1));
     edge.poll_native_once().unwrap();
+    assert!(!edge.is_closed());
+
+    let response = [
+        native_signal[0],
+        0,
+        native_signal[3],
+        native_signal[2],
+        native_signal[4],
+        native_signal[5],
+        0xcb,
+        0x80,
+        0,
+    ];
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::UserInformation(response.to_vec()));
+    edge.poll_native_once().unwrap();
+    edge.flush_tcp().unwrap();
+    assert_eq!(
+        read_record(&mut peer),
+        [0, 0, 0, 10, 1, 0x80, 0, 0xcb, 0x80, 0]
+    );
+    assert_eq!(edge.pending_expedited_bytes().0, 10);
+    peer.write_all(&[0, 0, 0, 5, 3]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.pending_expedited_bytes().0 != 0 && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(edge.pending_expedited_bytes().0, 0);
     assert!(!edge.is_closed());
 }
 

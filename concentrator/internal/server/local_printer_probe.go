@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"log"
@@ -525,25 +526,54 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if err != nil {
 			return nil
 		}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && outer.TH[0]&1 != 0 &&
+			outer.RH == [3]byte{0x4b, 0x80, 0} && bytes.Equal(outer.RU, []byte{0xc9, 0, 1, 0, 1}) {
+			th := [6]byte{outer.TH[0], outer.TH[1], outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}
+			response, err := (piu.FID2{TH: th, RH: [3]byte{0xcb, 0x80, 0}}).Bytes()
+			if err != nil {
+				return err
+			}
+			log.Printf("printer probe SIGNAL response: circuit=%s piu=%x", id, response)
+			return p.sendInformation(id, response)
+		}
 		inner, err := printer.ParseControllerDeviceGDS(outer.RU)
 		if err != nil || inner.Address != 56 || len(inner.RU) < 3 {
 			return nil
 		}
 		var ru []byte
+		queryReply := false
 		switch {
 		case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0d:
 			ru, err = printer.ACTLUResponseRU(inner.RU)
 		case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && inner.RU[14] == 7:
 			ru = append([]byte(nil), inner.RU...)
+		case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
+			bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 5, 0xd8, 0x20, 2}):
+			// VG03's D820/02 handler copies this 26-byte 5250 Query reply.
+			// Bytes 20-21 are runtime capability fields; the disk default is
+			// only a probe value until the device configuration is known.
+			ru = []byte{0, 0, 0x88, 0, 0x17, 0xd8, 0x21, 2, 0, 0x12, 1, 1, 0, 0x0e, 2, 1, 0, 0x0a, 3, 3, 3, 0x10, 0, 4, 0x40, 0xff}
+			queryReply = true
+		case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
+			bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 0x17, 0xd8, 0x21, 0x10, 0, 0x12, 1, 1, 0, 0x0e, 2, 1, 0, 0x0a, 3, 3, 3, 0x10, 0, 4, 0x40, 0xff}):
+			// VG03's D821/10 handler emits its eight-byte station-state
+			// reply template, including the 5250 structured-field AID.
+			ru = []byte{0, 0, 0x88, 0, 5, 0xd8, 0x20, 0x10}
+			queryReply = true
 		default:
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		response, err := printer.PositiveLU4Response(inner, ru)
-		if err != nil {
-			return err
+		var response printer.LU4PIU
+		if queryReply {
+			response = printer.LU4PIU{Address: inner.Address, Session: inner.Session, RH: [3]byte{0x03, 0x80, 0x20}, RU: ru}
+		} else {
+			response, err = printer.PositiveLU4Response(inner, ru)
+			if err != nil {
+				return err
+			}
 		}
 		gds, err := printer.EncodeControllerDeviceGDS(response)
 		if err != nil {

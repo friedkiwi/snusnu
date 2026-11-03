@@ -1,7 +1,7 @@
 //! Pure native user BIND to TCP62 gate. It does not activate a runtime route.
 
 use crate::{
-    anynet::TcpRecord,
+    anynet::{TcpKind, TcpRecord},
     mptn_compensations::CompensationSet,
     mptn_connect::Connect,
     mptn_session::{BindPolicy, GatewaySession, Phase as GatewayPhase},
@@ -49,6 +49,8 @@ pub struct Bridge {
     outstanding_implied_bracket_dr: bool,
     outstanding_native_dr: Option<[u8; 2]>,
     native_response_prepared: bool,
+    inbound_signal_snf: Option<[u8; 2]>,
+    signal_response: Option<TcpRecord>,
     first_attach_complete: bool,
     phase: Phase,
 }
@@ -116,6 +118,8 @@ impl Bridge {
             outstanding_implied_bracket_dr: false,
             outstanding_native_dr: None,
             native_response_prepared: false,
+            inbound_signal_snf: None,
+            signal_response: None,
             first_attach_complete: false,
             phase: Phase::Idle,
         })
@@ -126,6 +130,10 @@ impl Bridge {
 
     pub fn pending_bytes(&self) -> (usize, usize) {
         self.gateway.pending_bytes()
+    }
+
+    pub fn pending_expedited_bytes(&self) -> (usize, usize) {
+        self.gateway.pending_expedited_bytes()
     }
 
     pub fn begin_native_bind(&mut self, piu: &[u8], template: Connect) -> io::Result<TcpRecord> {
@@ -527,7 +535,51 @@ impl Bridge {
         if self.phase != Phase::Active || !self.first_attach_complete {
             return Err(wrong_phase());
         }
-        self.gateway.mptn_expedited(record)
+        let (piu, ack) = self.gateway.mptn_expedited(record)?;
+        if piu.len() == 14 && piu[6..9] == [0x4b, 0x80, 0] && piu[9..] == [0xc9, 0, 1, 0, 1] {
+            if self.inbound_signal_snf.is_some() {
+                return Err(invalid("previous TCP62 SIGNAL awaits native response"));
+            }
+            self.inbound_signal_snf = Some([piu[4], piu[5]]);
+        }
+        Ok((piu, ack))
+    }
+
+    /// Carry the correlated positive SNA response to a TCP62 SIGNAL as a
+    /// separate expedited record. Its transport ACK is handled independently.
+    pub fn next_native_signal_response(&mut self, piu: &[u8]) -> io::Result<TcpRecord> {
+        if self.phase != Phase::Active
+            || !self.first_attach_complete
+            || self.signal_response.is_some()
+            || self.inbound_signal_snf.is_none()
+            || piu.len() != 9
+            || piu[4..6] != self.inbound_signal_snf.unwrap()
+            || piu[6..9] != [0xcb, 0x80, 0]
+        {
+            return Err(invalid("native SIGNAL response has no matching request"));
+        }
+        let record = self.gateway.native_expedited(piu)?;
+        self.signal_response = Some(record.clone());
+        Ok(record)
+    }
+
+    pub fn mark_native_signal_response_enqueued(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if self.signal_response.as_ref() != Some(record) {
+            return Err(wrong_phase());
+        }
+        self.signal_response = None;
+        self.inbound_signal_snf = None;
+        Ok(())
+    }
+
+    pub fn accept_native_signal_response_ack(&mut self, record: &TcpRecord) -> io::Result<()> {
+        if record.kind != TcpKind::ExpeditedAck
+            || self.gateway.receive_expedited_control(record)?
+                != crate::mptn_expedited::Inbound::Acked
+        {
+            return Err(invalid("TCP62 SIGNAL response ACK is invalid"));
+        }
+        Ok(())
     }
 
     pub fn complete_mptn_udp_expedited(&mut self, piu_bytes: usize) -> io::Result<()> {

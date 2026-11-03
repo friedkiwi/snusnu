@@ -45,6 +45,7 @@ enum NativeReply {
 enum TcpWriteKind {
     Connect,
     Charged,
+    Expedited,
     ExpeditedAck,
 }
 
@@ -65,6 +66,7 @@ pub struct GatewayEdge<L: NativeLeg> {
     connect: Option<TcpRecord>,
     attach: Option<(TcpRecord, bool)>,
     normal: Option<(TcpRecord, bool, NativeNormalKind)>,
+    outbound_expedited: Option<TcpRecord>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
     /// TCP queue order and the accounting rule for each record.
@@ -97,6 +99,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             connect: None,
             attach: None,
             normal: None,
+            outbound_expedited: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             writes: VecDeque::new(),
@@ -136,6 +139,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
     }
     pub fn pending_gateway_bytes(&self) -> (usize, usize) {
         self.bridge.pending_bytes()
+    }
+    pub fn pending_expedited_bytes(&self) -> (usize, usize) {
+        self.bridge.pending_expedited_bytes()
     }
 
     /// Accept one UDP X'83' expedited PIU for this circuit. The caller keeps
@@ -222,6 +228,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.first_attach_delivery_complete()
                 && self.bridge.phase() == Phase::Active
                 && self.normal.is_none()
+                && self.outbound_expedited.is_none()
                 && self.native_reply.is_none()
                 && !self.ipr_ack_outstanding
                 && self.udp_expedited_pending.is_none()
@@ -259,6 +266,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     }
                     if piu.len() == 9 && piu[6..9] == [0x83, 0x01, 0] {
                         self.bridge.observe_native_ipr(&piu)?;
+                    } else if piu.len() == 9 && piu[6..9] == [0xcb, 0x80, 0] {
+                        self.outbound_expedited =
+                            Some(self.bridge.next_native_signal_response(&piu)?);
                     } else if piu.len() == 9 && piu[6..9] == [0x83, 0xa0, 0] {
                         let record = self.bridge.next_native_positive_response(&piu)?;
                         self.normal = Some((record, false, NativeNormalKind::PositiveResponse));
@@ -404,6 +414,11 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     self.drive_queues()?;
                     return Ok(());
                 }
+                TcpKind::ExpeditedAck => {
+                    let record = self.incoming.pop_front().unwrap();
+                    self.incoming_bytes -= record.bytes.len();
+                    self.bridge.accept_native_signal_response_ack(&record)?;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -461,6 +476,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     return Err(invalid("duplicate TCP62 Connect write completion"));
                 }
                 TcpWriteKind::ExpeditedAck => {}
+                TcpWriteKind::Expedited => {}
             }
         }
         result
@@ -491,6 +507,20 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     .push_back((ack.bytes.len(), TcpWriteKind::ExpeditedAck)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.tcp_expedited_ack = Some(ack);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(record) = self.outbound_expedited.take() {
+            match self.tcp.as_mut().unwrap().queue(record.clone()) {
+                Ok(()) => {
+                    self.writes
+                        .push_back((record.bytes.len(), TcpWriteKind::Expedited));
+                    self.bridge.mark_native_signal_response_enqueued(&record)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.outbound_expedited = Some(record);
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -580,6 +610,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.connect = None;
             self.attach = None;
             self.normal = None;
+            self.outbound_expedited = None;
             self.incoming.clear();
             self.incoming_bytes = 0;
             self.writes.clear();

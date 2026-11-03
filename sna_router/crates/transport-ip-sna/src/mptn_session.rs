@@ -480,7 +480,12 @@ impl GatewaySession {
         {
             return Err(invalid("native expedited PIU session address mismatch"));
         }
-        let translated = native_normal_to_mptn(piu)?;
+        if piu.first().is_none_or(|first| first & 1 == 0) {
+            return Err(invalid("native expedited PIU lacks expedited TH bit"));
+        }
+        let mut normalized = piu.to_vec();
+        normalized[0] &= !1;
+        let translated = native_normal_to_mptn(&normalized)?;
         if translated.native_pacing_requested {
             return Err(invalid("native pacing response handler is not installed"));
         }
@@ -859,7 +864,7 @@ mod tests {
             .receive_connect_response(&response_for(&decoded))
             .unwrap();
 
-        let outbound = [0x2c, 0, 1, 2, 0, 2, 0x4b, 0x80, 0, 0xc9];
+        let outbound = [0x2d, 0, 1, 2, 0, 2, 0x4b, 0x80, 0, 0xc9];
         let record = session.native_expedited(&outbound).unwrap();
         assert_eq!(record.kind, TcpKind::Expedited);
         assert_eq!(session.pending_expedited_bytes(), (11, 0));
@@ -900,7 +905,7 @@ mod tests {
             .unwrap();
         assert!(session.expedited_ack_timed_out().is_err());
         session
-            .native_expedited(&[0x2c, 0, 1, 2, 0, 2, 0x4b, 0x80, 0, 0xc9])
+            .native_expedited(&[0x2d, 0, 1, 2, 0, 2, 0x4b, 0x80, 0, 0xc9])
             .unwrap();
         session.expedited_ack_timed_out().unwrap();
         assert_eq!(session.phase(), Phase::Closed);

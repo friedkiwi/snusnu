@@ -325,6 +325,28 @@ the subsequent controller exchange; that experiment was removed from the
 router source. The native LLC path is verified for XID3, SNASVCMG, and the
 direct NMVT, as described above.
 
+In a later AnyNet run, the guest sent a WSF `D8 20 02` request inside the
+address-56 LU7 `D824` device GDS. A QA-only probe, gated by
+`SNUSNU_PRINTER_PROBE_LU7_QUERY=1`, returned the 26-byte `VG03.BIN` Query
+reply template (file offset `0x183A0`). Bytes 20–21 of that template are
+normally patched from the controller's runtime capabilities; the probe
+used the disk defaults and does not establish a real device's values.
+The guest then sent `D8 21 10`. QA returned `VG03`'s eight-byte reply
+template (file offset `0x183C2`), after which the guest sent another LU7
+WSF beginning `04 F3 03 18 D8 22 02`. The meaning and complete chain of
+that last WSF remain to be established.
+
+The same verbose run exposed and verified a router expedited-response fix.
+The guest sent TCP62 expedited SIGNAL `C9 00 01 00 01`; the router forwarded
+the complete FID2 PIU `2F00020180004B8000C900010001` to QA. QA returned
+positive response `2F0001028000CB8000` over the WebSocket circuit. The
+router logged that PIU on receipt, wrote TCP62 record
+`0000000A018000CB8000` to the guest socket, and received its five-byte
+expedited ACK `0000000503`. These adjacent logs prove the QA response was
+relayed to the guest, while the ACK only establishes TCP62 delivery. No
+address-01 LU4 BIND or SCS spool data followed in this run. The QA reply
+logic remains experimental and disabled without the environment flag.
+
 The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
 provide a direct source for the missing controller sender code. In
 `5494_Base.zip`, `VG*.BIN` contains 16-bit x86 code. `VG1C.BIN` is the only
