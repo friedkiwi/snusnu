@@ -429,6 +429,7 @@ impl Bridge {
         let Some(piu) = self.gateway.mptn_normal(record)? else {
             return Ok(None);
         };
+        tracing::debug!(piu = ?piu, "TCP62 normal PIU restored for native user session");
         if piu.len() >= 9 && piu[6..9] == [0x83, 0xa0, 0] {
             // An implied first LU6.2 bracket can answer a DR request with
             // SNF 8000 even when the request itself used a normal sequence.
@@ -471,7 +472,12 @@ impl Bridge {
         let supported_response_form = match response_form {
             0 => true,
             0xa0 => !self.outstanding_implied_bracket_dr,
-            0x90 => piu[6..9] == [0x03, 0x90, 0x20],
+            0x80 => self.mode == "QRMTWSC" && piu[6..9] == [0x09, 0x80, 1],
+            0x90 => {
+                piu[6..9] == [0x03, 0x90, 0x20]
+                    || (self.mode == "QRMTWSC"
+                        && matches!(&piu[6..9], [0x02, 0x90, 0] | [0x01, 0x90, 0x20]))
+            }
             _ => false,
         };
         if !supported_response_form {

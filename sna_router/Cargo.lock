@@ -1183,6 +1183,7 @@ name = "transport-ip-sna"
 version = "0.1.0"
 dependencies = [
  "router-core",
+ "tracing",
 ]
 
 [[package]]

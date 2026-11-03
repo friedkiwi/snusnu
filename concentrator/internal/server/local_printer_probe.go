@@ -340,6 +340,23 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			log.Printf("printer probe controller BIND: circuit=%s piu=%x", id, bind)
 			return p.sendInformation(id, bind)
 		}
+	case 5:
+		if len(data) < 36 || data[6] != 0xeb || data[9] != 0x31 || data[2] != 2 || data[3] != 1 {
+			return nil
+		}
+		// VG10's controller Attach carries a fixed QND5MAIN TPN and one
+		// length-qualified PIP GDS. The byte after the 03 20 prefix is a
+		// runtime controller value; zero probes the documented boundary.
+		attach := []byte{
+			0x2e, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20,
+			0x11, 5, 2, 0xff, 8, 3, 0xd0, 0, 0, 4,
+			0x30, 0xf0, 0xf6, 0xf6, 0, 0, 0,
+			0, 0x12, 0x12, 0xf5, 0, 0x0e, 0x12, 0xe2,
+			3, 0x20, 1, 0, 0x38, 4, 4, 0xd4, 7, 0x30,
+		}
+		log.Printf("printer probe controller Attach: circuit=%s piu=%x", id, attach)
+		c.managementPhase = 6
+		return p.sendInformation(id, attach)
 	}
 	return nil
 }

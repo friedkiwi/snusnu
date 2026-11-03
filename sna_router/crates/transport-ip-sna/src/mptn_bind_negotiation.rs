@@ -139,7 +139,23 @@ pub fn validate_positive_response(
     if response.user_slu.as_deref() != Some(request.slu) {
         return Err(BindNegotiationError::WrongSession);
     }
-    if request.fixed[..8] != response.fixed[..8]
+    if request.mode == [0xd8, 0xd9, 0xd4, 0xe3, 0xe6, 0xe2, 0xc3] {
+        // V5R4's 5494 controller response negotiates seven pacing slots and
+        // changes FM usage/characteristics while retaining LU6.2 identity.
+        if request.fixed[..6] != response.fixed[..6]
+            || request.fixed[6] != 0xd0
+            || response.fixed[6] != 0x50
+            || request.fixed[7] != response.fixed[7]
+            || response.fixed[8..10] != [0, 7]
+            || request.fixed[10..12] != response.fixed[10..12]
+            || response.fixed[12..14] != [0x87, 0]
+            || request.fixed[14..23] != response.fixed[14..23]
+            || response.fixed[23] != 0x90
+            || request.fixed[24..27] != response.fixed[24..27]
+        {
+            return Err(BindNegotiationError::Unsupported);
+        }
+    } else if request.fixed[..8] != response.fixed[..8]
         || request.fixed[14..23] != response.fixed[14..23]
         || request.fixed[25..27] != response.fixed[25..27]
     {
@@ -152,7 +168,8 @@ pub fn validate_positive_response(
         || (requested & 0x60 == 0x20 && sync != 0x20)
         || accepted & 0x03 != requested & 0x03
         || accepted & 0x9c != 0
-        || response.fixed[23] & !request.fixed[23] != 0
+        || (request.mode != [0xd8, 0xd9, 0xd4, 0xe3, 0xe6, 0xe2, 0xc3]
+            && response.fixed[23] & !request.fixed[23] != 0)
     {
         return Err(BindNegotiationError::InvalidCapabilities);
     }
@@ -178,6 +195,22 @@ mod tests {
     const RESPONSE: &str = "0000eb800031001307b0b0513303038c8c830306020000000000000094430000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b0238ff4f5c3000000006014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1";
     const V4R4_REQUEST: &str = "00006b840031001307b0b051330383c7c78303060200000000000000944340000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301235069de6780000c04e2d6d3d5c5e34be2d5c1c10a1300b0235069de678000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e3";
     const V4R4_RESPONSE: &str = "0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1";
+
+    #[test]
+    fn accepts_observed_v5r4_5494_controller_bind_response() {
+        let request = hex(concat!(
+            "00006b800031001307b0b0d0b300008686800006020000000000000000230000",
+            "0ee2d5e4e2d5e44bd7d9c9d5e3c5d91a000802d8d9d4e3e6e2c30f04",
+            "e2d5e4e2d5e44bd7d9c9d5e3c5d9000fe2d6d3d5c5e34be2f1f0f5f4f5f0f4",
+            "6013b35f896bd26878d10ae2d5e4e2d5e44be2e5c3"
+        ));
+        let response = hex(concat!(
+            "0000eb800031001307b0b050b30007868687000602000000000000009023000000",
+            "1b000802d8d9d4e3e6e2c31005e2d6d3d5c5e34be2f1f0f5f4f5f0f40000",
+            "6013b35f896bd26878d10ae2d5e4e2d5e44be2e5c3"
+        ));
+        assert_eq!(validate_positive_response(&request, &response), Ok(()));
+    }
 
     #[test]
     fn accepts_captured_anynet_bind_negotiation_and_confirm_downgrade() {

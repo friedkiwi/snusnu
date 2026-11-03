@@ -159,6 +159,9 @@ impl UserBindOffer {
             return Err(UserBindError::UnsupportedProfile);
         }
         let ru = &self.request[9..];
+        if self.mode == "QRMTWSC" {
+            return self.build_controller_response(ru, local_receive_window);
+        }
         if ru.len() < 27 || ru[..27] != V4R4_USER_REQUEST_FIXED {
             return Err(UserBindError::UnsupportedProfile);
         }
@@ -228,6 +231,68 @@ impl UserBindOffer {
         response.extend_from_slice(&self.fqpcid);
         Ok(response)
     }
+
+    /// Negotiate the 5494 profile observed from V5R4 after QRMTWSC CNOS.
+    /// The local receive window is bounded independently of the TCP62 host
+    /// leg so the router can grant credit only when its native queue is free.
+    fn build_controller_response(
+        &self,
+        ru: &[u8],
+        local_receive_window: u8,
+    ) -> Result<Vec<u8>, UserBindError> {
+        if ru.len() < 28
+            || ru[..10] != [0x31, 0, 0x13, 7, 0xb0, 0xb0, 0xd0, 0xb3, 0, 0]
+            || ru[12..27] != [0x80, 0, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0x23, 0, 0]
+            || ru[10] != ru[11]
+            || !(0x85..=0x87).contains(&ru[10])
+        {
+            return Err(UserBindError::UnsupportedProfile);
+        }
+        let plu = ebcdic_lu(&self.plu)?;
+        let slu = ebcdic_lu(&self.slu)?;
+        let plu_len = ru[27] as usize;
+        if plu_len != plu.len() || ru.get(28..28 + plu_len) != Some(plu.as_slice()) {
+            return Err(UserBindError::UnsupportedProfile);
+        }
+        let user_len_offset = 28 + plu_len;
+        let user_len = *ru
+            .get(user_len_offset)
+            .ok_or(UserBindError::UnsupportedProfile)? as usize;
+        let user_start = user_len_offset + 1;
+        let user_end = user_start + user_len;
+        let user = ru
+            .get(user_start..user_end)
+            .ok_or(UserBindError::UnsupportedProfile)?;
+        let mode = ebcdic_lu("QRMTWSC")?;
+        let mut expected_user = vec![0, 8, 2];
+        expected_user.extend_from_slice(&mode);
+        expected_user.extend_from_slice(&[(plu.len() + 1) as u8, 4]);
+        expected_user.extend_from_slice(&plu);
+        if user != expected_user
+            || ru.get(user_end) != Some(&0)
+            || ru.get(user_end + 1) != Some(&(slu.len() as u8))
+            || ru.get(user_end + 2..user_end + 2 + slu.len()) != Some(slu.as_slice())
+            || ru.get(user_end + 2 + slu.len()..ru.len()) != Some(self.fqpcid.as_slice())
+        {
+            return Err(UserBindError::UnsupportedProfile);
+        }
+        let mut response = vec![self.request[0], 0, self.oaf, self.daf, 0, 0, 0xeb, 0x80, 0];
+        let mut fixed = ru[..27].to_vec();
+        fixed[6] = 0x50;
+        fixed[9] = local_receive_window;
+        fixed[12] = 0x80 | local_receive_window;
+        fixed[23] = 0x90;
+        response.extend_from_slice(&fixed);
+        let mut response_user = vec![0, 8, 2];
+        response_user.extend_from_slice(&mode);
+        response_user.extend_from_slice(&[(slu.len() + 1) as u8, 5]);
+        response_user.extend_from_slice(&slu);
+        response.extend_from_slice(&[0, response_user.len() as u8]);
+        response.extend_from_slice(&response_user);
+        response.extend_from_slice(&[0, 0]);
+        response.extend_from_slice(&self.fqpcid);
+        Ok(response)
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +318,35 @@ mod tests {
             "0be2d6d3d5c5e34be2d5c1c2601411111111111111110b1111111111111111111111",
             "2c0a00000000000000000000"
         ))
+    }
+
+    #[test]
+    fn qrmtwsc_controller_bind_preserves_unpaced_profile() {
+        let request = hex(concat!(
+            "2f00010200006b800031001307b0b0d0b300008686800006020000000000000000230000",
+            "0ee2d5e4e2d5e44bd7d9c9d5e3c5d91a000802d8d9d4e3e6e2c30f04",
+            "e2d5e4e2d5e44bd7d9c9d5e3c5d9000fe2d6d3d5c5e34be2f1f0f5f4f5f0f4",
+            "601371a4c72be0f058930ae2d5e4e2d5e44be2e5c3"
+        ));
+        let offer = UserBindOffer {
+            daf: 1,
+            oaf: 2,
+            plu: "SNUSNU.PRINTER".into(),
+            slu: "SOLNET.S1054504".into(),
+            mode: "QRMTWSC".into(),
+            fqpcid: request_fqpcid(&request[9..]).unwrap(),
+            request,
+        };
+        let response = offer.build_fixed_response(1).unwrap();
+        assert_eq!(&response[..9], &[0x2f, 0, 2, 1, 0, 0, 0xeb, 0x80, 0]);
+        assert_eq!(
+            &response[9..17],
+            &[0x31, 0, 0x13, 7, 0xb0, 0xb0, 0x50, 0xb3]
+        );
+        assert_eq!(response[9 + 9], 1);
+        assert_eq!(response[9 + 12], 0x81);
+        assert_eq!(response[9 + 23..9 + 27], [0x90, 0x23, 0, 0]);
+        assert!(response.ends_with(&offer.fqpcid));
     }
 
     fn management() -> ManagementBind {

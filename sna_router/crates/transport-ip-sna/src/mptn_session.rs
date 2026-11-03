@@ -355,6 +355,11 @@ impl GatewaySession {
             return Err(invalid("MPTN response requests unavailable compensations"));
         }
         let data = response.connection_data();
+        tracing::debug!(
+            request_bind = ?request.connection_data(),
+            response_bind = ?data,
+            "TCP62 BIND negotiation images"
+        );
         if data.len() < 6
             || data[2] & 0xe0 != 0xe0
             || data[5] != 0x31
@@ -362,8 +367,12 @@ impl GatewaySession {
         {
             return Err(invalid("MPTN Connect lacks supported RSP(BIND)"));
         }
-        validate_positive_response(request.connection_data(), data)
-            .map_err(|_| invalid("MPTN BIND response does not negotiate the requested session"))?;
+        validate_positive_response(request.connection_data(), data).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("MPTN BIND response does not negotiate the requested session: {error}"),
+            )
+        })?;
         let mut piu = Vec::with_capacity(data.len() + 4);
         piu.extend_from_slice(&[
             0x2d | (u8::from(native.odai) << 1),

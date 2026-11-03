@@ -38,6 +38,30 @@ pub fn parse_first_user_attach(
     piu: &[u8],
     offer: &UserBindOffer,
 ) -> Result<FirstUserAttach, UserFmh5Error> {
+    if offer.mode == "QRMTWSC" {
+        if piu.len() < 9 + 17 + 8 {
+            return Err(UserFmh5Error::Truncated);
+        }
+        if piu.len() > 1496
+            || piu[0] != offer.request()[0] & !0x01
+            || piu[1] != 0
+            || piu[2] != offer.daf
+            || piu[3] != offer.oaf
+            || piu[4..9] != [0, 1, 0x0b, 0x91, 0x20]
+        {
+            return Err(UserFmh5Error::WrongSession);
+        }
+        if piu[9..19] != [0x11, 5, 2, 0xff, 8, 3, 0xd0, 0, 0, 4] || piu[23..26] != [0, 0, 0] {
+            return Err(UserFmh5Error::UnsupportedPiu);
+        }
+        return Ok(FirstUserAttach {
+            daf: piu[2],
+            oaf: piu[3],
+            sequence: 1,
+            fmh5_bytes: 17,
+            opaque_tail_bytes: piu.len() - 9 - 17,
+        });
+    }
     let fmh5_bytes = 25 + offer.plu.len();
     if piu.len() < 9 + fmh5_bytes {
         return Err(UserFmh5Error::Truncated);

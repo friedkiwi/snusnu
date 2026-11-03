@@ -90,6 +90,7 @@ pub struct UserPacingSession {
     expedited_th0: u8,
     response: Vec<u8>,
     local_receive_window: u8,
+    send_window: u8,
     phase: UserPacingPhase,
     pacing: Option<FixedPacing>,
     pending: Option<PendingEgress>,
@@ -127,7 +128,17 @@ impl UserPacingSession {
             return Err(UserPacingError::WrongSession);
         }
         let response = offer.build_fixed_response(local_receive_window)?;
-        if response[9 + 8] != 3
+        let controller = offer.mode == "QRMTWSC";
+        if controller {
+            if response[9 + 6] != 0x50
+                || response[9 + 9] != local_receive_window
+                || response[9 + 12] != 0x80 | local_receive_window
+                || response[9 + 23] != 0x90
+                || response[9 + 24] != 0x23
+            {
+                return Err(UserPacingError::Bind(UserBindError::UnsupportedProfile));
+            }
+        } else if response[9 + 8] != 3
             || response[9 + 9] != local_receive_window
             || response[9 + 12] != 0x80 | local_receive_window
             || response[9 + 13] != 3
@@ -143,6 +154,7 @@ impl UserPacingSession {
             expedited_th0: offer.request()[0],
             response,
             local_receive_window,
+            send_window: if controller { 7 } else { 3 },
             phase: UserPacingPhase::ResponsePrepared,
             pacing: None,
             pending: None,
@@ -183,6 +195,30 @@ impl UserPacingSession {
         }
         parse_first_user_attach(piu, offer)?;
         let ru = &piu[9..];
+        if offer.mode == "QRMTWSC" {
+            if expected_tp != [0x30, 0xf0, 0xf6, 0xf6] || ru[10..14] != *expected_tp {
+                return Err(UserPacingError::WrongRoute);
+            }
+            let pip = &ru[17..];
+            if pip.len() != 18
+                || pip[..8] != [0, 18, 0x12, 0xf5, 0, 14, 0x12, 0xe2]
+                || pip[8..11] != [3, 0x20, 1]
+                || pip[12..] != [0x38, 4, 4, 0xd4, 7, 0x30]
+            {
+                return Err(UserPacingError::InvalidFmh5);
+            }
+            self.observe_normal_request(piu)?;
+            self.first_attach_seen = true;
+            return Ok(FirstAttachRoute {
+                remote_lu: offer.plu.clone(),
+                local_lu: offer.slu.clone(),
+                mode: offer.mode.clone(),
+                transaction_program: expected_tp.to_vec(),
+                luw_instance: [0; 6],
+                luw_sequence: 0,
+                pip_bytes: pip.len(),
+            });
+        }
         let plu = encode_lu_name(&offer.plu)?;
         let fmh_len = 25 + plu.len();
         if ru.len() < fmh_len + 8
@@ -245,7 +281,10 @@ impl UserPacingSession {
         if self.phase != UserPacingPhase::AwaitBindAck || completed != 1 {
             return Err(UserPacingError::WrongPhase);
         }
-        self.pacing = Some(FixedPacing::new(3, self.local_receive_window)?);
+        self.pacing = Some(FixedPacing::new(
+            self.send_window,
+            self.local_receive_window,
+        )?);
         self.phase = UserPacingPhase::Active;
         Ok(())
     }
@@ -395,7 +434,12 @@ impl UserPacingSession {
             || piu[2] != daf
             || piu[3] != oaf
             || piu[6] & 0x60 != 0
-            || piu[6] & 0x07 != 0x03
+            || (piu[6] & 0x07 != 0x03
+                && !(self.send_window == 7
+                    && matches!(
+                        &piu[6..9],
+                        [0x02, 0x90, 0] | [0x01, 0x90, 0x20] | [0x09, 0x80, 1]
+                    )))
         {
             return Err(UserPacingError::WrongSession);
         }
