@@ -1266,19 +1266,15 @@ impl RouterConfig {
                 "HPR LAN attachment is experimental and cannot join automatic routing yet",
             ));
         }
-        if !self.ee.is_empty() {
-            if self.ee.len() != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "automatic HPR/IP currently requires one [[hpr_ip]] attachment",
-                ));
-            }
-            if self.ee[0].local_cp.is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "automatic HPR/IP requires local_cp until stable router-owned CP identity is available",
-                ));
-            }
+        if self
+            .ee
+            .iter()
+            .any(|attachment| attachment.local_cp.is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "automatic HPR/IP requires local_cp on every attachment until stable router-owned CP identity is available",
+            ));
         }
         if !self.anynet.is_empty() {
             return Err(io::Error::new(
@@ -2282,6 +2278,18 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
             duplicate.validate().unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+        let two_ee = parse(
+            "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SOLNET.RTRA'\n\
+             [[hpr_ip]]\nid='other'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\nlocal_cp='SOLNET.RTRB'\n",
+        );
+        two_ee.validate().unwrap();
+        assert!(two_ee.automatic());
+        let two_ee_upstream = parse(
+            "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SOLNET.RTRA'\n\
+             [[hpr_ip]]\nid='other'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\nlocal_cp='SOLNET.RTRB'\n\
+             [[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",
+        );
+        two_ee_upstream.validate().unwrap();
 
         let relay = parse(
             "[[mptn]]\nprofile='relay'\nid='relay'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\n",

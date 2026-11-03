@@ -2652,7 +2652,7 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
     let attachment = config
         .ee
         .first()
-        .ok_or_else(|| protocol("HPR runtime requires one EE attachment"))?;
+        .ok_or_else(|| protocol("HPR runtime requires an EE attachment"))?;
     let remote = config
         .remote
         .first()
@@ -2662,9 +2662,12 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
     while !STOP.load(Ordering::Relaxed) {
         match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
             Ok(mut hub) => {
-                if let Err(error) =
+                let result = if config.ee.len() == 1 {
                     run_connected(config, attachment, &mut hub, &mut local, &mut shared)
-                {
+                } else {
+                    run_connected_multi(config, &mut hub, &mut local, &mut shared)
+                };
+                if let Err(error) = result {
                     tracing::warn!(attachment = %attachment.id, error = %error,
                         "HPR upstream or EE adjacency reset");
                 }
@@ -2937,6 +2940,461 @@ fn run_connected(
     let _ = shared.withdraw_ee(local, &attachment.id);
     let _ = local.withdraw_ee_records(&attachment.id);
     result
+}
+
+struct ConnectedEeSlot<'a> {
+    attachment: &'a crate::config::EeConfig,
+    link: Option<AuthorizedEeAttachment>,
+    active: Option<DirectHprRuntime<'a>>,
+    retry_at: Instant,
+}
+
+fn retire_connected_slot(
+    slot: &mut ConnectedEeSlot<'_>,
+    local: &mut AutoLocalSessionRunner<'_>,
+    shared: &mut HprSharedLocal,
+) -> io::Result<()> {
+    if let Some(mut runtime) = slot.active.take() {
+        if let Some(peer_lus) = runtime.peer_lus.as_mut() {
+            peer_lus.deactivate();
+        }
+        if let Err(error) = runtime.release_shared_llc(local) {
+            tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                "failed to release EE LLC reservations during withdrawal");
+        }
+    }
+    let proxy_result = shared.withdraw_ee(local, &slot.attachment.id);
+    let route_result = local.withdraw_ee_records(&slot.attachment.id);
+    proxy_result?;
+    route_result?;
+    Ok(())
+}
+
+fn reject_shared_handoff(
+    ready: ReadyLocalHpr,
+    local: &mut AutoLocalSessionRunner<'_>,
+    shared: &mut HprSharedLocal,
+) -> io::Result<()> {
+    match ready {
+        ReadyLocalHpr::Llc(mut source) => {
+            let _ = source.source.close();
+            shared.release_llc(local, &source.ingress_id, source.proxy_mac)
+        }
+        ReadyLocalHpr::Mptn(mut source) => {
+            let _ = source.source.close();
+            shared.release_mptn(local, &source.gateway_id)
+        }
+        ReadyLocalHpr::Ee { mut source, .. } => source.close(),
+    }
+}
+
+fn connected_ee_target(
+    hub: &AutoWsHub,
+    local: &AutoLocalSessionRunner<'_>,
+    open: &wire::IncomingOpen,
+    slots: &BTreeMap<String, ConnectedEeSlot<'_>>,
+) -> Option<String> {
+    let route = open
+        .target
+        .as_ref()
+        .and_then(|reference| hub.local_route(reference))?;
+    let wire::route_export::Resource::LogicalUnit(lu) = route.resource.as_ref()? else {
+        return None;
+    };
+    let target = lu.lu.as_ref()?;
+    let target_lu = router_core::session::QualifiedName::new(&target.netid, &target.name).ok()?;
+    let target_cp = lu.hosting_cp.as_ref()?;
+    let target_cp =
+        router_core::session::QualifiedName::new(&target_cp.netid, &target_cp.name).ok()?;
+    local.local_routes().into_iter().find_map(|selection| {
+        let RouteKey::LogicalUnit { lu, hosting_cp } = selection.key else {
+            return None;
+        };
+        (lu == target_lu && hosting_cp == target_cp)
+            .then(|| selection.attachment.as_str().to_owned())
+            .filter(|id| slots.contains_key(id))
+    })
+}
+
+/// One hub and one LLC/TCP62 owner serve every authorized EE attachment.
+/// Link failures withdraw only that attachment's verified routes and sessions.
+fn run_connected_multi<'a>(
+    config: &'a RouterConfig,
+    hub: &mut AutoWsHub,
+    local: &mut AutoLocalSessionRunner<'a>,
+    shared: &mut HprSharedLocal,
+) -> io::Result<()> {
+    let mut slots = config
+        .ee
+        .iter()
+        .map(|attachment| {
+            (
+                attachment.id.clone(),
+                ConnectedEeSlot {
+                    attachment,
+                    link: None,
+                    active: None,
+                    retry_at: Instant::now(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut published = (Vec::new(), Vec::new());
+    local.sync_upstream(hub)?;
+    publish_shared_routes(local, hub, &mut published)?;
+    let result = (|| -> io::Result<()> {
+        while !STOP.load(Ordering::Relaxed) {
+            local.sync_upstream(hub)?;
+            if local.poll_local(Some(hub))?.hub_lost {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "concentrator session closed",
+                ));
+            }
+            let now = Instant::now();
+            for slot in slots.values_mut() {
+                let authorized = slot
+                    .link
+                    .as_ref()
+                    .map(|link| link.authorized(hub))
+                    .transpose();
+                if matches!(authorized.as_ref(), Ok(Some(false)) | Err(_)) {
+                    if let Err(error) = authorized {
+                        tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                            "EE authorization check failed");
+                    }
+                    if let Err(error) = retire_connected_slot(slot, local, shared) {
+                        tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                            "EE withdrawal failed");
+                    }
+                    slot.link = None;
+                    slot.retry_at = now + CONNECT_BACKOFF;
+                    continue;
+                }
+                if slot.link.is_none() && now >= slot.retry_at {
+                    match AuthorizedEeIdentity::resolve(hub, slot.attachment) {
+                        Ok(Some(identity)) => {
+                            match AuthorizedEeAttachment::bind(slot.attachment, identity) {
+                                Ok(link) => {
+                                    tracing::info!(attachment = %slot.attachment.id,
+                                    local_ip = %slot.attachment.local_ip,
+                                    peer_ip = %slot.attachment.peer_ip,
+                                    proxy_cp = %link.local_cp(), "HPR EE attachment listening");
+                                    slot.link = Some(link);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                                    "HPR EE listener bind failed");
+                                    slot.retry_at = now + CONNECT_BACKOFF;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                                "HPR EE identity unavailable");
+                            slot.retry_at = now + CONNECT_BACKOFF;
+                        }
+                    }
+                }
+                let Some(mut link) = slot.link.take() else {
+                    continue;
+                };
+                let update = (|| -> io::Result<()> {
+                    link.tick(now)?;
+                    if link.is_active() {
+                        let generation = link.link().generation();
+                        if slot
+                            .active
+                            .as_ref()
+                            .is_none_or(|runtime| runtime.bootstrap.generation != generation)
+                        {
+                            retire_connected_slot_runtime(slot, local, shared)?;
+                            let bootstrap = link.link().control_bootstrap()?.ok_or_else(|| {
+                                protocol("active EE link lacks control bootstrap")
+                            })?;
+                            let mut runtime = DirectHprRuntime::new(bootstrap);
+                            runtime.configure_peer_lus(slot.attachment)?;
+                            runtime.use_shared_publication();
+                            shared.configure_ee(
+                                local,
+                                config,
+                                &slot.attachment.id,
+                                runtime.bootstrap.peer.cp.clone(),
+                            )?;
+                            let export = runtime.ee_owner_export();
+                            local.replace_ee_records(&export.owner, export.records)?;
+                            slot.active = Some(runtime);
+                            tracing::info!(attachment = %slot.attachment.id,
+                                generation = generation.get(), "HPR EE link activated");
+                        }
+                    } else if slot.active.is_some() {
+                        retire_connected_slot_runtime(slot, local, shared)?;
+                        tracing::warn!(attachment = %slot.attachment.id,
+                            "HPR EE link deactivated; sessions withdrawn");
+                    }
+                    if let Some(datagram) = link.poll(now)? {
+                        if let Some(runtime) = slot.active.as_mut() {
+                            runtime.on_datagram(
+                                link.link(),
+                                &datagram,
+                                link.elapsed().as_micros() as u64,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = update {
+                    tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                        "HPR EE link reset");
+                    let _ = retire_connected_slot(slot, local, shared);
+                    slot.retry_at = now + CONNECT_BACKOFF;
+                } else {
+                    slot.link = Some(link);
+                }
+            }
+            let mut directory = HprDestinationDirectory::new();
+            let mut ee_routes_by_owner = BTreeMap::new();
+            for slot in slots.values_mut() {
+                let update = if let Some(runtime) = slot.active.as_mut() {
+                    (|| -> io::Result<Vec<_>> {
+                        runtime.refresh_shared_local(local, shared, config)?;
+                        let export = runtime.ee_owner_export();
+                        let routes = export
+                            .records
+                            .iter()
+                            .filter_map(|record| {
+                                let RouteKey::LogicalUnit { lu, hosting_cp } = &record.key else {
+                                    return None;
+                                };
+                                Some((
+                                    lu.clone(),
+                                    Destination::Ee {
+                                        hosting_cp: hosting_cp.clone(),
+                                        attachment_id: slot.attachment.id.clone(),
+                                    },
+                                ))
+                            })
+                            .collect();
+                        local.replace_ee_records(&export.owner, export.records)?;
+                        Ok(routes)
+                    })()
+                } else {
+                    Ok(Vec::new())
+                };
+                match update {
+                    Ok(routes) => {
+                        if slot.active.is_some() {
+                            ee_routes_by_owner.insert(slot.attachment.id.clone(), routes);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                            "EE local route refresh failed");
+                        let _ = retire_connected_slot(slot, local, shared);
+                        slot.link = None;
+                        slot.retry_at = Instant::now() + CONNECT_BACKOFF;
+                    }
+                }
+            }
+            let mut ee_routes = Vec::new();
+            for (id, routes) in ee_routes_by_owner {
+                directory.replace_owner(&format!("ee:{id}"), routes.clone())?;
+                ee_routes.extend(routes);
+            }
+            for slot in slots.values_mut() {
+                let update = if let Some(runtime) = slot.active.as_mut() {
+                    runtime.replace_other_ee_routes(
+                        ee_routes
+                            .iter()
+                            .filter(|(_, route)| route.attachment_id() != slot.attachment.id)
+                            .cloned()
+                            .collect(),
+                    )
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = update {
+                    tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                        "EE peer route refresh failed");
+                    let _ = retire_connected_slot(slot, local, shared);
+                    slot.link = None;
+                    slot.retry_at = Instant::now() + CONNECT_BACKOFF;
+                }
+            }
+            let can_accept = slots.values().any(|slot| {
+                slot.active
+                    .as_ref()
+                    .is_some_and(DirectHprRuntime::can_accept_local)
+            });
+            if let Some(ready) = shared.poll(local, &directory, can_accept)? {
+                let target = match &ready {
+                    ReadyLocalHpr::Llc(source) => &source.target_ee_id,
+                    ReadyLocalHpr::Mptn(source) => &source.target_ee_id,
+                    ReadyLocalHpr::Ee { target_ee_id, .. } => target_ee_id,
+                }
+                .clone();
+                if let Some(slot) = slots.get_mut(&target).filter(|slot| slot.active.is_some()) {
+                    if let Err(error) = slot.active.as_mut().unwrap().accept_shared_source(
+                        ready,
+                        slot.link.as_ref().unwrap().link(),
+                        shared,
+                        local,
+                    ) {
+                        tracing::warn!(attachment = %target, error = %error,
+                            "local source could not enter EE session");
+                    }
+                } else {
+                    reject_shared_handoff(ready, local, shared)?;
+                }
+            }
+            publish_shared_routes(local, hub, &mut published)?;
+            if let Some(open) = hub.poll_incoming()? {
+                if let OpenDisposition::Unhandled(open) = local.accept_upstream(hub, open)? {
+                    if let Some(target) = connected_ee_target(hub, local, &open, &slots) {
+                        if let Some(slot) = slots.get_mut(&target) {
+                            if let Err(error) = admit_connected_ee_open(slot, hub, open) {
+                                tracing::warn!(attachment = %target, error = %error,
+                                    "concentrator circuit could not enter EE attachment");
+                                let _ = retire_connected_slot(slot, local, shared);
+                                slot.link = None;
+                                slot.retry_at = Instant::now() + CONNECT_BACKOFF;
+                            }
+                        }
+                    } else {
+                        hub.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
+                    }
+                }
+            }
+            let mut handoffs = Vec::new();
+            for slot in slots.values_mut() {
+                let Some(link) = slot.link.as_ref() else {
+                    continue;
+                };
+                let Some(runtime) = slot.active.as_mut() else {
+                    continue;
+                };
+                let now_us = link.elapsed().as_micros() as u64;
+                let update = (|| -> io::Result<()> {
+                    runtime.tick(link.link(), now_us)?;
+                    let mut access = SharedLocalAccess {
+                        shared,
+                        runner: local,
+                        config,
+                    };
+                    runtime.pump(link.link(), Some(hub), now_us, Some(&mut access))?;
+                    let export = runtime.ee_owner_export();
+                    local.replace_ee_records(&export.owner, export.records)?;
+                    handoffs.extend(runtime.take_ee_handoffs());
+                    Ok(())
+                })();
+                if let Err(error) = update {
+                    tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                        "HPR EE session reset");
+                    let _ = retire_connected_slot(slot, local, shared);
+                    slot.link = None;
+                    slot.retry_at = Instant::now() + CONNECT_BACKOFF;
+                }
+            }
+            for ready in handoffs {
+                let ReadyLocalHpr::Ee { target_ee_id, .. } = &ready else {
+                    continue;
+                };
+                let target = target_ee_id.clone();
+                if let Some(slot) = slots.get_mut(&target).filter(|slot| slot.active.is_some()) {
+                    if let Err(error) = slot.active.as_mut().unwrap().accept_shared_source(
+                        ready,
+                        slot.link.as_ref().unwrap().link(),
+                        shared,
+                        local,
+                    ) {
+                        tracing::warn!(attachment = %target, error = %error,
+                            "EE source could not enter destination attachment");
+                    }
+                } else {
+                    reject_shared_handoff(ready, local, shared)?;
+                }
+            }
+            publish_shared_routes(local, hub, &mut published)?;
+            thread::sleep(IDLE_POLL);
+        }
+        Ok(())
+    })();
+    for slot in slots.values_mut() {
+        let _ = retire_connected_slot(slot, local, shared);
+    }
+    result
+}
+
+fn retire_connected_slot_runtime(
+    slot: &mut ConnectedEeSlot<'_>,
+    local: &mut AutoLocalSessionRunner<'_>,
+    shared: &mut HprSharedLocal,
+) -> io::Result<()> {
+    retire_connected_slot(slot, local, shared)
+}
+
+fn admit_connected_ee_open(
+    slot: &mut ConnectedEeSlot<'_>,
+    hub: &mut AutoWsHub,
+    open: wire::IncomingOpen,
+) -> io::Result<()> {
+    let Some(runtime) = slot.active.as_mut() else {
+        return hub.reject_incoming(&open, wire::OpenFailure::Busy);
+    };
+    if !runtime.can_accept_local() {
+        return hub.reject_incoming(&open, wire::OpenFailure::Busy);
+    }
+    let peer_cp = runtime.bootstrap.peer.cp.clone();
+    let Some((route_identity, mut ws)) = crate::auto_hpr_inbound::admit(hub, open, &peer_cp)?
+    else {
+        return Ok(());
+    };
+    let handle = runtime.next_handle;
+    runtime.next_handle = runtime
+        .next_handle
+        .checked_add(1)
+        .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+    let link = slot
+        .link
+        .as_ref()
+        .ok_or_else(|| protocol("EE link absent"))?;
+    let tg = link
+        .link()
+        .tg_number()
+        .ok_or_else(|| protocol("active EE link has no TG"))?;
+    let (label, instance) = target_nce(
+        &runtime.bootstrap.local.tower.route_setup_nce_label,
+        runtime.bootstrap.local.tower.route_setup_nce_instance,
+        127,
+    )?;
+    let advertised = Reachability {
+        lu: Some(route_identity.target_lu.clone()),
+        cp: route_identity.target_cp.clone(),
+    };
+    if let Err(error) = runtime.switch.replace_routes(HPR_ADAPTER, vec![advertised]) {
+        ws.close()?;
+        return Err(protocol(format!("HPR reverse route admission: {error:?}")));
+    }
+    tracing::info!(attachment = %slot.attachment.id,
+        source_lu = %route_identity.source_lu, target_lu = %route_identity.target_lu,
+        peer_cp = %peer_cp, handle, "concentrator LU session admitted to EE peer");
+    runtime.reverse = Some(ReverseRuntime::new(
+        route_identity,
+        ws,
+        runtime.bootstrap.clone(),
+        handle,
+        tg,
+        reciprocal_nonce().to_be_bytes(),
+        label,
+        instance,
+        router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+            transmission_time_us: 1000,
+            capacity_kbps: 100_000,
+            liveness_seconds: 10,
+        },
+    ));
+    Ok(())
 }
 
 /// The `session_v1` WebSocket profile carries the same complete reduced SNA
