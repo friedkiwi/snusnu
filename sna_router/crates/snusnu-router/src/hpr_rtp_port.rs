@@ -3,7 +3,7 @@
 //! The opaque `EePort` relay remains separate. This adapter receives only
 //! datagrams that `EeLdlcEndpoint` has already admitted by IP, SAP, and link
 //! generation. It validates CS Topic and Switching Information before
-//! creating RouteSetup, CP management, or one user RTP connection.
+//! creating RouteSetup, CP management, or bounded user RTP connections.
 
 use std::{
     io,
@@ -31,6 +31,7 @@ const ASSIGNOR: u64 = 1 << 63;
 const RESERVED: u64 = 1 << 62;
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
 const MAX_WINDOW_BYTES: usize = 1_048_576;
+const MAX_INBOUND_USER_RTP: usize = 64;
 const RETRANSMIT_TIMEOUT_US: u64 = 250_000;
 static NEXT_TCID: AtomicU64 = AtomicU64::new(1);
 
@@ -66,6 +67,7 @@ pub(crate) struct HprRtpPort {
     cp_svc_mg: Option<RtpInboundEndpoint>,
     cp_svc_mg_out: Option<RtpOutboundEndpoint>,
     user: Option<RtpInboundEndpoint>,
+    previous_users: Vec<RtpInboundEndpoint>,
     user_out: Option<RtpOutboundEndpoint>,
     authorized_user_route: Option<AuthorizedUserRoute>,
 }
@@ -79,6 +81,7 @@ impl HprRtpPort {
             cp_svc_mg: None,
             cp_svc_mg_out: None,
             user: None,
+            previous_users: Vec::new(),
             user_out: None,
             authorized_user_route: None,
         }
@@ -105,6 +108,33 @@ impl HprRtpPort {
     pub(crate) fn user_scope(&self) -> Option<RtpAssociationScope> {
         let user = self.user.as_ref()?;
         self.scope_for(user)
+    }
+
+    /// A user BIU may arrive on any of several RTP connections that the peer
+    /// keeps open concurrently. Match the observed directional TCID instead
+    /// of assigning every BIND to the most recently opened user connection.
+    pub(crate) fn user_scope_for(
+        &self,
+        observation: &RtpObservation,
+    ) -> Option<RtpAssociationScope> {
+        if observation.generation != self.bootstrap.generation {
+            return None;
+        }
+        self.user
+            .iter()
+            .chain(&self.previous_users)
+            .find_map(|endpoint| {
+                let scope = self.scope_for(endpoint)?;
+                scope_matches_observation(scope, observation).then_some(scope)
+            })
+    }
+
+    pub(crate) fn active_user_scopes(&self) -> Vec<RtpAssociationScope> {
+        self.user
+            .iter()
+            .chain(&self.previous_users)
+            .filter_map(|endpoint| self.scope_for(endpoint))
+            .collect()
     }
 
     pub(crate) fn route_setup_scope(&self) -> Option<RtpAssociationScope> {
@@ -393,6 +423,38 @@ impl HprRtpPort {
         let endpoint = self
             .endpoint_mut(kind)
             .ok_or_else(|| invalid("HPR RTP egress has no connection"))?;
+        Self::send_inbound_endpoint(ee, endpoint, message, now_us)
+    }
+
+    pub(crate) fn send_user_on_scope(
+        &mut self,
+        ee: &EeLdlcEndpoint,
+        scope: RtpAssociationScope,
+        message: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        self.check_link(ee)?;
+        if scope.generation != self.bootstrap.generation {
+            return Err(invalid("stale HPR user RTP connection generation"));
+        }
+        let endpoint = self
+            .user
+            .iter_mut()
+            .chain(&mut self.previous_users)
+            .find(|endpoint| {
+                endpoint.origin_tcid() == Some(scope.initial_plu_tcid)
+                    && endpoint.assigned_tcid() == Some(scope.subsequent_plu_tcid)
+            })
+            .ok_or_else(|| invalid("unknown HPR user RTP connection scope"))?;
+        Self::send_inbound_endpoint(ee, endpoint, message, now_us)
+    }
+
+    fn send_inbound_endpoint(
+        ee: &EeLdlcEndpoint,
+        endpoint: &mut RtpInboundEndpoint,
+        message: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
         let packet = match endpoint.prepare_message(message, now_us) {
             Ok(packet) => packet,
             Err(
@@ -430,32 +492,10 @@ impl HprRtpPort {
             let Some(endpoint) = self.endpoint_mut(kind) else {
                 continue;
             };
-            if let Some(status) = endpoint.pending_status_nlp().map(ToOwned::to_owned) {
-                let port = priority_port(status[0])?;
-                match ee.send_nlp(port, &status) {
-                    Ok(()) => endpoint
-                        .confirm_status_sent(&status)
-                        .map_err(endpoint_error)?,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-            let packet = if let Some(pending) = endpoint.pending_retransmission_nlp() {
-                pending.to_vec()
-            } else if let Some(due) = endpoint.retransmit_due(now_us).map_err(endpoint_error)? {
-                due
-            } else {
-                continue;
-            };
-            let port = priority_port(packet[0])?;
-            match ee.send_nlp(port, &packet) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(error),
-            }
-            endpoint
-                .confirm_retransmission_sent(&packet, now_us)
-                .map_err(endpoint_error)?;
+            Self::tick_inbound_endpoint(ee, endpoint, now_us)?;
+        }
+        for endpoint in &mut self.previous_users {
+            Self::tick_inbound_endpoint(ee, endpoint, now_us)?;
         }
         for kind in [
             RtpIngressKind::CpSvcMgOut,
@@ -465,6 +505,38 @@ impl HprRtpPort {
             self.tick_outbound(ee, kind, now_us)?;
         }
         Ok(())
+    }
+
+    fn tick_inbound_endpoint(
+        ee: &EeLdlcEndpoint,
+        endpoint: &mut RtpInboundEndpoint,
+        now_us: u64,
+    ) -> io::Result<()> {
+        if let Some(status) = endpoint.pending_status_nlp().map(ToOwned::to_owned) {
+            let port = priority_port(status[0])?;
+            match ee.send_nlp(port, &status) {
+                Ok(()) => endpoint
+                    .confirm_status_sent(&status)
+                    .map_err(endpoint_error)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        let packet = if let Some(pending) = endpoint.pending_retransmission_nlp() {
+            pending.to_vec()
+        } else if let Some(due) = endpoint.retransmit_due(now_us).map_err(endpoint_error)? {
+            due
+        } else {
+            return Ok(());
+        };
+        let port = priority_port(packet[0])?;
+        match ee.send_nlp(port, &packet) {
+            Ok(()) => endpoint
+                .confirm_retransmission_sent(&packet, now_us)
+                .map_err(endpoint_error),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn tick_outbound(
@@ -621,6 +693,28 @@ impl HprRtpPort {
         let topic = classify_setup_topic(packet)
             .map_err(|error| invalid(format!("invalid RTP setup topic: {error:?}")))?;
         let kind = kind_for(&topic);
+        if kind == RtpIngressKind::User {
+            for existing in &self.previous_users {
+                if let Some(reply) = existing.reply_to_duplicate_setup(&datagram.payload[3..]) {
+                    if datagram.port != 12004 - u16::from(existing.priority()) {
+                        return Err(invalid("duplicate RTP setup on wrong EE priority port"));
+                    }
+                    ee.send_nlp(datagram.port, reply)?;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        if kind == RtpIngressKind::User
+            && self
+                .previous_users
+                .iter()
+                .any(|existing| existing.origin_tcid() == Some(packet.tcid))
+        {
+            return Err(invalid(
+                "conflicting HPR RTP setup reuses a live origin TCID",
+            ));
+        }
+        let preserve_previous_user = kind == RtpIngressKind::User && !can_replace(kind);
         if let Some(existing) = self.endpoint(kind) {
             if let Some(reply) = existing.reply_to_duplicate_setup(&datagram.payload[3..]) {
                 if datagram.port != 12004 - u16::from(existing.priority()) {
@@ -629,7 +723,16 @@ impl HprRtpPort {
                 ee.send_nlp(datagram.port, reply)?;
                 return Ok(Vec::new());
             }
-            if !can_replace(kind) {
+            if existing.origin_tcid() == Some(packet.tcid) {
+                return Err(invalid(
+                    "conflicting HPR RTP setup reuses a live origin TCID",
+                ));
+            }
+            if preserve_previous_user {
+                if self.previous_users.len() + 2 > MAX_INBOUND_USER_RTP {
+                    return Err(invalid("inbound HPR user RTP connection limit reached"));
+                }
+            } else if !can_replace(kind) {
                 return Err(invalid("second HPR RTP setup on occupied topic"));
             }
         }
@@ -661,7 +764,7 @@ impl HprRtpPort {
                 .origin_tcid()
                 .ok_or_else(|| invalid("RTP setup missing origin identifier"))?,
         };
-        self.install_setup(kind, endpoint);
+        self.install_setup(kind, endpoint, preserve_previous_user);
         Ok(messages
             .into_iter()
             .map(|bytes| RtpIngress {
@@ -672,13 +775,24 @@ impl HprRtpPort {
             .collect())
     }
 
-    fn install_setup(&mut self, kind: RtpIngressKind, endpoint: RtpInboundEndpoint) {
+    fn install_setup(
+        &mut self,
+        kind: RtpIngressKind,
+        endpoint: RtpInboundEndpoint,
+        preserve_previous_user: bool,
+    ) {
         if self.endpoint(kind).is_some() {
             tracing::info!(kind = ?kind, generation = self.bootstrap.generation.get(),
-                "replaced quiescent HPR RTP connection after validated fresh setup");
+                preserve_previous_user,
+                "accepted fresh HPR RTP setup on active EE link");
             if kind == RtpIngressKind::RouteSetup {
                 self.authorized_user_route = None;
                 self.user = None;
+                self.previous_users.clear();
+            } else if preserve_previous_user {
+                if let Some(previous) = self.user.take() {
+                    self.previous_users.push(previous);
+                }
             }
         }
         *self.slot_mut(kind) = Some(endpoint);
@@ -690,7 +804,7 @@ impl HprRtpPort {
         datagram: &Datagram,
         packet: RtpPacket<'_>,
     ) -> io::Result<Vec<RtpIngress>> {
-        let kind = [
+        let current_kind = [
             RtpIngressKind::RouteSetup,
             RtpIngressKind::CpSvcMg,
             RtpIngressKind::User,
@@ -699,9 +813,19 @@ impl HprRtpPort {
         .find(|kind| {
             self.endpoint(*kind)
                 .is_some_and(|endpoint| endpoint.assigned_tcid() == Some(packet.tcid))
-        })
-        .ok_or_else(|| invalid("unknown HPR RTP connection identifier"))?;
-        let endpoint = self.endpoint_mut(kind).unwrap();
+        });
+        let previous_index = self
+            .previous_users
+            .iter()
+            .position(|endpoint| endpoint.assigned_tcid() == Some(packet.tcid));
+        let kind = current_kind
+            .or_else(|| previous_index.map(|_| RtpIngressKind::User))
+            .ok_or_else(|| invalid("unknown HPR RTP connection identifier"))?;
+        let endpoint = if let Some(index) = previous_index {
+            &mut self.previous_users[index]
+        } else {
+            self.endpoint_mut(kind).unwrap()
+        };
         let priority = (packet.nhdr[0] >> 1) & 3;
         let expected_port = 12004 - u16::from(endpoint.priority());
         if priority != endpoint.priority() || datagram.port != expected_port {
@@ -875,6 +999,12 @@ fn priority_port(first_nhdr_byte: u8) -> io::Result<u16> {
     Ok(12004 - u16::from((first_nhdr_byte >> 1) & 3))
 }
 
+fn scope_matches_observation(scope: RtpAssociationScope, observation: &RtpObservation) -> bool {
+    observation.generation == scope.generation
+        && (observation.tcid == scope.initial_plu_tcid
+            || observation.tcid == scope.subsequent_plu_tcid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,20 +1146,30 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        port.install_setup(RtpIngressKind::RouteSetup, old_route);
+        port.install_setup(RtpIngressKind::RouteSetup, old_route, false);
         port.authorize_user_route(route.clone()).unwrap();
         let old_user =
             RtpInboundEndpoint::new(port.config_for(RtpIngressKind::User, &path()).unwrap())
                 .unwrap();
-        port.install_setup(RtpIngressKind::User, old_user);
+        port.install_setup(RtpIngressKind::User, old_user, false);
+
+        // The peer can open another RTP while a previous LU session remains
+        // pooled. Keep its endpoint for later data and acknowledgements.
+        let second_user =
+            RtpInboundEndpoint::new(port.config_for(RtpIngressKind::User, &path()).unwrap())
+                .unwrap();
+        port.install_setup(RtpIngressKind::User, second_user, true);
+        assert_eq!(port.previous_users.len(), 1);
+        assert!(port.user.is_some());
 
         let new_route = RtpInboundEndpoint::new(
             port.config_for(RtpIngressKind::RouteSetup, &path())
                 .unwrap(),
         )
         .unwrap();
-        port.install_setup(RtpIngressKind::RouteSetup, new_route);
+        port.install_setup(RtpIngressKind::RouteSetup, new_route, false);
         assert!(port.user.is_none());
+        assert!(port.previous_users.is_empty());
         assert!(port.authorized_user_route.is_none());
         assert!(port.config_for(RtpIngressKind::User, &path()).is_err());
         port.authorize_user_route(route).unwrap();
@@ -1074,5 +1214,36 @@ mod tests {
             .on_outbound(&ee, &wrong_port, packet, RtpIngressKind::UserOut)
             .is_err());
         assert_eq!(port.user_out.as_ref().unwrap().phase(), OutboundPhase::Idle);
+    }
+
+    #[test]
+    fn distinct_user_rtp_tcids_keep_initial_and_following_bius_on_their_own_scope() {
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let first = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: ASSIGNOR | 0x100,
+            subsequent_plu_tcid: 0x201,
+            slu_tcid: 0x100,
+        };
+        let second = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: ASSIGNOR | 0x102,
+            subsequent_plu_tcid: 0x203,
+            slu_tcid: 0x102,
+        };
+        for tcid in [second.initial_plu_tcid, second.subsequent_plu_tcid] {
+            let observed = RtpObservation { generation, tcid };
+            let selected = [first, second]
+                .into_iter()
+                .find(|scope| scope_matches_observation(*scope, &observed));
+            assert_eq!(selected, Some(second));
+        }
+        assert!(!scope_matches_observation(
+            second,
+            &RtpObservation {
+                generation: ConnectionGeneration::new(2).unwrap(),
+                tcid: second.subsequent_plu_tcid,
+            }
+        ));
     }
 }

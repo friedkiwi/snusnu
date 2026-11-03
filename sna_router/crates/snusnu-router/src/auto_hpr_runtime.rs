@@ -96,6 +96,7 @@ fn user_nce_label(control: &[u8]) -> io::Result<Vec<u8>> {
 struct ActiveHprSession {
     handle: u64,
     peer_sa: u64,
+    rtp_scope: router_core::hpr_session_address::RtpAssociationScope,
     bind_message: Vec<u8>,
     fabric_id: FabricSessionId,
     identity: SessionIdentity,
@@ -124,7 +125,7 @@ struct DirectHprRuntime {
     pending_rtp: std::collections::VecDeque<RtpIngress>,
     pending_rtp_bytes: usize,
     next_handle: u64,
-    bound_user_scope: Option<router_core::hpr_session_address::RtpAssociationScope>,
+    bound_user_scopes: Vec<router_core::hpr_session_address::RtpAssociationScope>,
     user_route_authorized: bool,
     peer_lus: Option<EePeerLus>,
 }
@@ -151,7 +152,7 @@ impl DirectHprRuntime {
             pending_rtp: std::collections::VecDeque::new(),
             pending_rtp_bytes: 0,
             next_handle: 1,
-            bound_user_scope: None,
+            bound_user_scopes: Vec::new(),
             user_route_authorized: false,
             peer_lus: None,
         }
@@ -507,14 +508,7 @@ impl DirectHprRuntime {
                 .find(|session| session.peer_sa == peer_sa)
             {
                 if session.bind_message == message.bytes {
-                    let scope = self
-                        .rtp
-                        .user_scope()
-                        .ok_or_else(|| protocol("user RTP scope missing"))?;
-                    if message.observation.generation != scope.generation
-                        || ![scope.initial_plu_tcid, scope.subsequent_plu_tcid]
-                            .contains(&message.observation.tcid)
-                    {
+                    if self.rtp.user_scope_for(&message.observation) != Some(session.rtp_scope) {
                         return Err(protocol("duplicate HPR BIND on wrong RTP connection"));
                     }
                     tracing::debug!(
@@ -641,7 +635,7 @@ impl DirectHprRuntime {
         let peer_sa = u64::from_be_bytes(fid5.session_address);
         let scope = self
             .rtp
-            .user_scope()
+            .user_scope_for(&message.observation)
             .ok_or_else(|| protocol("user RTP scope missing"))?;
         let handle = self.next_handle;
         if handle >= (1u64 << 62) {
@@ -652,7 +646,7 @@ impl DirectHprRuntime {
             .checked_add(1)
             .ok_or_else(|| protocol("HPR session handles exhausted"))?;
         let local_sa = (1u64 << 63) | handle;
-        let constructor = if self.bound_user_scope == Some(scope) {
+        let constructor = if self.bound_user_scopes.contains(&scope) {
             HprSessionAdapter::new_subsequent
         } else {
             HprSessionAdapter::new
@@ -719,6 +713,7 @@ impl DirectHprRuntime {
             ActiveHprSession {
                 handle,
                 peer_sa,
+                rtp_scope: scope,
                 bind_message: message.bytes.clone(),
                 fabric_id,
                 identity,
@@ -730,7 +725,9 @@ impl DirectHprRuntime {
                 pending_credit: ingress.extra_credit,
             },
         );
-        self.bound_user_scope = Some(scope);
+        if !self.bound_user_scopes.contains(&scope) {
+            self.bound_user_scopes.push(scope);
+        }
         Ok(())
     }
 
@@ -869,7 +866,7 @@ impl DirectHprRuntime {
             let sent = match egress {
                 Some(egress) => {
                     self.rtp
-                        .send(link, RtpIngressKind::User, &egress.message, now_us)?
+                        .send_user_on_scope(link, session.rtp_scope, &egress.message, now_us)?
                 }
                 None => true,
             };
@@ -992,7 +989,6 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                     });
                 let old_route_scope = runtime.rtp.route_setup_scope();
                 let old_cp_scope = runtime.rtp.cp_scope();
-                let old_user_scope = runtime.rtp.user_scope();
                 let messages = match runtime.rtp.on_ee_ui(
                     &link,
                     &datagram,
@@ -1020,7 +1016,7 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                     runtime.route_reply = None;
                     runtime.negative_route_reply = None;
                     runtime.user_route_authorized = false;
-                    runtime.bound_user_scope = None;
+                    runtime.bound_user_scopes.clear();
                     tracing::info!(attachment = %attachment.id,
                         generation = link.generation().get(),
                         "HPR RouteSetup RTP restarted on active EE link");
@@ -1033,12 +1029,10 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                         generation = link.generation().get(),
                         "HPR CP management RTP restarted on active EE link");
                 }
-                if old_user_scope.is_some() && runtime.rtp.user_scope() != old_user_scope {
-                    runtime.bound_user_scope = None;
-                    tracing::info!(attachment = %attachment.id,
-                        generation = link.generation().get(),
-                        "HPR user RTP restarted on active EE link");
-                }
+                let live_user_scopes = runtime.rtp.active_user_scopes();
+                runtime
+                    .bound_user_scopes
+                    .retain(|scope| live_user_scopes.contains(scope));
                 runtime.queue_rtp(messages)?;
             }
         }
