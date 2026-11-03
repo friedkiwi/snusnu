@@ -108,6 +108,20 @@ impl LocalLlcIngress {
         self.pending_grant = None;
         Ok(true)
     }
+
+    /// Advance SNASVCMG teardown while a user BIND remains leased for a
+    /// negative response. `poll` would replay that BIND and stall control.
+    pub(crate) fn poll_carrier_control(&mut self) -> io::Result<()> {
+        self.native.port.tick()?;
+        self.native.port.poll(true)?;
+        if !self.native.port.link_established() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "native LLC adjacency closed while rejecting user BIND",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl SessionSource for LocalLlcIngress {

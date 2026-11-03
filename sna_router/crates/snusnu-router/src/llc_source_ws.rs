@@ -60,13 +60,7 @@ impl LlcSourceWs {
 
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
         if self.retiring {
-            match self.source.poll()? {
-                Some(SourceUpdate::Closed) => {
-                    self.source_closed = true;
-                    return Ok(false);
-                }
-                Some(SourceUpdate::Event(_)) | None => {}
-            }
+            self.source.poll_carrier_control()?;
             if self.source.reject_user_bind()? {
                 self.user_rejected = true;
                 return Ok(false);
