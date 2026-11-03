@@ -24,6 +24,8 @@ use crate::{
         configured_candidates, CandidateCarrier, ConfiguredCandidate, Destination,
     },
     hpr_local_mptn::HprToMptnSession,
+    hpr_mptn_session_source::MptnToHprSession,
+    hpr_session_source::SessionSource,
 };
 
 struct Attachment<'a> {
@@ -43,6 +45,13 @@ pub(crate) struct MptnIngressOffer {
     pub(crate) gateway_id: String,
     pub(crate) association: u64,
     pub(crate) offer: IngressOffer,
+}
+
+pub(crate) struct ReadyMptnSource {
+    pub(crate) gateway_id: String,
+    pub(crate) target_ee_id: String,
+    pub(crate) identity: SessionIdentity,
+    pub(crate) source: Box<dyn SessionSource>,
 }
 
 pub(crate) struct HprMptnAttachments<'a> {
@@ -206,6 +215,99 @@ impl<'a> HprMptnAttachments<'a> {
         Ok(Some(session))
     }
 
+    pub(crate) fn take_ingress_session(
+        &mut self,
+        offered: MptnIngressOffer,
+    ) -> io::Result<MptnToHprSession> {
+        let attachment = self
+            .attachments
+            .iter_mut()
+            .find(|entry| entry.gateway.id() == offered.gateway_id)
+            .ok_or_else(|| invalid("unknown MPTN ingress gateway"))?;
+        if attachment.active_user {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "MPTN UDP lease is busy",
+            ));
+        }
+        let endpoint = attachment.gateway.outbound_endpoint();
+        let (detached, udp) = match attachment
+            .gateway
+            .detach_user_for_hpr(offered.association, &offered.offer)
+        {
+            Ok(detached) => detached,
+            Err(error) => {
+                let _ = attachment
+                    .gateway
+                    .reject_offer(offered.association, &error.to_string());
+                return Err(error);
+            }
+        };
+        let session = match MptnToHprSession::new(detached, udp, endpoint, offered.offer) {
+            Ok(session) => session,
+            Err(error) => {
+                attachment.gateway.release_udp();
+                return Err(error);
+            }
+        };
+        attachment.active_user = true;
+        Ok(session)
+    }
+
+    /// Turn a validated inbound TCP62 user BIND into a local EE source only
+    /// when both LU names have live ownership proof. TCP62 management proves
+    /// the adjacent LU; the configured peer CP remains an operator assertion.
+    /// This method closes an offer it rejects before detach. Callers must not
+    /// reject the association a second time after an error.
+    pub(crate) fn take_source(
+        &mut self,
+        offered: MptnIngressOffer,
+        directory: &crate::hpr_destination_directory::HprDestinationDirectory,
+    ) -> io::Result<ReadyMptnSource> {
+        let gateway_id = offered.gateway_id.clone();
+        let association = offered.association;
+        let preflight = (|| -> io::Result<(SessionIdentity, String)> {
+            let source_lu = parse_name(&offered.offer.connect().source.qualified_lu()?)?;
+            let target_lu = parse_name(&offered.offer.connect().destination.qualified_lu()?)?;
+            let attachment = self
+                .attachments
+                .iter()
+                .find(|entry| entry.gateway.id() == offered.gateway_id)
+                .ok_or_else(|| invalid("unknown MPTN ingress gateway"))?;
+            if attachment.active_user || !attachment.gateway.udp_available() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "MPTN UDP lease is busy",
+                ));
+            }
+            trusted_source_identity(
+                source_lu,
+                target_lu,
+                attachment.trusted_peer_cp.as_ref(),
+                &attachment.observed_peer_lus,
+                directory,
+            )
+        })();
+        let (identity, target_ee_id) = match preflight {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = self.reject_offer(&gateway_id, association, &error.to_string());
+                return Err(error);
+            }
+        };
+        let session = self.take_ingress_session(offered)?;
+        tracing::info!(gateway = %gateway_id, target_ee = %target_ee_id,
+            source_lu = %identity.source_lu, target_lu = %identity.target_lu,
+            source_cp = %identity.source_cp.as_ref().unwrap(),
+            "validated TCP62 user BIND selected local EE route");
+        Ok(ReadyMptnSource {
+            gateway_id,
+            target_ee_id,
+            identity,
+            source: Box::new(session),
+        })
+    }
+
     pub(crate) fn release(&mut self, gateway_id: &str) {
         if let Some(attachment) = self
             .attachments
@@ -230,6 +332,35 @@ impl<'a> HprMptnAttachments<'a> {
             .gateway
             .reject_offer(association, reason)
     }
+}
+
+fn trusted_source_identity(
+    source_lu: QualifiedName,
+    target_lu: QualifiedName,
+    trusted_peer_cp: Option<&QualifiedName>,
+    observed_peer_lus: &HashSet<QualifiedName>,
+    directory: &crate::hpr_destination_directory::HprDestinationDirectory,
+) -> io::Result<(SessionIdentity, String)> {
+    let source_cp =
+        trusted_peer_cp.ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
+    if source_lu.netid != source_cp.netid || !observed_peer_lus.contains(&source_lu) {
+        return Err(invalid(
+            "MPTN source LU lacks live management and trusted CP binding",
+        ));
+    }
+    let Destination::Ee {
+        hosting_cp,
+        attachment_id,
+    } = directory
+        .resolve_lu(&target_lu)
+        .ok_or_else(|| invalid("MPTN target LU has no live EE route"))?
+    else {
+        return Err(invalid("MPTN target LU is not a live EE destination"));
+    };
+    let identity = SessionIdentity::new(source_lu, target_lu)
+        .with_control_points(Some(source_cp.clone()), Some(hosting_cp))
+        .map_err(io::Error::other)?;
+    Ok((identity, attachment_id))
 }
 
 impl Attachment<'_> {
@@ -364,6 +495,69 @@ mod tests {
                     attachment_id: "mptn-a".into(),
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn inbound_source_requires_live_management_cp_assertion_and_ee_target() {
+        let source: QualifiedName = "BOBNET.SNAB".parse().unwrap();
+        let target: QualifiedName = "SOLNET.SNAB".parse().unwrap();
+        let source_cp: QualifiedName = "BOBNET.BOBCP".parse().unwrap();
+        let target_cp: QualifiedName = "SOLNET.SNAB".parse().unwrap();
+        let mut directory = crate::hpr_destination_directory::HprDestinationDirectory::new();
+        directory
+            .replace_owner(
+                "ee",
+                [(
+                    target.clone(),
+                    Destination::Ee {
+                        hosting_cp: target_cp.clone(),
+                        attachment_id: "ee-a".into(),
+                    },
+                )],
+            )
+            .unwrap();
+        let observed = HashSet::from([source.clone()]);
+        let (identity, attachment) = trusted_source_identity(
+            source.clone(),
+            target.clone(),
+            Some(&source_cp),
+            &observed,
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(attachment, "ee-a");
+        assert_eq!(identity.source_cp, Some(source_cp.clone()));
+        assert_eq!(identity.target_cp, Some(target_cp));
+        assert!(trusted_source_identity(
+            source.clone(),
+            target.clone(),
+            None,
+            &observed,
+            &directory
+        )
+        .is_err());
+        assert!(trusted_source_identity(
+            source.clone(),
+            target.clone(),
+            Some(&source_cp),
+            &HashSet::new(),
+            &directory
+        )
+        .is_err());
+        let wrong_cp: QualifiedName = "OTHER.BOBCP".parse().unwrap();
+        assert!(trusted_source_identity(
+            source.clone(),
+            target.clone(),
+            Some(&wrong_cp),
+            &observed,
+            &directory
+        )
+        .is_err());
+        directory.withdraw_owner("ee");
+        assert!(
+            trusted_source_identity(source, target, Some(&source_cp), &observed, &directory)
+                .is_err()
         );
     }
 }

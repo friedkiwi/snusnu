@@ -198,6 +198,7 @@ pub(crate) struct DirectHprRuntime<'a> {
     reverse: Option<ReverseRuntime>,
     local_ingress: Option<LocalToHprRuntime>,
     reverse_local_reservation: Option<(String, [u8; 6])>,
+    reverse_mptn_reservation: Option<String>,
     local_ws: Vec<LlcSessionWs>,
 }
 
@@ -237,6 +238,7 @@ impl<'a> DirectHprRuntime<'a> {
             reverse: None,
             local_ingress: None,
             reverse_local_reservation: None,
+            reverse_mptn_reservation: None,
             local_ws: Vec::new(),
         }
     }
@@ -321,18 +323,88 @@ impl<'a> DirectHprRuntime<'a> {
         Ok(())
     }
 
-    fn pump_local_mptn(&mut self) -> io::Result<()> {
-        if let Some(mptn) = self.mptn.as_mut() {
-            for offer in mptn.poll_once()? {
+    fn pump_local_mptn(&mut self, link: &EeLdlcEndpoint) -> io::Result<()> {
+        let Some(mptn) = self.mptn.as_mut() else {
+            return Ok(());
+        };
+        let offers = mptn.poll_once()?;
+        for offer in offers {
+            if self.reverse.is_some()
+                || !self
+                    .reciprocal_cp
+                    .as_ref()
+                    .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+            {
                 mptn.reject_offer(
                     &offer.gateway_id,
                     offer.association,
-                    "MPTN-originated HPR routing is not active",
+                    "EE reverse route busy",
                 )?;
+                continue;
             }
-            self.local_directory
-                .replace_owner("mptn", mptn.trusted_routes())?;
+            let Some(tg) = link.tg_number() else {
+                mptn.reject_offer(&offer.gateway_id, offer.association, "EE TG unavailable")?;
+                continue;
+            };
+            let (label, instance) = target_nce(
+                &self.bootstrap.local.tower.route_setup_nce_label,
+                self.bootstrap.local.tower.route_setup_nce_instance,
+                125,
+            )?;
+            let ready = match mptn.take_source(offer, &self.local_directory) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    tracing::warn!(error = %error, "local MPTN-to-EE user association rejected");
+                    continue;
+                }
+            };
+            let mut source = ready.source;
+            if self.ee_attachment_id.as_deref() != Some(&ready.target_ee_id) {
+                source.close()?;
+                mptn.release(&ready.gateway_id);
+                tracing::warn!(gateway = %ready.gateway_id, target = %ready.target_ee_id,
+                    "local MPTN-to-EE target is not this EE attachment");
+                continue;
+            }
+            let reachability = Reachability {
+                lu: Some(ready.identity.target_lu.clone()),
+                cp: ready.identity.target_cp.clone(),
+            };
+            if let Err(error) = self.switch.replace_routes(HPR_ADAPTER, vec![reachability]) {
+                let _ = source.close();
+                mptn.release(&ready.gateway_id);
+                tracing::warn!(gateway = %ready.gateway_id, error = ?error,
+                    "local MPTN-to-EE fabric route rejected");
+                continue;
+            }
+            let handle = self.next_handle;
+            self.next_handle = self
+                .next_handle
+                .checked_add(1)
+                .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+            tracing::info!(gateway = %ready.gateway_id, target = %ready.target_ee_id,
+                source_lu = %ready.identity.source_lu, target_lu = %ready.identity.target_lu,
+                handle, "local MPTN session admitted to EE peer");
+            self.reverse_mptn_reservation = Some(ready.gateway_id);
+            self.reverse = Some(ReverseRuntime::with_source(
+                ready.identity,
+                source,
+                LOCAL_ADAPTER,
+                self.bootstrap.clone(),
+                handle,
+                tg,
+                reciprocal_nonce().to_be_bytes(),
+                label,
+                instance,
+                router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+                    transmission_time_us: 1000,
+                    capacity_kbps: 100_000,
+                    liveness_seconds: 10,
+                },
+            ));
         }
+        self.local_directory
+            .replace_owner("mptn", mptn.trusted_routes())?;
         Ok(())
     }
 
@@ -504,7 +576,7 @@ impl<'a> DirectHprRuntime<'a> {
         now_us: u64,
     ) -> io::Result<()> {
         self.pump_local_llc()?;
-        self.pump_local_mptn()?;
+        self.pump_local_mptn(link)?;
         self.pump_local_ws();
         let live_scopes = self.rtp.active_user_scopes();
         let directory = &self.local_directory;
@@ -562,6 +634,11 @@ impl<'a> DirectHprRuntime<'a> {
                 if let Some((ingress_id, proxy_mac)) = self.reverse_local_reservation.take() {
                     if let Some(local_ingress) = self.local_ingress.as_mut() {
                         local_ingress.release(&ingress_id, proxy_mac)?;
+                    }
+                }
+                if let Some(gateway_id) = self.reverse_mptn_reservation.take() {
+                    if let Some(mptn) = self.mptn.as_mut() {
+                        mptn.release(&gateway_id);
                     }
                 }
             }

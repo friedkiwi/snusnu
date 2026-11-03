@@ -269,9 +269,10 @@ hosting CP. Set the gateway's `peer_cp` as an explicit operator assertion and
 after live management confirms the LU in the asserted CP's NETID. With
 `peer_cp` omitted, it leaves the route unavailable. The gateway lends its
 UDP/397 socket to the selected user session for expedited data and UNBIND.
-MPTN-originated LU 6.2 sessions use SessionV1 toward an EE peer reached through
-the concentrator. Direct local MPTN-to-EE initiation without a concentrator
-still needs a local MPTN ingress selector.
+MPTN-originated LU 6.2 sessions can use SessionV1 toward an EE peer reached
+through the concentrator, or the same router's local EE attachment. The local
+path requires a live management observation of the source LU, a configured
+`peer_cp` in that LU's NETID, and a verified EE destination LU.
 
 ## Experimental HPR LAN to HPR/IP media route
 
