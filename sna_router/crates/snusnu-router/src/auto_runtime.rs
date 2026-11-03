@@ -89,6 +89,7 @@ struct PendingUpstreamLlc {
     proxy_mac: [u8; 6],
     target_cp: QualifiedName,
     source: Option<LocalLlcIngress>,
+    reject_pending: bool,
 }
 
 struct ActiveUpstreamLlc {
@@ -650,6 +651,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 attachment: active.attachment,
                                 listener: active.listener,
                                 proxy_mac: active.proxy_mac,
+                                reject_pending: false,
                             },
                         );
                         continue;
@@ -684,6 +686,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 source: Some(LocalLlcIngress::from_verified_port(
                                     native, target_cp,
                                 )),
+                                reject_pending: false,
                             },
                         );
                         continue;
@@ -786,6 +789,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                     proxy_mac: active.proxy_mac,
                                     target_cp: source.target_cp().clone(),
                                     source: Some(source),
+                                    reject_pending: false,
                                 },
                             );
                             continue;
@@ -808,7 +812,26 @@ impl<'a> AutoLocalSessionRunner<'a> {
             // user circuit. A guest may stay connected without issuing BIND
             // while a remote peer prepares to route toward its advertised LU.
             // The native adapter reports link loss through Closed or an error.
-            let update = pending.source.as_mut().unwrap().poll();
+            let update = if pending.reject_pending {
+                let source = pending.source.as_mut().unwrap();
+                match source
+                    .poll_carrier_control()
+                    .and_then(|()| source.reject_user_bind())
+                {
+                    Ok(queued) => {
+                        if queued {
+                            pending.reject_pending = false;
+                            tracing::info!(session = id, attachment = %pending.attachment.0,
+                                "native user BIND refused; verified LLC adjacency retained");
+                        }
+                        pending_llc_upstream.insert(id, pending);
+                        continue;
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                pending.source.as_mut().unwrap().poll()
+            };
             let ready = matches!(
                 update,
                 Ok(Some(SourceUpdate::Event(
@@ -946,10 +969,11 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 pending_llc_upstream.insert(id, pending);
                                 continue;
                             }
-                            Ok(false) => tracing::warn!(
-                                session = id,
-                                "native negative BIND response queue is full"
-                            ),
+                            Ok(false) => {
+                                pending.reject_pending = true;
+                                pending_llc_upstream.insert(id, pending);
+                                continue;
+                            }
                             Err(reject_error) => tracing::warn!(session = id,
                                 error = %reject_error, "native user BIND could not be rejected"),
                         }
@@ -1051,6 +1075,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                     source: Some(LocalLlcIngress::from_verified_port(
                                         native, target_cp,
                                     )),
+                                    reject_pending: false,
                                 },
                             );
                             tracing::info!(session = id, carrier = carrier_id,
@@ -1294,6 +1319,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 proxy_mac: ingress_proxy,
                                 target_cp: target_cp.clone(),
                                 source: Some(source),
+                                reject_pending: false,
                             },
                         );
                         next_id = id;
