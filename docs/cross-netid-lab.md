@@ -392,11 +392,10 @@ capture and parser fix. The live successes prove the stated directions
 through the first remote display or APING reply; they do not prove normal
 teardown, simultaneous sessions, or every carrier combination.
 
-The automatic runner now also leases a verified LLC dialout carrier when a
-local MPTN ingress selects it, and releases the lease after the session while
-retaining the local discovery proof. This behavior has focused Rust tests;
-the cross-NETID successes above do not constitute a live test of the newer
-standalone lease path.
+The automatic runner also leases a verified LLC dialout carrier when a local
+MPTN ingress selects it, and releases the lease after the session while
+retaining the local discovery proof. A separate standalone live test of that
+path is recorded below.
 
 The QA concentrator was left listening on `0.0.0.0:8081` for inspection. It
 used a persistent QA database so router IDs, tokens and managed MAC bindings
@@ -413,8 +412,10 @@ unique verified LLC CP learned from Alice's dialout XID3; it did not require
 an exact LU hint before opening the local call. The exact destination LU was
 added to the local registry only after Alice's positive user BIND. This is a
 live test of automatic local MPTN→LLC selection and of the verified LLC
-carrier lease. It does not establish the reverse local LLC→MPTN path or a
-local MPTN↔MPTN session; those remain separate acceptance tests.
+carrier lease. At 19:11 UTC, V4R4 Alice initiated through the same standalone
+router toward V5R4 Bob over TCP62 and reached Bob's remote Sign On. These
+two calls establish both local MPTN↔LLC initiation directions through the
+first display. A local MPTN↔MPTN session remains a separate acceptance test.
 
 The current Rust tree also has focused tests for short native UNBIND and
 source-close handling. A synchronized live teardown retest is still needed
@@ -422,3 +423,15 @@ to confirm that a normal close retains the idle LLC2 adjacency and route.
 Multiple EE attachments and their bounded session event bridge are
 code-gated, but no two-EE guest session through that bridge has been
 observed yet.
+
+## Standalone automatic LLC2 and EE, 2026-11-03
+
+At 19:16:06 UTC, V4R4 Alice initiated through one standalone Rust router
+from LLC2 to V5R4 Bob over EE and reached Bob's remote Sign On. At
+19:32:13 UTC, Bob initiated from EE through that same router to Alice's LLC2
+peer and reached Alice's remote Sign On. No concentrator or WebSocket hop was
+involved. For the Bob-initiated call the EE gateway borrowed Alice's already
+verified LLC dialout adjacency; it did not require a new XID/controller
+cycle. These two calls establish both local EE↔LLC initiation directions to
+the first display. They do not prove normal teardown, repeated or
+simultaneous user sessions, local EE↔MPTN, or a two-EE guest session.

@@ -43,17 +43,21 @@ configurations.
 
 ## Verification status
 
-- V5R4 TCP62 → standalone Rust → V4R4 LLC2 reached the remote Sign On at
+- V5R4 TCP62 → standalone Rust → V4R4 LLC2 reached remote Sign On at
   19:07:34 UTC on 2026-11-03. The LLC target was selected by its unique
-  verified CP, then the exact LU was learned from a positive user BIND. The
-  reverse standalone LLC→MPTN direction remains to be tested live.
+  verified CP, then the exact LU was learned from a positive user BIND.
+  V4R4 LLC2 → standalone Rust → V5R4 TCP62 reached remote Sign On at
+  19:11 UTC. These are both local MPTN↔LLC initiation directions.
 - V5R4 TCP62 → Rust → QA concentrator → Rust → V4R4 LLC2 reached remote
   Sign On. Both directions of V5R4 EE↔V4R4 LLC2 through the concentrator
   also reached remote Sign On. V5R4 EE reached the embedded APING responder.
+- V4R4 LLC2 → standalone Rust → V5R4 EE reached remote Sign On at
+  19:16:06 UTC. V5R4 EE → standalone Rust → V4R4 LLC2 reached remote
+  Sign On at 19:32:13 UTC using the verified LLC dialout adjacency borrowed
+  by the EE session. No concentrator participated in either call.
 - Multiple EE attachments and their bounded shared session bridge are
   implemented and code-gated. No live session between two EE guests through
-  that path has passed yet. Local MPTN↔MPTN and reverse local LLC↔MPTN need
-  separate live acceptance.
+  that path has passed yet. Local MPTN↔MPTN needs separate live acceptance.
 - Short native UNBIND and source-close handling have focused code gates.
   Normal teardown and route retention after close still need a live retest.
 

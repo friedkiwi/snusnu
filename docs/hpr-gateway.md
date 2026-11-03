@@ -45,6 +45,13 @@ attachments.
    BIND response exposed a pacing mode bit that Rust rejected; the corrected
    parser allowed this live session. Normal teardown and repeated sessions
    in this direction still need verification.
+4. Without a concentrator, V4R4 LLC2 → Rust → V5R4 EE reached remote
+   Sign On at 19:16:06 UTC. V5R4 EE → Rust → V4R4 LLC2 reached remote
+   Sign On at 19:32:13 UTC. The latter session borrowed an existing verified
+   LLC dialout adjacency; returning it after close remains part of the
+   pending live teardown retest.
+   Both results demonstrate local gateway routing to the first display, not
+   a completed normal teardown or a two-EE guest bridge.
 
 These are session gateway tests, distinct from the older configured EE UDP
 relay and direct [EE lab](ee-lab.md). The [cross-NETID lab](cross-netid-lab.md)
@@ -58,7 +65,7 @@ outside the repository.
    LLC2 adjacency and published route survive. Also exercise remote reset
    and peer loss.
 2. Repeat the embedded APING test after the reverse-path fixes, then test
-   local EE↔LLC and EE↔MPTN without a concentrator. Check routing among
+   local EE↔MPTN without a concentrator. Check routing among
    different local NETIDs, route withdrawal, reconnect and duplicate-route
    ambiguity.
 3. Connect two EE guests to different attachments on one router and verify
