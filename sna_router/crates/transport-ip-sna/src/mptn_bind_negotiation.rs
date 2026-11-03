@@ -157,7 +157,9 @@ pub fn validate_positive_response(
         }
     } else if request.fixed[..8] != response.fixed[..8]
         || request.fixed[14..23] != response.fixed[14..23]
-        || request.fixed[25..27] != response.fixed[25..27]
+        || request.fixed[26] != response.fixed[26]
+        || (request.fixed[25] != response.fixed[25]
+            && !(request.fixed[25] == 0 && response.fixed[25] == 0x40))
     {
         return Err(BindNegotiationError::Unsupported);
     }
@@ -195,6 +197,30 @@ mod tests {
     const RESPONSE: &str = "0000eb800031001307b0b0513303038c8c830306020000000000000094430000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b0238ff4f5c3000000006014cec37477b5dc299a0be2d6d3d5c5e34be2d5c1c1";
     const V4R4_REQUEST: &str = "00006b840031001307b0b051330383c7c78303060200000000000000944340000be2d6d3d5c5e34be2d5c1c12d0009024040404040404040090301235069de6780000c04e2d6d3d5c5e34be2d5c1c10a1300b0235069de678000000be2d6d3d5c5e34be2d5c1c26014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c12c0a01087bc3d6d5d5c5c3e3";
     const V4R4_RESPONSE: &str = "0000eb800031001307b0b051330080c7c7800006020000000000000094434000002600090240404040404040400203020c05e2d6d3d5c5e34be2d5c1c20a1300b023506a33da800000006014cec37477b5dbed8d0be2d6d3d5c5e34be2d5c1c1";
+    // Alice V4R4 user BIND sent to Bob V5R4 over EE, and Bob's positive
+    // response captured on 2026-11-03. The secondary sets fixed byte 25's
+    // 0x40 bit while preserving the negotiated LU and FQPCID.
+    const EE_REQUEST: &str = "00006b800031001307b0b0513303038c8c8303060200000000000000944300000cd8c1c1d3c9c3c54be2d5c1c12e0009024040404040404040090301262c0b907880000d04d8c1c1d3c9c3c54be2d5c1c10a1300b0262c0b90788000000ad8c1c2d6c24be2d5c1c26015d8e7221f0a553c940cd8c1c1d3c9c3c54be2d5c1c1";
+    const EE_RESPONSE: &str = "0000eb800031001307b0b0513303038c8c830306020000000000000094434000002500090240404040404040400203020b05d8c1c2d6c24be2d5c1c20a1300b0262c0ca620800000006015d8e7221f0a553c940cd8c1c1d3c9c3c54be2d5c1c1";
+
+    #[test]
+    fn accepts_captured_ee_bind_response_selecting_byte_25_option() {
+        let request = hex(EE_REQUEST);
+        let response = hex(EE_RESPONSE);
+        assert_eq!(validate_positive_response(&request, &response), Ok(()));
+        let mut unsupported = response.clone();
+        unsupported[5 + 25] = 0x60;
+        assert_eq!(
+            validate_positive_response(&request, &unsupported),
+            Err(BindNegotiationError::Unsupported)
+        );
+        unsupported = response;
+        unsupported[5 + 26] = 1;
+        assert_eq!(
+            validate_positive_response(&request, &unsupported),
+            Err(BindNegotiationError::Unsupported)
+        );
+    }
 
     #[test]
     fn accepts_observed_v5r4_5494_controller_bind_response() {
