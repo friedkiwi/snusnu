@@ -57,6 +57,22 @@ func (a *App) savePrintJob(ctx context.Context, peer LocalPeer, device, title st
 	if err = os.Rename(tempPath, finalPath); err != nil {
 		return store.PrintJob{}, err
 	}
+	// The file contents are synced above. Persist the new directory entry before
+	// committing a database row or acknowledging the print to its sender.
+	dir, err := os.Open(a.printDir)
+	if err != nil {
+		os.Remove(finalPath)
+		return store.PrintJob{}, err
+	}
+	err = dir.Sync()
+	closeErr := dir.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(finalPath)
+		return store.PrintJob{}, err
+	}
 	job := store.PrintJob{ID: id, OwnerID: peer.OwnerID, SourceRouterID: peer.RouterID, SourceNetID: peer.NetID, SourceCP: peer.CP, SourceLU: peer.LU, DeviceName: device, Title: title, ByteCount: int64(len(scs)), PageCount: int64(len(pages)), CreatedAt: store.Now()}
 	if err = a.DB.InsertPrintJob(ctx, job); err != nil {
 		os.Remove(finalPath)
