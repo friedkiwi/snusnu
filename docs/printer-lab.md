@@ -672,9 +672,10 @@ power-on record would be unsupported.
 
 1. Capture the actual V5R4 `QRMTWSC` control and printer sessions against a
    compatible 5494 or APPC printer peer. The firmware establishes the NMVT
-   Reply PSID payload and its direct network-management path, but dynamic
-   TH/RH fields, IBM i's response, and correlation with the parallel printer
-   session still need a trace.
+   Reply PSID payload and its inner FID2 PIU. Resident service `13` owns the
+   physical send path; its outer framing, dynamic TH/RH fields, IBM i's
+   application acceptance, and correlation with the parallel printer session
+   still need a trace.
 2. Generalize the router's service-directed BIND admission and both transport
    adapters for the printer's session profile. The concentrator local service
    registry can now open an outbound circuit from its own LU, but the router's
