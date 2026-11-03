@@ -9,6 +9,7 @@ use crate::{
     config::{self, MptnGatewayConfig},
     local_status::{self, CircuitStatus},
     mptn_bidirectional_gateway::{fresh_management, pump_virtual},
+    mptn_discovery::{MptnDiscovery, MptnDiscoverySnapshot, DISCOVERY_LEASE},
     mptn_gateway_port::{GatewayConfig, GatewayEvent, MptnGatewayPort},
     mptn_outbound_port::OutboundEndpoint,
     mptn_ws_reverse::{AutoReverseWsSession, ReverseWsConfig},
@@ -175,6 +176,7 @@ pub(crate) struct AutoMptnGateway<'a> {
     identity_observations: Vec<(String, IdentityObservation)>,
     closed_local_attachments: Vec<String>,
     management_lus: Vec<(String, String)>,
+    discovery: MptnDiscovery,
 }
 
 impl Drop for AutoMptnGateway<'_> {
@@ -222,6 +224,7 @@ impl<'a> AutoMptnGateway<'a> {
             identity_observations: Vec::new(),
             closed_local_attachments: Vec::new(),
             management_lus: Vec::new(),
+            discovery: MptnDiscovery::new(DISCOVERY_LEASE)?,
         })
     }
 
@@ -262,6 +265,24 @@ impl<'a> AutoMptnGateway<'a> {
         std::mem::take(&mut self.management_lus)
     }
 
+    /// Complete, attachment-owned LU reachability after a membership change.
+    /// The caller combines these LUs with its configured peer CP assertion;
+    /// TCP62 itself does not prove a hosting CP.
+    #[allow(dead_code)] // The shared registry integration will consume this snapshot.
+    pub(crate) fn take_discovery_snapshot(&mut self) -> Option<MptnDiscoverySnapshot> {
+        self.discovery.take_changed_snapshot()
+    }
+
+    #[allow(dead_code)] // The shared registry runtime will use this to schedule expiry.
+    pub(crate) fn next_discovery_expiry(&self) -> Option<Instant> {
+        self.discovery.next_expiry()
+    }
+
+    #[allow(dead_code)] // Called when the owning attachment is explicitly lost.
+    pub(crate) fn withdraw_discovery(&mut self) -> io::Result<()> {
+        self.discovery.withdraw_all()
+    }
+
     pub(crate) fn udp_available(&self) -> bool {
         !self.udp_leased && self.sessions.is_empty() && self.reverse.is_none()
     }
@@ -270,6 +291,7 @@ impl<'a> AutoMptnGateway<'a> {
     /// validated user BIND is returned to the owning fabric for destination
     /// selection; it remains pending in the TCP62 association until accepted.
     pub(crate) fn poll_once(&mut self) -> io::Result<Option<(u64, IngressOffer)>> {
+        self.discovery.expire(Instant::now())?;
         if let Some(reverse) = &mut self.reverse {
             match reverse.poll_once() {
                 Ok(true) => {
@@ -330,17 +352,30 @@ impl<'a> AutoMptnGateway<'a> {
         }
         let sessions = &self.sessions;
         let can_accept = |id| sessions.get(&id).is_none_or(MptnToWsSession::can_accept);
-        let event = if self.udp_leased {
-            self.listener.poll_tcp_only_with_credit(can_accept)?
+        let event_result = if self.udp_leased {
+            self.listener.poll_tcp_only_with_credit(can_accept)
         } else {
-            self.listener
-                .poll_association_once_with_credit(can_accept)?
+            self.listener.poll_association_once_with_credit(can_accept)
+        };
+        let event = match event_result {
+            Ok(event) => event,
+            Err(error) => {
+                self.discovery.withdraw_all()?;
+                return Err(error);
+            }
         };
         let Some((id, event)) = event else {
             return Ok(None);
         };
         if matches!(&event, GatewayEvent::ManagementReady) {
             if let Some(lus) = self.listener.take_management_lus() {
+                let source: router_core::session::QualifiedName = lus.0.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid MPTN management source LU",
+                    )
+                })?;
+                self.discovery.observe(source, Instant::now())?;
                 self.management_lus.push(lus);
             }
         }
@@ -360,7 +395,14 @@ impl<'a> AutoMptnGateway<'a> {
             return Ok(None);
         }
         match event {
-            GatewayEvent::UserBind(offer) if !self.udp_leased => Ok(Some((id, offer))),
+            GatewayEvent::UserBind(offer) if !self.udp_leased => {
+                let (source, _) = Self::offer_lus(&offer)?;
+                let source = source.parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid MPTN user source LU")
+                })?;
+                self.discovery.observe(source, Instant::now())?;
+                Ok(Some((id, offer)))
+            }
             GatewayEvent::UserBind(_) => {
                 self.listener.close_association_for(id)?;
                 tracing::warn!(gateway = %self.config.id, association = id,

@@ -101,6 +101,7 @@ mod local_status;
 mod local_web;
 #[cfg(target_os = "linux")]
 mod mptn_bidirectional_gateway;
+mod mptn_discovery;
 #[cfg(target_os = "linux")]
 mod mptn_gateway_port;
 #[cfg(target_os = "linux")]
