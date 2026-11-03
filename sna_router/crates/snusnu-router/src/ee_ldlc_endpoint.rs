@@ -363,7 +363,17 @@ impl EeLdlcEndpoint {
                 Ok(None)
             }
             LdlcKind::Dm => {
-                self.down();
+                if packet.port != CONTROL_PORT
+                    || packet.dsap != DEFAULT_BASE_SAP
+                    || packet.ssap != (DEFAULT_BASE_SAP | 1)
+                    || packet.payload.len() != 3
+                {
+                    return Err(invalid("invalid EE DM response"));
+                }
+                // DM acknowledges a DISC command. This endpoint never sends
+                // DISC, so no received DM can complete a local disconnect.
+                tracing::warn!(local_ip=%self.local_ip, peer_ip=%self.peer_ip,
+                    generation=self.generation, "unsolicited EE DM response discarded");
                 Ok(None)
             }
             LdlcKind::UiNlp => self.nlp(packet, now),
@@ -970,6 +980,20 @@ mod tests {
         let bootstrap = endpoint.control_bootstrap().unwrap().unwrap();
         assert_eq!(bootstrap.peer.cp.to_string(), "SOLNET.SNAB");
         assert_eq!(bootstrap.outbound_cp_label(), [0xa4, 0]);
+        let generation = endpoint.generation();
+        for bytes in [[0xc8, 5, 0x0f].as_slice(), &[4, 4, 0x0f], &[4, 5, 0x0f, 0]] {
+            let dm = Datagram::decode(CONTROL_PORT, bytes.to_vec()).unwrap();
+            assert_eq!(
+                endpoint.process(dm, now).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(endpoint.phase(), Phase::Active);
+            assert_eq!(endpoint.generation(), generation);
+        }
+        let unsolicited = Datagram::decode(CONTROL_PORT, vec![4, 5, 0x0f]).unwrap();
+        assert!(endpoint.process(unsolicited, now).unwrap().is_none());
+        assert_eq!(endpoint.phase(), Phase::Active);
+        assert_eq!(endpoint.generation(), generation);
         let priority = UdpSocket::bind((peer_ip, NETWORK_PORT)).unwrap();
         priority.set_nonblocking(true).unwrap();
         endpoint.send_nlp(NETWORK_PORT, &[0xc6, 0, 0xa4]).unwrap();
