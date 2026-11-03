@@ -724,7 +724,11 @@ An isolated trial changed only the Attach allocation byte after `03 20 01`
 from `00` to `01` with `SNUSNU_PRINTER_PROBE_PIP_BYTE=1`. The first fresh circuit
 reached XID and outer ACTLU, but no controller BIND or Attach followed. Guest
 controller `LLCPRT` later entered `FAILED` state, so this trial did not test the
-new PIP value. The probe also ignored the guest's `DACTLU` during the reset;
+new PIP value. Further firmware inspection found that `VG0F` reads this byte
+from shared memory `1000:C000+8`, which `VG1C` initializes to `00`. The `01`
+in the disk configuration file is a different field; a later runtime change
+to shared memory has not been excluded. The next trial should use the observed
+`00` initialization. The probe also ignored the guest's `DACTLU` during the reset;
 it now returns the architected positive DACTLU RU `0E`. The Go pre-commit gate
 passed for that fix. After a clean guest IPL, the controller did not auto-vary
 on, leaving the PIP trial pending an authorized guest sign-on and vary-on.
