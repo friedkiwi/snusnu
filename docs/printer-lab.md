@@ -115,6 +115,15 @@ does not itself make a 5494-like printer available to the guest. The service
 must initiate the controller session and accept the host-initiated printer
 session, including `QRMTWSC` application records.
 
+The QA binary can also take `-printer-probe-dial SOLNET.SNAB` to make one
+outbound SessionV1 open when the guest LU is advertised. A direct AnyNet lab
+attempt on V5R4 could not yet exercise this path: an additional `ANYPRT`
+controller for `SNUSNU.SVC` was created, but IBM i refused to vary it on while
+the existing `EETOA` low-entry-node controller for that same remote CP was
+active (message CPD2628, reason 00002217). The active EE controller was left
+in place. An LLC null XID sent to the guest's MAC elicited no LLC response;
+the guest currently has no active matching LLC controller for this target.
+
 ## Remaining acceptance work
 
 The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
@@ -172,6 +181,9 @@ power-on record would be unsupported.
 3. Add a reusable Go printer conversation in `sna`, then an embedded
    concentrator adapter that stamps the authenticated owner and source CP/LU,
    persists the raw stream, and acknowledges only durably accepted data.
+   The library already has the Reply PSID FID2 encoder and an LU4 actor for
+   ACTLU, printer BIND and durably accepted FMD chains. The private outer
+   device-session record and a reliable spool completion signal remain open.
 4. Print from the guest through AnyNet and LLC separately, capturing each
    router-to-concentrator circuit and confirming the received spool and both
    renderings. Passing APING or `VFYAPPCCNN` alone is insufficient.
