@@ -163,6 +163,20 @@ impl AutoLlcWsBridge {
         Ok(true)
     }
 
+    /// Remove live identity learned on this LLC association while retaining
+    /// configuration hints for the next dialout. Stale CP/LU evidence must
+    /// never remain in the local directory or an upstream announcement.
+    #[allow(dead_code)] // Replaced by association-scoped proof aggregation during registry migration.
+    pub(crate) fn withdraw(&mut self, id: &PortId) -> io::Result<bool> {
+        let local = self
+            .local
+            .get_mut(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LLC attachment is absent"))?;
+        let changed = local.cp.take().is_some() || !local.lus.is_empty();
+        local.lus.clear();
+        Ok(changed)
+    }
+
     /// Call only after a native BIND has established the LU on this guest's
     /// private association. A CP name alone never implies an LU export.
     pub(crate) fn observe_bound_lu(&mut self, id: &PortId, name: &str) -> io::Result<bool> {
@@ -537,6 +551,26 @@ mod tests {
         assert_eq!(lus[0].supported_types, vec![wire::LuType::LuType62 as i32]);
         bridge.observe_cp(&id, "SOLNET.OTHER").unwrap();
         assert!(bridge.advertisements("SOLNET").unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn disconnect_withdraws_cp_and_lu_but_reuses_configured_hint_on_new_xid() {
+        let mut bridge = AutoLlcWsBridge::default();
+        let id = PortId::new("dialout-peer");
+        bridge
+            .register(id.clone(), "tap0".into(), [2, 0, 0, 0, 0, 1])
+            .unwrap();
+        bridge
+            .configure_lu_hints(&id, "SOLNET.SNAA", &["SOLNET.APP1".into()], &HashMap::new())
+            .unwrap();
+        bridge.observe_cp(&id, "SOLNET.SNAA").unwrap();
+        assert_eq!(bridge.advertisements("SOLNET").unwrap().1.len(), 1);
+        assert!(bridge.withdraw(&id).unwrap());
+        assert!(bridge.advertisements("SOLNET").unwrap().0.is_empty());
+        assert!(bridge.local_addresses(&id).is_empty());
+        assert!(!bridge.withdraw(&id).unwrap());
+        bridge.observe_cp(&id, "SOLNET.SNAA").unwrap();
+        assert_eq!(bridge.advertisements("SOLNET").unwrap().1.len(), 1);
     }
 
     #[test]

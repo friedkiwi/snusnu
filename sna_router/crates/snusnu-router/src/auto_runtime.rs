@@ -461,6 +461,10 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
             let changed = match observation.identity {
                 IdentityObservation::ControlPoint(cp) => bridge.observe_cp(&id, &cp)?,
                 IdentityObservation::LogicalUnit(lu) => bridge.observe_bound_lu(&id, &lu)?,
+                // The shared registry aggregates evidence by association.
+                // This legacy bridge cannot withdraw one association without
+                // hiding another live one on the same attachment.
+                IdentityObservation::Withdraw => false,
             };
             learned |= changed;
         }
@@ -595,11 +599,12 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 }
             }
             let mut learned_local = false;
-            for (attachment, identity) in gateway.take_identity_observations() {
+            for (_association, attachment, identity) in gateway.take_identity_observations() {
                 let id = PortId::new(attachment);
                 learned_local |= match identity {
                     IdentityObservation::ControlPoint(cp) => bridge.observe_cp(&id, &cp)?,
                     IdentityObservation::LogicalUnit(lu) => bridge.observe_bound_lu(&id, &lu)?,
+                    IdentityObservation::Withdraw => false,
                 };
             }
             if learned_local {

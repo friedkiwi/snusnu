@@ -22,6 +22,7 @@ use std::{
 
 const CONNECT_BARRIER: Duration = Duration::from_millis(200);
 const NATIVE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+const ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct LlcAutoListener {
     port: PacketPort,
@@ -276,7 +277,7 @@ fn classify_native_offer(
     }
 }
 
-fn classify_offer(
+pub(crate) fn classify_offer(
     bytes: &[u8],
     guest_mac: [u8; 6],
     allowed_proxy_macs: &HashSet<[u8; 6]>,
@@ -292,21 +293,25 @@ fn classify_offer(
     {
         return Ok(None);
     }
+    // An old I/RR/UA frame can arrive after a prior association was retired.
+    // Only a command Type1 bootstrap can claim a new proxy association.
     let peer_cp = match frame.control {
-        Control::Unnumbered { byte }
-            if byte & !0x10 == 0xaf && frame.information.first() == Some(&0x32) =>
-        {
-            Xid3::decode(frame.information)
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid LLC XID3: {error}"),
-                    )
-                })?
-                .cp_name()
-                .ok()
-        }
-        _ => None,
+        Control::Unnumbered { byte } if !frame.is_response() => match byte & !0x10 {
+            0xaf if frame.information.is_empty() => None,
+            0xaf if frame.information.first() == Some(&0x32) => Some(
+                Xid3::decode(frame.information)
+                    .and_then(|xid| xid.cp_name())
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid LLC XID3 offer: {error}"),
+                        )
+                    })?,
+            ),
+            0xe3 => None,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     Ok(Some((frame.destination, peer_cp)))
 }
@@ -342,6 +347,7 @@ impl LlcIngressOffer {
             guest_mac,
             observed_cp: None,
             identity_observations: Vec::new(),
+            establishment_deadline: Some(Instant::now() + ESTABLISHMENT_TIMEOUT),
         })
     }
 }
@@ -353,6 +359,7 @@ pub(crate) struct AutoLlcPort {
     guest_mac: [u8; 6],
     observed_cp: Option<String>,
     identity_observations: Vec<IdentityObservation>,
+    establishment_deadline: Option<Instant>,
 }
 
 impl AutoLlcPort {
@@ -371,6 +378,7 @@ impl AutoLlcPort {
             guest_mac,
             observed_cp: None,
             identity_observations: Vec::new(),
+            establishment_deadline: Some(Instant::now() + ESTABLISHMENT_TIMEOUT),
         })
     }
 
@@ -417,6 +425,9 @@ impl AutoLlcPort {
                             self.observed_cp = Some(cp.clone());
                             self.identity_observations
                                 .push(IdentityObservation::ControlPoint(cp));
+                            if self.endpoint.state() == State::Connected {
+                                self.establishment_deadline = None;
+                            }
                             self.record_peer(if self.endpoint.state() == State::Connected {
                                 "connected"
                             } else {
@@ -429,10 +440,19 @@ impl AutoLlcPort {
                         }
                     }
                 }
-                Event::Connected => self.record_peer("connected"),
+                Event::Connected => {
+                    self.record_peer("connected");
+                    if self.observed_cp.is_some() {
+                        self.establishment_deadline = None;
+                    }
+                }
                 Event::Disconnected | Event::TimedOut => {
                     self.record_peer("disconnected");
-                    self.observed_cp = None;
+                    self.establishment_deadline = None;
+                    if self.observed_cp.take().is_some() {
+                        self.identity_observations
+                            .push(IdentityObservation::Withdraw);
+                    }
                 }
                 _ => {}
             }
@@ -456,7 +476,17 @@ impl RoutePort for AutoLlcPort {
 
     fn tick(&mut self) -> io::Result<Vec<RouterEvent>> {
         let events = self.endpoint.tick()?;
-        Ok(self.map_events(events))
+        let mut routed = self.map_events(events);
+        if self
+            .establishment_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            tracing::warn!(interface = %self.interface, guest_mac = %format_mac(self.guest_mac),
+                "LLC session establishment timed out");
+            self.endpoint.disconnect()?;
+            routed.extend(self.map_events(vec![Event::TimedOut]));
+        }
+        Ok(routed)
     }
 
     fn send(&mut self, unit: RoutedUnit) -> io::Result<bool> {
@@ -494,7 +524,11 @@ impl RoutePort for AutoLlcPort {
     fn disconnect(&mut self) -> io::Result<()> {
         self.endpoint.disconnect()?;
         self.record_peer("disconnected");
-        self.observed_cp = None;
+        self.establishment_deadline = None;
+        if self.observed_cp.take().is_some() {
+            self.identity_observations
+                .push(IdentityObservation::Withdraw);
+        }
         Ok(())
     }
     fn take_identity_observations(&mut self) -> Vec<IdentityObservation> {
