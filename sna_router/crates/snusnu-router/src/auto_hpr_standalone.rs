@@ -16,7 +16,7 @@ use crate::{
     auto_hpr_runtime::DirectHprRuntime,
     config::{EeConfig, RouterConfig},
     ee_ldlc_endpoint::EeLdlcEndpoint,
-    hpr_mptn_attachments::HprMptnAttachments,
+    hpr_local_session_runner::HprLocalSessionRunner,
     STOP,
 };
 use router_core::{
@@ -48,73 +48,80 @@ pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
             "standalone EE attachment missing",
         )
     })?;
+    let mut local = HprLocalSessionRunner::new(config)?;
     while !STOP.load(Ordering::Relaxed) {
-        if let Err(error) = run_link(config, attachment) {
+        if let Err(error) = run_link(config, attachment, &mut local) {
             tracing::warn!(attachment = %attachment.id, error = %error,
                 "standalone EE adjacency reset");
         }
         if !STOP.load(Ordering::Relaxed) {
+            local.poll_idle()?;
             thread::sleep(RESTART_BACKOFF);
         }
     }
     Ok(())
 }
 
-fn run_link(config: &RouterConfig, attachment: &EeConfig) -> io::Result<()> {
-    // The TCP62 listener is an independent local attachment. It remains
-    // bound while the EE adjacency is absent or renegotiates.
-    let mut local_mptn = (!config.mptn_gateway.is_empty())
-        .then(|| HprMptnAttachments::new(config))
-        .transpose()?;
+fn run_link<'a>(
+    config: &'a RouterConfig,
+    attachment: &EeConfig,
+    local: &mut HprLocalSessionRunner<'a>,
+) -> io::Result<()> {
     let mut link = StandaloneEeLink::bind(attachment)?;
     let clock = Instant::now();
     let mut active: Option<DirectHprRuntime<'_>> = None;
-    while !STOP.load(Ordering::Relaxed) {
-        match link.poll(Instant::now())? {
-            Some(StandaloneEvent::Activated(bootstrap)) => {
-                if let Some(mut previous) = active.take() {
-                    local_mptn = previous.detach_local_mptn();
-                }
-                let peer_cp = bootstrap.peer.cp.clone();
-                let generation = bootstrap.generation;
-                let mut runtime = DirectHprRuntime::new(*bootstrap);
-                runtime.configure_peer_lus(attachment)?;
-                runtime.configure_local_llc(config)?;
-                runtime.attach_local_mptn(local_mptn.take());
-                runtime.configure_local_ingress(config, attachment)?;
-                active = Some(runtime);
-                tracing::info!(attachment = %attachment.id, peer_cp = %peer_cp,
+    let result = (|| -> io::Result<()> {
+        while !STOP.load(Ordering::Relaxed) {
+            match link.poll(Instant::now())? {
+                Some(StandaloneEvent::Activated(bootstrap)) => {
+                    if let Some(mut previous) = active.take() {
+                        local.return_from_ee(previous.detach_local_mptn());
+                    }
+                    let peer_cp = bootstrap.peer.cp.clone();
+                    let generation = bootstrap.generation;
+                    let mut runtime = DirectHprRuntime::new(*bootstrap);
+                    runtime.configure_peer_lus(attachment)?;
+                    runtime.configure_local_llc(config)?;
+                    runtime.configure_local_ingress(config, attachment)?;
+                    runtime.attach_local_mptn(local.lease_for_ee());
+                    active = Some(runtime);
+                    tracing::info!(attachment = %attachment.id, peer_cp = %peer_cp,
                     generation = generation.get(),
                     "standalone EE peer activated; local routes available");
-            }
-            Some(StandaloneEvent::Datagram(datagram)) => {
-                if let Some(runtime) = active.as_mut() {
-                    runtime.on_datagram(
-                        link.link(),
-                        &datagram,
-                        clock.elapsed().as_micros() as u64,
-                    )?;
                 }
-            }
-            Some(StandaloneEvent::Deactivated) => {
-                if let Some(mut runtime) = active.take() {
-                    local_mptn = runtime.detach_local_mptn();
+                Some(StandaloneEvent::Datagram(datagram)) => {
+                    if let Some(runtime) = active.as_mut() {
+                        runtime.on_datagram(
+                            link.link(),
+                            &datagram,
+                            clock.elapsed().as_micros() as u64,
+                        )?;
+                    }
                 }
-                tracing::warn!(attachment = %attachment.id,
+                Some(StandaloneEvent::Deactivated) => {
+                    if let Some(mut runtime) = active.take() {
+                        local.return_from_ee(runtime.detach_local_mptn());
+                    }
+                    tracing::warn!(attachment = %attachment.id,
                     "standalone EE peer deactivated; local sessions withdrawn");
+                }
+                None => {}
             }
-            None => {}
+            if let Some(runtime) = active.as_mut() {
+                let now_us = clock.elapsed().as_micros() as u64;
+                runtime.tick(link.link(), now_us)?;
+                runtime.pump(link.link(), None, now_us)?;
+            } else {
+                local.poll_idle()?;
+            }
+            thread::sleep(IDLE_POLL);
         }
-        if let Some(runtime) = active.as_mut() {
-            let now_us = clock.elapsed().as_micros() as u64;
-            runtime.tick(link.link(), now_us)?;
-            runtime.pump(link.link(), None, now_us)?;
-        } else if let Some(mptn) = local_mptn.as_mut() {
-            mptn.poll_without_ee()?;
-        }
-        thread::sleep(IDLE_POLL);
+        Ok(())
+    })();
+    if let Some(mut runtime) = active.take() {
+        local.return_from_ee(runtime.detach_local_mptn());
     }
-    Ok(())
+    result
 }
 
 impl StandaloneEeLink {

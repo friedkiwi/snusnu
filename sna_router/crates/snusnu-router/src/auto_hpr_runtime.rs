@@ -30,6 +30,7 @@ use crate::{
     hpr_destination_directory::{Destination, HprDestinationDirectory},
     hpr_llc_attachments::HprLlcAttachments,
     hpr_local_session::HprLocalSession,
+    hpr_local_session_runner::HprLocalSessionRunner,
     hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     llc_session_ws::LlcSessionWs,
@@ -2090,10 +2091,11 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
         .remote
         .first()
         .ok_or_else(|| protocol("HPR runtime requires one concentrator"))?;
+    let mut local = HprLocalSessionRunner::new(config)?;
     while !STOP.load(Ordering::Relaxed) {
         match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
             Ok(mut hub) => {
-                if let Err(error) = run_connected(config, attachment, &mut hub) {
+                if let Err(error) = run_connected(config, attachment, &mut hub, &mut local) {
                     tracing::warn!(attachment = %attachment.id, error = %error,
                         "HPR upstream or EE adjacency reset");
                 }
@@ -2102,6 +2104,7 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
                 "HPR concentrator connection failed"),
         }
         if !STOP.load(Ordering::Relaxed) {
+            local.poll_idle()?;
             thread::sleep(CONNECT_BACKOFF);
         }
     }
@@ -2140,20 +2143,14 @@ fn run_connected(
     config: &RouterConfig,
     attachment: &crate::config::EeConfig,
     hub: &mut AutoWsHub,
+    local: &mut HprLocalSessionRunner<'_>,
 ) -> io::Result<()> {
-    // The TCP62 listener and management discoveries belong to MPTN, not to
-    // an EE link generation. They exist even before EE authorization arrives.
-    let mut local_mptn = (!config.mptn_gateway.is_empty())
-        .then(|| HprMptnAttachments::new(config))
-        .transpose()?;
     let identity = loop {
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
         }
         poll_unsolicited(hub)?;
-        if let Some(mptn) = local_mptn.as_mut() {
-            mptn.poll_without_ee()?;
-        }
+        local.poll_idle()?;
         if let Some(identity) = AuthorizedEeIdentity::resolve(hub, attachment)? {
             break identity;
         }
@@ -2164,141 +2161,148 @@ fn run_connected(
     tracing::info!(attachment = %attachment.id, local_ip = %attachment.local_ip,
         peer_ip = %attachment.peer_ip, proxy_cp = %ee.local_cp(),
         "HPR EE attachment listening");
-    while !STOP.load(Ordering::Relaxed) {
-        if !ee.authorized(hub)? {
-            return Err(protocol("EE proxy CP route withdrawn"));
-        }
-        let now = Instant::now();
-        ee.tick(now)?;
-        if ee.is_active() {
-            if active
-                .as_ref()
-                .is_none_or(|runtime| runtime.bootstrap.generation != ee.link().generation())
-            {
-                if let Some(mut previous) = active.take() {
-                    local_mptn = previous.detach_local_mptn();
-                }
-                let bootstrap = ee
-                    .link()
-                    .control_bootstrap()?
-                    .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
-                let mut runtime = DirectHprRuntime::new(bootstrap);
-                runtime.configure_peer_lus(attachment)?;
-                runtime.configure_local_llc(config)?;
-                runtime.attach_local_mptn(local_mptn.take());
-                runtime.configure_local_ingress(config, attachment)?;
-                runtime.publish_reachability(hub, None)?;
-                active = Some(runtime);
-                tracing::info!(attachment = %attachment.id, generation = ee.link().generation().get(),
+    let result = (|| -> io::Result<()> {
+        while !STOP.load(Ordering::Relaxed) {
+            if !ee.authorized(hub)? {
+                return Err(protocol("EE proxy CP route withdrawn"));
+            }
+            let now = Instant::now();
+            ee.tick(now)?;
+            if ee.is_active() {
+                if active
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.bootstrap.generation != ee.link().generation())
+                {
+                    if let Some(mut previous) = active.take() {
+                        local.return_from_ee(previous.detach_local_mptn());
+                    }
+                    let bootstrap = ee
+                        .link()
+                        .control_bootstrap()?
+                        .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
+                    let mut runtime = DirectHprRuntime::new(bootstrap);
+                    runtime.configure_peer_lus(attachment)?;
+                    runtime.configure_local_llc(config)?;
+                    runtime.configure_local_ingress(config, attachment)?;
+                    runtime.attach_local_mptn(local.lease_for_ee());
+                    if let Err(error) = runtime.publish_reachability(hub, None) {
+                        local.return_from_ee(runtime.detach_local_mptn());
+                        return Err(error);
+                    }
+                    active = Some(runtime);
+                    tracing::info!(attachment = %attachment.id, generation = ee.link().generation().get(),
                     peer_cp = ?ee.link().peer_cp(), "HPR EE link activated");
+                }
+            } else if let Some(mut runtime) = active.take() {
+                if let Some(peer_lus) = runtime.peer_lus.as_mut() {
+                    peer_lus.deactivate();
+                }
+                local.return_from_ee(runtime.detach_local_mptn());
+                hub.publish_local(&[], &[])?;
+                tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
             }
-        } else if let Some(mut runtime) = active.take() {
-            if let Some(peer_lus) = runtime.peer_lus.as_mut() {
-                peer_lus.deactivate();
-            }
-            local_mptn = runtime.detach_local_mptn();
-            hub.publish_local(&[], &[])?;
-            tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
-        }
-        if let Some(mptn) = local_mptn.as_mut() {
-            mptn.poll_without_ee()?;
-        }
-        if let Some(open) = hub.poll_incoming()? {
-            let local_llc = active
-                .as_ref()
-                .and_then(|runtime| local_llc_target(runtime, hub, &open));
-            if let Some((target_lu, target_cp, attachment_id)) = local_llc {
-                active.as_mut().unwrap().accept_local_llc(
-                    hub,
-                    open,
-                    target_lu,
-                    target_cp,
-                    attachment_id,
-                )?;
-            } else {
-                let ready = active.as_ref().is_some_and(|runtime| {
-                    runtime.reverse.is_none()
-                        && runtime
-                            .reciprocal_cp
-                            .as_ref()
-                            .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
-                });
-                if !ready {
-                    hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
-                } else if let Some(runtime) = active.as_mut() {
-                    let peer_cp = runtime.bootstrap.peer.cp.clone();
-                    if let Some((route_identity, mut ws)) =
-                        crate::auto_hpr_inbound::admit(hub, open, &peer_cp)?
-                    {
-                        let handle = runtime.next_handle;
-                        runtime.next_handle = runtime
-                            .next_handle
-                            .checked_add(1)
-                            .ok_or_else(|| protocol("HPR session handles exhausted"))?;
-                        let tg = ee
-                            .link()
-                            .tg_number()
-                            .ok_or_else(|| protocol("active EE link has no TG"))?;
-                        let (label, instance) = target_nce(
-                            &runtime.bootstrap.local.tower.route_setup_nce_label,
-                            runtime.bootstrap.local.tower.route_setup_nce_instance,
-                            127,
-                        )?;
-                        let advertised = Reachability {
-                            lu: Some(route_identity.target_lu.clone()),
-                            cp: route_identity.target_cp.clone(),
-                        };
-                        if let Err(error) =
-                            runtime.switch.replace_routes(HPR_ADAPTER, vec![advertised])
+            local.poll_idle()?;
+            if let Some(open) = hub.poll_incoming()? {
+                let local_llc = active
+                    .as_ref()
+                    .and_then(|runtime| local_llc_target(runtime, hub, &open));
+                if let Some((target_lu, target_cp, attachment_id)) = local_llc {
+                    active.as_mut().unwrap().accept_local_llc(
+                        hub,
+                        open,
+                        target_lu,
+                        target_cp,
+                        attachment_id,
+                    )?;
+                } else {
+                    let ready = active.as_ref().is_some_and(|runtime| {
+                        runtime.reverse.is_none()
+                            && runtime
+                                .reciprocal_cp
+                                .as_ref()
+                                .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+                    });
+                    if !ready {
+                        hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
+                    } else if let Some(runtime) = active.as_mut() {
+                        let peer_cp = runtime.bootstrap.peer.cp.clone();
+                        if let Some((route_identity, mut ws)) =
+                            crate::auto_hpr_inbound::admit(hub, open, &peer_cp)?
                         {
-                            ws.close()?;
-                            return Err(protocol(format!(
-                                "HPR reverse route admission: {error:?}"
-                            )));
-                        }
-                        tracing::info!(attachment = %attachment.id,
+                            let handle = runtime.next_handle;
+                            runtime.next_handle = runtime
+                                .next_handle
+                                .checked_add(1)
+                                .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+                            let tg = ee
+                                .link()
+                                .tg_number()
+                                .ok_or_else(|| protocol("active EE link has no TG"))?;
+                            let (label, instance) = target_nce(
+                                &runtime.bootstrap.local.tower.route_setup_nce_label,
+                                runtime.bootstrap.local.tower.route_setup_nce_instance,
+                                127,
+                            )?;
+                            let advertised = Reachability {
+                                lu: Some(route_identity.target_lu.clone()),
+                                cp: route_identity.target_cp.clone(),
+                            };
+                            if let Err(error) =
+                                runtime.switch.replace_routes(HPR_ADAPTER, vec![advertised])
+                            {
+                                ws.close()?;
+                                return Err(protocol(format!(
+                                    "HPR reverse route admission: {error:?}"
+                                )));
+                            }
+                            tracing::info!(attachment = %attachment.id,
                         source_lu = %route_identity.source_lu,
                         target_lu = %route_identity.target_lu,
                         peer_cp = %peer_cp, handle,
                         "concentrator LU session admitted to EE peer");
-                        runtime.reverse = Some(ReverseRuntime::new(
-                            route_identity,
-                            ws,
-                            runtime.bootstrap.clone(),
-                            handle,
-                            tg,
-                            reciprocal_nonce().to_be_bytes(),
-                            label,
-                            instance,
-                            router_core::hpr_route_setup_initiator::DirectLinkMetrics {
-                                transmission_time_us: 1000,
-                                capacity_kbps: 100_000,
-                                liveness_seconds: 10,
-                            },
-                        ));
+                            runtime.reverse = Some(ReverseRuntime::new(
+                                route_identity,
+                                ws,
+                                runtime.bootstrap.clone(),
+                                handle,
+                                tg,
+                                reciprocal_nonce().to_be_bytes(),
+                                label,
+                                instance,
+                                router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+                                    transmission_time_us: 1000,
+                                    capacity_kbps: 100_000,
+                                    liveness_seconds: 10,
+                                },
+                            ));
+                        }
                     }
                 }
             }
-        }
-        if let Some(datagram) = ee.poll(now)? {
-            if let Some(runtime) = active.as_mut() {
-                runtime.on_datagram(ee.link(), &datagram, ee.elapsed().as_micros() as u64)?;
+            if let Some(datagram) = ee.poll(now)? {
+                if let Some(runtime) = active.as_mut() {
+                    runtime.on_datagram(ee.link(), &datagram, ee.elapsed().as_micros() as u64)?;
+                }
             }
-        }
-        if let Some(runtime) = active.as_mut() {
-            runtime.tick(ee.link(), ee.elapsed().as_micros() as u64)?;
-            let started = Instant::now();
-            runtime.pump(ee.link(), Some(hub), ee.elapsed().as_micros() as u64)?;
-            let elapsed = started.elapsed();
-            if elapsed > Duration::from_millis(500) {
-                tracing::warn!(attachment = %attachment.id,
+            if let Some(runtime) = active.as_mut() {
+                runtime.tick(ee.link(), ee.elapsed().as_micros() as u64)?;
+                let started = Instant::now();
+                runtime.pump(ee.link(), Some(hub), ee.elapsed().as_micros() as u64)?;
+                let elapsed = started.elapsed();
+                if elapsed > Duration::from_millis(500) {
+                    tracing::warn!(attachment = %attachment.id,
                     elapsed_ms = elapsed.as_millis(),
                     "HPR router pump delayed concentrator keepalive");
+                }
             }
+            thread::sleep(IDLE_POLL);
         }
-        thread::sleep(IDLE_POLL);
+        Ok(())
+    })();
+    if let Some(mut runtime) = active.take() {
+        local.return_from_ee(runtime.detach_local_mptn());
     }
-    Ok(())
+    result
 }
 
 fn poll_unsolicited(hub: &mut AutoWsHub) -> io::Result<()> {
