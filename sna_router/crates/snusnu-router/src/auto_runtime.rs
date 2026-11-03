@@ -3,7 +3,7 @@
 use crate::{
     auto_address::AutoProxyMacs,
     auto_gateway_runtime::{virtual_cp_for_source, AutoMptnGateway},
-    auto_llc::{AutoLlcPort, LlcAutoListener},
+    auto_llc::{AutoLlcPort, LlcAutoListener, LlcIngressOffer},
     auto_llc_ws::AutoLlcWsBridge,
     auto_local_dispatch::AutoLocalDispatch,
     config::{self, RouterConfig},
@@ -29,9 +29,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use transport_ip_sna::mptn_ingress::IngressOffer;
 use transport_ws::wire;
 
 const IDLE_POLL: Duration = Duration::from_micros(200);
+const MAX_PENDING_HANDOFFS: usize = 256;
 
 fn require_session_v1_target(route: &wire::RouteExport) -> io::Result<()> {
     if matches!(route.resource.as_ref(), Some(wire::route_export::Resource::LogicalUnit(lu))
@@ -165,6 +167,9 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     next_mptn_target_id: u64,
     llc_ws_sessions: HashMap<u64, LlcSessionCircuit>,
     next_llc_ws_id: u64,
+    unhandled_llc: Vec<(String, LlcIngressOffer)>,
+    unhandled_mptn: Vec<(String, u64, IngressOffer)>,
+    mptn_management: Vec<(String, Vec<(String, String)>)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -180,6 +185,7 @@ pub(crate) enum OpenDisposition {
     Unhandled(wire::IncomingOpen),
 }
 
+#[allow(dead_code)] // HPR coordinator consumes the attachment handoff API.
 impl<'a> AutoLocalSessionRunner<'a> {
     pub(crate) fn new(config: &'a RouterConfig) -> io::Result<Self> {
         let proxies = AutoProxyMacs::from_ids(
@@ -279,7 +285,58 @@ impl<'a> AutoLocalSessionRunner<'a> {
             next_mptn_target_id: 0,
             llc_ws_sessions: HashMap::new(),
             next_llc_ws_id: 0,
+            unhandled_llc: Vec::new(),
+            unhandled_mptn: Vec::new(),
+            mptn_management: Vec::new(),
         })
+    }
+
+    pub(crate) fn take_unhandled_llc_offers(&mut self) -> Vec<(String, LlcIngressOffer)> {
+        std::mem::take(&mut self.unhandled_llc)
+    }
+
+    pub(crate) fn take_unhandled_mptn_offers(&mut self) -> Vec<(String, u64, IngressOffer)> {
+        std::mem::take(&mut self.unhandled_mptn)
+    }
+
+    pub(crate) fn take_mptn_management(&mut self) -> Vec<(String, Vec<(String, String)>)> {
+        std::mem::take(&mut self.mptn_management)
+    }
+
+    pub(crate) fn with_gateway<T>(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(&mut AutoMptnGateway<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let gateway = self
+            .gateways
+            .iter_mut()
+            .find(|gateway| gateway.id() == id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "MPTN attachment is absent"))?;
+        f(gateway)
+    }
+
+    pub(crate) fn allow_llc_proxy_mac(&mut self, id: &str, mac: [u8; 6]) -> io::Result<()> {
+        self.llc_listener(id)?.allow_native_proxy_mac(mac)
+    }
+
+    pub(crate) fn reserve_llc(&mut self, id: &str, mac: [u8; 6]) -> io::Result<bool> {
+        self.llc_listener(id)?.reserve(mac)
+    }
+
+    pub(crate) fn release_llc(&mut self, id: &str, mac: [u8; 6]) -> io::Result<()> {
+        self.llc_listener(id)?.release(mac);
+        Ok(())
+    }
+
+    fn llc_listener(&mut self, id: &str) -> io::Result<&mut LlcAutoListener> {
+        let index = self
+            .config
+            .llc
+            .iter()
+            .position(|peer| peer.id == id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LLC attachment is absent"))?;
+        Ok(&mut self.listeners[index])
     }
 
     pub(crate) fn exports(&self, netid: &str) -> (Vec<wire::SnaName>, Vec<wire::LuReachability>) {
@@ -542,6 +599,9 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_ws_sessions,
             mptn_target_sessions,
             llc_ws_sessions,
+            unhandled_llc,
+            unhandled_mptn,
+            mptn_management,
             ..
         } = self;
         let mut next_id = self.next_id;
@@ -717,6 +777,16 @@ impl<'a> AutoLocalSessionRunner<'a> {
             let destination = RouteAddress::Mac(ingress_proxy);
             let target = match fabric.resolve(&ingress_id, &destination) {
                 Ok(target) => target,
+                Err(error) if !config.ee.is_empty() && error.kind() == io::ErrorKind::NotFound => {
+                    if unhandled_llc.len() < MAX_PENDING_HANDOFFS {
+                        unhandled_llc.push((ingress_id.0, offer));
+                    } else {
+                        tracing::warn!(ingress = %ingress_id.0,
+                            "LLC offer handoff queue full; dropping offer");
+                        listeners[ingress].release(ingress_proxy);
+                    }
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(ingress = %ingress_id.0, proxy_mac = %crate::endpoint::format_mac(ingress_proxy), error = %error, "automatic LLC destination unresolved");
                     listeners[ingress].release(ingress_proxy);
@@ -820,13 +890,17 @@ impl<'a> AutoLocalSessionRunner<'a> {
         }
         for gateway in gateways.iter_mut() {
             let offered = gateway.poll_once()?;
-            for (source, destination) in gateway.take_management_lus() {
-                let source = config::parse_cp(&source)?;
-                let destination = config::parse_cp(&destination)?;
+            let management = gateway.take_management_lus();
+            for (source, destination) in &management {
+                let source = config::parse_cp(source)?;
+                let destination = config::parse_cp(destination)?;
                 tracing::info!(gateway = gateway.id(),
                     source_lu = %format!("{}.{}", source.netid, source.name),
                     destination_lu = %format!("{}.{}", destination.netid, destination.name),
                     "TCP62 management disclosed local LU reachability");
+            }
+            if !management.is_empty() {
+                mptn_management.push((gateway.id().to_owned(), management));
             }
             if let Some(snapshot) = gateway.take_discovery_snapshot() {
                 tracing::debug!(
@@ -886,6 +960,31 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 continue;
             };
             active = true;
+            if !config.ee.is_empty() {
+                if let Ok((_, target)) = AutoMptnGateway::offer_lus(&offer) {
+                    if let Ok(target) = config::parse_cp(&target) {
+                        let local_missing = matches!(bridge.select_lu(&target),
+                            Err(ref error) if error.kind() == io::ErrorKind::NotFound);
+                        let upstream_missing = match hub.as_ref() {
+                            Some(connected) => connected.resolve_lu(&target)?.is_none(),
+                            None => true,
+                        };
+                        if local_missing && upstream_missing {
+                            if unhandled_mptn.len() < MAX_PENDING_HANDOFFS {
+                                unhandled_mptn.push((gateway.id().to_owned(), association, offer));
+                            } else {
+                                tracing::warn!(
+                                    gateway = gateway.id(),
+                                    association,
+                                    "MPTN offer handoff queue full; rejecting offer"
+                                );
+                                gateway.reject_offer(association, "router offer queue is full")?;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             let mut detached_for_session = false;
             let result = (|| -> io::Result<()> {
                 let (source, destination) = AutoMptnGateway::offer_lus(&offer)?;
