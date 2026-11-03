@@ -31,6 +31,7 @@ fn invalid(reason: &'static str) -> io::Error {
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 const PENDING_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn expired(now: Instant, opened_at: Instant, bound: bool, pending_since: Option<Instant>) -> bool {
     (!bound && now.duration_since(opened_at) >= SETUP_TIMEOUT)
@@ -159,6 +160,7 @@ pub(crate) struct LlcSessionWs {
     log_session: Option<u64>,
     log_carrier: Option<u64>,
     last_management: Option<(Option<ManagementPhase>, Option<ResponderPhase>)>,
+    remote_closed_at: Option<Instant>,
 }
 
 impl LlcSessionWs {
@@ -189,6 +191,7 @@ impl LlcSessionWs {
             log_session: None,
             log_carrier: None,
             last_management: None,
+            remote_closed_at: None,
         })
     }
 
@@ -214,6 +217,7 @@ impl LlcSessionWs {
             log_session: None,
             log_carrier: None,
             last_management: None,
+            remote_closed_at: None,
         }
     }
 
@@ -241,6 +245,26 @@ impl LlcSessionWs {
     /// incoming unit remains leased until native LLC accepts it; native output
     /// remains leased until the WebSocket queues it.
     pub(crate) fn pump(&mut self) -> io::Result<bool> {
+        if let Some(closed_at) = self.remote_closed_at {
+            if let Some(session) = self.reverse_session.as_mut() {
+                if session.drain_after_remote_close()? {
+                    tracing::info!(attachment = %self.attachment_id,
+                        session = ?self.log_session, carrier = ?self.log_carrier,
+                        "remote SessionV1 closed; native UNBIND completed");
+                    return Ok(false);
+                }
+            }
+            if self.reverse_session.is_none() && self.verified_native.is_some() {
+                return Ok(false);
+            }
+            if closed_at.elapsed() >= REMOTE_CLOSE_TIMEOUT {
+                tracing::warn!(attachment = %self.attachment_id,
+                    session = ?self.log_session, carrier = ?self.log_carrier,
+                    "native UNBIND timed out after remote SessionV1 close");
+                return Ok(false);
+            }
+            return Ok(true);
+        }
         if expired(
             Instant::now(),
             self.opened_at,
@@ -273,7 +297,13 @@ impl LlcSessionWs {
                     self.pending_since = Some(Instant::now());
                 }
                 Some(SessionWsUpdate::Closed) => {
-                    if !self.uses_live_adjacency() {
+                    if self.uses_live_adjacency() {
+                        self.remote_closed_at = Some(Instant::now());
+                        tracing::info!(attachment = %self.attachment_id,
+                            session = ?self.log_session, carrier = ?self.log_carrier,
+                            "remote SessionV1 closed; draining native user session");
+                        return Ok(true);
+                    } else {
                         self.close()?;
                     }
                     return Ok(false);
