@@ -336,7 +336,12 @@ impl ReverseRuntime {
         if self.phase == Phase::SendRoute {
             let reverse = self.reverse.as_mut().unwrap();
             let request = reverse.route_request().to_vec();
-            if rtp.open_route_out(link, &request, now_us)? {
+            let sent = if rtp.route_out_scope().is_some() {
+                rtp.send_route_out(link, &request, now_us)?
+            } else {
+                rtp.open_route_out(link, &request, now_us)?
+            };
+            if sent {
                 reverse.mark_route_sent(&request)?;
                 self.phase = Phase::AwaitRoute;
                 tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
@@ -439,7 +444,8 @@ impl ReverseRuntime {
     }
 
     fn finish(&mut self, rtp: &mut HprRtpPort) -> io::Result<()> {
-        rtp.reset_route_out();
+        // The peer may reuse this link-scoped RouteSetup RTP for its own
+        // requests after the reverse LU circuit closes.
         rtp.reset_user_out();
         if !self.source_closed {
             self.source.close()?;

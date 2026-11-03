@@ -250,8 +250,12 @@ pub(crate) struct DirectHprRuntime<'a> {
     local_exports: Vec<(router_core::session::QualifiedName, Destination)>,
     llc: Option<HprLlcAttachments>,
     mptn: Option<HprMptnAttachments<'a>>,
-    route_reply: Option<(router_core::session::QualifiedName, PreparedRouteSetupReply)>,
-    negative_route_reply: Option<Vec<u8>>,
+    route_reply: Option<(
+        router_core::session::QualifiedName,
+        PreparedRouteSetupReply,
+        RtpIngressKind,
+    )>,
+    negative_route_reply: Option<(Vec<u8>, RtpIngressKind)>,
     cp_management: Option<CpManagementResponder>,
     pending_cp_replies: VecDeque<Vec<u8>>,
     pending_cp_reply_bytes: usize,
@@ -942,7 +946,7 @@ impl<'a> DirectHprRuntime<'a> {
         self.try_external_management_replies(link, now_us)?;
         while let Some(message) = self.pending_rtp.front().cloned() {
             let result = match message.kind {
-                RtpIngressKind::RouteSetup => {
+                RtpIngressKind::RouteSetup | RtpIngressKind::RouteSetupOut => {
                     self.route_message(link, hub.as_deref(), &message, now_us)
                 }
                 RtpIngressKind::User => {
@@ -950,7 +954,7 @@ impl<'a> DirectHprRuntime<'a> {
                 }
                 RtpIngressKind::CpSvcMg => self.cp_message(&message),
                 RtpIngressKind::CpSvcMgOut => self.reciprocal_cp_message(&message),
-                RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => self
+                RtpIngressKind::UserOut => self
                     .reverse
                     .as_mut()
                     .ok_or_else(|| protocol("unsolicited outbound HPR RTP message"))?
@@ -1522,7 +1526,7 @@ impl<'a> DirectHprRuntime<'a> {
                 .map_err(|error| {
                     protocol(format!("invalid HPR path-switch RouteSetup: {error:?}"))
                 })?;
-            self.negative_route_reply = Some(reply);
+            self.negative_route_reply = Some((reply, message.kind));
             tracing::warn!(pcid = ?request.pcid, generation = self.bootstrap.generation.get(),
                 "rejecting stale HPR path-switch RouteSetup without LU");
             return Ok(());
@@ -1604,6 +1608,7 @@ impl<'a> DirectHprRuntime<'a> {
                 .unwrap()
                 .prepare_reply(self.bootstrap.generation, &message.bytes)
                 .map_err(|error| protocol(format!("HPR RouteSetup rejected: {error:?}")))?,
+            message.kind,
         ));
         self.route_targets.insert(target, destination);
         Ok(())
@@ -1653,7 +1658,7 @@ impl<'a> DirectHprRuntime<'a> {
             &active,
         ) {
             Ok(reply) => {
-                self.route_reply = Some((target.clone(), reply));
+                self.route_reply = Some((target.clone(), reply, message.kind));
                 tracing::info!(target_lu = %target, pcid = ?request.pcid,
                     generation = message.observation.generation.get(),
                     "HPR path-switch matched live authorized user route");
@@ -1668,11 +1673,10 @@ impl<'a> DirectHprRuntime<'a> {
     }
 
     fn try_route_reply(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
-        if let Some(reply) = self.negative_route_reply.as_ref() {
-            if self
-                .rtp
-                .send(link, RtpIngressKind::RouteSetup, reply, now_us)?
-            {
+        if let Some((reply, kind)) = self.negative_route_reply.as_ref() {
+            let reply = reply.clone();
+            let kind = *kind;
+            if self.send_route_reply(link, kind, &reply, now_us)? {
                 self.negative_route_reply = None;
                 tracing::info!(
                     generation = self.bootstrap.generation.get(),
@@ -1681,7 +1685,7 @@ impl<'a> DirectHprRuntime<'a> {
             }
             return Ok(());
         }
-        let Some((target, reply)) = self.route_reply.as_ref() else {
+        let Some((target, reply, kind)) = self.route_reply.as_ref() else {
             return Ok(());
         };
         if let Some(destination @ (Destination::Llc { .. } | Destination::Mptn { .. })) =
@@ -1696,13 +1700,12 @@ impl<'a> DirectHprRuntime<'a> {
                 return Ok(());
             }
         }
-        if !self
-            .rtp
-            .send(link, RtpIngressKind::RouteSetup, &reply.gds, now_us)?
-        {
+        let reply_bytes = reply.gds.clone();
+        let kind = *kind;
+        if !self.send_route_reply(link, kind, &reply_bytes, now_us)? {
             return Ok(());
         }
-        let (target, reply) = self.route_reply.take().unwrap();
+        let (target, reply, _) = self.route_reply.take().unwrap();
         let authorized = self
             .route_setup
             .get_mut(&target)
@@ -1714,6 +1717,23 @@ impl<'a> DirectHprRuntime<'a> {
             generation = self.bootstrap.generation.get(),
             "HPR direct RouteSetup reply transmitted and user route authorized");
         Ok(())
+    }
+
+    fn send_route_reply(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        kind: RtpIngressKind,
+        reply: &[u8],
+        now_us: u64,
+    ) -> io::Result<bool> {
+        match kind {
+            RtpIngressKind::RouteSetup => {
+                self.rtp
+                    .send(link, RtpIngressKind::RouteSetup, reply, now_us)
+            }
+            RtpIngressKind::RouteSetupOut => self.rtp.send_route_out(link, reply, now_us),
+            _ => Err(protocol("RouteSetup reply has no RTP source")),
+        }
     }
 
     fn user_message(
@@ -2989,6 +3009,27 @@ mod tests {
                 Some((generation, reply.pcid))
             ),
             RouteIngressDisposition::StaleReply
+        );
+    }
+
+    #[test]
+    fn captured_guest_request_on_reused_outbound_route_connection_is_routable() {
+        // After a reverse circuit ended, OS/400 reused our RouteSetup RTP
+        // connection for its own request toward QAALICE.SNAA. The RTP topic
+        // remains link-scoped even though the prior LU circuit is gone.
+        let hex = "006f12ce0001000000000000000000000f0ef3d8c1c1d3c9c3c54be2d5c1c1152b010111460f80010ae2d5e4e2d5e44be2e5c3211560e8e772dd240920ee0ad8c1c2d6c24be2d5c1c20c2c01087bc3d6d5d5c5c3e31a800000000005b500000114000010cc00000000066704008002";
+        let gds = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        let request = RouteSetupGds::parse(&gds).unwrap();
+        assert_eq!(request.kind, RouteSetupKind::Request);
+        assert_eq!(request.destination_lu_name.as_deref(), Some("QAALICE.SNAA"));
+        let generation = ConnectionGeneration::new(1).unwrap();
+        assert_eq!(
+            classify_route_ingress(&request, generation, None),
+            RouteIngressDisposition::Request
         );
     }
 
