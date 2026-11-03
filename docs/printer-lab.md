@@ -154,6 +154,13 @@ concentrator's QA responder completed the guest-originated SNASVCMG BIND,
 default-mode CNOS, BIS, and UNBIND on this native circuit. This verifies
 the native transport and management path; it has not carried a printer job.
 
+In the same trace, immediately after BIS and before the management UNBIND,
+the guest sent a second BIND with FID2 addresses `(2,2)`, PLU
+`SOLNET.S1054504`, SLU `SNUSNU.PRINTER`, and a blank mode. This was the
+separate user connection requested by `VFYAPPCCNN`, not a `QRMTWSC`
+controller BIND. The QA printer probe did not answer that user BIND; it
+must not be counted as evidence that the printer controller session advanced.
+
 A subsequent concentrator-originated source-management BIND reached the
 guest, but was rejected before QRMTWSC CNOS. FID2 address pair `(2,1)` and
 `(2,3)` returned `80040000` (unrecognized destination); `(2,2)` returned

@@ -4,6 +4,7 @@ import (
 	"log"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
+	"github.com/friedkiwi/snusnu/sna/lu62"
 	"github.com/friedkiwi/snusnu/sna/piu"
 )
 
@@ -48,6 +49,15 @@ func (h *routerHub) debugCircuitEvent(id string, side int, event *wire.CircuitEv
 			h.a.debugSNA("circuit=%s side=%d fid2_parse_error=%v data=%x", id, side, err, value.SnaInformation)
 		} else {
 			h.a.debugSNA("circuit=%s side=%d fid2 th=%x rh=%x ru=%x", id, side, parsed.TH, parsed.RH, parsed.RU)
+			if len(parsed.RU) > 0 && parsed.RU[0] == 0x31 && parsed.RH[0]&0xe0 == 0x60 {
+				bind, bindErr := lu62.ParseBind(value.SnaInformation)
+				if bindErr != nil {
+					h.a.debugSNA("circuit=%s side=%d bind_parse_error=%v", id, side, bindErr)
+				} else if bind != nil {
+					h.a.debugSNA("circuit=%s side=%d bind plu=%s slu=%s mode=%q daf=%d oaf=%d management=%t", id, side,
+						bind.PLU, bind.SLU, bind.Mode, bind.DAF, bind.OAF, bind.Management)
+				}
+			}
 		}
 	case *wire.CircuitEvent_SessionEvent:
 		h.a.debugSNA("circuit=%s side=%d session_event=%v", id, side, value.SessionEvent)
