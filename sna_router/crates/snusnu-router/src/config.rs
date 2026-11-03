@@ -1264,10 +1264,10 @@ impl RouterConfig {
             ));
         }
         if !self.ee.is_empty() {
-            if self.ee.len() != 1 || self.remote.len() != 1 || !self.mptn_gateway.is_empty() {
+            if self.ee.len() != 1 || self.remote.len() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "automatic HPR/IP currently requires one [[hpr_ip]] and one [[concentrator]], with no MPTN gateway attachments",
+                    "automatic HPR/IP currently requires one [[hpr_ip]] and one [[concentrator]]",
                 ));
             }
             if self.ee[0].local_cp.is_none() {
@@ -2254,6 +2254,10 @@ url = "ws://127.0.0.1:8081/router/v1/ws"
         );
         mixed_llc.validate().unwrap();
         assert!(mixed_llc.automatic());
+        let mixed_mptn = parse(
+            "[[mptn]]\nprofile='gateway'\nid='tcp62'\nlocal_ip='192.0.2.3'\npeer_ip='192.0.2.4'\nlocal_cp='SOLNET.SNAB'\npeer_cp='OTHERNET.SNAA'\nsource_lu='SOLNET.SNAB'\ndestination_lu='OTHERNET.SNAA'\n[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\nlocal_cp='SNUSNU.SVC'\n[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",
+        );
+        mixed_mptn.validate().unwrap();
         assert!(parse(
             "[[hpr_ip]]\nid='ee'\nlocal_ip='192.0.2.1'\npeer_ip='192.0.2.2'\n[[concentrator]]\nid='upstream'\nurl='ws://127.0.0.1:8081/router/v1/ws'\n",
         )

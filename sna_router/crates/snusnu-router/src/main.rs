@@ -62,6 +62,15 @@ mod hpr_llc_attachments;
 #[allow(dead_code)] // Native LLC user session adapter for the EE switch.
 mod hpr_local_llc;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Local MPTN user session adapter for the EE switch.
+mod hpr_local_mptn;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Shared local carrier session wrapper.
+mod hpr_local_session;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Live MPTN gateway routes for the EE switch.
+mod hpr_mptn_attachments;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // The HPR session loop attaches this adapter once wired.
 mod hpr_rtp_port;
 #[cfg(target_os = "linux")]

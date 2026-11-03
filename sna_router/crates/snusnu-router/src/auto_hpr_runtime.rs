@@ -25,7 +25,8 @@ use crate::{
     ee_peer_lus::EePeerLus,
     hpr_destination_directory::{Destination, HprDestinationDirectory},
     hpr_llc_attachments::HprLlcAttachments,
-    hpr_local_llc::HprToLlcSession,
+    hpr_local_session::HprLocalSession,
+    hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
     STOP,
@@ -115,7 +116,7 @@ struct ActiveHprSession {
     adapter: HprSessionAdapter,
     egress: AdapterId,
     ws: Option<SessionWsPort>,
-    local: Option<HprToLlcSession>,
+    local: Option<HprLocalSession>,
     local_attachment_id: Option<String>,
     ws_closed: bool,
     pending_ws: Option<(SessionEvent, bool)>,
@@ -123,13 +124,14 @@ struct ActiveHprSession {
     pending_local_grant: bool,
 }
 
-struct DirectHprRuntime {
+struct DirectHprRuntime<'a> {
     bootstrap: HprControlBootstrap,
     rtp: HprRtpPort,
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
     route_targets: HashMap<router_core::session::QualifiedName, Destination>,
     local_directory: HprDestinationDirectory,
     llc: Option<HprLlcAttachments>,
+    mptn: Option<HprMptnAttachments<'a>>,
     route_reply: Option<(router_core::session::QualifiedName, PreparedRouteSetupReply)>,
     negative_route_reply: Option<Vec<u8>>,
     cp_management: Option<CpManagementResponder>,
@@ -148,7 +150,7 @@ struct DirectHprRuntime {
     reverse: Option<ReverseRuntime>,
 }
 
-impl DirectHprRuntime {
+impl<'a> DirectHprRuntime<'a> {
     fn new(bootstrap: HprControlBootstrap) -> Self {
         let mut switch = SessionSwitch::new();
         switch.register(HPR_ADAPTER);
@@ -162,6 +164,7 @@ impl DirectHprRuntime {
             route_targets: HashMap::new(),
             local_directory: HprDestinationDirectory::new(),
             llc: None,
+            mptn: None,
             route_reply: None,
             negative_route_reply: None,
             pending_cp_replies: VecDeque::new(),
@@ -198,11 +201,33 @@ impl DirectHprRuntime {
         Ok(())
     }
 
+    fn configure_local_mptn(&mut self, config: &'a RouterConfig) -> io::Result<()> {
+        if !config.mptn_gateway.is_empty() {
+            self.mptn = Some(HprMptnAttachments::new(config)?);
+        }
+        Ok(())
+    }
+
     fn pump_local_llc(&mut self) -> io::Result<()> {
         if let Some(llc) = self.llc.as_mut() {
             llc.pump();
             self.local_directory
                 .replace_owner("llc", llc.verified_routes())?;
+        }
+        Ok(())
+    }
+
+    fn pump_local_mptn(&mut self) -> io::Result<()> {
+        if let Some(mptn) = self.mptn.as_mut() {
+            for offer in mptn.poll_once()? {
+                mptn.reject_offer(
+                    &offer.gateway_id,
+                    offer.association,
+                    "MPTN-originated HPR routing is not active",
+                )?;
+            }
+            self.local_directory
+                .replace_owner("mptn", mptn.trusted_routes())?;
         }
         Ok(())
     }
@@ -260,6 +285,7 @@ impl DirectHprRuntime {
 
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
         self.pump_local_llc()?;
+        self.pump_local_mptn()?;
         self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
         self.try_cp_replies(link, now_us)?;
@@ -844,8 +870,7 @@ impl DirectHprRuntime {
         };
         let egress = match &destination {
             Destination::Ws { .. } => WS_ADAPTER,
-            Destination::Llc { .. } => LOCAL_ADAPTER,
-            Destination::Mptn { .. } => return Err(protocol("HPR MPTN egress is not active")),
+            Destination::Llc { .. } | Destination::Mptn { .. } => LOCAL_ADAPTER,
             Destination::Ee { .. } => return Err(protocol("HPR route loops to EE carrier")),
         };
         self.switch
@@ -913,12 +938,70 @@ impl DirectHprRuntime {
                         .map_err(|error| protocol(format!("HPR local BIND rollback: {error:?}")))?;
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "LLC probe busy"));
                 };
-                self.switch
-                    .bind_egress(fabric_id, LOCAL_ADAPTER, handle)
-                    .map_err(|error| protocol(format!("HPR local bind failed: {error:?}")))?;
-                (None, Some(session), Some(attachment_id.clone()))
+                if let Err(error) = self.switch.bind_egress(fabric_id, LOCAL_ADAPTER, handle) {
+                    self.llc.as_mut().unwrap().release(attachment_id);
+                    self.switch
+                        .discard_unopened(HPR_ADAPTER, handle)
+                        .map_err(|failure| {
+                            protocol(format!("HPR local bind rollback: {failure:?}"))
+                        })?;
+                    return Err(protocol(format!("HPR local bind failed: {error:?}")));
+                }
+                (
+                    None,
+                    Some(HprLocalSession::Llc(Box::new(session))),
+                    Some(attachment_id.clone()),
+                )
             }
-            Destination::Mptn { .. } | Destination::Ee { .. } => unreachable!(),
+            Destination::Mptn { attachment_id, .. } => {
+                let session = self
+                    .mptn
+                    .as_mut()
+                    .ok_or_else(|| protocol("HPR local MPTN attachments unavailable"))?
+                    .take_session(
+                        attachment_id,
+                        &identity,
+                        &bind_request,
+                        Duration::from_secs(10),
+                    );
+                let session =
+                    match session {
+                        Ok(Some(session)) => session,
+                        Ok(None) => {
+                            self.switch.discard_unopened(HPR_ADAPTER, handle).map_err(
+                                |failure| protocol(format!("HPR MPTN BIND rollback: {failure:?}")),
+                            )?;
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "MPTN gateway busy",
+                            ));
+                        }
+                        Err(error) => {
+                            self.switch.discard_unopened(HPR_ADAPTER, handle).map_err(
+                                |failure| protocol(format!("HPR MPTN BIND rollback: {failure:?}")),
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                if let Err(error) = self.switch.bind_egress(fabric_id, LOCAL_ADAPTER, handle) {
+                    self.mptn.as_mut().unwrap().release(attachment_id);
+                    self.switch
+                        .discard_unopened(HPR_ADAPTER, handle)
+                        .map_err(|failure| {
+                            protocol(format!("HPR MPTN bind rollback: {failure:?}"))
+                        })?;
+                    return Err(protocol(format!("HPR MPTN bind failed: {error:?}")));
+                }
+                (
+                    None,
+                    Some(HprLocalSession::Mptn {
+                        session: Box::new(session),
+                        gateway_id: attachment_id.clone(),
+                    }),
+                    Some(attachment_id.clone()),
+                )
+            }
+            Destination::Ee { .. } => unreachable!(),
         };
         tracing::info!(source_lu = %identity.source_lu, target_lu = %identity.target_lu,
             peer_cp = %self.bootstrap.peer.cp, target_cp = %destination.hosting_cp(),
@@ -969,12 +1052,18 @@ impl DirectHprRuntime {
         for handle in &stale {
             if let Some(mut session) = self.sessions.remove(handle) {
                 if let Some(local) = session.local.as_mut() {
-                    local.close()?;
-                }
-                if let Some(attachment_id) = session.local_attachment_id.as_deref() {
-                    if let Some(llc) = self.llc.as_mut() {
-                        llc.release(attachment_id);
+                    let mptn_gateway = local.mptn_gateway_id().map(str::to_owned);
+                    let close_result = local.close();
+                    if let Some(gateway_id) = mptn_gateway {
+                        if let Some(mptn) = self.mptn.as_mut() {
+                            mptn.release(&gateway_id);
+                        }
+                    } else if let Some(attachment_id) = session.local_attachment_id.as_deref() {
+                        if let Some(llc) = self.llc.as_mut() {
+                            llc.release(attachment_id);
+                        }
                     }
+                    close_result?;
                 }
             }
         }
@@ -1236,6 +1325,7 @@ fn run_connected(
                 let mut runtime = DirectHprRuntime::new(bootstrap);
                 runtime.configure_peer_lus(attachment)?;
                 runtime.configure_local_llc(config)?;
+                runtime.configure_local_mptn(config)?;
                 runtime.publish_reachability(hub, None)?;
                 active = Some(runtime);
                 tracing::info!(attachment = %attachment.id, generation = link.generation().get(),

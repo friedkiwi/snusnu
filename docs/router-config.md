@@ -240,6 +240,16 @@ be configured as the EE peer's remote adapter address on the LLC guest when
 that guest also dials out. The local web UI shows the generated MAC. LLC-originated
 sessions toward the EE attachment are not yet admitted by this automatic path.
 
+An EE-originated session can also target a local MPTN gateway. TCP62
+management confirms the peer LU and NETID, but does not identify a separate
+hosting CP. Set the gateway's `peer_cp` as an explicit operator assertion and
+`destination_lu` to the exact peer LU. The router advertises that route only
+after live management confirms the LU in the asserted CP's NETID. With
+`peer_cp` omitted, it leaves the route unavailable. The gateway lends its
+UDP/397 socket to the selected user session for expedited data and UNBIND.
+MPTN-originated sessions toward the EE attachment are not yet admitted by
+this automatic path.
+
 ## Experimental HPR LAN to HPR/IP media route
 
 `[[hpr_lan]]` describes one HPR-capable OS/400 Ethernet peer through AF_PACKET. Its `proxy_mac` is the remote adapter address configured on that guest. Pair it with one `[[hpr_ip]]` port on an IP address assigned to the host. The media adapter code translates HPR LAN UI framing and EE UDP framing while preserving HPR NLP bytes. **The runtime currently rejects this configuration as unsupported** until it can validate XID3 transmission-group agreement across both media before SETMODE. The example records the intended configuration shape for that integration test.
