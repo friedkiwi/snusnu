@@ -79,7 +79,6 @@ mod hpr_local_mptn;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Shared local carrier session wrapper.
 mod hpr_local_session;
-mod hpr_local_session_runner;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Live MPTN gateway routes for the EE switch.
 mod hpr_mptn_attachments;

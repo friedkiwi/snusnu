@@ -13,10 +13,12 @@ use std::{
 
 use crate::{
     auto_hpr_identity::StandaloneEeIdentity,
-    auto_hpr_runtime::DirectHprRuntime,
+    auto_hpr_runtime::{DirectHprRuntime, SharedLocalAccess},
+    auto_runtime::AutoLocalSessionRunner,
     config::{EeConfig, RouterConfig},
     ee_ldlc_endpoint::EeLdlcEndpoint,
-    hpr_local_session_runner::HprLocalSessionRunner,
+    hpr_destination_directory::HprDestinationDirectory,
+    hpr_shared_local::HprSharedLocal,
     STOP,
 };
 use router_core::{
@@ -48,14 +50,16 @@ pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
             "standalone EE attachment missing",
         )
     })?;
-    let mut local = HprLocalSessionRunner::new(config)?;
+    let mut local = AutoLocalSessionRunner::new(config)?;
+    let mut shared = HprSharedLocal::new(config)?;
     while !STOP.load(Ordering::Relaxed) {
-        if let Err(error) = run_link(config, attachment, &mut local) {
+        if let Err(error) = run_link(config, attachment, &mut local, &mut shared) {
             tracing::warn!(attachment = %attachment.id, error = %error,
                 "standalone EE adjacency reset");
         }
         if !STOP.load(Ordering::Relaxed) {
-            local.poll_idle()?;
+            local.poll_local(None)?;
+            shared.poll(&mut local, &HprDestinationDirectory::new(), false)?;
             thread::sleep(RESTART_BACKOFF);
         }
     }
@@ -65,25 +69,32 @@ pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
 fn run_link<'a>(
     config: &'a RouterConfig,
     attachment: &EeConfig,
-    local: &mut HprLocalSessionRunner<'a>,
+    local: &mut AutoLocalSessionRunner<'a>,
+    shared: &mut HprSharedLocal,
 ) -> io::Result<()> {
     let mut link = StandaloneEeLink::bind(attachment)?;
     let clock = Instant::now();
     let mut active: Option<DirectHprRuntime<'_>> = None;
+    let mut peer_netid: Option<String> = None;
     let result = (|| -> io::Result<()> {
         while !STOP.load(Ordering::Relaxed) {
+            local.poll_local(None)?;
             match link.poll(Instant::now())? {
                 Some(StandaloneEvent::Activated(bootstrap)) => {
                     if let Some(mut previous) = active.take() {
-                        local.return_from_ee(previous.detach_local_mptn());
+                        previous.release_shared_llc(local)?;
                     }
+                    shared.withdraw_ee(local)?;
+                    local.withdraw_ee_records(&attachment.id)?;
                     let peer_cp = bootstrap.peer.cp.clone();
                     let generation = bootstrap.generation;
                     let mut runtime = DirectHprRuntime::new(*bootstrap);
                     runtime.configure_peer_lus(attachment)?;
-                    runtime.configure_local_llc(config)?;
-                    runtime.configure_local_ingress(config, attachment)?;
-                    runtime.attach_local_mptn(local.lease_for_ee());
+                    runtime.use_shared_publication();
+                    shared.configure_ee(local, config, &attachment.id, peer_cp.clone())?;
+                    let export = runtime.ee_owner_export();
+                    local.replace_ee_records(&export.owner, export.records)?;
+                    peer_netid = Some(peer_cp.netid.clone());
                     active = Some(runtime);
                     tracing::info!(attachment = %attachment.id, peer_cp = %peer_cp,
                     generation = generation.get(),
@@ -100,8 +111,11 @@ fn run_link<'a>(
                 }
                 Some(StandaloneEvent::Deactivated) => {
                     if let Some(mut runtime) = active.take() {
-                        local.return_from_ee(runtime.detach_local_mptn());
+                        runtime.release_shared_llc(local)?;
                     }
+                    shared.withdraw_ee(local)?;
+                    local.withdraw_ee_records(&attachment.id)?;
+                    peer_netid = None;
                     tracing::warn!(attachment = %attachment.id,
                     "standalone EE peer deactivated; local sessions withdrawn");
                 }
@@ -109,18 +123,36 @@ fn run_link<'a>(
             }
             if let Some(runtime) = active.as_mut() {
                 let now_us = clock.elapsed().as_micros() as u64;
+                runtime.poll_shared_local(
+                    link.link(),
+                    shared,
+                    local,
+                    config,
+                    peer_netid
+                        .as_deref()
+                        .ok_or_else(|| io::Error::other("active EE peer NETID unavailable"))?,
+                )?;
                 runtime.tick(link.link(), now_us)?;
-                runtime.pump(link.link(), None, now_us, None)?;
+                let mut access = SharedLocalAccess {
+                    shared,
+                    runner: local,
+                    config,
+                };
+                runtime.pump(link.link(), None, now_us, Some(&mut access))?;
+                let export = runtime.ee_owner_export();
+                local.replace_ee_records(&export.owner, export.records)?;
             } else {
-                local.poll_idle()?;
+                shared.poll(local, &HprDestinationDirectory::new(), false)?;
             }
             thread::sleep(IDLE_POLL);
         }
         Ok(())
     })();
     if let Some(mut runtime) = active.take() {
-        local.return_from_ee(runtime.detach_local_mptn());
+        let _ = runtime.release_shared_llc(local);
     }
+    let _ = shared.withdraw_ee(local);
+    let _ = local.withdraw_ee_records(&attachment.id);
     result
 }
 
