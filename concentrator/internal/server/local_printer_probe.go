@@ -170,7 +170,7 @@ func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source Local
 	if !ok || !peer.Valid() || len(p.circuits) >= 64 {
 		return
 	}
-	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
+	local, err := printerProbeXID()
 	if err != nil {
 		return
 	}
@@ -189,7 +189,7 @@ func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
 		_ = p.hub.decision(p.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN})
 		return
 	}
-	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
+	local, err := printerProbeXID()
 	if err != nil {
 		log.Printf("printer probe XID: %v", err)
 		return
@@ -205,6 +205,25 @@ func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
 		return
 	}
 	log.Printf("printer probe open: circuit=%s peer=%s.%s profile=%s", id, peer.NetID, peer.CP, open.Profile)
+}
+
+func printerProbeXID() (xid3.XID, error) {
+	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
+	if err != nil || os.Getenv("SNUSNU_PRINTER_PROBE_5494_XID") != "1" {
+		return local, err
+	}
+	// VG0F's XID3 Product Set ID: hardware 5494 model 002. Keep the
+	// configured CP identity and link node ID, which are independent fields.
+	local.Vectors[2].Data = []byte{
+		0, 0x16, 0x11, 1, 0x13, 0, 0x12,
+		0xf5, 0xf4, 0xf9, 0xf4, 0xf0, 0xf0, 0xf2, 0xf0, 0xf0,
+		0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf1,
+	}
+	local.Fixed[1] = byte(len(local.Fixed))
+	for _, vector := range local.Vectors {
+		local.Fixed[1] += byte(2 + len(vector.Data))
+	}
+	return local, local.Validate()
 }
 
 func (p *localPrinterProbe) type1(id string, c *printerProbeCircuit, input *wire.DlcType1) error {
@@ -625,6 +644,9 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		switch {
 		case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0d:
 			ru, err = printer.ACTLUResponseRU(inner.RU)
+			if err == nil && inner.Address == 56 {
+				ru[5] = 0x80 // LU7 display: type bits 10 in the ACTLU status byte.
+			}
 		case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && (inner.RU[14] == 7 || inner.RU[14] == 4):
 			ru = append([]byte(nil), inner.RU...)
 		case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
