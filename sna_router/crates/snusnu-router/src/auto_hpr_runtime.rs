@@ -99,6 +99,30 @@ fn as_wire_name(value: &router_core::session::QualifiedName) -> wire::SnaName {
     }
 }
 
+fn verified_upstream_host(
+    target: &router_core::session::QualifiedName,
+    proxy_cp: &router_core::session::QualifiedName,
+    lu_route: &wire::RouteReference,
+    cp: &wire::SnaName,
+    cp_route: Option<&wire::RouteReference>,
+) -> io::Result<router_core::session::QualifiedName> {
+    let host: router_core::session::QualifiedName = format!("{}.{}", cp.netid, cp.name)
+        .parse()
+        .map_err(|_| protocol("HPR upstream LU has invalid hosting CP"))?;
+    if host.netid != target.netid {
+        return Err(protocol("HPR upstream LU and hosting CP NETIDs differ"));
+    }
+    if host != *proxy_cp {
+        let cp_route = cp_route.ok_or_else(|| protocol("HPR upstream hosting CP has no route"))?;
+        if cp_route.router_id != lu_route.router_id || cp_route.epoch != lu_route.epoch {
+            return Err(protocol(
+                "HPR upstream LU and hosting CP have different owners",
+            ));
+        }
+    }
+    Ok(host)
+}
+
 fn eligible_local_exports(
     routes: &[(router_core::session::QualifiedName, Destination)],
     allowed_netid: &str,
@@ -457,14 +481,27 @@ impl<'a> DirectHprRuntime<'a> {
                 "HPR target {target} is ambiguous between local and upstream routes"
             ))),
             (Some(destination), None) => Ok(destination),
-            (None, Some((_, Some(cp)))) if cp == as_wire_name(&self.bootstrap.local.cp) => {
+            (None, Some((lu_route, Some(cp)))) => {
+                let cp_route = if cp == as_wire_name(&self.bootstrap.local.cp) {
+                    None
+                } else {
+                    hub.ok_or_else(|| protocol("HPR upstream CP directory unavailable"))?
+                        .resolve_cp(&cp)?
+                };
+                let hosting_cp = verified_upstream_host(
+                    target,
+                    &self.bootstrap.local.cp,
+                    &lu_route,
+                    &cp,
+                    cp_route.as_ref(),
+                )?;
                 Ok(Destination::Ws {
-                    hosting_cp: self.bootstrap.local.cp.clone(),
+                    hosting_cp,
                     attachment_id: "concentrator".into(),
                 })
             }
             (None, Some(_)) => Err(protocol(format!(
-                "HPR upstream target {target} is not hosted by EE proxy CP"
+                "HPR upstream target {target} lacks a verified hosting CP"
             ))),
             (None, None)
                 if self
@@ -481,6 +518,28 @@ impl<'a> DirectHprRuntime<'a> {
                 "HPR RouteSetup target {target} unavailable"
             ))),
         }
+    }
+
+    fn resolve_route_setup_target(
+        &self,
+        hub: Option<&AutoWsHub>,
+        target: &router_core::session::QualifiedName,
+    ) -> io::Result<Destination> {
+        // A CP management session can name a CP as its RouteSetup destination
+        // even when that CP is not separately exported as an LU. Keep this
+        // fallback confined to RouteSetup; application BIND still needs an LU.
+        if self.local_directory.resolve_lu(target).is_none() {
+            if let Some(hub) = hub {
+                let name = as_wire_name(target);
+                if hub.resolve_lu(&name)?.is_none() && hub.resolve_cp(&name)?.is_some() {
+                    return Ok(Destination::Ws {
+                        hosting_cp: target.clone(),
+                        attachment_id: "concentrator".into(),
+                    });
+                }
+            }
+        }
+        self.resolve_target(hub, target)
     }
 
     fn queue_rtp(&mut self, messages: Vec<RtpIngress>) -> io::Result<()> {
@@ -587,15 +646,34 @@ impl<'a> DirectHprRuntime<'a> {
         self.pump_local_mptn(link)?;
         self.pump_local_ws();
         let live_scopes = self.rtp.active_user_scopes();
-        let directory = &self.local_directory;
+        let verified_management_targets = self
+            .route_targets
+            .iter()
+            .filter_map(|(lu, destination)| {
+                let current = match destination {
+                    Destination::Llc { .. } => self.local_directory.resolve_lu(lu),
+                    Destination::Ws { .. } => {
+                        self.resolve_route_setup_target(hub.as_deref(), lu).ok()
+                    }
+                    _ => None,
+                };
+                (current.as_ref() == Some(destination)).then(|| {
+                    (
+                        lu.clone(),
+                        destination.hosting_cp().clone(),
+                        destination.attachment_id().to_owned(),
+                    )
+                })
+            })
+            .collect::<HashSet<_>>();
         self.external_management
             .retain(|lu, cp, attachment, scope| {
                 live_scopes.contains(&scope)
-                    && directory.resolve_lu(lu)
-                        == Some(Destination::Llc {
-                            hosting_cp: cp.clone(),
-                            attachment_id: attachment.to_owned(),
-                        })
+                    && verified_management_targets.contains(&(
+                        lu.clone(),
+                        cp.clone(),
+                        attachment.to_owned(),
+                    ))
             });
         if let Some(hub) = hub.as_deref_mut() {
             self.refresh_local_exports(hub)?;
@@ -1080,7 +1158,7 @@ impl<'a> DirectHprRuntime<'a> {
                 .cloned()
                 .ok_or_else(|| protocol("active local HPR session lost its route"))?
         } else {
-            self.resolve_target(hub, &target)?
+            self.resolve_route_setup_target(hub, &target)?
         };
         if self
             .route_targets
@@ -1107,16 +1185,20 @@ impl<'a> DirectHprRuntime<'a> {
                 liveness_seconds: 10,
             };
             let service = match &destination {
-                Destination::Ws { .. } => DirectRouteSetupService::new(
-                    self.bootstrap.clone(),
-                    target.clone(),
-                    user_label,
-                    instance,
-                    tg,
-                    metrics,
-                    16,
-                ),
-                Destination::Llc { hosting_cp, .. } | Destination::Mptn { hosting_cp, .. } => {
+                Destination::Ws { hosting_cp, .. } if *hosting_cp == self.bootstrap.local.cp => {
+                    DirectRouteSetupService::new(
+                        self.bootstrap.clone(),
+                        target.clone(),
+                        user_label,
+                        instance,
+                        tg,
+                        metrics,
+                        16,
+                    )
+                }
+                Destination::Ws { hosting_cp, .. }
+                | Destination::Llc { hosting_cp, .. }
+                | Destination::Mptn { hosting_cp, .. } => {
                     DirectRouteSetupService::new_verified_external(
                         self.bootstrap.clone(),
                         target.clone(),
@@ -1171,7 +1253,7 @@ impl<'a> DirectHprRuntime<'a> {
                 self.local_directory.resolve_lu(&target) == Some(destination.clone())
             }
             Destination::Ws { .. } => {
-                self.resolve_target(hub, &target).ok().as_ref() == Some(destination)
+                self.resolve_route_setup_target(hub, &target).ok().as_ref() == Some(destination)
             }
             Destination::Ee { .. } => false,
         };
@@ -1263,7 +1345,7 @@ impl<'a> DirectHprRuntime<'a> {
             .classify_bind()
             .map_err(|error| protocol(format!("invalid HPR BIND: {error:?}")))?;
         let external_start = if let Some(bind) = bind.as_ref() {
-            match self.external_management_start(message, bind) {
+            match self.external_management_start(hub.as_deref(), message, bind) {
                 Ok(start) => start,
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                     tracing::warn!(error = %error, generation = message.observation.generation.get(),
@@ -1367,6 +1449,7 @@ impl<'a> DirectHprRuntime<'a> {
 
     fn external_management_start(
         &mut self,
+        hub: Option<&AutoWsHub>,
         message: &RtpIngress,
         bind: &router_core::fid2_bind::BindIdentity,
     ) -> io::Result<Option<VerifiedExternalRoute>> {
@@ -1381,12 +1464,19 @@ impl<'a> DirectHprRuntime<'a> {
             .slu
             .parse()
             .map_err(|_| protocol("external CP BIND target is not qualified"))?;
-        let Some(Destination::Llc {
-            hosting_cp,
-            attachment_id,
-        }) = self.route_targets.get(&target_lu).cloned()
-        else {
+        let Some(destination) = self.route_targets.get(&target_lu).cloned() else {
             return Ok(None);
+        };
+        let (hosting_cp, attachment_id) = match &destination {
+            Destination::Llc {
+                hosting_cp,
+                attachment_id,
+            }
+            | Destination::Ws {
+                hosting_cp,
+                attachment_id,
+            } => (hosting_cp.clone(), attachment_id.clone()),
+            _ => return Ok(None),
         };
         if bind.plu != self.bootstrap.peer.cp.to_string()
             || target_lu != hosting_cp
@@ -1396,15 +1486,15 @@ impl<'a> DirectHprRuntime<'a> {
                 "external CP BIND conflicts with authorized EE route",
             ));
         }
-        if self.local_directory.resolve_lu(&target_lu)
-            != Some(Destination::Llc {
-                hosting_cp: hosting_cp.clone(),
-                attachment_id: attachment_id.clone(),
-            })
-        {
+        let current = match &destination {
+            Destination::Llc { .. } => self.local_directory.resolve_lu(&target_lu),
+            Destination::Ws { .. } => self.resolve_route_setup_target(hub, &target_lu).ok(),
+            _ => None,
+        };
+        if current != Some(destination) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "external CP BIND awaits live LLC XID proof",
+                "external CP BIND awaits current target CP route proof",
             ));
         }
         let scope = self
@@ -1507,6 +1597,15 @@ impl<'a> DirectHprRuntime<'a> {
             .get(&selected_lu)
             .cloned()
             .ok_or_else(|| protocol("HPR BIND target has no authorized RouteSetup"))?;
+        if matches!(destination, Destination::Ws { .. })
+            && hub
+                .as_deref()
+                .ok_or_else(|| protocol("HPR upstream LU directory unavailable"))?
+                .resolve_lu(&as_wire_name(&selected_lu))?
+                .is_none()
+        {
+            return Err(protocol("HPR application BIND targets a CP-only route"));
+        }
         if matches!(
             destination,
             Destination::Llc { .. } | Destination::Mptn { .. }
@@ -2553,6 +2652,59 @@ mod tests {
         let reverse = target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], 127).unwrap();
         assert!(!allocations.contains(&reverse));
         assert!(target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], 128).is_err());
+    }
+
+    #[test]
+    fn upstream_external_cp_requires_same_live_owner_as_lu() {
+        let target = q("QAALICE.APP1");
+        let proxy = q("SNUSNU.SVC");
+        let host = as_wire_name(&q("QAALICE.SNAA"));
+        let lu_route = wire::RouteReference {
+            router_id: vec![1; 16],
+            epoch: vec![2; 16],
+            route_id: 5,
+            route_generation: 3,
+        };
+        let cp_route = wire::RouteReference {
+            route_id: 6,
+            ..lu_route.clone()
+        };
+        assert_eq!(
+            verified_upstream_host(&target, &proxy, &lu_route, &host, Some(&cp_route)).unwrap(),
+            q("QAALICE.SNAA")
+        );
+        assert!(verified_upstream_host(&target, &proxy, &lu_route, &host, None).is_err());
+        let mut wrong_owner = cp_route.clone();
+        wrong_owner.router_id = vec![3; 16];
+        assert!(
+            verified_upstream_host(&target, &proxy, &lu_route, &host, Some(&wrong_owner)).is_err()
+        );
+        let mut stale_epoch = cp_route.clone();
+        stale_epoch.epoch = vec![4; 16];
+        assert!(
+            verified_upstream_host(&target, &proxy, &lu_route, &host, Some(&stale_epoch)).is_err()
+        );
+        assert!(verified_upstream_host(
+            &q("OTHERNET.APP1"),
+            &proxy,
+            &lu_route,
+            &host,
+            Some(&cp_route),
+        )
+        .is_err());
+        // Concentrator-owned service LUs retain their existing proxy-CP
+        // admission; their CP need not be a separate remote router route.
+        assert_eq!(
+            verified_upstream_host(
+                &q("SNUSNU.PING"),
+                &proxy,
+                &lu_route,
+                &as_wire_name(&proxy),
+                None,
+            )
+            .unwrap(),
+            proxy
+        );
     }
 
     #[test]
