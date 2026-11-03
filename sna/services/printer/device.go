@@ -30,19 +30,31 @@ type LU4Device struct {
 	pending []byte
 }
 
-// PrepareFMD accepts one complete, definite-response printer data chain.
-// appendSCS must durably accept the raw SCS bytes before this method can
-// return a positive response, and must deduplicate retransmissions using the
-// enclosing LU 6.2 session's sequence/correlation state. A caller may
-// concatenate multiple chains into one spool file; the LU 4 stream itself
-// does not identify a spool boundary.
+// PrepareFMD accepts a one-PIU, definite-response printer data chain.
+// For a multi-PIU chain, use ChainAssembler and PrepareFMDChain.
 func (d *LU4Device) PrepareFMD(input []byte, appendSCS func([]byte) error) ([]byte, error) {
+	p, err := ParseLU4PIU(input)
+	if err != nil || p.RH[0]&3 != 3 {
+		return nil, ErrDeviceState
+	}
+	return d.PrepareFMDChain(input, p.RU, appendSCS)
+}
+
+// PrepareFMDChain accepts a completed printer data chain. last is its final
+// FID3 PIU and scs is the RU assembled by ChainAssembler. appendSCS must
+// durably accept the raw bytes before a positive response can be returned.
+// The caller owns LU 6.2 sequence deduplication and spool-job boundaries.
+func (d *LU4Device) PrepareFMDChain(last, scs []byte, appendSCS func([]byte) error) ([]byte, error) {
 	if d == nil || d.phase != DeviceBound || len(d.pending) != 0 || appendSCS == nil {
 		return nil, ErrDeviceState
 	}
-	p, err := ParseLU4PIU(input)
+	p, err := ParseLU4PIU(last)
 	if err != nil || p.Address != d.address || p.Session != LU4PrintSession || p.Expedited || p.Response ||
-		p.RH[0]&0xe3 != 0x03 || len(p.RU) == 0 || p.RH[1]&0xa0 == 0 {
+		p.RH[0]&0xe0 != 0 || len(p.RU) == 0 || len(scs) == 0 || len(scs) > MaxJobBytes ||
+		(p.RH[0]&3 != 1 && p.RH[0]&3 != 3) || p.RH[1]&0xa0 == 0 ||
+		!bytes.HasSuffix(scs, p.RU) ||
+		(p.RH[0]&3 == 3 && len(scs) != len(p.RU)) ||
+		(p.RH[0]&3 == 1 && len(scs) <= len(p.RU)) {
 		return nil, ErrDeviceState
 	}
 	response, err := PositiveLU4Response(p, nil)
@@ -53,7 +65,7 @@ func (d *LU4Device) PrepareFMD(input []byte, appendSCS func([]byte) error) ([]by
 	if err != nil {
 		return nil, err
 	}
-	if err := appendSCS(append([]byte(nil), p.RU...)); err != nil {
+	if err := appendSCS(append([]byte(nil), scs...)); err != nil {
 		return nil, err
 	}
 	d.pending = encoded

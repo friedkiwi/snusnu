@@ -52,3 +52,57 @@ func TestLU4DeviceACTLUAndPrinterBind(t *testing.T) {
 		t.Fatalf("printer FMD send: %v", err)
 	}
 }
+
+func TestLU4DeviceMultiPIUPrintChainWaitsForDurableWrite(t *testing.T) {
+	d, err := NewLU4Device(1, 0x86)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actlu, err := d.Prepare([]byte{0x3d, 0x41, 0x73, 0x80, 0, 0x0d, 1, 1})
+	if err != nil || d.MarkSent(actlu) != nil {
+		t.Fatal("ACTLU setup failed")
+	}
+	bind := []byte{0x3d, 0xc1, 0x73, 0x80, 0,
+		0x31, 0, 7, 7, 0xf0, 0xb0, 0x10, 0x81, 0, 7, 0x85, 0x85, 0, 7, 4, 0xc0,
+		0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0}
+	bound, err := d.Prepare(bind)
+	if err != nil || d.MarkSent(bound) != nil {
+		t.Fatal("BIND setup failed")
+	}
+	assembler, err := NewChainAssembler(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := []byte{0x3c, 0xc1, 0x02, 0, 0, 0xc1, 0xc2}
+	last := []byte{0x3c, 0xc1, 0x01, 0x80, 0, 0x0c}
+	for i, piu := range [][]byte{first, last} {
+		parsed, err := ParseLU4PIU(piu)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scs, done, err := assembler.Feed(parsed)
+		if err != nil || done != (i == 1) {
+			t.Fatalf("chain fragment %d: done=%t err=%v", i, done, err)
+		}
+		if !done {
+			continue
+		}
+		if _, err := d.PrepareFMD(last, func([]byte) error { t.Fatal("partial chain accepted"); return nil }); err == nil {
+			t.Fatal("accepted last PIU as a complete chain")
+		}
+		if _, err := d.PrepareFMDChain(last, []byte{0xc1, 0x0d}, func([]byte) error { t.Fatal("wrong chain accepted"); return nil }); err == nil {
+			t.Fatal("accepted mismatched chain data")
+		}
+		if _, err := d.PrepareFMDChain(last, scs, func([]byte) error { return ErrSCS }); err != ErrSCS || d.Phase() != DeviceBound {
+			t.Fatalf("failed write acknowledged: phase=%d err=%v", d.Phase(), err)
+		}
+		var stored []byte
+		response, err := d.PrepareFMDChain(last, scs, func(data []byte) error { stored = append(stored, data...); return nil })
+		if err != nil || !bytes.Equal(stored, []byte{0xc1, 0xc2, 0x0c}) || !bytes.Equal(response, []byte{0x3c, 0xc1, 0x83, 0x80, 0}) {
+			t.Fatalf("chain response: response=%x stored=%x err=%v", response, stored, err)
+		}
+		if err := d.MarkSent(response); err != nil || d.Phase() != DeviceBound {
+			t.Fatalf("chain response send: phase=%d err=%v", d.Phase(), err)
+		}
+	}
+}
