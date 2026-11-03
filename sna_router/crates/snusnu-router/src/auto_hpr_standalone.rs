@@ -75,7 +75,6 @@ fn run_link<'a>(
     let mut link = StandaloneEeLink::bind(attachment)?;
     let clock = Instant::now();
     let mut active: Option<DirectHprRuntime<'_>> = None;
-    let mut peer_netid: Option<String> = None;
     let result = (|| -> io::Result<()> {
         while !STOP.load(Ordering::Relaxed) {
             local.poll_local(None)?;
@@ -94,7 +93,6 @@ fn run_link<'a>(
                     shared.configure_ee(local, config, &attachment.id, peer_cp.clone())?;
                     let export = runtime.ee_owner_export();
                     local.replace_ee_records(&export.owner, export.records)?;
-                    peer_netid = Some(peer_cp.netid.clone());
                     active = Some(runtime);
                     tracing::info!(attachment = %attachment.id, peer_cp = %peer_cp,
                     generation = generation.get(),
@@ -115,7 +113,6 @@ fn run_link<'a>(
                     }
                     shared.withdraw_ee(local)?;
                     local.withdraw_ee_records(&attachment.id)?;
-                    peer_netid = None;
                     tracing::warn!(attachment = %attachment.id,
                     "standalone EE peer deactivated; local sessions withdrawn");
                 }
@@ -123,15 +120,7 @@ fn run_link<'a>(
             }
             if let Some(runtime) = active.as_mut() {
                 let now_us = clock.elapsed().as_micros() as u64;
-                runtime.poll_shared_local(
-                    link.link(),
-                    shared,
-                    local,
-                    config,
-                    peer_netid
-                        .as_deref()
-                        .ok_or_else(|| io::Error::other("active EE peer NETID unavailable"))?,
-                )?;
+                runtime.poll_shared_local(link.link(), shared, local, config)?;
                 runtime.tick(link.link(), now_us)?;
                 let mut access = SharedLocalAccess {
                     shared,

@@ -479,6 +479,16 @@ impl RouteRegistry {
     /// A locally owned CP or LU may be advertised only in the assigned NETID.
     /// Collisions with any other owner are omitted rather than published.
     pub fn local_exports(&self, netid: &str) -> Vec<RouteSelection> {
+        self.unambiguous_local_routes(Some(netid))
+    }
+
+    /// Live, unambiguous local identities for routing between attachments.
+    /// The concentrator's NETID restriction applies only to publication.
+    pub fn local_routes(&self) -> Vec<RouteSelection> {
+        self.unambiguous_local_routes(None)
+    }
+
+    fn unambiguous_local_routes(&self, netid: Option<&str>) -> Vec<RouteSelection> {
         let mut identities = HashMap::<
             PublicationIdentity,
             Option<(AttachmentId, RouteKey, RouteOrigin, Vec<LuType>)>,
@@ -518,7 +528,8 @@ impl RouteRegistry {
                     state.origin,
                     route.supported_types.clone(),
                 );
-                if identity.netid() != netid || identities.get(&identity) != Some(&Some(signature))
+                if netid.is_some_and(|allowed| identity.netid() != allowed)
+                    || identities.get(&identity) != Some(&Some(signature))
                 {
                     continue;
                 }
@@ -593,6 +604,38 @@ impl PublicationIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_routing_spans_netids_while_publication_is_filtered() {
+        let mut registry = RouteRegistry::new();
+        for (slot, netid) in [("llc-a", "NETA"), ("llc-b", "NETB")] {
+            registry
+                .replace_records(
+                    owner(slot),
+                    attachment(slot),
+                    RouteOrigin::Local,
+                    version(1, 1),
+                    vec![RouteRecord {
+                        key: lu(&format!("{netid}.LU1"), &format!("{netid}.CP1")),
+                        supported_types: vec![LuType::Lu62],
+                    }],
+                )
+                .unwrap();
+        }
+        assert_eq!(registry.local_routes().len(), 2);
+        assert_eq!(registry.local_exports("NETA").len(), 1);
+        assert_eq!(registry.local_exports("NETB").len(), 1);
+        registry
+            .replace_owner(
+                owner("upstream"),
+                attachment("upstream"),
+                RouteOrigin::Upstream,
+                version(1, 1),
+                vec![lu("NETC.LU1", "NETC.CP1")],
+            )
+            .unwrap();
+        assert_eq!(registry.local_routes().len(), 2);
+    }
 
     fn name(value: &str) -> QualifiedName {
         value.parse().unwrap()

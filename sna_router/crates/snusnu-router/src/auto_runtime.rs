@@ -374,6 +374,10 @@ impl<'a> AutoLocalSessionRunner<'a> {
         self.fabric.directory().local_exports(netid)
     }
 
+    pub(crate) fn local_routes(&self) -> Vec<RouteSelection> {
+        self.fabric.directory().local_routes()
+    }
+
     pub(crate) fn take_unhandled_llc_offers(&mut self) -> Vec<(String, LlcIngressOffer)> {
         std::mem::take(&mut self.unhandled_llc)
     }
