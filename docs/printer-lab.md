@@ -211,6 +211,16 @@ The rejection therefore persists beyond the request RH, those names,
 and those three timing points. The source-session address and activation
 state still need a real 5494 trace or a stronger firmware reconstruction.
 
+The 5494 BIND builder at VG10 image `0x6185` copies a TH template whose
+DAF/OAF bytes are zero and a sequence from the runtime session record at
+`+0x2e`. The common send routine fills addressing from the resolved
+session descriptor. The firmware therefore does not supply a constant
+DAF/OAF pair for a native source BIND. Re-varying `SNUPRT` with the LLC
+route online produced no controller PIU by itself; a later `VFYAPPCCNN`
+sent only a blank-mode user BIND. This is consistent with management
+state surviving that QA restart, so further trials need controlled
+fresh guest/session state and the descriptor mapping.
+
 ### Live V5R4 AnyNet controller trace, 2026-11-03
 
 An isolated V5R4 clone at `10.99.6.2` accepted `QRMTWSC` source CNOS
