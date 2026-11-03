@@ -140,7 +140,16 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 			c.allowance += uint64(len(value.SnaInformation))
 			err = p.hub.credit(p.hub.local, &wire.CircuitCredit{CircuitId: idBytes, AllowanceBytes: c.allowance})
 			if err == nil {
-				if c.initiated {
+				if parsed.RH[0] == 0x6b && len(parsed.RU) > 0 && parsed.RU[0] == 0x0e {
+					th := [6]byte{parsed.TH[0], parsed.TH[1], parsed.TH[3], parsed.TH[2], parsed.TH[4], parsed.TH[5]}
+					response, responseErr := (piu.FID2{TH: th, RH: [3]byte{0xeb, parsed.RH[1], 0}, RU: []byte{0x0e}}).Bytes()
+					if responseErr != nil {
+						err = responseErr
+					} else {
+						log.Printf("printer probe DACTLU response: circuit=%s piu=%x", id, response)
+						err = p.sendInformation(id, response)
+					}
+				} else if c.initiated {
 					err = p.managementInformation(id, c, value.SnaInformation)
 				} else {
 					err = p.passiveManagementInformation(id, c, value.SnaInformation)
