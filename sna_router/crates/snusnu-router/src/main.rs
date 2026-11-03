@@ -25,6 +25,10 @@ mod auto_hpr_inbound;
 #[allow(dead_code)] // Prepared for HPR gateway integration; automatic config remains gated.
 mod auto_hpr_ip;
 #[cfg(target_os = "linux")]
+mod auto_hpr_reverse;
+#[cfg(target_os = "linux")]
+mod auto_hpr_reverse_runtime;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // Prepared session switch; HPR endpoint remains gated.
 mod auto_hpr_runtime;
 #[cfg(target_os = "linux")]

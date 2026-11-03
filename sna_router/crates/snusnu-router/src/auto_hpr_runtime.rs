@@ -19,6 +19,7 @@ use std::{
 
 use crate::{
     auto_hpr_identity::AuthorizedEeIdentity,
+    auto_hpr_reverse_runtime::ReverseRuntime,
     config::RouterConfig,
     ee_ldlc_endpoint::EeLdlcEndpoint,
     ee_peer_lus::EePeerLus,
@@ -43,8 +44,8 @@ use router_core::{
 };
 use transport_ws::wire;
 
-const HPR_ADAPTER: AdapterId = AdapterId(1);
-const WS_ADAPTER: AdapterId = AdapterId(2);
+pub(crate) const HPR_ADAPTER: AdapterId = AdapterId(1);
+pub(crate) const WS_ADAPTER: AdapterId = AdapterId(2);
 const IDLE_POLL: Duration = Duration::from_micros(200);
 const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PENDING_RTP_MESSAGES: usize = 64;
@@ -128,6 +129,7 @@ struct DirectHprRuntime {
     bound_user_scopes: Vec<router_core::hpr_session_address::RtpAssociationScope>,
     user_route_authorized: bool,
     peer_lus: Option<EePeerLus>,
+    reverse: Option<ReverseRuntime>,
 }
 
 impl DirectHprRuntime {
@@ -155,6 +157,7 @@ impl DirectHprRuntime {
             bound_user_scopes: Vec::new(),
             user_route_authorized: false,
             peer_lus: None,
+            reverse: None,
         }
     }
 
@@ -189,9 +192,11 @@ impl DirectHprRuntime {
                 RtpIngressKind::User => self.user_message(hub, &message),
                 RtpIngressKind::CpSvcMg => self.cp_message(&message),
                 RtpIngressKind::CpSvcMgOut => self.reciprocal_cp_message(&message),
-                RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => {
-                    Err(protocol("unsolicited outbound HPR RTP message"))
-                }
+                RtpIngressKind::RouteSetupOut | RtpIngressKind::UserOut => self
+                    .reverse
+                    .as_mut()
+                    .ok_or_else(|| protocol("unsolicited outbound HPR RTP message"))?
+                    .on_rtp(message.clone(), &mut self.switch),
             };
             if result
                 .as_ref()
@@ -206,7 +211,14 @@ impl DirectHprRuntime {
             self.try_cp_replies(link, now_us)?;
             self.try_reciprocal_replies(link, now_us)?;
         }
-        self.pump_sessions(link, hub, now_us)
+        self.pump_sessions(link, hub, now_us)?;
+        if let Some(reverse) = self.reverse.as_mut() {
+            reverse.pump(link, &mut self.rtp, &mut self.switch, now_us)?;
+            if reverse.is_done() {
+                self.reverse = None;
+            }
+        }
+        Ok(())
     }
 
     fn try_open_reciprocal_cp(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {
@@ -936,7 +948,6 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
         peer_ip = %attachment.peer_ip, proxy_cp = %identity.local_cp,
         "HPR EE attachment listening");
     while !STOP.load(Ordering::Relaxed) {
-        poll_unsolicited(hub)?;
         if !identity.still_authorized(hub)? {
             return Err(protocol("EE proxy CP route withdrawn"));
         }
@@ -963,6 +974,63 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
             }
             hub.publish_local(&[], &[])?;
             tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
+        }
+        if let Some(open) = hub.poll_incoming()? {
+            let ready = active.as_ref().is_some_and(|runtime| {
+                runtime.reverse.is_none()
+                    && runtime
+                        .reciprocal_cp
+                        .as_ref()
+                        .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active)
+            });
+            if !ready {
+                hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
+            } else if let Some(runtime) = active.as_mut() {
+                let peer_cp = runtime.bootstrap.peer.cp.clone();
+                if let Some((route_identity, mut ws)) =
+                    crate::auto_hpr_inbound::admit(hub, open, &peer_cp)?
+                {
+                    let handle = runtime.next_handle;
+                    runtime.next_handle = runtime
+                        .next_handle
+                        .checked_add(1)
+                        .ok_or_else(|| protocol("HPR session handles exhausted"))?;
+                    let tg = link
+                        .tg_number()
+                        .ok_or_else(|| protocol("active EE link has no TG"))?;
+                    let label =
+                        user_nce_label(&runtime.bootstrap.local.tower.route_setup_nce_label)?;
+                    let advertised = Reachability {
+                        lu: Some(route_identity.target_lu.clone()),
+                        cp: route_identity.target_cp.clone(),
+                    };
+                    if let Err(error) = runtime.switch.replace_routes(HPR_ADAPTER, vec![advertised])
+                    {
+                        ws.close()?;
+                        return Err(protocol(format!("HPR reverse route admission: {error:?}")));
+                    }
+                    tracing::info!(attachment = %attachment.id,
+                        source_lu = %route_identity.source_lu,
+                        target_lu = %route_identity.target_lu,
+                        peer_cp = %peer_cp, handle,
+                        "concentrator LU session admitted to EE peer");
+                    runtime.reverse = Some(ReverseRuntime::new(
+                        route_identity,
+                        ws,
+                        runtime.bootstrap.clone(),
+                        handle,
+                        tg,
+                        reciprocal_nonce().to_be_bytes(),
+                        label,
+                        runtime.bootstrap.local.tower.route_setup_nce_instance,
+                        router_core::hpr_route_setup_initiator::DirectLinkMetrics {
+                            transmission_time_us: 1000,
+                            capacity_kbps: 100_000,
+                            liveness_seconds: 10,
+                        },
+                    ));
+                }
+            }
         }
         if let Some(datagram) = link.poll(now)? {
             if let Some(runtime) = active.as_mut() {
@@ -1161,6 +1229,25 @@ impl SessionSwitch {
         self.fabric
             .submit(id, details.egress, SessionEvent::Reset)?;
         Ok(())
+    }
+
+    /// Cancel a BIND whose destination has not produced a result yet. No
+    /// carrier has been told that the LU session is open, so there is no
+    /// peer-side reset to deliver. Both opaque handles are retired together.
+    pub(crate) fn discard_unopened(
+        &mut self,
+        adapter: AdapterId,
+        handle: CarrierHandle,
+    ) -> Result<(), SwitchError> {
+        let id = self.lookup(adapter, handle)?;
+        self.fabric.discard_unopened(id)?;
+        self.handles.retain(|_, known| *known != id);
+        self.leased.retain(|(known, _), _| *known != id);
+        Ok(())
+    }
+
+    pub(crate) fn has_handle(&self, adapter: AdapterId, handle: CarrierHandle) -> bool {
+        self.handles.contains_key(&(adapter, handle))
     }
 
     /// Submit one complete session event. On `Capacity`, the carrier must
@@ -1421,6 +1508,39 @@ mod tests {
             )
             .unwrap();
         switch
+    }
+
+    #[test]
+    fn abandoned_reverse_bind_releases_both_carrier_handles() {
+        let mut switch = switch();
+        switch
+            .replace_routes(
+                HPR_ADAPTER,
+                vec![Reachability {
+                    lu: Some(q("PEERNET.PINGER")),
+                    cp: Some(q("PEERNET.HOST")),
+                }],
+            )
+            .unwrap();
+        let reverse = SessionIdentity::new(q("SNUSNU.PING"), q("PEERNET.PINGER"))
+            .with_control_points(Some(q("SNUSNU.SVC")), Some(q("PEERNET.HOST")))
+            .unwrap();
+        let (id, egress) = switch
+            .open(WS_ADAPTER, 42, reverse.clone(), unit(0x31))
+            .unwrap();
+        assert_eq!(egress, HPR_ADAPTER);
+        switch.bind_egress(id, HPR_ADAPTER, 42).unwrap();
+        switch.discard_unopened(WS_ADAPTER, 42).unwrap();
+        assert_eq!(switch.fabric.session_count(), 0);
+        assert!(matches!(
+            switch.lookup(WS_ADAPTER, 42),
+            Err(SwitchError::UnknownHandle)
+        ));
+        assert!(matches!(
+            switch.lookup(HPR_ADAPTER, 42),
+            Err(SwitchError::UnknownHandle)
+        ));
+        assert!(switch.open(WS_ADAPTER, 42, reverse, unit(0x31)).is_ok());
     }
 
     #[test]
