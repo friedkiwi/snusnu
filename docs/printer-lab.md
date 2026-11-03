@@ -198,6 +198,19 @@ completion yielded `80050000` because the session had ended. These traces
 rule out reusing the guest's default-management bracket in those states;
 they do not identify the separate source-session activation sequence.
 
+An outbound native source-BIND probe with the captured `6B 80 00` request
+RH was sent first immediately after XID and then only after answering the
+host's `ACTLU`. With FID2 addresses `(2,1)`, IBM i returned `80040000`
+in both orders. Using the advertised `SNUSNU.PRINTER` and
+`SOLNET.S1054504` LU names after `ACTLU` also returned `80040000`.
+A separate probe sent a source BIND with addresses `(2,2)` while the
+guest-originated management session was still active, just after the
+default-mode CNOS reply; IBM i returned `08090000`. These probes were
+run with both QA and router debug logging, then removed from the source.
+The rejection therefore persists beyond the request RH, those names,
+and those three timing points. The source-session address and activation
+state still need a real 5494 trace or a stronger firmware reconstruction.
+
 ### Live V5R4 AnyNet controller trace, 2026-11-03
 
 An isolated V5R4 clone at `10.99.6.2` accepted `QRMTWSC` source CNOS
