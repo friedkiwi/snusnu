@@ -46,6 +46,7 @@ impl HprManagementInitiator {
         )
         .map_err(|error| invalid(format!("HPR management policy: {error}")))?;
         protocol.accept_hpr_response_shape();
+        protocol.allow_unilateral_bis();
         Ok(Self {
             protocol,
             initial_sa,
@@ -127,7 +128,9 @@ impl HprManagementInitiator {
         let mut piu = vec![if fid5.expedited { 0x2f } else { 0x2e }, 0, 2, 1];
         piu.extend_from_slice(&fid5.th[2..4]);
         piu.extend_from_slice(&fid5.rh);
-        if phase == Phase::AwaitPeerBis && fid5.rh == [0x4b, 0xb0, 0] {
+        if matches!(phase, Phase::AwaitPeerBis | Phase::UnbindPrepared)
+            && fid5.rh == [0x4b, 0xb0, 0]
+        {
             piu[7] = 0xb1;
         }
         if phase == Phase::AwaitBindResponse {
@@ -152,8 +155,74 @@ mod tests {
         ConnectionGeneration,
     };
 
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn captured_v5r4_ee_management_ipr_can_advance_to_unbind() {
+        let mut initiator = HprManagementInitiator::new(
+            &"QAALICE.SNAA".parse().unwrap(),
+            &"QABOB.SNAB".parse().unwrap(),
+            0xa000_0000_0000_0002,
+            [0x18, 0xf1, 0xbe, 0xf9, 0xcd, 0x93, 0x43, 0x14],
+            [0x23, 0, 0, 0, 0, 0, 2],
+            "",
+        )
+        .unwrap();
+        let bind = hex(concat!(
+            "5d000000a0000000000000026b800031001307b0b0513307878686870706020000000000000094434000",
+            "0cd8c1c1d3c9c3c54be2d5c1c12e000902e2d5c1e2e5c3d4c709030123000000000002",
+            "0d04d8c1c1d3c9c3c54be2d5c1c10a1300b023000000000002000ad8c1c2d6c24be2d5c1c2",
+            "601518f1bef9cd9343140cd8c1c1d3c9c3c54be2d5c1c12c0a04087bc3d6d5d5c5c3e3"
+        ));
+        assert_eq!(initiator.prepared().unwrap(), Some(bind.clone()));
+        initiator.confirm_sent(&bind).unwrap();
+        initiator
+            .observe(&hex(concat!(
+                "5d0000002000000000000002eb800031001307b0b0513300808686800006020000000000000094434000",
+                "0025000902e2d5c1e2e5c3d4c70203020b05d8c1c2d6c24be2d5c1c20a1300b02627bf13fa80000000",
+                "601518f1bef9cd9343140cd8c1c1d3c9c3c54be2d5c1c1620881010200f0f10001"
+            )))
+            .unwrap();
+        let cnos = hex("5c00000101010200f0f100010b91200c0502ff0003d000000206f100191210020000000000080004000400084040404040404040");
+        assert_eq!(initiator.prepared().unwrap(), Some(cnos.clone()));
+        initiator.confirm_sent(&cnos).unwrap();
+        let guest_ipr = hex("5d0000002000000000000002830100000001");
+        initiator.observe(&guest_ipr).unwrap();
+        initiator
+            .observe(&hex(
+                "5c0000012000000000000002039101001912100a0000000000080004000400084040404040404040",
+            ))
+            .unwrap();
+        let cnos_ipr = hex("5d00000001010200f0f10001830100");
+        assert_eq!(initiator.prepared().unwrap(), Some(cnos_ipr.clone()));
+        initiator.confirm_sent(&cnos_ipr).unwrap();
+        let bis = hex("5c00000201010200f0f100014b910070");
+        assert_eq!(initiator.prepared().unwrap(), Some(bis.clone()));
+        initiator.confirm_sent(&bis).unwrap();
+        initiator.observe(&guest_ipr).unwrap();
+        assert_eq!(initiator.phase(), Phase::UnbindPrepared);
+        assert!(!initiator.complete());
+        let unbind = initiator.prepared().unwrap().unwrap();
+        assert_eq!(Fid5WholeBiu::parse_complete(&unbind).unwrap().ru[0], 0x32);
+    }
+
     #[test]
     fn fid5_management_cnos_completes_against_hpr_responder() {
+        complete_management_with_responder(false);
+    }
+
+    #[test]
+    fn fid5_management_completes_when_ee_peer_omits_reciprocal_bis() {
+        complete_management_with_responder(true);
+    }
+
+    fn complete_management_with_responder(omit_peer_bis: bool) {
         let generation = ConnectionGeneration::new(1).unwrap();
         let scope = RtpAssociationScope {
             generation,
@@ -191,6 +260,11 @@ mod tests {
             responder = next;
             initiator.confirm_sent(&request).unwrap();
             for reply in replies {
+                if omit_peer_bis
+                    && Fid5WholeBiu::parse_complete(&reply).unwrap().rh == [0x4b, 0xb0, 0]
+                {
+                    continue;
+                }
                 initiator.observe(&reply).unwrap();
             }
         }

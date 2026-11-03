@@ -76,6 +76,7 @@ pub struct NativeManagementInitiator {
     peer_cnos_ipr: bool,
     peer_bis_ipr: bool,
     hpr_response_shape: bool,
+    peer_bis_optional: bool,
 }
 
 fn name(value: &str) -> Result<Vec<u8>, InitiatorError> {
@@ -189,6 +190,7 @@ impl NativeManagementInitiator {
             peer_cnos_ipr: false,
             peer_bis_ipr: false,
             hpr_response_shape: false,
+            peer_bis_optional: false,
         })
     }
 
@@ -197,6 +199,13 @@ impl NativeManagementInitiator {
     /// must still validate the FID5 address and the response correlation.
     pub fn accept_hpr_response_shape(&mut self) {
         self.hpr_response_shape = true;
+    }
+
+    /// Some EE peers acknowledge our BIS but do not initiate a reciprocal
+    /// BIS. They can proceed directly to management UNBIND. Native LLC peers
+    /// retain the captured bilateral BIS exchange by default.
+    pub fn allow_unilateral_bis(&mut self) {
+        self.peer_bis_optional = true;
     }
 
     pub fn phase(&self) -> Phase {
@@ -319,9 +328,16 @@ impl NativeManagementInitiator {
             }
             Phase::AwaitPeerBis if self.is_peer_ipr(piu) => {
                 self.peer_bis_ipr = true;
+                if self.peer_bis_optional {
+                    self.pending = self.build_unbind();
+                    self.phase = Phase::UnbindPrepared;
+                }
                 Ok(())
             }
-            Phase::AwaitPeerBis => {
+            Phase::AwaitPeerBis | Phase::UnbindPrepared
+                if self.phase == Phase::AwaitPeerBis
+                    || (self.peer_bis_optional && self.peer_bis_ipr) =>
+            {
                 if !self.peer_bis_ipr
                     || !self.inbound(piu, self.expedited_th0 & !1, 2, &[0x4b, 0xb1, 0])
                     || piu.get(9..) != Some(&[0x70][..])
