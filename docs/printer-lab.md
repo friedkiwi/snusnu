@@ -479,7 +479,10 @@ TPN `30F0F5F1` and the PIP-present flag set. The firmware copies
 `30F0F6F6` from `5494CONF.DAT` over that TPN at runtime for the controller
 Attach. VG0F constructs the 18-byte allocation/PIP area as
 `00 12 12 F5 00 0E 12 E2 03 20 01 xx 38 04 04 D4 07 30`.
-The runtime byte `xx` and final transmitted work area still need capture.
+`VG0F` reads `xx` from offset `+8` of the shared far pointer `1000:C000`
+(image `0x1BDB`). `VG1C` initializes that same pointer's `+8` to zero at
+image `0x1751`, so zero is the firmware's initial value. A later runtime
+writer could still change it; the final transmitted work area needs capture.
 Another local constant contains `30F0F6F3`,
 whose purpose still needs to be traced.
 `DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
@@ -554,6 +557,18 @@ expedited SIGNAL. QA answered the SIGNAL; no address-01 BIND followed, and
 establish that the first notice was correctly timed. The verbose evidence is
 in `/tmp/snusnu-printer-qa-first-notice.log` and
 `/tmp/snusnu-printer-router-first-notice.log` on the test host.
+
+The three station-56 LU7 fragments reassemble to 794 bytes: a `04 F3`
+Write Structured Field command followed by a 792-byte structured field.
+Its EBCDIC entries repeatedly name `3486` and `3487` display models and
+`AJLPY...` objects. This is display-side setup on address 56; it does not
+show that the address-01 3812 printer has started. The final fragment's
+inner RH is `01 90 20`. The IBM 5494 Functions Reference RH table defines
+`90` on a request as exception response, so a positive inner SNA response
+is not requested. A disposable QA trial attempted to prepare one; the
+library rejected it and the trial reset its circuit. That trial did not
+test printer activation. The next printer probe should focus on the
+NMVT/VPD to remote-device transition.
 
 A later LLC trial corrected the experimental Reply-PSID FID2 TH byte 1
 from `FF` to `00`, matching the reserved byte in the 5494 reference and
