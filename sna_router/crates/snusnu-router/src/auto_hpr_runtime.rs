@@ -99,7 +99,7 @@ fn as_wire_name(value: &router_core::session::QualifiedName) -> wire::SnaName {
     }
 }
 
-fn verified_upstream_host(
+pub(crate) fn verified_upstream_host(
     target: &router_core::session::QualifiedName,
     proxy_cp: &router_core::session::QualifiedName,
     lu_route: &wire::RouteReference,
@@ -2705,6 +2705,171 @@ mod tests {
             .unwrap(),
             proxy
         );
+    }
+
+    #[test]
+    fn remote_cp_route_setup_and_management_leg_complete() {
+        use router_core::hpr_session_address::RtpAssociationScope;
+
+        fn hex(bytes: &str) -> Vec<u8> {
+            bytes
+                .split_ascii_whitespace()
+                .map(|pair| u8::from_str_radix(pair, 16).unwrap())
+                .collect()
+        }
+        fn fid5(sequence: u16, address: u64, reduced: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0x5c, 0];
+            bytes.extend_from_slice(&sequence.to_be_bytes());
+            bytes.extend_from_slice(&address.to_be_bytes());
+            bytes.extend_from_slice(reduced);
+            bytes
+        }
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let mut local = advertisement("SNUSNU.SVC", 1);
+        local.link_label = vec![0x80, 0x80];
+        let bootstrap =
+            HprControlBootstrap::new(generation, local, advertisement("SOLNET.SNAB", 2)).unwrap();
+        // Captured V5R4 RouteSetup to a CP hosted behind another router.
+        let request = hex("00 6f 12 ce 00 01 00 00 00 00 00 00 00 00 00 00
+            0e 0e f3 e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c1
+            15 2b 01 01 11 46 0f 80 01 0a e2 d5 e4 e2 d5 e4 4b e2 e5 c3
+            21 16 60 ce c3 70 e7 b2 83 a3 4d 0b e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c2
+            0c 2c 01 08 7b c3 d6 d5 d5 c5 c3 e3
+            1a 80 00 00 00 00 05 b5 00 00 01 14 00 00 10 cc 00 00 00 00
+            06 67 04 00 80 02");
+        let mut service = DirectRouteSetupService::new_verified_external(
+            bootstrap,
+            q("SOLNET.SNAA"),
+            q("SOLNET.SNAA"),
+            vec![0xa4, 0x24],
+            [0xff, 0xfa, 0x77, 0x24],
+            1,
+            ReverseLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            },
+            16,
+        )
+        .unwrap();
+        let reply = service.prepare_reply(generation, &request).unwrap();
+        assert_eq!(
+            RouteSetupGds::parse(&reply.gds).unwrap().kind,
+            RouteSetupKind::PositiveReply
+        );
+        let authorized = service
+            .confirm_reply_sent(generation, reply.pcid, &reply.gds)
+            .unwrap();
+        assert_eq!(authorized.target_lu, q("SOLNET.SNAA"));
+        assert_eq!(authorized.verified_external_cp, Some(q("SOLNET.SNAA")));
+
+        let scope = RtpAssociationScope {
+            generation,
+            initial_plu_tcid: 0x80e8_992d_2a00_0178,
+            subsequent_plu_tcid: 0x0000_0001_0000_0004,
+            slu_tcid: 0x0000_e899_2d1b_00f8,
+        };
+        let initial = RtpObservation {
+            generation,
+            tcid: scope.initial_plu_tcid,
+        };
+        let subsequent = RtpObservation {
+            tcid: scope.subsequent_plu_tcid,
+            ..initial
+        };
+        let bind = hex("5d 00 00 00 80 02 07 00 f0 f1 00 01 6b 80 00
+            31 00 13 07 b0 b0 51 33 07 87 86 86 87 07 06 02
+            00 00 00 00 00 00 00 94 43 40 00
+            0b e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c2
+            2d 00 09 02 e2 d5 c1 e2 e5 c3 d4 c7
+            09 03 01 25 bf 6c 0f 61 00 00
+            0c 04 e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c2
+            0a 13 00 b0 25 bf 6c 0f 61 00 00
+            00 0b e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c1
+            60 14 ce c3 70 e7 b2 83 a3 31
+            0b e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c2
+            2c 0a 04 08 7b c3 d6 d5 d5 c5 c3 e3");
+        let mut management = ExternalManagementRoutes::default();
+        assert!(management
+            .receive(
+                initial,
+                &bind,
+                Some(VerifiedExternalRoute {
+                    scope,
+                    peer_cp: q("SOLNET.SNAB"),
+                    target_lu: authorized.target_lu.clone(),
+                    target_cp: q("SOLNET.SNAA"),
+                    attachment_id: "concentrator".into(),
+                    assigned_sa: 0x8000_0000_0000_0006,
+                }),
+            )
+            .unwrap());
+        let mut sent = Vec::new();
+        assert_eq!(
+            management
+                .pump(|_, reply| {
+                    sent.push(reply.to_vec());
+                    Ok(true)
+                })
+                .unwrap(),
+            Some(scope)
+        );
+        assert_eq!(Fid5WholeBiu::parse_complete(&sent[0]).unwrap().ru[0], 0x31);
+        management.retain(|lu, cp, attachment, active_scope| {
+            lu == &q("SOLNET.SNAA")
+                && cp == &q("SOLNET.SNAA")
+                && attachment == "concentrator"
+                && active_scope == scope
+        });
+        let cnos = fid5(
+            1,
+            6,
+            &[
+                0x0b, 0x91, 0x20, 0x0c, 0x05, 0x02, 0xff, 0, 3, 0xd0, 0, 0, 2, 0x06, 0xf1, 0, 25,
+                0x12, 0x10, 2, 0, 0, 0, 0, 0, 8, 0, 4, 0, 4, 0, 8, 0x40, 0x40, 0x40, 0x40, 0x40,
+                0x40, 0x40, 0x40,
+            ],
+        );
+        assert!(management.receive(subsequent, &cnos, None).unwrap());
+        sent.clear();
+        management
+            .pump(|_, reply| {
+                sent.push(reply.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&sent[1]).unwrap().ru[..4],
+            [0, 25, 0x12, 0x10]
+        );
+        let bis = fid5(2, 6, &[0x4b, 0x91, 0, 0x70]);
+        assert!(management.receive(subsequent, &bis, None).unwrap());
+        sent.clear();
+        management
+            .pump(|_, reply| {
+                sent.push(reply.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(
+            Fid5WholeBiu::parse_complete(&sent[1]).unwrap().rh,
+            [0x4b, 0xb0, 0]
+        );
+        let unbind = hex("5d 00 00 00 00 00 00 00 00 00 00 06 6b 80 00
+            32 01 00 00 00 00 60 14 ce c3 70 e7 b2 83 a3 31
+            0b e2 d6 d3 d5 c5 e3 4b e2 d5 c1 c2");
+        assert!(management.receive(subsequent, &unbind, None).unwrap());
+        sent.clear();
+        management
+            .pump(|_, reply| {
+                sent.push(reply.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(Fid5WholeBiu::parse_complete(&sent[0]).unwrap().ru, [0x32]);
+        // The management leg leaves its separately authorized HPR route intact.
+        assert_eq!(service.local_lu(), &authorized.target_lu);
     }
 
     #[test]
