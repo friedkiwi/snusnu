@@ -380,14 +380,23 @@ attempt used EE instead of TCP62 and reached the same V4 Sign On. The EE
 router also carried one successful V5 APINGD round trip to the embedded
 concentrator responder, reported by the guest as 31 ms.
 
-The reverse V4 LLC2 → QA → V5 EE test reached V5's positive user BIND
-response after external SNASVCMG management, CNOS and BIS. Rust rejected the
-response while interpreting its pacing fields, so this direction had not
-reached Sign On at the time of this record. EE → LLC2 request end closed its
-QA circuit, but the V4 native UNBIND response still needs a synchronized
+The reverse V4 LLC2 → QA → V5 EE test first reached V5's positive user BIND
+response after external SNASVCMG management, CNOS and BIS. Rust initially
+rejected a pacing mode bit in that response. After the focused parser fix,
+Alice initiated again. QA opened circuit `b38611ed` (prefix), and at
+18:23:36 UTC Alice's V4 console displayed Bob V5R4's remote Sign On. This
+proves the reverse gateway path through the first display, including the
+external management and user BIND exchanges. EE → LLC2 request end closed
+its QA circuit, but the V4 native UNBIND response still needs a synchronized
 capture and parser fix. The live successes prove the stated directions
 through the first remote display or APING reply; they do not prove normal
 teardown, simultaneous sessions, or every carrier combination.
+
+The automatic runner now also leases a verified LLC dialout carrier when a
+local MPTN ingress selects it, and releases the lease after the session while
+retaining the local discovery proof. This behavior has focused Rust tests;
+the cross-NETID successes above do not constitute a live test of the newer
+standalone lease path.
 
 The QA concentrator was left listening on `0.0.0.0:8081` for inspection. It
 used a persistent QA database so router IDs, tokens and managed MAC bindings

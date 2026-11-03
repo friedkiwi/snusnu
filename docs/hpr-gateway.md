@@ -39,9 +39,12 @@ attachments.
    variant; the LLC adapter restarted discovery. That teardown still needs a
    synchronized packet capture and a focused parser fix.
 3. The reverse V4R4 LLC2 → Rust → Go → Rust → V5R4 EE path completed EE
-   external SNASVCMG management, CNOS/BIS and user BIND exchange. The guest's
-   positive user BIND response currently triggers an `UnsupportedPacing`
-   error in Rust. A full reverse Sign On has **not** passed yet.
+   external SNASVCMG management, CNOS/BIS, user BIND and first display
+   traffic. At 18:23:36 UTC the V4R4 console displayed the V5R4 remote
+   Sign On. The QA circuit was `b38611ed` (prefix). An earlier positive user
+   BIND response exposed a pacing mode bit that Rust rejected; the corrected
+   parser allowed this live session. Normal teardown and repeated sessions
+   in this direction still need verification.
 
 These are session gateway tests, distinct from the older configured EE UDP
 relay and direct [EE lab](ee-lab.md). The [cross-NETID lab](cross-netid-lab.md)
@@ -50,16 +53,16 @@ outside the repository.
 
 ## Next test gates
 
-1. Decode the captured V5R4 positive user BIND response pacing fields,
-   correct the EE session adapter, and repeat LLC2 → concentrator → EE until
-   remote Sign On and bidirectional user traffic pass.
-2. Capture the V4R4 native UNBIND response during EE → LLC2 teardown, accept
+1. Capture the V4R4 native UNBIND response during EE → LLC2 teardown, accept
    its verified shape, and check that the idle LLC2 adjacency and published
    route survive a normal close. Also exercise remote reset and peer loss.
-3. Repeat the embedded APING test after the reverse-path fixes, then test
+2. Repeat the embedded APING test after the reverse-path fixes, then test
    local EE↔LLC and EE↔MPTN without a concentrator. Check routing among
    different local NETIDs, route withdrawal, reconnect and duplicate-route
    ambiguity.
+3. Test repeated and overlapping EE sessions, both initiation directions,
+   normal close and recovery after a guest or concentrator disconnect. The
+   current automatic EE runtime has a bounded user-session slot.
 4. Keep the configured EE↔EE relay, native LLC↔LLC and MPTN↔LLC live paths
    as regression tests. Run the staged-tree CI gate before each commit and
    push.
