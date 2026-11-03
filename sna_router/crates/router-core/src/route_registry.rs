@@ -223,6 +223,7 @@ struct OwnerState {
 
 /// The sole authority for attachment reachability and new-session next hops.
 /// Closed sessions and carrier protocol state remain with their adapters.
+#[derive(Clone)]
 pub struct RouteRegistry {
     owners: HashMap<OwnerId, OwnerState>,
     // Tombstones must outlive withdrawal so delayed adapter events cannot

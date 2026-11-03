@@ -4,9 +4,15 @@
 //! attachment withdraws its learned LUs without disturbing other carriers.
 //! An LU exported by more than one owner is ambiguous and cannot be routed.
 
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
-use router_core::session::QualifiedName;
+use router_core::{
+    route_registry::{AttachmentId, OwnerId, OwnerVersion, RouteKey, RouteOrigin, RouteRegistry},
+    session::QualifiedName,
+};
 
 use crate::config::RouterConfig;
 
@@ -147,7 +153,10 @@ impl Destination {
 
 #[derive(Default)]
 pub(crate) struct HprDestinationDirectory {
-    owners: HashMap<String, HashMap<QualifiedName, Destination>>,
+    registry: RouteRegistry,
+    members: HashMap<String, HashSet<OwnerId>>,
+    destinations: HashMap<OwnerId, HashMap<QualifiedName, Destination>>,
+    revisions: HashMap<OwnerId, u64>,
 }
 
 impl HprDestinationDirectory {
@@ -174,45 +183,139 @@ impl HprDestinationDirectory {
                 return Err(invalid("duplicate LU in one attachment snapshot"));
             }
         }
-        if snapshot.is_empty() {
-            self.owners.remove(owner);
+        let mut grouped = HashMap::<OwnerId, HashMap<QualifiedName, Destination>>::new();
+        for (lu, destination) in snapshot {
+            let scoped = scoped_owner(owner, destination.attachment_id())?;
+            grouped.entry(scoped).or_default().insert(lu, destination);
+        }
+        let old_members = self.members.get(owner).cloned().unwrap_or_default();
+        let new_members = grouped.keys().cloned().collect::<HashSet<_>>();
+        let mut next_registry = self.registry.clone();
+        let mut next_revisions = self.revisions.clone();
+        for member in old_members.difference(&new_members) {
+            let revision = next_revision(&mut next_revisions, member)?;
+            let old = self
+                .destinations
+                .get(member)
+                .ok_or_else(|| invalid("missing HPR route owner"))?;
+            let origin = old
+                .values()
+                .next()
+                .map(route_origin)
+                .ok_or_else(|| invalid("empty HPR route owner"))?;
+            next_registry
+                .withdraw_owner(
+                    member,
+                    origin,
+                    OwnerVersion::new(1, revision).map_err(registry_error)?,
+                )
+                .map_err(registry_error)?;
+        }
+        for (member, destinations) in &grouped {
+            let first = destinations
+                .values()
+                .next()
+                .ok_or_else(|| invalid("empty HPR route owner"))?;
+            let origin = route_origin(first);
+            if destinations.values().any(|destination| {
+                route_origin(destination) != origin
+                    || destination.attachment_id() != first.attachment_id()
+            }) {
+                return Err(invalid("mixed HPR route owner"));
+            }
+            let keys = destinations
+                .iter()
+                .map(|(lu, destination)| RouteKey::LogicalUnit {
+                    lu: lu.clone(),
+                    hosting_cp: destination.hosting_cp().clone(),
+                })
+                .collect();
+            let revision = next_revision(&mut next_revisions, member)?;
+            next_registry
+                .replace_owner(
+                    member.clone(),
+                    AttachmentId::new(first.attachment_id()).map_err(registry_error)?,
+                    origin,
+                    OwnerVersion::new(1, revision).map_err(registry_error)?,
+                    keys,
+                )
+                .map_err(registry_error)?;
+        }
+        self.registry = next_registry;
+        self.revisions = next_revisions;
+        for member in old_members {
+            self.destinations.remove(&member);
+        }
+        for (member, destinations) in grouped {
+            self.destinations.insert(member, destinations);
+        }
+        if new_members.is_empty() {
+            self.members.remove(owner);
         } else {
-            self.owners.insert(owner.to_owned(), snapshot);
+            self.members.insert(owner.to_owned(), new_members);
         }
         Ok(())
     }
 
-    pub(crate) fn withdraw_owner(&mut self, owner: &str) {
-        self.owners.remove(owner);
+    pub(crate) fn withdraw_owner(&mut self, owner: &str) -> io::Result<()> {
+        self.replace_owner(owner, [])
     }
 
     /// Return one unambiguous route. Two owners advertising the same LU fail
     /// closed even when their CP names happen to match.
     pub(crate) fn resolve_lu(&self, lu: &QualifiedName) -> Option<Destination> {
-        let mut matches = self.owners.values().filter_map(|routes| routes.get(lu));
-        let first = matches.next()?;
-        matches.next().is_none().then(|| first.clone())
+        let selected = self.registry.resolve_lu(lu, None, None).ok()?;
+        self.destinations.get(&selected.owner)?.get(lu).cloned()
     }
 
     /// Only unambiguous, verified routes are eligible for publication. A
     /// duplicate LU is omitted until one owner withdraws it.
     pub(crate) fn routes(&self) -> Vec<(QualifiedName, Destination)> {
-        let mut by_lu = HashMap::<QualifiedName, Option<Destination>>::new();
-        for routes in self.owners.values() {
-            for (lu, destination) in routes {
-                by_lu
-                    .entry(lu.clone())
-                    .and_modify(|existing| *existing = None)
-                    .or_insert_with(|| Some(destination.clone()));
-            }
-        }
-        let mut routes = by_lu
+        let mut seen = HashSet::new();
+        let mut routes = self
+            .registry
+            .entries()
             .into_iter()
-            .filter_map(|(lu, destination)| destination.map(|destination| (lu, destination)))
+            .filter_map(|entry| {
+                let RouteKey::LogicalUnit { lu, .. } = entry.key else {
+                    return None;
+                };
+                seen.insert(lu.clone())
+                    .then(|| self.resolve_lu(&lu).map(|destination| (lu, destination)))
+                    .flatten()
+            })
             .collect::<Vec<_>>();
         routes.sort_by(|(a, _), (b, _)| (&a.netid, &a.name).cmp(&(&b.netid, &b.name)));
         routes
     }
+}
+
+fn scoped_owner(owner: &str, attachment: &str) -> io::Result<OwnerId> {
+    OwnerId::new(format!("hpr:{}:{owner}:{attachment}", owner.len())).map_err(registry_error)
+}
+
+fn next_revision(revisions: &mut HashMap<OwnerId, u64>, owner: &OwnerId) -> io::Result<u64> {
+    let revision = revisions
+        .get(owner)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| invalid("HPR route revision exhausted"))?;
+    revisions.insert(owner.clone(), revision);
+    Ok(revision)
+}
+
+fn route_origin(destination: &Destination) -> RouteOrigin {
+    match destination {
+        Destination::Ws { .. } => RouteOrigin::Upstream,
+        Destination::Llc { .. } | Destination::Mptn { .. } | Destination::Ee { .. } => {
+            RouteOrigin::Local
+        }
+    }
+}
+
+fn registry_error(error: router_core::route_registry::RegistryError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -252,6 +355,31 @@ mod tests {
     }
 
     #[test]
+    fn one_carrier_snapshot_preserves_other_attachment_and_retires_old_lease() {
+        let mut directory = HprDestinationDirectory::new();
+        let a = name("SOLNET.PING");
+        let b = name("SOLNET.PRINTER");
+        directory
+            .replace_owner(
+                "llc",
+                [(a.clone(), llc("lan-a")), (b.clone(), llc("lan-b"))],
+            )
+            .unwrap();
+        let lease = directory.registry.resolve_lu(&b, None, None).unwrap().lease;
+        directory
+            .replace_owner("llc", [(a.clone(), llc("lan-a"))])
+            .unwrap();
+        assert_eq!(directory.resolve_lu(&a), Some(llc("lan-a")));
+        assert!(directory.resolve_lu(&b).is_none());
+        assert!(!directory.registry.validate_lease(&lease));
+        directory
+            .replace_owner("llc", [(a, llc("lan-a")), (b.clone(), llc("lan-b"))])
+            .unwrap();
+        assert_eq!(directory.resolve_lu(&b), Some(llc("lan-b")));
+        assert!(!directory.registry.validate_lease(&lease));
+    }
+
+    #[test]
     fn ambiguous_lu_fails_closed_and_recovers_when_owner_withdraws() {
         let mut directory = HprDestinationDirectory::new();
         let lu = name("SOLNET.SNAA");
@@ -263,7 +391,7 @@ mod tests {
             .unwrap();
         assert!(directory.resolve_lu(&lu).is_none());
         assert!(directory.routes().is_empty());
-        directory.withdraw_owner("llc-b");
+        directory.withdraw_owner("llc-b").unwrap();
         assert_eq!(directory.resolve_lu(&lu), Some(llc("llc-a")));
         assert_eq!(directory.routes(), vec![(lu, llc("llc-a"))]);
     }
