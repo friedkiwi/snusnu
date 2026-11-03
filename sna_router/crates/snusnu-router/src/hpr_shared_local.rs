@@ -76,7 +76,7 @@ impl HprSharedLocal {
                 .iter()
                 .map(|entry| entry.id.as_str())
                 .chain(config.mptn_gateway.iter().map(|entry| entry.id.as_str()))
-                .chain(std::iter::once(attachment_id)),
+                .chain(config.ee.iter().map(|entry| entry.id.as_str())),
         )?
         .get(attachment_id)
         .ok_or_else(|| io::Error::other("EE proxy MAC allocation failed"))?;
