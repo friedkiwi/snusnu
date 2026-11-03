@@ -524,6 +524,17 @@ the `0x044F` event path invokes it when station state reaches `07`. It cannot
 be sent opportunistically on the controller session. Neither this trial nor
 the address-56 dialogue has activated the configured printer.
 
+A later isolated probe waited for the first station-56 LU7 `D822/02` FMD
+fragment before sending `D823/02`. IBM i acknowledged it and transmitted
+two more `D824` fragments. The three inner RUs were 50, 503 and 241 bytes:
+the first two bytes are `04 F3` (Write Structured Field), followed by exactly
+`0x0318` (792) structured-field bytes. Their inner RH chain flags were first
+`02`, middle `00`, and last `01`; the last fragment carried CD. This proves
+that a `D824` record is one PIU, not necessarily one complete application
+request. A second `D823/02` after the final fragment also received a positive
+SNA response, but no address-01 LU4 printer session followed. The 5494's
+correct station-56 completion behavior remains to be established.
+
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
 four-byte `04 D4 07 30` subvector identifying the 5494 controller family.
