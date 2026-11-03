@@ -23,7 +23,7 @@ outbound SessionV1 open attempt from PRINTER when that LU is advertised.
 The open result and any resulting session events are logged. This option
 requires `-printer-probe`.
 
-Every launch creates a new private directory under the OS temporary directory and a new `qa.sqlite` database in it. The database path is printed at startup. The QA binary **ignores** `SNUSNU_DB_DRIVER` and `SNUSNU_DB_DSN`, does not accept a database path flag, and creates the file exclusively. It cannot open or overwrite the normal concentrator's configured database. Previous QA databases are retained until removed by the operator or the OS temporary-directory cleanup.
+By default, every launch creates a new private directory under the OS temporary directory and a new `qa.sqlite` database in it. The database path is printed at startup. To restart a lab while retaining its accounts, router tokens and managed MACs, pass `-db /path/to/existing/qa.sqlite`. The file must already exist and be private (`0600`); live connections and routes are reset at startup, and fixtures are not seeded again. The QA binary ignores `SNUSNU_DB_DRIVER` and `SNUSNU_DB_DSN`. Previous QA databases are retained until removed by the operator or the OS temporary-directory cleanup.
 
 ## Accounts
 

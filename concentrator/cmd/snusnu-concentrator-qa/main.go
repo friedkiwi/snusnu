@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ func main() {
 		listenDefault = ":8081"
 	}
 	addr := flag.String("listen", listenDefault, "QA HTTP listen address (host:port or :port for all interfaces)")
+	dbPath := flag.String("db", "", "reuse an existing private QA SQLite database instead of creating a fresh fixture")
 	origin := flag.String("origin", "http://localhost:8081", "QA public origin")
 	aliceNetID := flag.String("alice-netid", "QAALICE", "NETID for the isolated Alice QA fixture")
 	printerProbe := flag.Bool("printer-probe", false, "advertise a QA-only SNUSNU.PRINTER wire trace endpoint")
@@ -37,13 +39,15 @@ func main() {
 	qa.Accounts[1].NetID = *aliceNetID
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	db, path, err := createQAStore(ctx)
+	db, path, fresh, err := openQAStore(ctx, *dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.DB.Close()
-	if err = qa.Seed(ctx, db); err != nil {
-		log.Fatal(err)
+	if fresh {
+		if err = qa.Seed(ctx, db); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if err = db.ResetLiveState(ctx); err != nil {
 		log.Fatal(err)
@@ -95,6 +99,22 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+}
+
+func openQAStore(ctx context.Context, existingPath string) (*store.Store, string, bool, error) {
+	if existingPath == "" {
+		db, path, err := createQAStore(ctx)
+		return db, path, true, err
+	}
+	info, err := os.Stat(existingPath)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+		return nil, "", false, fmt.Errorf("QA database must be an existing private regular file")
+	}
+	db, err := store.Open(ctx, "sqlite", existingPath)
+	return db, existingPath, false, err
 }
 
 func createQAStore(ctx context.Context) (*store.Store, string, error) {
