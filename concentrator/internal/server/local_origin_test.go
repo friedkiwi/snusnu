@@ -31,6 +31,43 @@ func TestLocalServiceRegistrationRejectsInvalidDefinitions(t *testing.T) {
 	}
 }
 
+func TestLocalServiceMayShareControlPointName(t *testing.T) {
+	a := testApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := localService{LU: "SVC", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
+		AcceptSource: func(*wire.RouteExport, wire.CircuitProfile) bool { return true },
+		Handle:       func(*wire.WsEnvelope, LocalPeer) {}}
+	if err := a.hub.registerLocalServices(ctx, service); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	a.apiDirectory(response, httptest.NewRequest("GET", "/api/v1/directory", nil), store.User{})
+	var entries []store.Export
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &entries) != nil || len(entries) != 2 ||
+		entries[0].Kind != "CP" || entries[0].Name != "SVC" || entries[1].Kind != "LU" || entries[1].Name != "SVC" || entries[1].HostingCPName != "SVC" {
+		t.Fatalf("same-name CP and LU routes: status=%d entries=%+v", response.Code, entries)
+	}
+}
+
+func TestPrinterProbeAdvertises5494ControllerLU(t *testing.T) {
+	a := testApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := a.StartLocalSNAPrinterProbe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	a.apiDirectory(response, httptest.NewRequest("GET", "/api/v1/directory", nil), store.User{})
+	var entries []store.Export
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &entries) != nil || len(entries) != 4 ||
+		entries[0].Kind != "CP" || entries[0].Name != "SVC" ||
+		entries[2].Kind != "LU" || entries[2].Name != "PRINTER" || entries[2].HostingCPName != "SVC" ||
+		entries[3].Kind != "LU" || entries[3].Name != "SVC" || entries[3].HostingCPName != "SVC" {
+		t.Fatalf("printer probe routes: status=%d entries=%+v", response.Code, entries)
+	}
+}
+
 func TestLocalServiceRouteAndStampedSource(t *testing.T) {
 	a := testApp(t)
 	owner := store.RandomUUID()

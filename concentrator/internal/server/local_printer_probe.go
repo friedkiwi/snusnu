@@ -182,7 +182,7 @@ func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source Local
 func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
 	id, ok := uuidString(open.CircuitId)
 	peer := source.SNAPeer()
-	if !ok || !peer.Valid() || open.Target == nil || open.Target.RouteId != 3 || len(p.circuits) >= 64 ||
+	if !ok || !peer.Valid() || open.Target == nil || (open.Target.RouteId != 3 && open.Target.RouteId != 4) || len(p.circuits) >= 64 ||
 		(open.Profile != wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC && open.Profile != wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1) {
 		_ = p.hub.decision(p.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN})
 		return
@@ -306,7 +306,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 		return err
 	}
 	if bind != nil && bind.Management && c.management == nil {
-		if bind.PLU != c.peer.NetID+"."+c.peer.LU || bind.SLU != "SNUSNU.PRINTER" {
+		if bind.PLU != c.peer.NetID+"."+c.peer.LU || (bind.SLU != "SNUSNU.PRINTER" && bind.SLU != "SNUSNU.SVC") {
 			return fmt.Errorf("printer probe management BIND identity mismatch: %s to %s", bind.PLU, bind.SLU)
 		}
 		management, err := lu62.NewManagementSession(bind.PLU, bind.SLU)
@@ -488,7 +488,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			if _, err := rand.Read(pcid[:]); err != nil {
 				return err
 			}
-			bind, err := lu62.Candidate5494ControllerBind("SNUSNU.PRINTER", c.peer.NetID+"."+c.peer.LU, "SNUSNU.SVC", 1, 2, 0x86, pcid)
+			bind, err := lu62.Candidate5494ControllerBind("SNUSNU.SVC", c.peer.NetID+"."+c.peer.LU, "SNUSNU.SVC", 1, 2, 0x86, pcid)
 			if err != nil {
 				return err
 			}

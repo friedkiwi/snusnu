@@ -230,7 +230,7 @@ func (h *routerHub) registerLocalServices(ctx context.Context, services ...local
 	routes := []*wire.RouteExport{{Id: 1, Generation: 1, Resource: &wire.RouteExport_ControlPoint{ControlPoint: name("SVC")}}}
 	seen := map[string]bool{}
 	for i, service := range services {
-		if !localServiceName.MatchString(service.LU) || service.LU == "SVC" || seen[service.LU] || len(service.Types) == 0 || service.AcceptSource == nil || service.Handle == nil {
+		if !localServiceName.MatchString(service.LU) || seen[service.LU] || len(service.Types) == 0 || service.AcceptSource == nil || service.Handle == nil {
 			return errors.New("invalid or duplicate local service")
 		}
 		types := map[wire.LuType]bool{}

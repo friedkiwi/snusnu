@@ -76,6 +76,9 @@ func (a *App) StartLocalSNAPrinterProbe(ctx context.Context) error {
 			Handle:       aping.handle},
 		localService{LU: "PRINTER", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
 			AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
+			Handle:       probe.handle},
+		localService{LU: "SVC", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
+			AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
 			Handle:       probe.handle})
 }
 
@@ -91,7 +94,7 @@ func (a *App) DialLocalSNAPrinterProbe(ctx context.Context, netID, lu string) {
 				if a.printerProbe != nil {
 					a.printerProbe.setOutboundPeer(peer)
 				}
-				requestID, err := a.hub.localServices.openFrom(3, target, wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC)
+				requestID, err := a.hub.localServices.openFrom(4, target, wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC)
 				log.Printf("printer probe outbound open: target=%s.%s request=%d err=%v", netID, lu, requestID, err)
 				return
 			}

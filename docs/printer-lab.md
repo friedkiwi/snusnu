@@ -93,6 +93,17 @@ guest reported `SNUPRT` and `SNUPRT01` as **VARY ON PENDING**. A `DSPLIB
 LIB(QGPL) OUTPUT(*PRINT)` spool was requested after setting the job output
 queue to `SNUPRT01`; no printer data was observed at the concentrator.
 
+The initial `RMTLOCNAME(PRINTER)` above was corrected to `SVC` on the
+isolated guest with `CHGCTLRWS CTLD(SNUPRT) RMTLOCNAME(SVC)`. IBM's
+[5494 configuration guide](https://www.ibm.com/support/pages/configuring-5494-remote-control-units)
+shows that the remote workstation controller's location is the 5494 CP
+name, matching the APPC controller's remote CP. The guest's `LLCPRT` and
+`ANYSVC` APPC controllers both name `SNUSNU.SVC`; `DSPCFGL CFGL(QAPPNRMT)`
+confirmed a `SVC` remote-location entry for the guest's local LU
+`SOLNET.S1054504`. A separate `SNUSNU.PRINTER` LU remains advertised for
+the user-facing printer service. This correction did not by itself vary
+`SNUPRT01` on.
+
 An isolated QA concentrator advertised `SNUSNU.PRINTER` as LU 6.2 using a
 diagnostic handler. A V5R4 `VFYAPPCCNN` to that LU sent a successful HPR
 RouteSetup, then exposed two independent gates:
@@ -190,6 +201,14 @@ rejected a shared-session QRMTWSC Attach with `80050000` after its default
 management session ended, so the source CNOS/session association remains
 the next blocker.
 
+After correcting `SNUPRT` to `RMTLOCNAME(SVC)`, the QA concentrator also
+advertised a controller LU `SNUSNU.SVC` alongside `SNUSNU.PRINTER`. The
+guest's LLC management BIND then named `SNUSNU.SVC`; its CNOS completed,
+and IBM i positively acknowledged the address-01 NMVT on this circuit.
+`SNUPRT` remained pending. The source controller BIND is still missing on
+LLC, so neither the remote workstation controller nor the printer became
+active.
+
 Two further QA-only source CNOS timing probes were removed after capture.
 Sending the QRMTWSC Attach immediately after the guest's SNASVCMG BIND, or
 on receipt of its BIS before answering BIS, caused a host UNBIND of type
@@ -252,6 +271,16 @@ captured from a real 5494. Station `38` is not the configured printer at
 address `01`, and its LU type is 7 rather than 4. The controller remains
 `VARY ON PENDING`; the guest has queued spool files but has not sent an
 address-01 printer BIND or SCS data. No spool has reached the concentrator.
+
+With `SNUPRT` corrected to remote location `SVC`, an outbound AnyNet
+controller circuit sourced from the distinct LU route `SNUSNU.SVC`
+again completed source CNOS, the controller BIND, and the `30F0F6F6`
+Attach. The guest still emitted the address-56 LU7 exchange. Sending the
+same direct address-01 NMVT PIU on that bound TCP62 controller association
+caused the router to reject it as `native PIU session address mismatch`;
+the guest did not receive it. AnyNet therefore needs a separate
+management-services path for the NMVT, or evidence of the correct MPTN
+envelope, rather than inserting it into the controller LU6.2 session.
 
 The next protocol gate is activating the 5494 controller session and
 observing the host's printer-session BIND and private `D824` records. The current
