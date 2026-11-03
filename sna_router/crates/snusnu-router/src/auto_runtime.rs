@@ -199,9 +199,23 @@ fn local_llc_hosting_cp(
 fn unique_cold_llc_target(
     config: &RouterConfig,
     bridge: &AutoLlcWsBridge,
+    fabric: &AutomaticFabric,
     pending: &HashMap<u64, PendingUpstreamLlc>,
+    ingress: &str,
     target_lu: &QualifiedName,
 ) -> io::Result<Option<(PortId, QualifiedName)>> {
+    // A CP proof on another local carrier is enough to make a NETID-only
+    // fallback ambiguous, even before that carrier has disclosed this LU.
+    // In particular, do not send a cold EE destination to the sole LLC peer.
+    let other_carriers = config
+        .ee
+        .iter()
+        .map(|peer| peer.id.as_str())
+        .chain(config.mptn_gateway.iter().map(|peer| peer.id.as_str()))
+        .filter(|id| *id != ingress);
+    if competing_local_cp_in_netid(fabric, target_lu, other_carriers) {
+        return Ok(None);
+    }
     let mut candidates = Vec::new();
     for attachment in &config.llc {
         let id = PortId::new(&attachment.id);
@@ -217,6 +231,18 @@ fn unique_cold_llc_target(
         candidates.push((id, cp));
     }
     select_unique_cold_llc_cp(target_lu, candidates)
+}
+
+fn competing_local_cp_in_netid<'a>(
+    fabric: &AutomaticFabric,
+    target_lu: &QualifiedName,
+    other_carriers: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let others: HashSet<&str> = other_carriers.into_iter().collect();
+    fabric.directory().local_routes().into_iter().any(|route| {
+        others.contains(route.attachment.as_str())
+            && matches!(route.key, RouteKey::ControlPoint(cp) if cp.netid == target_lu.netid)
+    })
 }
 
 fn select_unique_cold_llc_cp(
@@ -2626,7 +2652,14 @@ impl<'a> AutoLocalSessionRunner<'a> {
                         && requested_target.is_ok() =>
                 {
                     let target = requested_target.as_ref().unwrap();
-                    match unique_cold_llc_target(config, bridge, pending_llc_upstream, target) {
+                    match unique_cold_llc_target(
+                        config,
+                        bridge,
+                        fabric,
+                        pending_llc_upstream,
+                        gateway.id(),
+                        target,
+                    ) {
                         Ok(Some((id, cp))) => {
                             tracing::info!(gateway = gateway.id(), association,
                                 target_lu = %target, target_cp = %cp, egress = %id.0,
@@ -3903,6 +3936,41 @@ mod session_profile_tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn cold_llc_fallback_withholds_unknown_lu_when_ee_could_host_netid() {
+        let mut fabric = AutomaticFabric::new();
+        let target: QualifiedName = "LOCAL.UNKNOWN".parse().unwrap();
+        let llc_cp: QualifiedName = "LOCAL.LLCCP".parse().unwrap();
+        let ee_cp: QualifiedName = "LOCAL.EECP".parse().unwrap();
+        let llc = PortId::new("llc");
+        let ee = PortId::new("ee");
+        fabric
+            .directory_mut()
+            .replace_local_records(
+                llc.clone(),
+                vec![RouteRecord::from(RouteKey::ControlPoint(llc_cp.clone()))],
+            )
+            .unwrap();
+        let select_llc = || select_unique_cold_llc_cp(&target, [(llc.clone(), llc_cp.clone())]);
+        assert_eq!(select_llc().unwrap(), Some((llc, llc_cp)));
+        assert!(!competing_local_cp_in_netid(&fabric, &target, ["ee"]));
+
+        fabric
+            .directory_mut()
+            .replace_local_records(ee, vec![RouteRecord::from(RouteKey::ControlPoint(ee_cp))])
+            .unwrap();
+        assert!(competing_local_cp_in_netid(&fabric, &target, ["ee"]));
+        assert!(!competing_local_cp_in_netid(
+            &fabric,
+            &target,
+            ["mptn-source"]
+        ));
+        assert!(fabric
+            .directory()
+            .resolve_lu(&PortId::new("mptn-source"), &target)
+            .is_err());
     }
 
     #[test]
