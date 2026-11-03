@@ -646,6 +646,22 @@ the corrected 20:01 NMVT trial. The existing `SNUPRT01 not available` writer
 message was sent at 13:12:38; neither is evidence of a new rejection of the
 corrected NMVT. Both controller and printer remain `VARY ON PENDING`.
 
+The six zero Address List bytes in the QA Reply PSID also match the VG15
+short-product firmware template at raw-image offset `0x1407`. In the power-on
+builder (`0x5C0..0x833`), the only write to the ten-byte Address List after
+copying that template is at output offset `+0x12`, where the final linear
+workstation address is set to `01`. This rules out those six zero bytes as an
+identified deviation from this firmware branch. It does not establish that
+the host's positive SNA response delivered the report to the closed 5494
+controller application: the [5494 Functions Reference](https://bitsavers.org/pdf/ibm/5494/SC30-3533-04_5494_Remote_Control_Unit_Functions_Reference_Rel_3.1_1995.pdf)
+describes workstation notification as travelling on the controller session.
+
+After the 20:41 corrected NMVT trial, varying `SNUPRT01` off and back on did
+not cause another address-01 session. `WRKCFGSTS CFGTYPE(*DEV)
+CFGD(SNUPRT01)` reported "Powered off or not yet available". The verbose
+router and QA logs show no new SNA information following that vary-on; the
+existing LLC traffic was supervisory keepalives.
+
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
 four-byte `04 D4 07 30` subvector identifying the 5494 controller family.
