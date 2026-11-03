@@ -100,6 +100,10 @@ impl HprRtpPort {
         self.scope_for(user)
     }
 
+    pub(crate) fn route_setup_scope(&self) -> Option<RtpAssociationScope> {
+        self.scope_for(self.route_setup.as_ref()?)
+    }
+
     /// Directional identifiers for the validated CP management RTP topic.
     /// The first qualified BIND uses the origin TCID; subsequent peer BIUs
     /// use our CIE-assigned TCID after the link generation is pinned.
@@ -123,6 +127,12 @@ impl HprRtpPort {
 
     pub(crate) fn cp_out_ready(&self) -> bool {
         self.cp_out_scope().is_some()
+    }
+
+    /// A replacement of the peer's CP management RTP invalidates the old
+    /// reciprocal CP connection. The caller first retires its CP session.
+    pub(crate) fn reset_cp_out(&mut self) {
+        self.cp_svc_mg_out = None;
     }
 
     /// Originate the reciprocal CPSVCMG RTP connection on the same EE TG.
@@ -207,12 +217,16 @@ impl HprRtpPort {
         })
     }
 
-    pub(crate) fn on_ee_ui(
+    pub(crate) fn on_ee_ui<F>(
         &mut self,
         ee: &EeLdlcEndpoint,
         datagram: &Datagram,
         _now_us: u64,
-    ) -> io::Result<Vec<RtpIngress>> {
+        can_replace: F,
+    ) -> io::Result<Vec<RtpIngress>>
+    where
+        F: Fn(RtpIngressKind) -> bool,
+    {
         self.check_link(ee)?;
         if datagram.kind != LdlcKind::UiNlp || datagram.payload.len() < 4 {
             return Err(invalid("RTP port requires one EE UI NLP"));
@@ -221,7 +235,7 @@ impl HprRtpPort {
         let packet = RtpPacket::parse(nlp)
             .map_err(|error| invalid(format!("invalid RTP NLP: {error:?}")))?;
         if packet.tcid & ASSIGNOR != 0 {
-            return self.on_setup(ee, datagram, packet);
+            return self.on_setup(ee, datagram, packet, &can_replace);
         }
         if self
             .cp_svc_mg_out
@@ -442,16 +456,20 @@ impl HprRtpPort {
             .collect())
     }
 
-    fn on_setup(
+    fn on_setup<F>(
         &mut self,
         ee: &EeLdlcEndpoint,
         datagram: &Datagram,
         packet: RtpPacket<'_>,
-    ) -> io::Result<Vec<RtpIngress>> {
+        can_replace: &F,
+    ) -> io::Result<Vec<RtpIngress>>
+    where
+        F: Fn(RtpIngressKind) -> bool,
+    {
         let topic = classify_setup_topic(packet)
             .map_err(|error| invalid(format!("invalid RTP setup topic: {error:?}")))?;
         let kind = kind_for(&topic);
-        if let Some(existing) = self.endpoint_mut(kind) {
+        if let Some(existing) = self.endpoint(kind) {
             if let Some(reply) = existing.reply_to_duplicate_setup(&datagram.payload[3..]) {
                 if datagram.port != 12004 - u16::from(existing.priority()) {
                     return Err(invalid("duplicate RTP setup on wrong EE priority port"));
@@ -459,7 +477,9 @@ impl HprRtpPort {
                 ee.send_nlp(datagram.port, reply)?;
                 return Ok(Vec::new());
             }
-            return Err(invalid("second HPR RTP setup on occupied topic"));
+            if !can_replace(kind) {
+                return Err(invalid("second HPR RTP setup on occupied topic"));
+            }
         }
         let tg = ee.tg_number().ok_or_else(|| invalid("EE TG not active"))?;
         let trusted = validate_inbound_switching_path(
@@ -489,7 +509,7 @@ impl HprRtpPort {
                 .origin_tcid()
                 .ok_or_else(|| invalid("RTP setup missing origin identifier"))?,
         };
-        *self.slot_mut(kind) = Some(endpoint);
+        self.install_setup(kind, endpoint);
         Ok(messages
             .into_iter()
             .map(|bytes| RtpIngress {
@@ -498,6 +518,18 @@ impl HprRtpPort {
                 bytes,
             })
             .collect())
+    }
+
+    fn install_setup(&mut self, kind: RtpIngressKind, endpoint: RtpInboundEndpoint) {
+        if self.endpoint(kind).is_some() {
+            tracing::info!(kind = ?kind, generation = self.bootstrap.generation.get(),
+                "replaced quiescent HPR RTP connection after validated fresh setup");
+            if kind == RtpIngressKind::RouteSetup {
+                self.authorized_user_route = None;
+                self.user = None;
+            }
+        }
+        *self.slot_mut(kind) = Some(endpoint);
     }
 
     fn on_established_packet(
@@ -794,5 +826,42 @@ mod tests {
         assert_eq!(priority_port(0xc6).unwrap(), 12001);
         assert_eq!(priority_port(0xc2).unwrap(), 12003);
         assert!(priority_port(0x80).is_err());
+    }
+
+    #[test]
+    fn replacing_route_setup_retires_old_user_rtp_and_authorization() {
+        let mut port = HprRtpPort::new(bootstrap());
+        let route = AuthorizedUserRoute {
+            generation: ConnectionGeneration::new(1).unwrap(),
+            target_lu: "SNUSNU.PING".parse().unwrap(),
+            local_nce_label: vec![0xb0, 1],
+            local_nce_instance: [0, 0, 0, 9],
+            cos_tpf: vec![4, 0x2c, 1, 0],
+            tg_number: 1,
+            return_link_label: vec![0x80, 1],
+            maximum_packet_size: 1461,
+        };
+        let old_route = RtpInboundEndpoint::new(
+            port.config_for(RtpIngressKind::RouteSetup, &path())
+                .unwrap(),
+        )
+        .unwrap();
+        port.install_setup(RtpIngressKind::RouteSetup, old_route);
+        port.authorize_user_route(route.clone()).unwrap();
+        let old_user =
+            RtpInboundEndpoint::new(port.config_for(RtpIngressKind::User, &path()).unwrap())
+                .unwrap();
+        port.install_setup(RtpIngressKind::User, old_user);
+
+        let new_route = RtpInboundEndpoint::new(
+            port.config_for(RtpIngressKind::RouteSetup, &path())
+                .unwrap(),
+        )
+        .unwrap();
+        port.install_setup(RtpIngressKind::RouteSetup, new_route);
+        assert!(port.user.is_none());
+        assert!(port.authorized_user_route.is_none());
+        assert!(port.config_for(RtpIngressKind::User, &path()).is_err());
+        port.authorize_user_route(route).unwrap();
     }
 }

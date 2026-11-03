@@ -933,10 +933,40 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
         }
         if let Some(datagram) = link.poll(now)? {
             if let Some(runtime) = active.as_mut() {
+                let no_user_work = runtime.sessions.is_empty()
+                    && runtime
+                        .pending_rtp
+                        .iter()
+                        .all(|message| message.kind != RtpIngressKind::User);
+                let replace_route = no_user_work
+                    && runtime.route_reply.is_none()
+                    && runtime.negative_route_reply.is_none()
+                    && runtime
+                        .pending_rtp
+                        .iter()
+                        .all(|message| message.kind != RtpIngressKind::RouteSetup);
+                let replace_cp = no_user_work
+                    && runtime.pending_cp_replies.is_empty()
+                    && runtime.pending_reciprocal_replies.is_empty()
+                    && runtime.pending_rtp.iter().all(|message| {
+                        !matches!(
+                            message.kind,
+                            RtpIngressKind::CpSvcMg | RtpIngressKind::CpSvcMgOut
+                        )
+                    });
+                let old_route_scope = runtime.rtp.route_setup_scope();
+                let old_cp_scope = runtime.rtp.cp_scope();
+                let old_user_scope = runtime.rtp.user_scope();
                 let messages = match runtime.rtp.on_ee_ui(
                     &link,
                     &datagram,
                     clock.elapsed().as_micros() as u64,
+                    |kind| match kind {
+                        RtpIngressKind::RouteSetup => replace_route,
+                        RtpIngressKind::CpSvcMg => replace_cp,
+                        RtpIngressKind::CpSvcMgOut => false,
+                        RtpIngressKind::User => no_user_work,
+                    },
                 ) {
                     Ok(messages) => messages,
                     Err(error) if error.kind() == io::ErrorKind::InvalidData => {
@@ -948,6 +978,30 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                     }
                     Err(error) => return Err(error),
                 };
+                if old_route_scope.is_some() && runtime.rtp.route_setup_scope() != old_route_scope {
+                    runtime.route_setup = None;
+                    runtime.route_reply = None;
+                    runtime.negative_route_reply = None;
+                    runtime.user_route_authorized = false;
+                    runtime.bound_user_scope = None;
+                    tracing::info!(attachment = %attachment.id,
+                        generation = link.generation().get(),
+                        "HPR RouteSetup RTP restarted on active EE link");
+                }
+                if old_cp_scope.is_some() && runtime.rtp.cp_scope() != old_cp_scope {
+                    runtime.cp_management = None;
+                    runtime.reciprocal_cp = None;
+                    runtime.rtp.reset_cp_out();
+                    tracing::info!(attachment = %attachment.id,
+                        generation = link.generation().get(),
+                        "HPR CP management RTP restarted on active EE link");
+                }
+                if old_user_scope.is_some() && runtime.rtp.user_scope() != old_user_scope {
+                    runtime.bound_user_scope = None;
+                    tracing::info!(attachment = %attachment.id,
+                        generation = link.generation().get(),
+                        "HPR user RTP restarted on active EE link");
+                }
                 runtime.queue_rtp(messages)?;
             }
         }
