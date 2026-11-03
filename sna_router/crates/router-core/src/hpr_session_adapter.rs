@@ -631,13 +631,12 @@ fn user_bind_identity(
         .map_err(|_| HprAdapterError::UnqualifiedBind)?
         .ok_or(HprAdapterError::UnqualifiedBind)?;
     if let BindClass::Management { ref mode } = bind.class {
-        // V5R4 APING can send its LU 6.2 BIND with SNASVCMG as the mode even
-        // though the target is the concentrator's application LU. Admit only
-        // this exact server-owned service and a caller-verified CP pair; all
-        // CP management modes and untrusted/unqualified targets stay out of
-        // the user-session fabric.
+        // IBM i can send a service-directed LU 6.2 BIND with SNASVCMG as its
+        // mode. The route and hosting CP are verified by the caller; allow
+        // any advertised concentrator service LU under SNUSNU.SVC. A CP BIND
+        // itself still stays out of the user-session fabric.
         if mode != "SNASVCMG"
-            || bind.slu != "SNUSNU.PING"
+            || !is_concentrator_service_lu(&bind.slu)
             || !target_cp
                 .as_ref()
                 .is_some_and(|cp| cp.netid == "SNUSNU" && cp.name == "SVC")
@@ -651,6 +650,10 @@ fn user_bind_identity(
     let target_lu =
         QualifiedName::from_str(&bind.slu).map_err(|_| HprAdapterError::UnqualifiedBind)?;
     Ok(SessionIdentity::new(source_lu, target_lu).with_control_points(source_cp, target_cp)?)
+}
+
+fn is_concentrator_service_lu(name: &str) -> bool {
+    QualifiedName::from_str(name).is_ok_and(|lu| lu.netid == "SNUSNU" && lu.name != "SVC")
 }
 
 fn is_unbind_request(unit: &SessionUnit) -> bool {
@@ -1328,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_v5r4_aping_snasvcmg_bind_requires_exact_service_cp() {
+    fn captured_v5r4_aping_snasvcmg_bind_requires_service_cp() {
         // Complete FID5 BIU observed in the V5R4 EE APING attempt.
         let hex = concat!(
             "5d00000080020600f0f100016b800031001307b0b051330787868687070602",
@@ -1406,6 +1409,15 @@ mod tests {
             reject_cp.ingest_verified(observation(s.initial_plu_tcid), &cp_management),
             Err(HprAdapterError::ManagementBind)
         );
+    }
+
+    #[test]
+    fn concentrator_service_bind_scope_includes_printer_without_admitting_cp() {
+        assert!(is_concentrator_service_lu("SNUSNU.PING"));
+        assert!(is_concentrator_service_lu("SNUSNU.PRINTER"));
+        assert!(!is_concentrator_service_lu("SNUSNU.SVC"));
+        assert!(!is_concentrator_service_lu("OTHER.PRINTER"));
+        assert!(!is_concentrator_service_lu("PRINTER"));
     }
 
     #[test]
