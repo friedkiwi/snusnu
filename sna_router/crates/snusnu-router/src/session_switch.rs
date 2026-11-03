@@ -9,6 +9,9 @@ use router_core::{
     },
 };
 
+#[path = "ee_session_bridge.rs"]
+pub(crate) mod ee_bridge;
+
 pub(crate) const HPR_ADAPTER: AdapterId = AdapterId(1);
 pub(crate) const WS_ADAPTER: AdapterId = AdapterId(2);
 pub(crate) const LOCAL_ADAPTER: AdapterId = AdapterId(3);
