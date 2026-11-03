@@ -47,6 +47,7 @@ use router_core::{
     session_fabric::{
         AdapterId, FabricError, FabricLimits, FabricSessionId, Reachability, SessionFabric,
     },
+    ConnectionGeneration,
 };
 use transport_ws::wire;
 
@@ -65,6 +66,27 @@ static CP_NONCE_SEED: OnceLock<u64> = OnceLock::new();
 
 fn protocol(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteIngressDisposition {
+    Request,
+    ReverseReply,
+    StaleReply,
+}
+
+fn classify_route_ingress(
+    request: &RouteSetupGds<'_>,
+    generation: ConnectionGeneration,
+    reverse_key: Option<(ConnectionGeneration, [u8; 8])>,
+) -> RouteIngressDisposition {
+    if request.kind == RouteSetupKind::Request {
+        RouteIngressDisposition::Request
+    } else if reverse_key == Some((generation, request.pcid)) {
+        RouteIngressDisposition::ReverseReply
+    } else {
+        RouteIngressDisposition::StaleReply
+    }
 }
 
 fn as_wire_name(value: &router_core::session::QualifiedName) -> wire::SnaName {
@@ -671,16 +693,42 @@ impl<'a> DirectHprRuntime<'a> {
         message: &RtpIngress,
         _now_us: u64,
     ) -> io::Result<()> {
+        let request = RouteSetupGds::parse(&message.bytes)
+            .map_err(|error| protocol(format!("invalid HPR RouteSetup: {error:?}")))?;
+        match classify_route_ingress(
+            &request,
+            message.observation.generation,
+            self.reverse
+                .as_ref()
+                .and_then(ReverseRuntime::route_reply_key),
+        ) {
+            RouteIngressDisposition::StaleReply => {
+                tracing::warn!(pcid = ?request.pcid, generation = message.observation.generation.get(),
+                    kind = ?request.kind, "ignoring stale or unrelated HPR RouteSetup reply");
+                return Ok(());
+            }
+            RouteIngressDisposition::ReverseReply => {}
+            RouteIngressDisposition::Request => {}
+        }
+        if request.kind != RouteSetupKind::Request {
+            let reverse = self.reverse.as_mut().expect("matched reverse route exists");
+            let result = if request.kind == RouteSetupKind::PositiveReply {
+                reverse.on_rtp(message.clone(), &mut self.switch)
+            } else {
+                Err(protocol("negative HPR RouteSetup reply"))
+            };
+            if let Err(error) = result {
+                tracing::warn!(pcid = ?request.pcid, error = %error,
+                    "reverse HPR RouteSetup rejected; closing one LU circuit");
+                reverse.abort_route(&mut self.switch)?;
+            }
+            return Ok(());
+        }
         if self.route_reply.is_some() || self.negative_route_reply.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "route reply pending",
             ));
-        }
-        let request = RouteSetupGds::parse(&message.bytes)
-            .map_err(|error| protocol(format!("invalid HPR RouteSetup: {error:?}")))?;
-        if request.kind != RouteSetupKind::Request {
-            return Err(protocol("unexpected HPR RouteSetup reply"));
         }
         let Some(target_name) = request.destination_lu_name.as_deref() else {
             let tg = link
@@ -1954,6 +2002,38 @@ mod tests {
         hpr_session_address::RtpObservation,
         ConnectionGeneration,
     };
+
+    #[test]
+    fn captured_guest_route_reply_uses_inbound_route_setup_topic() {
+        // The OS/400 peer returned this positive GDS on its existing inbound
+        // RouteSetup RTP connection, not on our new outbound setup TCID.
+        let hex = "009212ce8001a0000003a980000000001a800000000005b5000003e8000186a00000000a066704008023156018d9345accc7b4460ae2d5e4e2d5e44be2e5c30c2c01087bc3d6d5d5c5c3e30e0ef4e2d6d3d5c5e34be2d5c1c20426a400063900000007152b010011460f80010ae2d5e4e2d5e44be2e5c3211a808000000005b500000114000010cc00000000066704008002";
+        let gds = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        let reply = RouteSetupGds::parse(&gds).unwrap();
+        assert_eq!(reply.kind, RouteSetupKind::PositiveReply);
+        assert_eq!(reply.pcid, [0x18, 0xd9, 0x34, 0x5a, 0xcc, 0xc7, 0xb4, 0x46]);
+        let generation = ConnectionGeneration::new(1).unwrap();
+        assert_eq!(
+            classify_route_ingress(&reply, generation, Some((generation, reply.pcid))),
+            RouteIngressDisposition::ReverseReply
+        );
+        assert_eq!(
+            classify_route_ingress(&reply, generation, None),
+            RouteIngressDisposition::StaleReply
+        );
+        assert_eq!(
+            classify_route_ingress(
+                &reply,
+                ConnectionGeneration::new(2).unwrap(),
+                Some((generation, reply.pcid))
+            ),
+            RouteIngressDisposition::StaleReply
+        );
+    }
 
     fn q(value: &str) -> QualifiedName {
         value.parse().unwrap()

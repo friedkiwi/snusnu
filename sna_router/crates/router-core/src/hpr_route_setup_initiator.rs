@@ -456,4 +456,37 @@ mod tests {
         );
         assert_eq!(packet.data, initiator.request());
     }
+
+    #[test]
+    fn accepts_captured_os400_reverse_route_reply() {
+        let mut local = ad("SNUSNU.SVC", 1);
+        local.link_label = vec![0x80, 0x23];
+        let mut peer = ad("SOLNET.SNAB", 2);
+        peer.link_label = vec![0x80, 0x02];
+        let generation = ConnectionGeneration::new(1).unwrap();
+        let bootstrap = HprControlBootstrap::new(generation, local, peer).unwrap();
+        let pcid = [0x18, 0xd9, 0x34, 0x5a, 0xcc, 0xc7, 0xb4, 0x46];
+        let mut initiator = DirectRouteSetupInitiator::new(
+            bootstrap,
+            "SOLNET.SNAB".parse().unwrap(),
+            1,
+            pcid,
+            vec![0xa4, 1],
+            [0, 0, 0, 5],
+            DirectLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            },
+        )
+        .unwrap();
+        let request = initiator.request().to_vec();
+        initiator.confirm_request_sent(&request).unwrap();
+        let reply = unhex("009212ce8001a0000003a980000000001a800000000005b5000003e8000186a00000000a066704008023156018d9345accc7b4460ae2d5e4e2d5e44be2e5c30c2c01087bc3d6d5d5c5c3e30e0ef4e2d6d3d5c5e34be2d5c1c20426a400063900000007152b010011460f80010ae2d5e4e2d5e44be2e5c3211a808000000005b500000114000010cc00000000066704008002");
+        let route = initiator.observe_reply(generation, &reply).unwrap();
+        assert_eq!(route.peer_user_nce_label, [0xa4, 0]);
+        assert_eq!(route.peer_user_nce_instance, [0, 0, 0, 7]);
+        assert_eq!(route.peer_link_label, [0x80, 2]);
+        assert_eq!(route.maximum_packet_size, 1461);
+    }
 }

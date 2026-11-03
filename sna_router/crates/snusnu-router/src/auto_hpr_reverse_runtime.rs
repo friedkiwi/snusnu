@@ -188,13 +188,32 @@ impl ReverseRuntime {
         self.phase == Phase::Done
     }
 
+    pub(crate) fn route_reply_key(&self) -> Option<(router_core::ConnectionGeneration, [u8; 8])> {
+        (self.phase == Phase::AwaitRoute).then_some((self.bootstrap.generation, self.pcid))
+    }
+
+    pub(crate) fn abort_route(&mut self, switch: &mut SessionSwitch) -> io::Result<()> {
+        if self.phase != Phase::AwaitRoute {
+            return Err(invalid("reverse HPR RouteSetup is not awaiting a reply"));
+        }
+        switch
+            .discard_unopened(self.source_adapter, self.handle)
+            .map_err(|error| switch_error("reverse HPR RouteSetup abort", error))?;
+        self.phase = Phase::Done;
+        self.source.close()?;
+        self.source_closed = true;
+        Ok(())
+    }
+
     pub(crate) fn on_rtp(
         &mut self,
         message: RtpIngress,
         switch: &mut SessionSwitch,
     ) -> io::Result<()> {
         match message.kind {
-            RtpIngressKind::RouteSetupOut if self.phase == Phase::AwaitRoute => {
+            RtpIngressKind::RouteSetup | RtpIngressKind::RouteSetupOut
+                if self.phase == Phase::AwaitRoute =>
+            {
                 let reverse = self
                     .reverse
                     .as_mut()
