@@ -25,6 +25,7 @@ pub(crate) enum ReadyLocalHpr {
 /// Owns protocol proof and EE session state, but never binds LLC or TCP62.
 pub(crate) struct HprSharedLocal {
     mptn: HashMap<String, HprMptnPeerState>,
+    mptn_owners: HashMap<String, String>,
     candidates: Vec<ConfiguredCandidate>,
     ee_llc: HashMap<String, EeLlcState>,
 }
@@ -52,6 +53,7 @@ impl HprSharedLocal {
             .collect();
         Ok(Self {
             mptn,
+            mptn_owners: HashMap::new(),
             candidates,
             ee_llc: HashMap::new(),
         })
@@ -143,7 +145,10 @@ impl HprSharedLocal {
             match runner.with_gateway(&id, |gateway| {
                 state.take_source(gateway, offered, directory)
             }) {
-                Ok(source) => ready = Some(ReadyLocalHpr::Mptn(source)),
+                Ok(source) => {
+                    self.mptn_owners.insert(id, source.target_ee_id.clone());
+                    ready = Some(ReadyLocalHpr::Mptn(source));
+                }
                 Err(error) => tracing::warn!(gateway = %id, association, error = %error,
                     "MPTN offer did not select a verified EE destination"),
             }
@@ -196,6 +201,7 @@ impl HprSharedLocal {
     pub(crate) fn take_mptn_session(
         &mut self,
         runner: &mut AutoLocalSessionRunner<'_>,
+        ee_attachment_id: &str,
         gateway_id: &str,
         identity: &SessionIdentity,
         bind: &SessionUnit,
@@ -205,9 +211,14 @@ impl HprSharedLocal {
             .mptn
             .get_mut(gateway_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "MPTN peer state absent"))?;
-        runner.with_gateway(gateway_id, |gateway| {
+        let session = runner.with_gateway(gateway_id, |gateway| {
             state.take_session(gateway, &self.candidates, identity, bind, timeout)
-        })
+        })?;
+        if session.is_some() {
+            self.mptn_owners
+                .insert(gateway_id.to_owned(), ee_attachment_id.to_owned());
+        }
+        Ok(session)
     }
 
     pub(crate) fn release_mptn(
@@ -222,7 +233,9 @@ impl HprSharedLocal {
         runner.with_gateway(gateway_id, |gateway| {
             state.release(gateway);
             Ok(())
-        })
+        })?;
+        self.mptn_owners.remove(gateway_id);
+        Ok(())
     }
 
     pub(crate) fn release_llc(
@@ -254,11 +267,20 @@ impl HprSharedLocal {
                 runner.withdraw_llc_proxy_mac(&id, state.proxy_mac)?;
             }
         }
-        for (id, state) in &mut self.mptn {
-            runner.with_gateway(id, |gateway| {
+        let owned = self
+            .mptn_owners
+            .iter()
+            .filter_map(|(gateway, ee)| (ee == attachment_id).then_some(gateway.clone()))
+            .collect::<Vec<_>>();
+        for id in owned {
+            let state = self.mptn.get_mut(&id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "MPTN owner has no gateway state")
+            })?;
+            runner.with_gateway(&id, |gateway| {
                 state.release(gateway);
                 Ok(())
             })?;
+            self.mptn_owners.remove(&id);
         }
         Ok(())
     }

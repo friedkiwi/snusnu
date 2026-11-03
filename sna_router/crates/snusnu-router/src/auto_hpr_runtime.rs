@@ -2236,6 +2236,9 @@ impl<'a> DirectHprRuntime<'a> {
                 let session = if let Some(access) = shared.as_deref_mut() {
                     access.shared.take_mptn_session(
                         access.runner,
+                        self.ee_attachment_id
+                            .as_deref()
+                            .ok_or_else(|| protocol("EE attachment ID absent"))?,
                         attachment_id,
                         &identity,
                         &bind_request,
