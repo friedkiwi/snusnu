@@ -179,7 +179,19 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                     local.replace_ee_records(&export.owner, export.records)?;
                 }
             }
-            directory.replace_owner("ee", ee_routes.clone())?;
+            for slot in &slots {
+                if slot.active.is_some() {
+                    directory.replace_owner(
+                        &format!("ee:{}", slot.attachment.id),
+                        ee_routes
+                            .iter()
+                            .filter(|(_, destination)| {
+                                destination.attachment_id() == slot.attachment.id
+                            })
+                            .cloned(),
+                    )?;
+                }
+            }
             for slot in &mut slots {
                 if let Some(runtime) = slot.active.as_mut() {
                     runtime.replace_other_ee_routes(

@@ -249,6 +249,7 @@ pub(crate) struct DirectHprRuntime<'a> {
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
     route_targets: HashMap<router_core::session::QualifiedName, Destination>,
     local_directory: HprDestinationDirectory,
+    other_ee_owners: HashSet<String>,
     external_management: ExternalManagementRoutes,
     local_exports: Vec<(router_core::session::QualifiedName, Destination)>,
     llc: Option<HprLlcAttachments>,
@@ -298,6 +299,7 @@ impl<'a> DirectHprRuntime<'a> {
             route_setup: HashMap::new(),
             route_targets: HashMap::new(),
             local_directory: HprDestinationDirectory::new(),
+            other_ee_owners: HashSet::new(),
             external_management: ExternalManagementRoutes::default(),
             local_exports: Vec::new(),
             llc: None,
@@ -377,7 +379,24 @@ impl<'a> DirectHprRuntime<'a> {
         &mut self,
         routes: Vec<(router_core::session::QualifiedName, Destination)>,
     ) -> io::Result<()> {
-        self.local_directory.replace_owner("other_ee", routes)
+        let mut grouped = HashMap::<String, Vec<_>>::new();
+        for (lu, destination) in routes {
+            grouped
+                .entry(destination.attachment_id().to_owned())
+                .or_default()
+                .push((lu, destination));
+        }
+        let next = grouped.keys().cloned().collect::<HashSet<_>>();
+        for old in self.other_ee_owners.difference(&next) {
+            self.local_directory
+                .withdraw_owner(&format!("other_ee:{old}"))?;
+        }
+        for (id, routes) in grouped {
+            self.local_directory
+                .replace_owner(&format!("other_ee:{id}"), routes)?;
+        }
+        self.other_ee_owners = next;
+        Ok(())
     }
 
     pub(crate) fn take_ee_handoffs(&mut self) -> Vec<ReadyLocalHpr> {
