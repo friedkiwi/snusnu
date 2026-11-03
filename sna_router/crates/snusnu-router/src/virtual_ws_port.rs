@@ -164,7 +164,6 @@ impl<P: RoutePort> VirtualWsPort<P> {
         if self.initial_xid_sent
             || self.management.is_some()
             || self.management_invalidated
-            || initiator.local_cp() != self.local_cp
             || initiator.remote_cp() != self.peer_cp
         {
             return Err(protocol(
@@ -182,7 +181,7 @@ impl<P: RoutePort> VirtualWsPort<P> {
         &mut self,
         initiator: NativeManagementInitiator,
     ) -> io::Result<()> {
-        if initiator.local_cp() != self.local_cp || initiator.remote_cp() != self.peer_cp {
+        if initiator.remote_cp() != self.peer_cp {
             return Err(protocol("virtual management identity mismatch"));
         }
         if self.user_closed {
@@ -768,9 +767,14 @@ impl<P: RoutePort> VirtualWsPort<P> {
 
     fn receive_reciprocal_management(&mut self, piu: &[u8]) -> io::Result<()> {
         if self.reciprocal_management.is_none() {
+            let management_cp = self
+                .management
+                .as_ref()
+                .map(NativeManagementInitiator::local_cp)
+                .unwrap_or(&self.local_cp);
             self.reciprocal_management = Some(ManagementSession::new(
                 self.peer_cp.clone(),
-                self.local_cp.clone(),
+                management_cp.to_owned(),
             ));
         }
         let responder = self.reciprocal_management.as_mut().unwrap();
@@ -1310,6 +1314,40 @@ mod tests {
             8,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn routed_management_cp_may_differ_from_adjacent_xid_cp() {
+        let inner = MockWs {
+            incoming: VecDeque::new(),
+            sent: vec![],
+            information: vec![],
+            completed: 0,
+            inbound_completed: 0,
+            ready_sent: 0,
+        };
+        let mut port = VirtualWsPort::new(
+            inner,
+            xid("SOLNET.SNAB", Role::Secondary),
+            "SOLNET.SNAB",
+            "SOLNET.SNAA",
+        )
+        .unwrap();
+        let management = NativeManagementInitiator::new(
+            "QABOB.SNAB",
+            "SOLNET.SNAA",
+            0x2f,
+            1,
+            2,
+            [1; 8],
+            [0x23, 1, 1, 1, 1, 0, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        port.attach_management(management).unwrap();
+        assert_eq!(port.management.as_ref().unwrap().local_cp(), "QABOB.SNAB");
+        assert_eq!(port.local_cp, "SOLNET.SNAB");
     }
 
     #[test]

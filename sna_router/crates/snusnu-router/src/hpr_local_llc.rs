@@ -168,7 +168,7 @@ impl HprToLlcProbe {
         )?)?;
         Ok(Self {
             port,
-            source_cp: adjacent_cp.clone(),
+            source_cp: management_source_cp.clone(),
             target_cp: target_cp.clone(),
             last_progress: None,
         })
