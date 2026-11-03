@@ -8,7 +8,9 @@ use crate::{
         encode_data_nlp, encode_status_nlp, BaseArb, EndpointError, EndpointPath, EndpointReceive,
     },
     hpr_rtp_message::OrderedMessageAssembler,
-    hpr_rtp_outbound_setup::encode_cp_setup,
+    hpr_rtp_outbound_setup::{
+        encode_cp_setup, encode_route_setup_setup, encode_user_setup, UserSetupConfig,
+    },
     hpr_rtp_receive::{ReceiveResult, ReliableReceiveWindow},
     hpr_rtp_send::{parse_peer_status, ReliableSendWindow, SendError},
     ConnectionGeneration,
@@ -34,6 +36,9 @@ pub struct RtpOutboundEndpoint {
     origin_tcid: u64,
     peer_tcid: Option<u64>,
     path: EndpointPath,
+    local_nce_label: Vec<u8>,
+    user_setup: Option<UserSetupConfig>,
+    route_setup: bool,
     phase: OutboundPhase,
     setup_nlp: Option<Vec<u8>>,
     setup_last_sent_us: Option<u64>,
@@ -65,12 +70,16 @@ impl RtpOutboundEndpoint {
             peer_anr_label: bootstrap.peer.tower.cp_nce_label.clone(),
             priority: 3,
         };
+        let local_nce_label = bootstrap.local.tower.cp_nce_label.clone();
         Ok(Self {
             bootstrap,
             tg_number,
             origin_tcid,
             peer_tcid: None,
             path,
+            local_nce_label,
+            user_setup: None,
+            route_setup: false,
             phase: OutboundPhase::Idle,
             setup_nlp: None,
             setup_last_sent_us: None,
@@ -90,6 +99,41 @@ impl RtpOutboundEndpoint {
         })
     }
 
+    /// Create a user RTP connection only after a validated RouteSetup reply
+    /// has supplied both directional user NCEs and the selected COS/TPF.
+    pub fn new_user(
+        bootstrap: HprControlBootstrap,
+        tg_number: u8,
+        origin_tcid: u64,
+        config: UserSetupConfig,
+    ) -> Result<Self, EndpointError> {
+        let priority = config
+            .priority()
+            .map_err(|_| EndpointError::InvalidConfig)?;
+        let mut endpoint = Self::new(bootstrap, tg_number, origin_tcid)?;
+        endpoint.path = EndpointPath {
+            peer_anr_label: config.peer_nce_label.clone(),
+            priority,
+        };
+        endpoint.local_nce_label = config.local_nce_label.clone();
+        endpoint.user_setup = Some(config);
+        Ok(endpoint)
+    }
+
+    /// Create the RouteSetup RTP connection to the adjacent peer's control
+    /// tower. Its first message is a RouteSetup GDS rather than a FID5 BIND.
+    pub fn new_route_setup(
+        bootstrap: HprControlBootstrap,
+        tg_number: u8,
+        origin_tcid: u64,
+    ) -> Result<Self, EndpointError> {
+        let mut endpoint = Self::new(bootstrap, tg_number, origin_tcid)?;
+        endpoint.path.peer_anr_label = endpoint.bootstrap.peer.tower.route_setup_nce_label.clone();
+        endpoint.local_nce_label = endpoint.bootstrap.local.tower.route_setup_nce_label.clone();
+        endpoint.route_setup = true;
+        Ok(endpoint)
+    }
+
     pub fn phase(&self) -> OutboundPhase {
         self.phase
     }
@@ -106,12 +150,33 @@ impl RtpOutboundEndpoint {
         self.peer_tcid
     }
 
+    pub fn priority(&self) -> u8 {
+        self.path.priority
+    }
+
     pub fn prepare_setup(&mut self, first_biu: &[u8]) -> Result<Vec<u8>, EndpointError> {
         if self.phase != OutboundPhase::Idle || self.setup_nlp.is_some() {
             return Err(EndpointError::WrongPhase);
         }
-        let nlp = encode_cp_setup(&self.bootstrap, self.tg_number, self.origin_tcid, first_biu)
-            .map_err(|_| EndpointError::InvalidConfig)?;
+        let nlp = match (self.route_setup, self.user_setup.as_ref()) {
+            (true, _) => encode_route_setup_setup(
+                &self.bootstrap,
+                self.tg_number,
+                self.origin_tcid,
+                first_biu,
+            ),
+            (false, Some(config)) => encode_user_setup(
+                &self.bootstrap,
+                self.tg_number,
+                self.origin_tcid,
+                first_biu,
+                config,
+            ),
+            (false, None) => {
+                encode_cp_setup(&self.bootstrap, self.tg_number, self.origin_tcid, first_biu)
+            }
+        }
+        .map_err(|_| EndpointError::InvalidConfig)?;
         if nlp.len() > usize::from(self.bootstrap.max_packet_size) || first_biu.len() > MAX_MESSAGE
         {
             return Err(EndpointError::TooLarge);
@@ -182,8 +247,8 @@ impl RtpOutboundEndpoint {
         let packet = RtpPacket::parse(nlp).map_err(EndpointError::InvalidRtp)?;
         if packet.tcid != self.origin_tcid & !ASSIGNOR
             || packet.nhdr.len() < 5
-            || packet.nhdr[2..packet.nhdr.len() - 2] != self.bootstrap.local.tower.cp_nce_label
-            || (packet.nhdr[0] >> 1) & 3 != 3
+            || packet.nhdr[2..packet.nhdr.len() - 2] != self.local_nce_label
+            || (packet.nhdr[0] >> 1) & 3 != self.path.priority
             || !packet.data.is_empty()
         {
             return Err(EndpointError::WrongPeer);
@@ -277,7 +342,8 @@ impl RtpOutboundEndpoint {
         let packet = RtpPacket::parse(nlp).map_err(EndpointError::InvalidRtp)?;
         if packet.tcid != self.origin_tcid & !ASSIGNOR
             || packet.nhdr.len() < 5
-            || packet.nhdr[2..packet.nhdr.len() - 2] != self.bootstrap.local.tower.cp_nce_label
+            || packet.nhdr[2..packet.nhdr.len() - 2] != self.local_nce_label
+            || (packet.nhdr[0] >> 1) & 3 != self.path.priority
             || packet
                 .connection_identifier_exchange()
                 .map_err(EndpointError::InvalidRtp)?
@@ -331,6 +397,9 @@ impl RtpOutboundEndpoint {
         }
         let packet = RtpPacket::parse(nlp).ok()?;
         (packet.tcid == self.origin_tcid & !ASSIGNOR
+            && packet.nhdr.len() >= 5
+            && packet.nhdr[2..packet.nhdr.len() - 2] == self.local_nce_label
+            && (packet.nhdr[0] >> 1) & 3 == self.path.priority
             && packet.data.is_empty()
             && packet.connection_identifier_exchange().ok().flatten()
                 == self.peer_tcid.map(|id| id | ASSIGNOR))
@@ -345,7 +414,8 @@ impl RtpOutboundEndpoint {
         let packet = RtpPacket::parse(nlp).map_err(EndpointError::InvalidRtp)?;
         if packet.tcid != self.origin_tcid & !ASSIGNOR
             || packet.nhdr.len() < 5
-            || packet.nhdr[2..packet.nhdr.len() - 2] != self.bootstrap.local.tower.cp_nce_label
+            || packet.nhdr[2..packet.nhdr.len() - 2] != self.local_nce_label
+            || (packet.nhdr[0] >> 1) & 3 != self.path.priority
         {
             return Err(EndpointError::WrongPeer);
         }
@@ -544,11 +614,12 @@ impl RtpOutboundEndpoint {
 mod tests {
     use super::*;
     use crate::{
-        hpr_control_bootstrap::ControlAdvertisement,
+        hpr_control_bootstrap::{encode_network_name_component, ControlAdvertisement},
         hpr_cp_initiator::ReciprocalCpSession,
         hpr_cv61::{ArbMode, ControlFlowsTower},
+        hpr_fid5::encode_whole_biu,
         hpr_rtp_reply::{encode_setup_reply, CallerStatus, ReplyPath},
-        session::QualifiedName,
+        session::{Flow, QualifiedName, SessionUnit},
     };
 
     const ORIGIN: u64 = ASSIGNOR | 0x1234;
@@ -589,6 +660,54 @@ mod tests {
         )
     }
 
+    fn user_fixture() -> (RtpOutboundEndpoint, Vec<u8>) {
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            advertisement("SNUSNU.SVC", 2, &[0x80, 0x80], &[0xa4, 0x80]),
+            advertisement("SOLNET.SNAB", 1, &[0x80, 2], &[0xa4, 0]),
+        )
+        .unwrap();
+        let config = UserSetupConfig {
+            local_nce_label: vec![0xa4, 0x81],
+            local_nce_instance: [0, 0, 0, 2],
+            peer_nce_label: vec![0xa4, 1],
+            peer_nce_instance: [0, 0, 0, 1],
+            peer_link_label: vec![0x80, 2],
+            cos_tpf: vec![
+                0x0c, 0x2c, 1, 8, 0x7b, 0xc3, 0xd6, 0xd5, 0xd5, 0xc5, 0xc3, 0xe3,
+            ],
+            target_lu: "SOLNET.SNAB".into(),
+        };
+        let encode_name = |netid: &str, name: &str| {
+            let mut result = encode_network_name_component(netid).unwrap();
+            result.push(0x4b);
+            result.extend_from_slice(&encode_network_name_component(name).unwrap());
+            result
+        };
+        let plu = encode_name("QAALICE", "PING");
+        let slu = encode_name("SOLNET", "SNAB");
+        let mut ru = vec![0; 27];
+        ru[..4].copy_from_slice(&[0x31, 0, 0x13, 7]);
+        ru[14..16].copy_from_slice(&[6, 2]);
+        ru.push(plu.len() as u8);
+        ru.extend_from_slice(&plu);
+        ru.extend_from_slice(&[1, 0, 0]);
+        ru.push(slu.len() as u8);
+        ru.extend_from_slice(&slu);
+        let mut reduced = vec![0x80, 1, 0x6b, 0x80, 0];
+        reduced.extend_from_slice(&ru);
+        let bind = encode_whole_biu(
+            (ASSIGNOR | 0x3456).to_be_bytes(),
+            Flow::Expedited,
+            &SessionUnit::from_reduced(&reduced).unwrap(),
+        )
+        .unwrap();
+        (
+            RtpOutboundEndpoint::new_user(bootstrap, 1, ORIGIN, config).unwrap(),
+            bind,
+        )
+    }
+
     fn peer_reply(rseq: u32) -> Vec<u8> {
         encode_setup_reply(
             ORIGIN,
@@ -605,6 +724,43 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn user_setup_accepts_only_its_route_priority_and_nce() {
+        let (mut endpoint, bind) = user_fixture();
+        let setup = endpoint.prepare_setup(&bind).unwrap();
+        assert_eq!(endpoint.priority(), 1);
+        assert_eq!(&setup[..4], &[0xc2, 8, 0xa4, 1]);
+        endpoint.confirm_setup_sent(&setup, 10_000).unwrap();
+        let rseq = RtpPacket::parse(&setup)
+            .unwrap()
+            .next_byte_sequence_number();
+        let make_reply = |priority| {
+            encode_setup_reply(
+                ORIGIN,
+                PEER_ASSIGNED,
+                ReplyPath {
+                    anr_label: &[0xa4, 0x81],
+                    priority,
+                },
+                CallerStatus {
+                    sync: 0,
+                    echo: 0,
+                    rseq,
+                    outbound_bsn: 0,
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            endpoint.prepare_reply_status(&make_reply(3)),
+            Err(EndpointError::WrongPeer)
+        );
+        let status = endpoint.prepare_reply_status(&make_reply(1)).unwrap();
+        assert_eq!(&status[..4], &[0xc2, 8, 0xa4, 1]);
+        endpoint.confirm_status_sent(&status).unwrap();
+        assert_eq!(endpoint.phase(), OutboundPhase::Active);
     }
 
     fn peer_data(data: &[u8]) -> Vec<u8> {
