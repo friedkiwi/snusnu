@@ -206,6 +206,17 @@ impl AutomaticDirectory {
         .map_err(registry_error)?;
         Ok(PortId::new(selected.attachment.as_str()))
     }
+
+    /// Resolve an LU without guessing its hosting CP. MPTN user BINDs carry
+    /// the target LU but may not carry the CP; duplicate claims fail closed.
+    pub(crate) fn resolve_lu(&self, ingress: &PortId, lu: &QualifiedName) -> io::Result<PortId> {
+        let ingress = attachment_id(ingress)?;
+        let selected = self
+            .registry
+            .resolve_lu(lu, None, Some(&ingress))
+            .map_err(registry_error)?;
+        Ok(PortId::new(selected.attachment.as_str()))
+    }
 }
 
 fn route_key(address: &RouteAddress) -> io::Result<Option<RouteKey>> {
