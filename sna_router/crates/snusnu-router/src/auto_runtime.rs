@@ -87,7 +87,6 @@ struct PendingUpstreamLlc {
     proxy_mac: [u8; 6],
     target_cp: QualifiedName,
     source: Option<LocalLlcIngress>,
-    opened_at: Instant,
 }
 
 struct ActiveUpstreamLlc {
@@ -746,14 +745,11 @@ impl<'a> AutoLocalSessionRunner<'a> {
         }
         for id in pending_llc_upstream.keys().copied().collect::<Vec<_>>() {
             let mut pending = pending_llc_upstream.remove(&id).unwrap();
-            let update = if pending.opened_at.elapsed() >= Duration::from_secs(60) {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "LLC source did not send a user BIND",
-                ))
-            } else {
-                pending.source.as_mut().unwrap().poll()
-            };
+            // A dialout LLC association is carrier discovery, not a pending
+            // user circuit. A guest may stay connected without issuing BIND
+            // while a remote peer prepares to route toward its advertised LU.
+            // The native adapter reports link loss through Closed or an error.
+            let update = pending.source.as_mut().unwrap().poll();
             let ready = matches!(
                 update,
                 Ok(Some(SourceUpdate::Event(
@@ -1185,7 +1181,6 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 proxy_mac: ingress_proxy,
                                 target_cp: target_cp.clone(),
                                 source: Some(source),
-                                opened_at: Instant::now(),
                             },
                         );
                         next_id = id;
