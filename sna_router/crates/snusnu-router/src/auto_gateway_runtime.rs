@@ -50,6 +50,7 @@ pub(crate) fn confirmed_mptn_transport_failure(error: &io::Error) -> bool {
     }
 }
 
+#[allow(dead_code)] // Virtual CP generation remains covered for explicit/native routes.
 const BASE36: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 fn stable_hash(seed: &[u8], netid: &str, name: &str) -> u64 {
@@ -72,6 +73,7 @@ fn stable_hash(seed: &[u8], netid: &str, name: &str) -> u64 {
 /// a stable router identity and attachment ID, so reconnects retain the name.
 /// An explicit CP may override the generated name, but must be in the LU's
 /// NETID because the concentrator can only publish this router's NETID.
+#[allow(dead_code)]
 pub(crate) fn virtual_cp_for_source(
     source_lu: &wire::SnaName,
     seed: &[u8],
