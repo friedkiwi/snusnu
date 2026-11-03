@@ -211,6 +211,22 @@ impl HprSessionAdapter {
         self.identity.as_ref()
     }
 
+    /// A native egress may grant the next HPR receive window only after it
+    /// has accepted the PI-bearing request into its own bounded queue.
+    pub fn needs_receive_grant(&self) -> bool {
+        self.phase == HprSessionPhase::Open && self.pending_pacing_snf.is_some()
+    }
+
+    /// Exact credit needed to acknowledge the pending PI-bearing HPR unit.
+    /// The caller submits it only after the selected egress accepts that
+    /// unit, keeping HPR and native pacing windows independent.
+    pub fn receive_grant(&self) -> Option<SessionEvent> {
+        self.needs_receive_grant().then_some(SessionEvent::Credit {
+            normal: u32::from(self.receive_window),
+            expedited: 0,
+        })
+    }
+
     /// Install the negotiated session pacing windows after a positive BIND
     /// and before any information is delivered. The caller derives these
     /// values from the accepted BIND profile; RTP ARB is separate.
@@ -908,6 +924,8 @@ mod tests {
             .ends_with(&[0x62, 8, 0x80, 0, 0, 0, 0, 0, 0x22, 0x22]));
         assert_eq!(adapter.phase(), HprSessionPhase::Open);
         adapter.configure_fixed_pacing(7, 1).unwrap();
+        assert!(!adapter.needs_receive_grant());
+        assert_eq!(adapter.receive_grant(), None);
 
         let inbound = encode_whole_biu(
             (SLU_SA & !ASSIGNOR).to_be_bytes(),
@@ -925,6 +943,14 @@ mod tests {
                 ..
             }
         ));
+        assert!(adapter.needs_receive_grant());
+        assert_eq!(
+            adapter.receive_grant(),
+            Some(SessionEvent::Credit {
+                normal: 1,
+                expedited: 0,
+            })
+        );
         let grant = adapter
             .encode_event(SessionEvent::Credit {
                 normal: 1,
@@ -932,6 +958,8 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+        assert!(!adapter.needs_receive_grant());
+        assert_eq!(adapter.receive_grant(), None);
         let grant_fid5 = Fid5WholeBiu::parse_complete(&grant.message).unwrap();
         assert_eq!(grant_fid5.sequence_number, 2);
         assert_eq!(grant_fid5.rh, IPR_RH);

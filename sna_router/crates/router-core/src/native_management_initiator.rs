@@ -199,6 +199,13 @@ impl NativeManagementInitiator {
     pub fn remote_cp(&self) -> &str {
         &self.remote_cp
     }
+
+    /// FID2 addresses used by this live management BIND. The private native
+    /// egress can allocate its first user address only after this management
+    /// session has completed on the same association.
+    pub fn address_pair(&self) -> (u8, u8) {
+        (self.daf, self.oaf)
+    }
     pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
     }

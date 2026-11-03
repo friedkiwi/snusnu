@@ -230,6 +230,16 @@ local_cp = "SNUSNU.SVC"
 peer_lus = ["SOLNET.SNAB", "SOLNET.APP1"]
 ```
 
+In automatic mode, one `[[hpr_ip]]` attachment can share a router with LLC
+attachments and one concentrator. An EE-originated LU session can reach an LLC
+guest when the LLC attachment declares its own CP (`local_cp`) and reachable
+LUs (`lus`). These names are candidate routes until the router verifies that
+CP through XID3 and completes native management on the same LLC association.
+The local proxy MAC for each LLC attachment is generated from its ID and must
+be configured as the EE peer's remote adapter address on the LLC guest when
+that guest also dials out. The local web UI shows the generated MAC. LLC-originated
+sessions toward the EE attachment are not yet admitted by this automatic path.
+
 ## Experimental HPR LAN to HPR/IP media route
 
 `[[hpr_lan]]` describes one HPR-capable OS/400 Ethernet peer through AF_PACKET. Its `proxy_mac` is the remote adapter address configured on that guest. Pair it with one `[[hpr_ip]]` port on an IP address assigned to the host. The media adapter code translates HPR LAN UI framing and EE UDP framing while preserving HPR NLP bytes. **The runtime currently rejects this configuration as unsupported** until it can validate XID3 transmission-group agreement across both media before SETMODE. The example records the intended configuration shape for that integration test.

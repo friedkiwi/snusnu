@@ -236,6 +236,29 @@ impl<P: RoutePort> VirtualWsPort<P> {
                 .is_none_or(|management| management.phase() == ResponderPhase::Closed)
     }
 
+    /// Allocate the first user address on this private native association
+    /// from the active management BIND address pair. The observed V4R4
+    /// profile accepts the next remote address with the same local address;
+    /// this method refuses reuse before management has completed.
+    pub(crate) fn first_user_address(&self) -> io::Result<NativeAddress> {
+        if !self.management_complete() || self.user_bind.is_some() || self.user_address.is_some() {
+            return Err(protocol("native user address requires idle managed link"));
+        }
+        let (management_daf, management_oaf) = self
+            .management
+            .as_ref()
+            .ok_or_else(|| protocol("native management BIND unavailable"))?
+            .address_pair();
+        let daf = management_daf
+            .checked_add(1)
+            .ok_or_else(|| protocol("native user address space exhausted"))?;
+        Ok(NativeAddress {
+            daf,
+            oaf: management_oaf,
+            odai: true,
+        })
+    }
+
     pub(crate) fn begin_user_bind(
         &mut self,
         offer: &IngressOffer,
@@ -1668,6 +1691,14 @@ mod tests {
             ))));
         port.poll(false).unwrap();
         assert!(port.management_complete());
+        assert_eq!(
+            port.first_user_address().unwrap(),
+            NativeAddress {
+                daf: 2,
+                oaf: 2,
+                odai: true,
+            }
+        );
 
         port.begin_user_bind(
             &user_offer(),

@@ -143,9 +143,20 @@ fn name(value: &str) -> io::Result<Vec<u8>> {
 fn user_fqpcid(data: &[u8], source: &[u8], destination: &[u8]) -> io::Result<Vec<u8>> {
     // The fixed V5R4 profile is preserved while PLU, SLU, user subfield and
     // X'60' CV lengths follow their explicitly encoded network-qualified names.
+    // V5R4 HPR/IP uses X'40' in the blank-mode profile byte where the
+    // captured TCP62 variant uses X'00'. Both carry the same LU 6.2 BIND;
+    // all other profile bytes must still match the validated image.
+    let mut fixed = data
+        .get(5..32)
+        .ok_or_else(|| invalid("truncated V5R4 user BIND"))?
+        .to_vec();
+    if !matches!(fixed[25], 0 | 0x40) {
+        return Err(invalid("unsupported V5R4 user BIND profile"));
+    }
+    fixed[25] = 0;
     if data.len() != 93 + 3 * source.len() + destination.len()
         || data[..5] != [0, 0, 0x6b, 0x80, 0]
-        || data[5..32] != USER_FIXED
+        || fixed.as_slice() != USER_FIXED
     {
         return Err(invalid("unsupported V5R4 user BIND profile"));
     }

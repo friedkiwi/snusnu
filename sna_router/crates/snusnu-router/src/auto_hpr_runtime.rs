@@ -23,6 +23,9 @@ use crate::{
     config::RouterConfig,
     ee_ldlc_endpoint::EeLdlcEndpoint,
     ee_peer_lus::EePeerLus,
+    hpr_destination_directory::{Destination, HprDestinationDirectory},
+    hpr_llc_attachments::HprLlcAttachments,
+    hpr_local_llc::HprToLlcSession,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
     STOP,
@@ -46,6 +49,7 @@ use transport_ws::wire;
 
 pub(crate) const HPR_ADAPTER: AdapterId = AdapterId(1);
 pub(crate) const WS_ADAPTER: AdapterId = AdapterId(2);
+pub(crate) const LOCAL_ADAPTER: AdapterId = AdapterId(3);
 const IDLE_POLL: Duration = Duration::from_micros(200);
 const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PENDING_RTP_MESSAGES: usize = 64;
@@ -109,16 +113,23 @@ struct ActiveHprSession {
     identity: SessionIdentity,
     bind_request: SessionUnit,
     adapter: HprSessionAdapter,
+    egress: AdapterId,
     ws: Option<SessionWsPort>,
+    local: Option<HprToLlcSession>,
+    local_attachment_id: Option<String>,
     ws_closed: bool,
     pending_ws: Option<(SessionEvent, bool)>,
     pending_credit: Option<SessionEvent>,
+    pending_local_grant: bool,
 }
 
 struct DirectHprRuntime {
     bootstrap: HprControlBootstrap,
     rtp: HprRtpPort,
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
+    route_targets: HashMap<router_core::session::QualifiedName, Destination>,
+    local_directory: HprDestinationDirectory,
+    llc: Option<HprLlcAttachments>,
     route_reply: Option<(router_core::session::QualifiedName, PreparedRouteSetupReply)>,
     negative_route_reply: Option<Vec<u8>>,
     cp_management: Option<CpManagementResponder>,
@@ -142,11 +153,15 @@ impl DirectHprRuntime {
         let mut switch = SessionSwitch::new();
         switch.register(HPR_ADAPTER);
         switch.register(WS_ADAPTER);
+        switch.register(LOCAL_ADAPTER);
         Self {
             rtp: HprRtpPort::new(bootstrap.clone()),
             cp_management: None,
             bootstrap,
             route_setup: HashMap::new(),
+            route_targets: HashMap::new(),
+            local_directory: HprDestinationDirectory::new(),
+            llc: None,
             route_reply: None,
             negative_route_reply: None,
             pending_cp_replies: VecDeque::new(),
@@ -172,6 +187,64 @@ impl DirectHprRuntime {
         Ok(())
     }
 
+    fn configure_local_llc(&mut self, config: &RouterConfig) -> io::Result<()> {
+        if !config.llc.is_empty() {
+            self.llc = Some(HprLlcAttachments::new(
+                config,
+                &self.bootstrap.peer.cp,
+                &self.bootstrap.local.node_id,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn pump_local_llc(&mut self) -> io::Result<()> {
+        if let Some(llc) = self.llc.as_mut() {
+            llc.pump();
+            self.local_directory
+                .replace_owner("llc", llc.verified_routes())?;
+        }
+        Ok(())
+    }
+
+    fn resolve_target(
+        &self,
+        hub: &AutoWsHub,
+        target: &router_core::session::QualifiedName,
+    ) -> io::Result<Destination> {
+        let local = self.local_directory.resolve_lu(target);
+        let upstream = hub.resolve_lu(&as_wire_name(target))?;
+        match (local, upstream) {
+            (Some(_), Some(_)) => Err(protocol(format!(
+                "HPR target {target} is ambiguous between local and upstream routes"
+            ))),
+            (Some(destination), None) => Ok(destination),
+            (None, Some((_, Some(cp)))) if cp == as_wire_name(&self.bootstrap.local.cp) => {
+                Ok(Destination::Ws {
+                    hosting_cp: self.bootstrap.local.cp.clone(),
+                    attachment_id: "concentrator".into(),
+                })
+            }
+            (None, Some(_)) => Err(protocol(format!(
+                "HPR upstream target {target} is not hosted by EE proxy CP"
+            ))),
+            (None, None)
+                if self
+                    .llc
+                    .as_ref()
+                    .is_some_and(|attachments| attachments.has_candidate(target)) =>
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "HPR target awaits live LLC XID/management proof",
+                ))
+            }
+            (None, None) => Err(protocol(format!(
+                "HPR RouteSetup target {target} unavailable"
+            ))),
+        }
+    }
+
     fn queue_rtp(&mut self, messages: Vec<RtpIngress>) -> io::Result<()> {
         for message in messages {
             if self.pending_rtp.len() >= MAX_PENDING_RTP_MESSAGES
@@ -186,6 +259,7 @@ impl DirectHprRuntime {
     }
 
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
+        self.pump_local_llc()?;
         self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
         self.try_cp_replies(link, now_us)?;
@@ -425,15 +499,24 @@ impl DirectHprRuntime {
         let target: router_core::session::QualifiedName = target_name
             .parse()
             .map_err(|_| protocol("invalid HPR RouteSetup target LU"))?;
-        let Some((_, Some(hosting_cp))) = hub.resolve_lu(&as_wire_name(&target))? else {
-            return Err(protocol(format!(
-                "HPR RouteSetup target {target} unavailable"
-            )));
+        let destination = if self
+            .sessions
+            .values()
+            .any(|session| session.identity.target_lu == target && session.local.is_some())
+        {
+            self.route_targets
+                .get(&target)
+                .cloned()
+                .ok_or_else(|| protocol("active local HPR session lost its route"))?
+        } else {
+            self.resolve_target(hub, &target)?
         };
-        if hosting_cp != as_wire_name(&self.bootstrap.local.cp) {
-            return Err(protocol(
-                "HPR RouteSetup target is not hosted by EE proxy CP",
-            ));
+        if self
+            .route_targets
+            .get(&target)
+            .is_some_and(|previous| previous != &destination)
+        {
+            return Err(protocol("HPR target route changed on active TG"));
         }
         if !self.route_setup.contains_key(&target) {
             let tg = link
@@ -447,19 +530,35 @@ impl DirectHprRuntime {
                 self.bootstrap.local.tower.route_setup_nce_instance,
                 self.route_setup.len(),
             )?;
-            let service = DirectRouteSetupService::new(
-                self.bootstrap.clone(),
-                target.clone(),
-                user_label,
-                instance,
-                tg,
-                ReverseLinkMetrics {
-                    transmission_time_us: 1000,
-                    capacity_kbps: 100_000,
-                    liveness_seconds: 10,
-                },
-                16,
-            )
+            let metrics = ReverseLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            };
+            let service = match &destination {
+                Destination::Ws { .. } => DirectRouteSetupService::new(
+                    self.bootstrap.clone(),
+                    target.clone(),
+                    user_label,
+                    instance,
+                    tg,
+                    metrics,
+                    16,
+                ),
+                Destination::Llc { hosting_cp, .. } | Destination::Mptn { hosting_cp, .. } => {
+                    DirectRouteSetupService::new_verified_external(
+                        self.bootstrap.clone(),
+                        target.clone(),
+                        hosting_cp.clone(),
+                        user_label,
+                        instance,
+                        tg,
+                        metrics,
+                        16,
+                    )
+                }
+                Destination::Ee { .. } => return Err(protocol("HPR route loops to EE carrier")),
+            }
             .map_err(|error| protocol(format!("HPR RouteSetup service: {error:?}")))?;
             self.route_setup.insert(target.clone(), service);
         }
@@ -471,6 +570,7 @@ impl DirectHprRuntime {
                 .prepare_reply(self.bootstrap.generation, &message.bytes)
                 .map_err(|error| protocol(format!("HPR RouteSetup rejected: {error:?}")))?,
         ));
+        self.route_targets.insert(target, destination);
         Ok(())
     }
 
@@ -488,9 +588,21 @@ impl DirectHprRuntime {
             }
             return Ok(());
         }
-        let Some((_, reply)) = self.route_reply.as_ref() else {
+        let Some((target, reply)) = self.route_reply.as_ref() else {
             return Ok(());
         };
+        if let Some(destination @ (Destination::Llc { .. } | Destination::Mptn { .. })) =
+            self.route_targets.get(target)
+        {
+            let active_local = self
+                .sessions
+                .values()
+                .any(|session| session.identity.target_lu == *target && session.local.is_some());
+            if !active_local && self.local_directory.resolve_lu(target) != Some(destination.clone())
+            {
+                return Ok(());
+            }
+        }
         if !self
             .rtp
             .send(link, RtpIngressKind::RouteSetup, &reply.gds, now_us)?
@@ -650,6 +762,34 @@ impl DirectHprRuntime {
         }
         let fid5 = Fid5WholeBiu::parse_complete(&message.bytes)
             .map_err(|error| protocol(format!("invalid HPR BIND BIU: {error:?}")))?;
+        let bind_name = fid5
+            .classify_bind()
+            .map_err(|error| protocol(format!("invalid HPR BIND identity: {error:?}")))?
+            .ok_or_else(|| protocol("HPR first user BIU is not BIND"))?;
+        let selected_lu: router_core::session::QualifiedName = bind_name
+            .slu
+            .parse()
+            .map_err(|_| protocol("HPR BIND target LU is not qualified"))?;
+        let destination = self
+            .route_targets
+            .get(&selected_lu)
+            .cloned()
+            .ok_or_else(|| protocol("HPR BIND target has no authorized RouteSetup"))?;
+        if matches!(
+            destination,
+            Destination::Llc { .. } | Destination::Mptn { .. }
+        ) {
+            match self.local_directory.resolve_lu(&selected_lu) {
+                Some(current) if current == destination => {}
+                Some(_) => return Err(protocol("HPR local target CP changed after RouteSetup")),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "HPR local target awaits renewed live proof",
+                    ))
+                }
+            }
+        }
         let peer_sa = u64::from_be_bytes(fid5.session_address);
         let scope = self
             .rtp
@@ -673,7 +813,7 @@ impl DirectHprRuntime {
             HprSessionRole::PeerPlu,
             scope,
             local_sa,
-            Some(self.bootstrap.local.cp.clone()),
+            Some(destination.hosting_cp().clone()),
             Some(self.bootstrap.peer.cp.clone()),
         )
         .map_err(|error| protocol(format!("HPR session address: {error:?}")))?;
@@ -698,35 +838,91 @@ impl DirectHprRuntime {
         let source_lu = as_wire_name(&identity.source_lu);
         let target_lu = as_wire_name(&identity.target_lu);
         self.publish_reachability(hub, Some(&identity))?;
-        self.switch
-            .replace_routes(
-                WS_ADAPTER,
-                vec![Reachability {
-                    lu: Some(identity.target_lu.clone()),
-                    cp: identity.target_cp.clone(),
-                }],
-            )
-            .map_err(|error| protocol(format!("HPR route admission: {error:?}")))?;
         let bind_request = match ingress.event {
             SessionEvent::BindRequest(ref unit) => unit.clone(),
             _ => return Err(protocol("HPR first session unit is not BIND")),
         };
+        let egress = match &destination {
+            Destination::Ws { .. } => WS_ADAPTER,
+            Destination::Llc { .. } => LOCAL_ADAPTER,
+            Destination::Mptn { .. } => return Err(protocol("HPR MPTN egress is not active")),
+            Destination::Ee { .. } => return Err(protocol("HPR route loops to EE carrier")),
+        };
+        self.switch
+            .replace_routes(
+                WS_ADAPTER,
+                (egress == WS_ADAPTER)
+                    .then(|| Reachability {
+                        lu: Some(identity.target_lu.clone()),
+                        cp: identity.target_cp.clone(),
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+            .map_err(|error| protocol(format!("HPR WS route admission: {error:?}")))?;
+        self.switch
+            .replace_routes(
+                LOCAL_ADAPTER,
+                (egress == LOCAL_ADAPTER)
+                    .then(|| Reachability {
+                        lu: Some(identity.target_lu.clone()),
+                        cp: identity.target_cp.clone(),
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+            .map_err(|error| protocol(format!("HPR local route admission: {error:?}")))?;
         let (fabric_id, egress) = self
             .switch
             .open(HPR_ADAPTER, handle, identity.clone(), bind_request.clone())
             .map_err(|error| protocol(format!("HPR BIND route unavailable: {error:?}")))?;
-        if egress != WS_ADAPTER {
-            return Err(protocol("HPR session selected unexpected egress"));
-        }
-        let ws = hub.open_session_lu(&target_lu, &source_lu)?;
-        if ws.is_some() {
-            self.switch
-                .bind_egress(fabric_id, WS_ADAPTER, handle)
-                .map_err(|error| protocol(format!("HPR WS bind failed: {error:?}")))?;
-        }
+        let (ws, local, local_attachment_id) = match &destination {
+            Destination::Ws { .. } => {
+                let ws = hub.open_session_lu(&target_lu, &source_lu)?;
+                if ws.is_some() {
+                    self.switch
+                        .bind_egress(fabric_id, WS_ADAPTER, handle)
+                        .map_err(|error| protocol(format!("HPR WS bind failed: {error:?}")))?;
+                }
+                (ws, None, None)
+            }
+            Destination::Llc { attachment_id, .. } => {
+                let session = self
+                    .llc
+                    .as_mut()
+                    .ok_or_else(|| protocol("HPR local LLC attachments unavailable"))?
+                    .take_session(
+                        attachment_id,
+                        &identity.source_lu,
+                        &identity.target_lu,
+                        &bind_request,
+                    );
+                let session =
+                    match session {
+                        Ok(session) => session,
+                        Err(error) => {
+                            self.switch.discard_unopened(HPR_ADAPTER, handle).map_err(
+                                |failure| protocol(format!("HPR local BIND rollback: {failure:?}")),
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                let Some(session) = session else {
+                    self.switch
+                        .discard_unopened(HPR_ADAPTER, handle)
+                        .map_err(|error| protocol(format!("HPR local BIND rollback: {error:?}")))?;
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "LLC probe busy"));
+                };
+                self.switch
+                    .bind_egress(fabric_id, LOCAL_ADAPTER, handle)
+                    .map_err(|error| protocol(format!("HPR local bind failed: {error:?}")))?;
+                (None, Some(session), Some(attachment_id.clone()))
+            }
+            Destination::Mptn { .. } | Destination::Ee { .. } => unreachable!(),
+        };
         tracing::info!(source_lu = %identity.source_lu, target_lu = %identity.target_lu,
-            peer_cp = %self.bootstrap.peer.cp, proxy_cp = %self.bootstrap.local.cp,
-            "HPR LU session routed to concentrator");
+            peer_cp = %self.bootstrap.peer.cp, target_cp = %destination.hosting_cp(),
+            egress = ?egress, "HPR LU session routed");
         self.sessions.insert(
             handle,
             ActiveHprSession {
@@ -738,10 +934,14 @@ impl DirectHprRuntime {
                 identity,
                 bind_request,
                 adapter,
+                egress,
                 ws,
+                local,
+                local_attachment_id,
                 ws_closed: false,
                 pending_ws: None,
                 pending_credit: ingress.extra_credit,
+                pending_local_grant: false,
             },
         );
         if !self.bound_user_scopes.contains(&scope) {
@@ -760,11 +960,25 @@ impl DirectHprRuntime {
         for handle in handles {
             self.pump_session(handle, link, hub, now_us)?;
         }
-        let previous_count = self.sessions.len();
-        let switch = &self.switch;
-        self.sessions
-            .retain(|handle, _| switch.lookup(HPR_ADAPTER, *handle).is_ok());
-        if self.sessions.len() != previous_count {
+        let stale = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|handle| !self.switch.has_handle(HPR_ADAPTER, *handle))
+            .collect::<Vec<_>>();
+        for handle in &stale {
+            if let Some(mut session) = self.sessions.remove(handle) {
+                if let Some(local) = session.local.as_mut() {
+                    local.close()?;
+                }
+                if let Some(attachment_id) = session.local_attachment_id.as_deref() {
+                    if let Some(llc) = self.llc.as_mut() {
+                        llc.release(attachment_id);
+                    }
+                }
+            }
+        }
+        if !stale.is_empty() {
             self.publish_reachability(hub, None)?;
         }
         Ok(())
@@ -794,71 +1008,119 @@ impl DirectHprRuntime {
                 }
             }
         }
-        if session.ws.is_none() {
-            let target = as_wire_name(&session.identity.target_lu);
-            let source = as_wire_name(&session.identity.source_lu);
-            if let Some(port) = hub.open_session_lu(&target, &source)? {
-                self.switch
-                    .bind_egress(session.fabric_id, WS_ADAPTER, session.handle)
-                    .map_err(|error| protocol(format!("HPR WS open: {error:?}")))?;
-                session.ws = Some(port);
-            } else {
-                return Ok(());
-            }
-        }
-        let ws = session.ws.as_mut().unwrap();
-        if session.pending_ws.is_none() && !session.ws_closed {
-            match ws.poll()? {
-                Some(SessionWsUpdate::Event(event)) => {
-                    let event = from_session_wire(event)?;
-                    let charge = !matches!(event, SessionEvent::Credit { .. });
-                    session.pending_ws = Some((event, charge));
-                }
-                Some(SessionWsUpdate::Closed) => {
+        if session.egress == WS_ADAPTER {
+            if session.ws.is_none() {
+                let target = as_wire_name(&session.identity.target_lu);
+                let source = as_wire_name(&session.identity.source_lu);
+                if let Some(port) = hub.open_session_lu(&target, &source)? {
                     self.switch
-                        .submit(WS_ADAPTER, session.handle, SessionEvent::Reset)
-                        .map_err(|error| protocol(format!("HPR WS close: {error:?}")))?;
-                    session.ws_closed = true;
+                        .bind_egress(session.fabric_id, WS_ADAPTER, session.handle)
+                        .map_err(|error| protocol(format!("HPR WS open: {error:?}")))?;
+                    session.ws = Some(port);
+                } else {
+                    return Ok(());
                 }
-                Some(SessionWsUpdate::Opened) | None => {}
             }
-        }
-        if let Some((event, charge)) = session.pending_ws.clone() {
-            match self.switch.submit(WS_ADAPTER, session.handle, event) {
-                Ok(()) => {
-                    if charge {
-                        ws.complete_received(1)?;
+            let ws = session.ws.as_mut().unwrap();
+            if session.pending_ws.is_none() && !session.ws_closed {
+                match ws.poll()? {
+                    Some(SessionWsUpdate::Event(event)) => {
+                        let event = from_session_wire(event)?;
+                        let charge = !matches!(event, SessionEvent::Credit { .. });
+                        session.pending_ws = Some((event, charge));
                     }
-                    session.pending_ws = None;
-                }
-                Err(SwitchError::Fabric(FabricError::Capacity)) => {}
-                Err(error) => {
-                    return Err(protocol(format!(
-                        "HPR WS session event rejected: {error:?}"
-                    )))
+                    Some(SessionWsUpdate::Closed) => {
+                        self.switch
+                            .submit(WS_ADAPTER, session.handle, SessionEvent::Reset)
+                            .map_err(|error| protocol(format!("HPR WS close: {error:?}")))?;
+                        session.ws_closed = true;
+                    }
+                    Some(SessionWsUpdate::Opened) | None => {}
                 }
             }
-        }
-        if let Some(event) = self
-            .switch
-            .next_delivery(WS_ADAPTER, session.handle)
-            .map_err(|error| protocol(format!("HPR WS delivery: {error:?}")))?
-        {
-            if session.ws_closed {
-                self.switch
-                    .mark_sent(WS_ADAPTER, session.handle)
-                    .map_err(|error| protocol(format!("HPR WS closed completion: {error:?}")))?;
-            } else if let Some(wire_event) = to_session_wire(&event) {
-                if ws.send(wire_event)? {
+            if let Some((event, charge)) = session.pending_ws.clone() {
+                match self.switch.submit(WS_ADAPTER, session.handle, event) {
+                    Ok(()) => {
+                        if charge {
+                            ws.complete_received(1)?;
+                        }
+                        session.pending_ws = None;
+                    }
+                    Err(SwitchError::Fabric(FabricError::Capacity)) => {}
+                    Err(error) => {
+                        return Err(protocol(format!(
+                            "HPR WS session event rejected: {error:?}"
+                        )))
+                    }
+                }
+            }
+            if let Some(event) = self
+                .switch
+                .next_delivery(WS_ADAPTER, session.handle)
+                .map_err(|error| protocol(format!("HPR WS delivery: {error:?}")))?
+            {
+                if session.ws_closed {
                     self.switch
                         .mark_sent(WS_ADAPTER, session.handle)
-                        .map_err(|error| protocol(format!("HPR WS completion: {error:?}")))?;
+                        .map_err(|error| {
+                            protocol(format!("HPR WS closed completion: {error:?}"))
+                        })?;
+                } else if let Some(wire_event) = to_session_wire(&event) {
+                    if ws.send(wire_event)? {
+                        self.switch
+                            .mark_sent(WS_ADAPTER, session.handle)
+                            .map_err(|error| protocol(format!("HPR WS completion: {error:?}")))?;
+                    }
+                } else {
+                    ws.close()?;
+                    self.switch
+                        .mark_sent(WS_ADAPTER, session.handle)
+                        .map_err(|error| protocol(format!("HPR WS reset: {error:?}")))?;
                 }
-            } else {
-                ws.close()?;
-                self.switch
-                    .mark_sent(WS_ADAPTER, session.handle)
-                    .map_err(|error| protocol(format!("HPR WS reset: {error:?}")))?;
+            }
+            let _ = ws.take_completed_send_count();
+        } else {
+            let local = session
+                .local
+                .as_mut()
+                .ok_or_else(|| protocol("HPR local session missing"))?;
+            if let Some(event) = local.poll()? {
+                match self.switch.submit(LOCAL_ADAPTER, session.handle, event) {
+                    Ok(()) => local.confirm_polled()?,
+                    Err(SwitchError::Fabric(FabricError::Capacity)) => {}
+                    Err(error) => {
+                        return Err(protocol(format!("HPR local ingress rejected: {error:?}")));
+                    }
+                }
+            }
+            if let Some(event) = self
+                .switch
+                .next_delivery(LOCAL_ADAPTER, session.handle)
+                .map_err(|error| protocol(format!("HPR local delivery: {error:?}")))?
+            {
+                if local.send(&event)? {
+                    self.switch
+                        .mark_sent(LOCAL_ADAPTER, session.handle)
+                        .map_err(|error| protocol(format!("HPR local completion: {error:?}")))?;
+                    if matches!(event, SessionEvent::Information { .. })
+                        && session.adapter.receive_grant().is_some()
+                    {
+                        session.pending_local_grant = true;
+                    }
+                }
+            }
+            if session.pending_local_grant {
+                if let Some(grant) = session.adapter.receive_grant() {
+                    match self.switch.submit(LOCAL_ADAPTER, session.handle, grant) {
+                        Ok(()) => session.pending_local_grant = false,
+                        Err(SwitchError::Fabric(FabricError::Capacity)) => {}
+                        Err(error) => {
+                            return Err(protocol(format!("HPR local grant rejected: {error:?}")));
+                        }
+                    }
+                } else {
+                    session.pending_local_grant = false;
+                }
             }
         }
         if let Some(event) = self
@@ -896,7 +1158,6 @@ impl DirectHprRuntime {
                     .map_err(|error| protocol(format!("HPR egress completion: {error:?}")))?;
             }
         }
-        let _ = ws.take_completed_send_count();
         Ok(())
     }
 }
@@ -918,7 +1179,7 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
     while !STOP.load(Ordering::Relaxed) {
         match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
             Ok(mut hub) => {
-                if let Err(error) = run_connected(attachment, &mut hub) {
+                if let Err(error) = run_connected(config, attachment, &mut hub) {
                     tracing::warn!(attachment = %attachment.id, error = %error,
                         "HPR upstream or EE adjacency reset");
                 }
@@ -933,7 +1194,11 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> io::Result<()> {
+fn run_connected(
+    config: &RouterConfig,
+    attachment: &crate::config::EeConfig,
+    hub: &mut AutoWsHub,
+) -> io::Result<()> {
     let identity = loop {
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
@@ -970,6 +1235,7 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                     .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
                 let mut runtime = DirectHprRuntime::new(bootstrap);
                 runtime.configure_peer_lus(attachment)?;
+                runtime.configure_local_llc(config)?;
                 runtime.publish_reachability(hub, None)?;
                 active = Some(runtime);
                 tracing::info!(attachment = %attachment.id, generation = link.generation().get(),
@@ -1091,6 +1357,7 @@ fn run_connected(attachment: &crate::config::EeConfig, hub: &mut AutoWsHub) -> i
                 };
                 if old_route_scope.is_some() && runtime.rtp.route_setup_scope() != old_route_scope {
                     runtime.route_setup.clear();
+                    runtime.route_targets.clear();
                     runtime.route_reply = None;
                     runtime.negative_route_reply = None;
                     runtime.bound_user_scopes.clear();
