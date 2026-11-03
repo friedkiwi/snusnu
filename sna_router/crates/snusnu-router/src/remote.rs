@@ -1008,6 +1008,45 @@ impl WsRoutePort {
                     return Err(protocol("invalid route epoch"));
                 }
                 if self.auto_owned {
+                    // A SessionV1 source may have opened just as the selected
+                    // router disconnected. Keep its owner identity while the
+                    // WebSocket stays up, so a fresh epoch can be selected
+                    // without discarding the local TCP62 session.
+                    if self.target_lu.is_some() && self.inbound_open.is_none() {
+                        let Some(current) = self.target.as_ref() else {
+                            return Ok(Vec::new());
+                        };
+                        if current.router_id != origin.router_id {
+                            return Ok(Vec::new());
+                        }
+                        let next = snapshot
+                            .routes
+                            .iter()
+                            .find(|route| self.matches_target_route(route))
+                            .map(|route| wire::RouteReference {
+                                router_id: origin.router_id.clone(),
+                                epoch: snapshot.epoch.clone(),
+                                route_id: route.id,
+                                route_generation: route.generation,
+                            });
+                        if self.target.as_ref() != next.as_ref() {
+                            if self.circuit.is_some() {
+                                self.disconnect()?;
+                                return Ok(vec![RouterEvent::Closed]);
+                            }
+                            if self.opening {
+                                self.clear_circuit();
+                            }
+                            if let Some(next) = next {
+                                self.target = Some(next);
+                                self.retry_at = None;
+                                self.maybe_open()?;
+                            } else {
+                                self.retry_at = Some(Instant::now() + Duration::from_secs(30));
+                            }
+                        }
+                        return Ok(Vec::new());
+                    }
                     let target_gone = self.target.as_ref().is_some_and(|target| {
                         target.router_id == origin.router_id
                             && target.epoch == snapshot.epoch
@@ -1101,14 +1140,23 @@ impl WsRoutePort {
                         target_cp = %format_cp(&self.target_cp),
                         "target router withdrew routes"
                     );
-                    self.target = None;
-                    self.sync_gateway_target();
+                    let retryable_auto_lu = self.auto_owned
+                        && self.target_lu.is_some()
+                        && self.inbound_open.is_none()
+                        && self.circuit.is_none();
+                    if !retryable_auto_lu {
+                        self.target = None;
+                        self.sync_gateway_target();
+                    }
                     if self.circuit.is_some() {
                         self.disconnect()?;
                         return Ok(vec![RouterEvent::Closed]);
                     }
                     if self.opening {
                         self.clear_circuit();
+                    }
+                    if retryable_auto_lu {
+                        self.retry_at = Some(Instant::now() + Duration::from_secs(30));
                     }
                 }
             }
@@ -3163,8 +3211,51 @@ mod tests {
             assert_eq!(open.target.as_ref().unwrap().route_id, 2);
             send(
                 &mut socket,
+                wire::ws_envelope::Body::OriginWithdraw(wire::OriginWithdraw {
+                    router_id: vec![9; 16],
+                    epoch: vec![10; 16],
+                }),
+            );
+            send(
+                &mut socket,
                 wire::ws_envelope::Body::OpenResult(wire::OpenResult {
                     request_id: open.request_id,
+                    circuit_id: vec![],
+                    accepted: false,
+                    peer_receive_allowance_bytes: 0,
+                    reason: wire::OpenFailure::RouteGone as i32,
+                }),
+            );
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OriginRoutes(wire::OriginRouteSnapshot {
+                    router_id: vec![9; 16],
+                    snapshot: Some(wire::RouteSnapshot {
+                        epoch: vec![11; 16],
+                        revision: 1,
+                        routes: vec![wire::RouteExport {
+                            id: 2,
+                            generation: 1,
+                            resource: Some(wire::route_export::Resource::LogicalUnit(
+                                wire::LuReachability {
+                                    lu: Some(name("SNUSNU", "PING")),
+                                    hosting_cp: Some(name("SNUSNU", "SVC")),
+                                    supported_types: vec![wire::LuType::LuType62 as i32],
+                                },
+                            )),
+                        }],
+                    }),
+                }),
+            );
+            let wire::ws_envelope::Body::OpenRequest(reopened) = read(&mut socket) else {
+                panic!("replacement session open expected")
+            };
+            assert!(reopened.request_id > open.request_id);
+            assert_eq!(reopened.target.as_ref().unwrap().epoch, vec![11; 16]);
+            send(
+                &mut socket,
+                wire::ws_envelope::Body::OpenResult(wire::OpenResult {
+                    request_id: reopened.request_id,
                     circuit_id: server_id.clone(),
                     accepted: true,
                     peer_receive_allowance_bytes: 1500,
