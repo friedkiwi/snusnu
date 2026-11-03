@@ -303,7 +303,11 @@ func (s *localSNAService) sessionInformation(c *localSNACircuit, request []byte)
 		return c.user.MarkAttachGrantSent(grant)
 	}
 	if c.user.Phase() == lu62.UserActive {
-		if len(request) >= 12 && request[6] == 0x4b && request[7]&^byte(1) == 0xa0 && request[8] == 1 {
+		if len(request) >= 12 && request[6] == 0x4b && request[7] == 0xa0 && request[8] == 1 {
+			// The neutral wire carries the carrier's PI as pacing credit.
+			// CONFIRM is also a paced request: restore PI for the virtual
+			// FID2 responder so it grants the receive window before +RSP.
+			request[7] |= 1
 			grant, reply, err := c.user.PrepareConfirm(request)
 			if err != nil {
 				return err

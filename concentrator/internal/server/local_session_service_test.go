@@ -119,6 +119,9 @@ func TestLocalAPINGSessionProfileVersionAndEcho(t *testing.T) {
 	outbound += uint64(len(reply.ReducedUnit))
 	ack(outbound)
 	send(&wire.SessionEvent{Event: &wire.SessionEvent_Information{Information: &wire.SessionInformation{ReducedUnit: []byte{0, 5, 0x4b, 0xa0, 1, 4, 0, 6}}}})
+	if grant := read().GetPacingCredit(); grant == nil || grant.Normal != 1 || grant.Expedited != 0 {
+		t.Fatalf("CONFIRM pacing grant: %+v", grant)
+	}
 	reply = read().GetInformation()
 	if reply == nil || !bytes.Equal(reply.ReducedUnit, []byte{0x80, 0, 0xcb, 0xa0, 0, 4}) {
 		t.Fatalf("CONFIRM reply: %+v", reply)
