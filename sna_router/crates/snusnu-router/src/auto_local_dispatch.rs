@@ -23,6 +23,7 @@ use std::{
 use transport_ws::wire;
 
 pub(crate) struct CompletedLocalSession {
+    pub(crate) id: u64,
     pub(crate) ingress_id: String,
     pub(crate) proxy_mac: [u8; 6],
     pub(crate) gateway_id: String,
@@ -69,7 +70,7 @@ impl AutoLocalDispatch {
         target_cp: &wire::SnaName,
         seed: &[u8],
         timeout: Duration,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         if self.gateway_busy(gateway.id()) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -112,7 +113,7 @@ impl AutoLocalDispatch {
                 handle,
             },
         );
-        Ok(())
+        Ok(id)
     }
 
     /// Return finished sessions; caller must release each gateway UDP lease
@@ -123,6 +124,7 @@ impl AutoLocalDispatch {
             if let Some(active) = self.active.remove(&id) {
                 let joined = active.handle.join();
                 completed.push(CompletedLocalSession {
+                    id,
                     ingress_id: active.ingress_id,
                     proxy_mac: active.proxy_mac,
                     gateway_id: active.gateway_id,
@@ -145,6 +147,7 @@ impl AutoLocalDispatch {
             if let Some(active) = self.active.remove(&id) {
                 let result = active.handle.join();
                 completed.push(CompletedLocalSession {
+                    id,
                     ingress_id: active.ingress_id,
                     proxy_mac: active.proxy_mac,
                     gateway_id: active.gateway_id,
