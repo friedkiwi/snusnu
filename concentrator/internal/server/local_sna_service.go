@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"time"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/friedkiwi/snusnu/sna"
@@ -75,6 +76,28 @@ func (a *App) StartLocalSNAPrinterProbe(ctx context.Context) error {
 		localService{LU: "PRINTER", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
 			AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
 			Handle:       probe.handle})
+}
+
+// DialLocalSNAPrinterProbe makes one QA-only outbound session attempt once a
+// named authenticated LU appears. It is useful for observing whether the
+// router can originate the 5494 controller session toward a guest.
+func (a *App) DialLocalSNAPrinterProbe(ctx context.Context, netID, lu string) {
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			if target := a.hub.findLocalProbeTarget(netID, lu); target != nil {
+				requestID, err := a.hub.localServices.openFrom(3, target, wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1)
+				log.Printf("printer probe outbound open: target=%s.%s request=%d err=%v", netID, lu, requestID, err)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 }
 
 func (s *localSNAService) handle(envelope *wire.WsEnvelope, source LocalPeer) {

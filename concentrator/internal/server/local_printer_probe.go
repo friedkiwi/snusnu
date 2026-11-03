@@ -26,8 +26,37 @@ func newLocalPrinterProbe(h *routerHub) *localPrinterProbe {
 	return &localPrinterProbe{hub: h, circuits: make(map[string]*printerProbeCircuit)}
 }
 
+func (h *routerHub) findLocalProbeTarget(netID, lu string) *wire.RouteReference {
+	var target *wire.RouteReference
+	h.clients.Range(func(_, value any) bool {
+		session := value.(*routerSession)
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if session.snapshot == nil || session.closed.Load() {
+			return true
+		}
+		for _, route := range session.snapshot.Routes {
+			unit := route.GetLogicalUnit()
+			if unit == nil || unit.Lu == nil || unit.Lu.Netid != netID || unit.Lu.Name != lu || !sourceLUSupports62(route) {
+				continue
+			}
+			target = &wire.RouteReference{RouterId: uuidBytes(session.router.ID), Epoch: uuidBytes(session.epoch), RouteId: route.Id, RouteGeneration: route.Generation}
+			return false
+		}
+		return true
+	})
+	return target
+}
+
 func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) {
 	if envelope == nil {
+		return
+	}
+	if result := envelope.GetOpenResult(); result != nil {
+		log.Printf("printer probe outbound result: request=%d accepted=%t reason=%s circuit=%x peer=%s.%s", result.RequestId, result.Accepted, result.Reason, result.CircuitId, source.NetID, source.LU)
+		if result.Accepted {
+			p.acceptOutbound(result, source)
+		}
 		return
 	}
 	if open := envelope.GetIncomingOpen(); open != nil {
@@ -96,6 +125,23 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 		delete(p.circuits, id)
 		p.hub.resetCircuit(id, wire.ResetReason_RESET_REASON_PROTOCOL)
 	}
+}
+
+func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source LocalPeer) {
+	id, ok := uuidString(result.CircuitId)
+	peer := source.SNAPeer()
+	if !ok || !peer.Valid() || len(p.circuits) >= 64 {
+		return
+	}
+	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
+	if err != nil {
+		return
+	}
+	xid, err := xid3.NewActivation(local)
+	if err != nil {
+		return
+	}
+	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1, allowance: 1500}
 }
 
 func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {

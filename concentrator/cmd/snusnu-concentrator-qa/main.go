@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ func main() {
 	origin := flag.String("origin", "http://localhost:8081", "QA public origin")
 	aliceNetID := flag.String("alice-netid", "QAALICE", "NETID for the isolated Alice QA fixture")
 	printerProbe := flag.Bool("printer-probe", false, "advertise a QA-only SNUSNU.PRINTER wire trace endpoint")
+	printerProbeDial := flag.String("printer-probe-dial", "", "make one outbound printer probe session attempt to NETID.LU")
 	snaDebug := flag.Bool("sna-debug", false, "log SNA circuit state and protocol data to stderr")
 	flag.Parse()
 	if !store.ValidNetID(*aliceNetID) {
@@ -64,6 +66,13 @@ func main() {
 	}
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *printerProbeDial != "" {
+		parts := strings.Split(*printerProbeDial, ".")
+		if !*printerProbe || len(parts) != 2 || !store.ValidNetID(parts[0]) || !store.ValidNetID(parts[1]) {
+			log.Fatal("-printer-probe-dial requires -printer-probe and NETID.LU")
+		}
+		app.DialLocalSNAPrinterProbe(ctx, parts[0], parts[1])
 	}
 	log.Printf("QA database: %s", path)
 	log.Printf("QA accounts and router tokens: see concentrator/QA.md")

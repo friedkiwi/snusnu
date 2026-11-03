@@ -18,6 +18,10 @@ printer BIND or store output, so use it only to capture the first guest
 exchange before enabling the embedded printer service.
 Use `-sna-debug` to log full SNA PIUs, circuit credit and internal service
 state to stderr in the QA process.
+With `-printer-probe-dial SOLNET.SNAB`, the QA instance also makes one
+outbound SessionV1 open attempt from PRINTER when that LU is advertised.
+The open result and any resulting session events are logged. This option
+requires `-printer-probe`.
 
 Every launch creates a new private directory under the OS temporary directory and a new `qa.sqlite` database in it. The database path is printed at startup. The QA binary **ignores** `SNUSNU_DB_DRIVER` and `SNUSNU_DB_DSN`, does not accept a database path flag, and creates the file exclusively. It cannot open or overwrite the normal concentrator's configured database. Previous QA databases are retained until removed by the operator or the OS temporary-directory cleanup.
 
