@@ -709,6 +709,7 @@ impl<'a> DirectHprRuntime<'a> {
             ws.close()?;
             return Ok(());
         };
+        let adjacent_cp = llc.adjacent_cp().clone();
         let reservation = match llc.reserve_external(&attachment_id, &target_lu) {
             Ok(Some(reservation)) => reservation,
             Ok(None) => {
@@ -729,6 +730,7 @@ impl<'a> DirectHprRuntime<'a> {
             ws,
             reservation.attachment_id.clone(),
             reservation.peer(),
+            &adjacent_cp,
             &self.bootstrap.local.node_id,
         ) {
             Ok(bridge) => bridge,
@@ -739,7 +741,8 @@ impl<'a> DirectHprRuntime<'a> {
         };
         tracing::info!(attachment = %attachment_id,
             source_lu = %identity.source_lu, target_lu = %identity.target_lu,
-            source_cp = ?identity.source_cp, target_cp = %target_cp,
+            source_cp = ?identity.source_cp, adjacent_cp = %adjacent_cp,
+            target_cp = %target_cp,
             "concentrator SessionV1 admitted to local LLC peer");
         self.local_ws.push(bridge);
         Ok(())

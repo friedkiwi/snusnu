@@ -36,13 +36,16 @@ fn invalid(reason: &'static str) -> io::Error {
 }
 
 fn validate_lu_cp_pair(
-    source_cp: &QualifiedName,
+    _source_cp: &QualifiedName,
     target_cp: &QualifiedName,
-    source_lu: &QualifiedName,
+    _source_lu: &QualifiedName,
     target_lu: &QualifiedName,
 ) -> io::Result<()> {
-    if source_cp.netid != source_lu.netid || target_cp.netid != target_lu.netid {
-        return Err(invalid("local LLC route CP and LU NETIDs disagree"));
+    // The adjacent CP belongs to the local network, while the routed source
+    // LU may belong to a different network. Only the destination CP and LU
+    // must share the local NETID.
+    if target_cp.netid != target_lu.netid {
+        return Err(invalid("local LLC target CP and LU NETIDs disagree"));
     }
     Ok(())
 }
@@ -454,15 +457,21 @@ mod tests {
         invalid[5 + 25] = 0x41;
         let invalid = SessionUnit::from_reduced(&invalid).unwrap();
         assert!(offer_from_bind(&invalid, "SOLNET.SNAB", "SNUSNU.PING", [2; 8]).is_err());
+        assert!(validate_lu_cp_pair(
+            &"OTHER.CP".parse().unwrap(),
+            &"SNUSNU.SVC".parse().unwrap(),
+            &"SOLNET.SNAB".parse().unwrap(),
+            &"SNUSNU.PING".parse().unwrap(),
+        )
+        .is_ok());
         assert_eq!(
             validate_lu_cp_pair(
                 &"OTHER.CP".parse().unwrap(),
                 &"SNUSNU.SVC".parse().unwrap(),
                 &"SOLNET.SNAB".parse().unwrap(),
-                &"SNUSNU.PING".parse().unwrap(),
+                &"OTHER.PING".parse().unwrap(),
             )
-            .err()
-            .unwrap()
+            .unwrap_err()
             .kind(),
             io::ErrorKind::InvalidData
         );

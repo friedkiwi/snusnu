@@ -65,6 +65,10 @@ impl ReservedLlcPeer {
 }
 
 impl HprLlcAttachments {
+    pub(crate) fn adjacent_cp(&self) -> &QualifiedName {
+        &self.source_cp
+    }
+
     pub(crate) fn new(
         config: &RouterConfig,
         source_cp: &QualifiedName,

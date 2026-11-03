@@ -142,10 +142,11 @@ impl LlcSessionWs {
         ws: SessionWsPort,
         attachment_id: String,
         peer: LlcPeer<'_>,
+        adjacent_cp: &QualifiedName,
         seed: &[u8],
     ) -> io::Result<Self> {
-        let (source_cp, target_cp) = control_points(&identity)?;
-        let probe = HprToLlcProbe::new(peer, source_cp, target_cp, seed)?;
+        let (_, target_cp) = control_points(&identity)?;
+        let probe = HprToLlcProbe::new(peer, adjacent_cp, target_cp, seed)?;
         Ok(Self {
             identity,
             attachment_id,

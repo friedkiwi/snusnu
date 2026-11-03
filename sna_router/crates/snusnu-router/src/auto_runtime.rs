@@ -1233,11 +1233,17 @@ fn open_incoming_llc_session(
             proxy_mac: selected.proxy_mac,
         };
         let seed = format!("{}:{}", selected.attachment.0, id);
+        let adjacent_cp = identity
+            .source_cp
+            .as_ref()
+            .ok_or_else(|| io::Error::other("incoming LLC source CP missing"))?
+            .clone();
         let session = LlcSessionWs::new(
             identity,
             ws,
             selected.attachment.0.clone(),
             peer,
+            &adjacent_cp,
             seed.as_bytes(),
         )?;
         *next_id = id;
