@@ -756,6 +756,7 @@ fn udp_expedited_completion_waits_for_exact_native_ack() {
         transport_ip_sna::mptn_gateway::native_normal_to_mptn(&first_application_reply()).unwrap();
     edge.submit_udp_expedited(&reduced.bytes[5..]).unwrap();
     let mut expected = first_application_reply();
+    expected[0] |= 1; // TCP62 expedited restores the FID2 expedited bit.
     expected[7] &= !1; // TCP62 does not carry native pacing indication.
     assert_eq!(edge.native_mut().sent.last().unwrap(), &expected);
     assert!(!edge.take_completed_udp_expedited());
@@ -776,6 +777,70 @@ fn udp_expedited_completion_waits_for_exact_native_ack() {
     edge.poll_native_once().unwrap();
     assert!(edge.take_completed_udp_abort());
     assert!(!edge.take_completed_udp_abort());
+}
+
+#[test]
+fn tcp_expedited_signal_is_delivered_and_acked_before_later_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let bridge = Bridge::new(
+        policy(),
+        CompensationSet::from_codes(&TCP62_REQUIRED).unwrap(),
+        management_bind(),
+        [0x30, 0xf0, 0xf0, 0xf5],
+        1,
+    )
+    .unwrap();
+    let mut native = MockNative {
+        accepts: true,
+        ..Default::default()
+    };
+    native.events.push_back(NativeEvent::UserBind(user_bind()));
+    let mut edge = GatewayEdge::new(native, TcpSession::new(sender).unwrap(), bridge, template());
+    edge.poll_native_once().unwrap();
+    edge.flush_tcp().unwrap();
+    let connect = Connect::decode(&read_record(&mut peer)).unwrap();
+    peer.write_all(&positive_response(&connect).bytes).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.phase() == BridgePhase::AwaitConnect && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::BindResponseAck(1));
+    edge.poll_native_once().unwrap();
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::FirstAttach(first_user_attach()));
+    edge.poll_native_once().unwrap();
+    edge.flush_tcp().unwrap();
+    let _attach = read_record(&mut peer);
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    assert!(edge.first_attach_delivery_complete());
+
+    let signal = [0, 0, 0, 15, 1, 0x80, 0, 0x4b, 0x80, 0, 0xc9, 0, 1, 0, 1];
+    peer.write_all(&signal).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while edge.native_mut().sent.len() < 3 && Instant::now() < deadline {
+        edge.poll_tcp_once().unwrap();
+        std::thread::yield_now();
+    }
+    let native_signal = edge.native_mut().sent.last().unwrap();
+    assert_eq!(native_signal[0] & 1, 1); // FID2 expedited flow.
+    assert_eq!(&native_signal[6..], &signal[7..]);
+    edge.flush_tcp().unwrap();
+    assert_eq!(read_record(&mut peer), [0, 0, 0, 5, 3]);
+    edge.native_mut()
+        .events
+        .push_back(NativeEvent::EgressAck(1));
+    edge.poll_native_once().unwrap();
+    assert!(!edge.is_closed());
 }
 
 #[test]

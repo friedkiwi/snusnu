@@ -517,6 +517,19 @@ impl Bridge {
         Ok(piu)
     }
 
+    /// Convert an expedited record received on the same TCP62 association.
+    /// The caller sends the returned TCP ACK after native egress accepts the
+    /// PIU, and holds later normal records until native delivery completes.
+    pub fn next_mptn_tcp_expedited(
+        &mut self,
+        record: &TcpRecord,
+    ) -> io::Result<(Vec<u8>, TcpRecord)> {
+        if self.phase != Phase::Active || !self.first_attach_complete {
+            return Err(wrong_phase());
+        }
+        self.gateway.mptn_expedited(record)
+    }
+
     pub fn complete_mptn_udp_expedited(&mut self, piu_bytes: usize) -> io::Result<()> {
         self.gateway.complete_native_expedited_delivery(piu_bytes)
     }

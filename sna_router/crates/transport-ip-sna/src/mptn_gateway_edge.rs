@@ -37,7 +37,15 @@ enum NativeReply {
     Ipr,
     UserNormal,
     UdpExpedited,
+    TcpExpedited,
     UdpAbort,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TcpWriteKind {
+    Connect,
+    Charged,
+    ExpeditedAck,
 }
 
 #[derive(Clone, Copy)]
@@ -59,14 +67,16 @@ pub struct GatewayEdge<L: NativeLeg> {
     normal: Option<(TcpRecord, bool, NativeNormalKind)>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
-    /// TCP queue order and whether GatewaySession charged this record.
-    writes: VecDeque<(usize, bool)>,
+    /// TCP queue order and the accounting rule for each record.
+    writes: VecDeque<(usize, TcpWriteKind)>,
     connect_fully_sent: bool,
     ipr_ack_outstanding: bool,
     ipr_ack_received: bool,
     attach_fully_sent: bool,
     udp_expedited_pending: Option<usize>,
     udp_expedited_completed: bool,
+    tcp_expedited_pending: Option<usize>,
+    tcp_expedited_ack: Option<TcpRecord>,
     udp_abort_pending: bool,
     udp_abort_completed: bool,
     closed: bool,
@@ -96,6 +106,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             attach_fully_sent: false,
             udp_expedited_pending: None,
             udp_expedited_completed: false,
+            tcp_expedited_pending: None,
+            tcp_expedited_ack: None,
             udp_abort_pending: false,
             udp_abort_completed: false,
             closed: false,
@@ -135,6 +147,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             || self.native_reply.is_some()
             || self.udp_expedited_pending.is_some()
             || self.udp_expedited_completed
+            || self.tcp_expedited_pending.is_some()
             || self.ipr_ack_outstanding
         {
             return Err(io::Error::new(
@@ -201,7 +214,10 @@ impl<L: NativeLeg> GatewayEdge<L> {
         // After Attach, consume at most one native I-frame per TCP delivery
         // and local pacing grant. The LLC receive window supplies backpressure
         // while any converted record or IPR is outstanding.
-        let charged_write = self.writes.iter().any(|(_, charged)| *charged);
+        let charged_write = self
+            .writes
+            .iter()
+            .any(|(_, kind)| *kind == TcpWriteKind::Charged);
         let can_accept_information = if self.attach_fully_sent {
             self.first_attach_delivery_complete()
                 && self.bridge.phase() == Phase::Active
@@ -210,6 +226,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                 && !self.ipr_ack_outstanding
                 && self.udp_expedited_pending.is_none()
                 && !self.udp_expedited_completed
+                && self.tcp_expedited_pending.is_none()
                 && !charged_write
         } else {
             self.attach.is_none() && !charged_write
@@ -260,6 +277,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
                     } else if let Some(bytes) = self.udp_expedited_pending.take() {
                         self.bridge.complete_mptn_udp_expedited(bytes)?;
                         self.udp_expedited_completed = true;
+                    } else if let Some(bytes) = self.tcp_expedited_pending.take() {
+                        self.bridge.complete_mptn_udp_expedited(bytes)?;
                     } else if self.udp_abort_pending {
                         self.udp_abort_pending = false;
                         self.udp_abort_completed = true;
@@ -355,6 +374,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
                         || self.ipr_ack_outstanding
                         || self.udp_expedited_pending.is_some()
                         || self.udp_expedited_completed
+                        || self.tcp_expedited_pending.is_some()
                     {
                         return Ok(());
                     }
@@ -366,7 +386,33 @@ impl<L: NativeLeg> GatewayEdge<L> {
                         return Ok(()); // one LLC I-frame is outstanding
                     }
                 }
-                _ => return Err(invalid("unsupported TCP62 record on native gateway")),
+                TcpKind::Expedited => {
+                    if !self.first_attach_delivery_complete()
+                        || self.bridge.phase() != Phase::Active
+                        || self.native_reply.is_some()
+                        || self.ipr_ack_outstanding
+                        || self.udp_expedited_pending.is_some()
+                        || self.tcp_expedited_pending.is_some()
+                    {
+                        return Ok(());
+                    }
+                    let record = self.incoming.pop_front().unwrap();
+                    self.incoming_bytes -= record.bytes.len();
+                    let (piu, ack) = self.bridge.next_mptn_tcp_expedited(&record)?;
+                    self.tcp_expedited_ack = Some(ack);
+                    self.native_reply = Some((NativeReply::TcpExpedited, piu));
+                    self.drive_queues()?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported TCP62 record on native gateway: kind={:?} bytes={:02x?}",
+                            record.kind, record.bytes
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
@@ -394,7 +440,7 @@ impl<L: NativeLeg> GatewayEdge<L> {
             .unwrap()
             .flush_with_completion(|len| completed.push(len));
         for len in completed {
-            let Some((expected, charged)) = self.writes.pop_front() else {
+            let Some((expected, kind)) = self.writes.pop_front() else {
                 self.close()?;
                 return Err(invalid("untracked TCP62 write completion"));
             };
@@ -402,14 +448,19 @@ impl<L: NativeLeg> GatewayEdge<L> {
                 self.close()?;
                 return Err(invalid("TCP62 completion length mismatch"));
             }
-            if charged {
-                self.bridge.complete_tcp_delivery(len)?;
-                self.attach_fully_sent = true;
-            } else if self.connect_fully_sent {
-                self.close()?;
-                return Err(invalid("duplicate TCP62 Connect write completion"));
-            } else {
-                self.connect_fully_sent = true;
+            match kind {
+                TcpWriteKind::Charged => {
+                    self.bridge.complete_tcp_delivery(len)?;
+                    self.attach_fully_sent = true;
+                }
+                TcpWriteKind::Connect if !self.connect_fully_sent => {
+                    self.connect_fully_sent = true;
+                }
+                TcpWriteKind::Connect => {
+                    self.close()?;
+                    return Err(invalid("duplicate TCP62 Connect write completion"));
+                }
+                TcpWriteKind::ExpeditedAck => {}
             }
         }
         result
@@ -429,12 +480,27 @@ impl<L: NativeLeg> GatewayEdge<L> {
                 }
                 NativeReply::UserNormal => self.bridge.mark_native_normal_enqueued(&piu)?,
                 NativeReply::UdpExpedited => self.udp_expedited_pending = Some(piu.len()),
+                NativeReply::TcpExpedited => self.tcp_expedited_pending = Some(piu.len()),
                 NativeReply::UdpAbort => self.udp_abort_pending = true,
+            }
+        }
+        if let Some(ack) = self.tcp_expedited_ack.take() {
+            match self.tcp.as_mut().unwrap().queue(ack.clone()) {
+                Ok(()) => self
+                    .writes
+                    .push_back((ack.bytes.len(), TcpWriteKind::ExpeditedAck)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.tcp_expedited_ack = Some(ack);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
         }
         if let Some(record) = self.connect.take() {
             match self.tcp.as_mut().unwrap().queue(record.clone()) {
-                Ok(()) => self.writes.push_back((record.bytes.len(), false)),
+                Ok(()) => self
+                    .writes
+                    .push_back((record.bytes.len(), TcpWriteKind::Connect)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.connect = Some(record);
                     return Ok(());
@@ -445,7 +511,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
         if let Some((record, queued)) = self.attach.take() {
             if !queued {
                 match self.tcp.as_mut().unwrap().queue(record.clone()) {
-                    Ok(()) => self.writes.push_back((record.bytes.len(), true)),
+                    Ok(()) => self
+                        .writes
+                        .push_back((record.bytes.len(), TcpWriteKind::Charged)),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         self.attach = Some((record, false));
                         return Ok(());
@@ -471,7 +539,9 @@ impl<L: NativeLeg> GatewayEdge<L> {
         if let Some((record, queued, kind)) = self.normal.take() {
             if !queued {
                 match self.tcp.as_mut().unwrap().queue(record.clone()) {
-                    Ok(()) => self.writes.push_back((record.bytes.len(), true)),
+                    Ok(()) => self
+                        .writes
+                        .push_back((record.bytes.len(), TcpWriteKind::Charged)),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         self.normal = Some((record, false, kind));
                         return Ok(());
@@ -519,6 +589,8 @@ impl<L: NativeLeg> GatewayEdge<L> {
             self.attach_fully_sent = false;
             self.udp_expedited_pending = None;
             self.udp_expedited_completed = false;
+            self.tcp_expedited_pending = None;
+            self.tcp_expedited_ack = None;
             self.udp_abort_pending = false;
             self.udp_abort_completed = false;
             self.native.close()?;

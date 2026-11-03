@@ -507,7 +507,10 @@ impl GatewaySession {
         let mut normal = record.clone();
         normal.kind = TcpKind::Normal;
         normal.bytes[4] = 0;
-        let piu = mptn_normal_to_native(&normal, reversed)?;
+        let mut piu = mptn_normal_to_native(&normal, reversed)?;
+        // The reduced header is shared with normal TCP62 records, so the
+        // decoder cannot infer the FID2 expedited-flow bit from its bytes.
+        piu[0] |= 0x01;
         let ExpeditedInbound::Expedited { ack } = self.expedited.receive(record)? else {
             return Err(invalid("unexpected TCP62 expedited state"));
         };
@@ -869,7 +872,7 @@ mod tests {
         let incoming =
             TcpRecord::decode(vec![0, 0, 0, 11, 0x01, 0, 3, 0x4b, 0x80, 0, 0xc9]).unwrap();
         let (native, ack) = session.mptn_expedited(&incoming).unwrap();
-        assert_eq!(native, [0x2c, 0, 2, 1, 0, 3, 0x4b, 0x80, 0, 0xc9]);
+        assert_eq!(native, [0x2d, 0, 2, 1, 0, 3, 0x4b, 0x80, 0, 0xc9]);
         assert_eq!(ack.bytes, [0, 0, 0, 5, 0x03]);
         let later = TcpRecord::decode(vec![0, 0, 0, 10, 0, 0, 4, 3, 0, 0]).unwrap();
         assert_eq!(

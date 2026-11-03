@@ -272,6 +272,17 @@ address `01`, and its LU type is 7 rather than 4. The controller remains
 `VARY ON PENDING`; the guest has queued spool files but has not sent an
 address-01 printer BIND or SCS data. No spool has reached the concentrator.
 
+A QA-only trial answered the next address-56 LU7 FMD (`03 90 20`) with an
+unsolicited positive inner response. The guest then sent a TCP62 expedited
+SIGNAL `C9 00 01 00 01` and a negative inner response with sense `10030000`
+to that positive response. The `03 90 20` request is exception-response
+form, so the trial response was removed. This trial did reveal a generic
+router gap: the AnyNet converter rejected all TCP62 expedited records and
+closed the circuit. The converter now restores the FID2 expedited bit,
+forwards the SIGNAL to the concentrator, and sends the five-byte TCP62 ACK.
+Verbose router and QA traces confirm the exact SIGNAL arrived at QA. This
+does not make the address-56 device exchange or printer session complete.
+
 With `SNUPRT` corrected to remote location `SVC`, an outbound AnyNet
 controller circuit sourced from the distinct LU route `SNUSNU.SVC`
 again completed source CNOS, the controller BIND, and the `30F0F6F6`
