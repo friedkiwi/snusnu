@@ -30,8 +30,10 @@ and the controller notification before a writer can send spool data.
 The transport-independent Go `sna/services/printer` package now parses the
 IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds
 candidate ACTLU and printer BIND responses, and renders common SCS fixed-pitch
-text. These response candidates have not been exercised against the guest.
-The enclosing LU 6.2 controller and device GDS envelopes remain unknown.
+text. It also encodes the short, hardware-only NMVT Reply Product Set ID used
+to announce a powered-on printer, with runtime SNA address and VPD supplied by
+the caller. These candidates have not been exercised against the guest. The
+enclosing LU 6.2 controller and device GDS envelopes remain unknown.
 The package does not perform APPC session management, store jobs, or produce a
 PDF. The concentrator now has owner-scoped durable raw SCS storage,
 a searchable print list, a monospace preview, and a greenbar PDF writer. These
@@ -43,11 +45,11 @@ The reusable `sna/lu62` package also constructs candidate `QRMTWSC` CNOS and
 controller BIND requests with dynamic LU names, CP name, and FQPCID. Its
 CNOS reply validator checks the accepted-pending service, mode, session limits,
 and reversed FID2 addresses before the controller can proceed. Its
-binary architecture-TP Attach parser can retain the likely controller TPN
+binary architecture-TP Attach parser can retain the controller TPN
 `30F0F6F6` without treating it as an EBCDIC application name. These requests
 have not been accepted by a live IBM i controller session. Building the
-controller Attach, processing its reply, and issuing the private power-on
-notification remain to be implemented.
+controller Attach, processing its reply, and wrapping the NMVT in the live
+controller exchange remain to be implemented.
 
 IBM's [LU 6.2 guide](https://www.ibm.com/docs/en/SSLTBW_3.1.0/pdf/istp620_v3r1.pdf)
 defines both basic and mapped FMH-5 conversation forms. The parser accepts
@@ -108,14 +110,22 @@ EBCDIC `SNASVCMG` constant appears in `VG10.BIN` at offset `0x7236`.
 `0x7244`. This independently supports the fixed portion built by the Go
 candidate; it does not reveal the dynamically generated names or PCID.
 At `VG10.BIN` offset `0x9288`, a basic-conversation FMH-5 template has binary
-TPN `30F0F5F1` and the PIP-present flag set. IBM's
-[V5R4 architecture-TP table](https://public.dhe.ibm.com/systems/power/docs/systemi/v5r4/en_US/rzamv.pdf)
-identifies that TPN as DIA Version 2, so this template is not the controller
-Attach. Another local constant contains `30F0F6F3`, whose purpose still needs
-to be traced. No `VG*.BIN` file contains a literal `30F0F6F6`.
+TPN `30F0F5F1` and the PIP-present flag set. The firmware copies
+`30F0F6F6` from `5494CONF.DAT` over that TPN at runtime for the controller
+Attach. This establishes the target TP for Release 3.2, though the transmitted
+FMH-5 and PIP still need a trace. Another local constant contains `30F0F6F3`,
+whose purpose still needs to be traced.
 `DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
-observations identify a reverse-engineering lead; they do not establish the
-power-on record or a successful 5494 conversation.
+observations do not establish a successful 5494 conversation.
+
+The firmware's `VG15.BIN` constructs an NMVT Reply PSID (`41 03 8D` request,
+`00 90` major-vector key) with address-01 power-on bytes
+`09 82 04 10 00 01 03 20 01`. Its product subvector starts `19 10` and
+copies machine type, model, plant and serial from runtime twinax VPD. The
+[research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
+lists exact firmware offsets and the remaining unknown wrapper and host reply.
+The configured `3812` machine type would be `F3 F8 F1 F2` in EBCDIC, but that
+value was not observed in a populated firmware VPD table.
 
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
@@ -126,10 +136,9 @@ subvector is part of Attach PIP; treating it as the printer address or the
 power-on record would be unsupported.
 
 1. Capture the actual V5R4 `QRMTWSC` control and printer sessions against a
-   compatible 5494 or APPC printer peer. IBM documents the inner LU 4 protocol
-   but omits the controller power-on announcement and its correlation with the
-   parallel device session. The likely controller Attach TP is `30F0F6F6`;
-   it still needs trace confirmation.
+   compatible 5494 or APPC printer peer. The firmware establishes the NMVT
+   Reply PSID payload, but its outer controller record, IBM i's immediate
+   reply, and correlation with the parallel printer session still need a trace.
 2. Generalize the router's service-directed BIND admission and both transport
    adapters for the printer's session profile. The concentrator local service
    registry can now open an outbound circuit from its own LU, but the router's
