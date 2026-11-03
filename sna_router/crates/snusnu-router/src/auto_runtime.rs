@@ -587,10 +587,33 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                     source_lu = %format!("{}.{}", source.netid, source.name),
                     destination_lu = %format!("{}.{}", destination.netid, destination.name),
                     "TCP62 management disclosed local LU reachability");
-                learned_mptn_lus
-                    .entry(gateway.id().into())
-                    .or_default()
-                    .insert((source.netid, source.name));
+            }
+            if let Some(snapshot) = gateway.take_discovery_snapshot() {
+                tracing::debug!(
+                    gateway = gateway.id(),
+                    revision = snapshot.revision,
+                    learned_lus = snapshot.lus.len(),
+                    "MPTN attachment discovery snapshot changed"
+                );
+                learned_mptn_lus.insert(
+                    gateway.id().to_owned(),
+                    snapshot
+                        .lus
+                        .into_iter()
+                        .map(|lu| (lu.netid, lu.name))
+                        .collect(),
+                );
+                if let Some(connected) = hub.as_mut() {
+                    if refresh_mptn_exports(
+                        config,
+                        &learned_mptn_lus,
+                        connected,
+                        &mut mptn_exports,
+                        &mut mptn_owner,
+                    )? {
+                        publish_local(&bridge, &mptn_exports, connected)?;
+                    }
+                }
             }
             for attachment in gateway.take_closed_local_attachments() {
                 if let Some(index) = config.llc.iter().position(|peer| peer.id == attachment) {
@@ -622,10 +645,6 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 let (source, destination) = AutoMptnGateway::offer_lus(&offer)?;
                 let source = config::parse_cp(&source)?;
                 let destination = config::parse_cp(&destination)?;
-                learned_mptn_lus
-                    .entry(gateway.id().into())
-                    .or_default()
-                    .insert((source.netid.clone(), source.name.clone()));
                 match bridge.select_lu(&destination) {
                     Ok(target_id) => {
                         let target_cp = bridge
@@ -715,27 +734,14 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
                 })?;
                 tracing::debug!(gateway = gateway.id(), target_cp = %format!("{}.{}", target_cp.netid, target_cp.name),
                     "automatic TCP62 target LU resolved for SessionV1");
-                let seed = format!("{}:{}.{}", gateway.id(), source.netid, source.name);
-                let local_cp = gateway
-                    .configured_local_cp()?
-                    .map(Ok)
-                    .unwrap_or_else(|| virtual_cp_for_source(&source, seed.as_bytes(), None))?;
-                mptn_exports.insert(
-                    format!("{}:{}.{}", gateway.id(), source.netid, source.name),
-                    (
-                        local_cp.clone(),
-                        wire::LuReachability {
-                            lu: Some(source.clone()),
-                            hosting_cp: Some(local_cp.clone()),
-                            supported_types: vec![wire::LuType::LuType62 as i32],
-                        },
-                    ),
-                );
-                mptn_owner.insert(
-                    (source.netid.clone(), source.name.clone()),
-                    gateway.id().into(),
-                );
-                publish_local(&bridge, &mptn_exports, connected)?;
+                if mptn_owner.get(&(source.netid.clone(), source.name.clone()))
+                    != Some(&gateway.id().to_owned())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "MPTN source LU discovery is unavailable or ambiguous",
+                    ));
+                }
                 let ws = connected
                     .open_session_lu(&destination, &source)?
                     .ok_or_else(|| {
@@ -824,7 +830,18 @@ fn refresh_mptn_exports(
     exports: &mut HashMap<String, (wire::SnaName, wire::LuReachability)>,
     owner: &mut HashMap<(String, String), String>,
 ) -> io::Result<bool> {
-    let mut changed = false;
+    // Rebuild from complete adapter snapshots. A closed or expired peer must
+    // disappear from both the upstream export and the reverse-route owner map.
+    let mut counts = HashMap::<(String, String), usize>::new();
+    for lus in learned.values() {
+        for (netid, name) in lus {
+            if netid == hub.allowed_netid() {
+                *counts.entry((netid.clone(), name.clone())).or_default() += 1;
+            }
+        }
+    }
+    let mut next_exports = HashMap::new();
+    let mut next_owner = HashMap::new();
     for (gateway_id, lus) in learned {
         for (netid, name) in lus {
             if netid != hub.allowed_netid() {
@@ -834,16 +851,10 @@ fn refresh_mptn_exports(
                 continue;
             }
             let key = format!("{gateway_id}:{netid}.{name}");
-            if exports.contains_key(&key) {
+            if counts.get(&(netid.clone(), name.clone())) != Some(&1) {
+                tracing::warn!(source_lu = %format!("{netid}.{name}"), gateway = gateway_id,
+                    "ambiguous learned TCP62 LU; route withheld");
                 continue;
-            }
-            if let Some(previous) = owner.get(&(netid.clone(), name.clone())) {
-                if previous != gateway_id {
-                    tracing::warn!(source_lu = %format!("{netid}.{name}"),
-                        first_gateway = previous, second_gateway = gateway_id,
-                        "ambiguous learned TCP62 LU; second route excluded");
-                    continue;
-                }
             }
             let source = wire::SnaName {
                 netid: netid.clone(),
@@ -857,7 +868,7 @@ fn refresh_mptn_exports(
                 .map(|gateway| gateway.local_cp.as_str())
                 .filter(|value| !value.is_empty());
             let cp = virtual_cp_for_source(&source, seed.as_bytes(), configured_cp)?;
-            exports.insert(
+            next_exports.insert(
                 key,
                 (
                     cp.clone(),
@@ -868,10 +879,12 @@ fn refresh_mptn_exports(
                     },
                 ),
             );
-            owner.insert((netid.clone(), name.clone()), gateway_id.clone());
-            changed = true;
+            next_owner.insert((netid.clone(), name.clone()), gateway_id.clone());
         }
     }
+    let changed = *exports != next_exports || *owner != next_owner;
+    *exports = next_exports;
+    *owner = next_owner;
     Ok(changed)
 }
 
