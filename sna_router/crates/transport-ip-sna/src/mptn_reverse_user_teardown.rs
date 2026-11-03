@@ -66,6 +66,34 @@ impl ReverseUserTeardown {
         self.phase
     }
 
+    /// Build the canonical TCP62 X'83' body for this admitted user session.
+    /// HPR/IP peers can send the shorter FID5 UNBIND form; the carrier
+    /// adapter verifies that form's FQPCID before asking this native teardown
+    /// gate to prepare the equivalent FID2 UNBIND.
+    pub fn canonical_udp_abort(&self) -> io::Result<Vec<u8>> {
+        if self.phase != Phase::Active || self.destination.len() > 17 {
+            return Err(invalid("TCP62 user teardown is not active"));
+        }
+        let mut body = Vec::with_capacity(21 + self.fqpcid.len() + self.destination.len());
+        body.extend_from_slice(&[0, 0, 0x6b, 0x80, 0, 0x32, 0x0f, 0x08, 1, 0, 0]);
+        body.extend_from_slice(&self.fqpcid);
+        body.extend_from_slice(&[
+            0x35,
+            0x13,
+            0x08,
+            1,
+            0,
+            0,
+            (self.destination.len() + 1) as u8,
+            0,
+            self.destination.len() as u8,
+        ]);
+        body.extend_from_slice(&self.destination);
+        body.push(0);
+        self.check_abort(&body)?;
+        Ok(body)
+    }
+
     pub fn accept_abort(&mut self, record: &TcpRecord) -> io::Result<AbortAction<'_>> {
         if self.phase != Phase::Active {
             return Err(invalid("duplicate or retired TCP62 user Abort"));
