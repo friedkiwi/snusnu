@@ -1290,6 +1290,23 @@ mod tests {
             ),
             Err(HprAdapterError::UnsupportedPacing)
         );
+
+        // Bob V5R4 answered the Alice adaptive offer with these four BIND
+        // pacing bytes: adaptive selected, both fixed windows zero. The EE
+        // adapter must keep rejecting this until IPM handling exists.
+        let mut captured_adaptive = response.as_reduced().to_vec();
+        captured_adaptive[5 + 8] = 0x00;
+        captured_adaptive[5 + 9] = 0x80;
+        captured_adaptive[5 + 12] = 0x80;
+        captured_adaptive[5 + 13] = 0x00;
+        assert_eq!(
+            negotiated_fixed_windows(
+                HprSessionRole::RouterPlu,
+                &request,
+                &SessionUnit::from_reduced(&captured_adaptive).unwrap(),
+            ),
+            Err(HprAdapterError::UnsupportedPacing)
+        );
     }
 
     #[test]
