@@ -13,6 +13,7 @@ use router_core::{
     hpr_session_adapter::{negotiated_fixed_windows, HprSessionRole},
     hpr_session_address::RtpObservation,
     session::{SessionEvent, SessionIdentity},
+    session_fabric::AdapterId,
 };
 
 use crate::{
@@ -22,6 +23,7 @@ use crate::{
     },
     ee_ldlc_endpoint::EeLdlcEndpoint,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
+    hpr_session_source::{SessionSource, SourceUpdate},
     remote::{SessionWsPort, SessionWsUpdate},
 };
 
@@ -34,6 +36,60 @@ fn invalid(reason: impl Into<String>) -> io::Error {
 
 fn switch_error(context: &str, error: SwitchError) -> io::Error {
     invalid(format!("{context}: {error:?}"))
+}
+
+struct WsSessionSource {
+    port: SessionWsPort,
+    pending: Option<SourceUpdate>,
+}
+
+impl WsSessionSource {
+    fn new(port: SessionWsPort) -> Self {
+        Self {
+            port,
+            pending: None,
+        }
+    }
+}
+
+impl SessionSource for WsSessionSource {
+    fn poll(&mut self) -> io::Result<Option<SourceUpdate>> {
+        if let Some(update) = &self.pending {
+            return Ok(Some(update.clone()));
+        }
+        self.pending = match self.port.poll()? {
+            Some(SessionWsUpdate::Event(wire)) => {
+                Some(SourceUpdate::Event(from_session_wire(wire)?))
+            }
+            Some(SessionWsUpdate::Closed) => Some(SourceUpdate::Closed),
+            Some(SessionWsUpdate::Opened) | None => None,
+        };
+        Ok(self.pending.clone())
+    }
+
+    fn complete_received(&mut self, charge: bool) -> io::Result<()> {
+        if !matches!(self.pending, Some(SourceUpdate::Event(_))) {
+            return Err(invalid("WebSocket source has no event to complete"));
+        }
+        if charge {
+            self.port.complete_received(1)?;
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    fn send(&mut self, event: &SessionEvent) -> io::Result<bool> {
+        let Some(wire) = to_session_wire(event) else {
+            return Ok(true);
+        };
+        let sent = self.port.send(wire)?;
+        let _ = self.port.take_completed_send_count();
+        Ok(sent)
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        self.port.close()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,7 +105,8 @@ enum Phase {
 
 pub(crate) struct ReverseRuntime {
     identity: SessionIdentity,
-    ws: SessionWsPort,
+    source: Box<dyn SessionSource>,
+    source_adapter: AdapterId,
     bootstrap: HprControlBootstrap,
     handle: u64,
     tg_number: u8,
@@ -60,11 +117,10 @@ pub(crate) struct ReverseRuntime {
     phase: Phase,
     reverse: Option<ReverseHprUser>,
     user_config: Option<UserSetupConfig>,
-    pending_ws: Option<(SessionEvent, bool)>,
     pending_credit: Option<SessionEvent>,
     early_user: VecDeque<RtpIngress>,
     early_user_bytes: usize,
-    ws_closed: bool,
+    source_closed: bool,
 }
 
 impl ReverseRuntime {
@@ -80,9 +136,37 @@ impl ReverseRuntime {
         local_user_nce_instance: [u8; 4],
         metrics: DirectLinkMetrics,
     ) -> Self {
+        Self::with_source(
+            identity,
+            Box::new(WsSessionSource::new(ws)),
+            WS_ADAPTER,
+            bootstrap,
+            handle,
+            tg_number,
+            pcid,
+            local_user_nce_label,
+            local_user_nce_instance,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_source(
+        identity: SessionIdentity,
+        source: Box<dyn SessionSource>,
+        source_adapter: AdapterId,
+        bootstrap: HprControlBootstrap,
+        handle: u64,
+        tg_number: u8,
+        pcid: [u8; 8],
+        local_user_nce_label: Vec<u8>,
+        local_user_nce_instance: [u8; 4],
+        metrics: DirectLinkMetrics,
+    ) -> Self {
         Self {
             identity,
-            ws,
+            source,
+            source_adapter,
             bootstrap,
             handle,
             tg_number,
@@ -93,11 +177,10 @@ impl ReverseRuntime {
             phase: Phase::AwaitBind,
             reverse: None,
             user_config: None,
-            pending_ws: None,
             pending_credit: None,
             early_user: VecDeque::new(),
             early_user_bytes: 0,
-            ws_closed: false,
+            source_closed: false,
         }
     }
 
@@ -149,7 +232,7 @@ impl ReverseRuntime {
         if self.phase == Phase::Done {
             return self.finish(rtp);
         }
-        self.poll_ws(switch)?;
+        self.poll_source(switch)?;
         if self.phase == Phase::Done {
             return self.finish(rtp);
         }
@@ -200,10 +283,10 @@ impl ReverseRuntime {
             self.deliver_hpr(link, rtp, switch, now_us)?;
         }
         if self.phase != Phase::Done {
-            self.deliver_ws(switch)?;
+            self.deliver_source(switch)?;
         }
         if self.phase != Phase::AwaitBind
-            && !switch.has_handle(WS_ADAPTER, self.handle)
+            && !switch.has_handle(self.source_adapter, self.handle)
             && !switch.has_handle(HPR_ADAPTER, self.handle)
         {
             self.phase = Phase::Done;
@@ -217,45 +300,43 @@ impl ReverseRuntime {
     fn finish(&mut self, rtp: &mut HprRtpPort) -> io::Result<()> {
         rtp.reset_route_out();
         rtp.reset_user_out();
-        if !self.ws_closed {
-            self.ws.close()?;
-            self.ws_closed = true;
+        if !self.source_closed {
+            self.source.close()?;
+            self.source_closed = true;
         }
         Ok(())
     }
 
-    fn poll_ws(&mut self, switch: &mut SessionSwitch) -> io::Result<()> {
-        if self.pending_ws.is_none() && !self.ws_closed {
-            match self.ws.poll()? {
-                Some(SessionWsUpdate::Event(wire)) => {
-                    let event = from_session_wire(wire)?;
-                    let charge = !matches!(event, SessionEvent::Credit { .. });
-                    self.pending_ws = Some((event, charge));
-                }
-                Some(SessionWsUpdate::Closed) => {
-                    self.ws_closed = true;
-                    match self.phase {
-                        Phase::AwaitBind => self.phase = Phase::Done,
-                        Phase::Active => {
-                            switch
-                                .submit(WS_ADAPTER, self.handle, SessionEvent::Reset)
-                                .map_err(|error| switch_error("reverse HPR WS close", error))?;
-                        }
-                        Phase::Done => {}
-                        _ => {
-                            switch
-                                .discard_unopened(WS_ADAPTER, self.handle)
-                                .map_err(|error| switch_error("reverse HPR WS close", error))?;
-                            self.phase = Phase::Done;
-                        }
-                    }
-                }
-                Some(SessionWsUpdate::Opened) | None => {}
-            }
+    fn poll_source(&mut self, switch: &mut SessionSwitch) -> io::Result<()> {
+        if self.source_closed {
+            return Ok(());
         }
-        let Some((event, charge)) = self.pending_ws.clone() else {
+        let Some(update) = self.source.poll()? else {
             return Ok(());
         };
+        let event = match update {
+            SourceUpdate::Event(event) => event,
+            SourceUpdate::Closed => {
+                self.source_closed = true;
+                match self.phase {
+                    Phase::AwaitBind => self.phase = Phase::Done,
+                    Phase::Active => {
+                        switch
+                            .submit(self.source_adapter, self.handle, SessionEvent::Reset)
+                            .map_err(|error| switch_error("reverse HPR source close", error))?;
+                    }
+                    Phase::Done => {}
+                    _ => {
+                        switch
+                            .discard_unopened(self.source_adapter, self.handle)
+                            .map_err(|error| switch_error("reverse HPR source close", error))?;
+                        self.phase = Phase::Done;
+                    }
+                }
+                return Ok(());
+            }
+        };
+        let charge = !matches!(event, SessionEvent::Credit { .. });
         if self.phase == Phase::AwaitBind {
             let SessionEvent::BindRequest(bind) = event else {
                 return Err(invalid("reverse HPR circuit must start with BIND"));
@@ -273,7 +354,12 @@ impl ReverseRuntime {
                 self.metrics,
             )?;
             let (id, egress) = switch
-                .open(WS_ADAPTER, self.handle, self.identity.clone(), bind)
+                .open(
+                    self.source_adapter,
+                    self.handle,
+                    self.identity.clone(),
+                    bind,
+                )
                 .map_err(|error| switch_error("reverse HPR route selection", error))?;
             if egress != HPR_ADAPTER {
                 return Err(invalid("reverse HPR selected non-EE egress"));
@@ -283,21 +369,15 @@ impl ReverseRuntime {
                 .map_err(|error| switch_error("reverse HPR egress bind", error))?;
             self.reverse = Some(reverse);
             self.phase = Phase::SendRoute;
-            if charge {
-                self.ws.complete_received(1)?;
-            }
-            self.pending_ws = None;
+            self.source.complete_received(charge)?;
             return Ok(());
         }
-        match switch.submit(WS_ADAPTER, self.handle, event) {
+        match switch.submit(self.source_adapter, self.handle, event) {
             Ok(()) => {
-                if charge {
-                    self.ws.complete_received(1)?;
-                }
-                self.pending_ws = None;
+                self.source.complete_received(charge)?;
             }
             Err(SwitchError::Fabric(router_core::session_fabric::FabricError::Capacity)) => {}
-            Err(error) => return Err(switch_error("reverse HPR WS event", error)),
+            Err(error) => return Err(switch_error("reverse HPR source event", error)),
         }
         Ok(())
     }
@@ -398,43 +478,38 @@ impl ReverseRuntime {
         Ok(())
     }
 
-    fn deliver_ws(&mut self, switch: &mut SessionSwitch) -> io::Result<()> {
+    fn deliver_source(&mut self, switch: &mut SessionSwitch) -> io::Result<()> {
         if self.phase == Phase::AwaitBind {
             return Ok(());
         }
-        let event = match switch.next_delivery(WS_ADAPTER, self.handle) {
+        let event = match switch.next_delivery(self.source_adapter, self.handle) {
             Ok(event) => event,
             Err(SwitchError::UnknownHandle) => {
                 self.phase = Phase::Done;
                 return Ok(());
             }
-            Err(error) => return Err(switch_error("reverse HPR WS delivery", error)),
+            Err(error) => return Err(switch_error("reverse HPR source delivery", error)),
         };
         let Some(event) = event else {
             return Ok(());
         };
-        if self.ws_closed {
+        if self.source_closed {
             switch
-                .mark_sent(WS_ADAPTER, self.handle)
-                .map_err(|error| switch_error("reverse HPR closed WS completion", error))?;
+                .mark_sent(self.source_adapter, self.handle)
+                .map_err(|error| switch_error("reverse HPR closed source completion", error))?;
             self.phase = Phase::Done;
             return Ok(());
         }
-        if let Some(wire) = to_session_wire(&event) {
-            if self.ws.send(wire)? {
-                switch
-                    .mark_sent(WS_ADAPTER, self.handle)
-                    .map_err(|error| switch_error("reverse HPR WS completion", error))?;
-            }
-        } else {
-            self.ws.close()?;
-            self.ws_closed = true;
+        if self.source.send(&event)? {
             switch
-                .mark_sent(WS_ADAPTER, self.handle)
-                .map_err(|error| switch_error("reverse HPR WS reset", error))?;
-            self.phase = Phase::Done;
+                .mark_sent(self.source_adapter, self.handle)
+                .map_err(|error| switch_error("reverse HPR source completion", error))?;
+            if matches!(event, SessionEvent::Reset) {
+                self.source.close()?;
+                self.source_closed = true;
+                self.phase = Phase::Done;
+            }
         }
-        let _ = self.ws.take_completed_send_count();
         Ok(())
     }
 }

@@ -65,6 +65,8 @@ mod hpr_local_llc;
 #[allow(dead_code)] // The HPR session loop attaches this adapter once wired.
 mod hpr_rtp_port;
 #[cfg(target_os = "linux")]
+mod hpr_session_source;
+#[cfg(target_os = "linux")]
 mod ip_ports;
 #[cfg(target_os = "linux")]
 mod lab;
