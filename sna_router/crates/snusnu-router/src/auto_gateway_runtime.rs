@@ -614,6 +614,10 @@ impl<'a> AutoMptnGateway<'a> {
         self.listener.close_association_for(association)
     }
 
+    pub(crate) fn offer_is_pending(&self, association: u64, offer: &IngressOffer) -> bool {
+        self.listener.has_pending_offer(association, offer)
+    }
+
     /// One UDP socket reader owns expedited and keepalive traffic at a time.
     /// The lease must be returned when an outbound session closes.
     pub(crate) fn lease_udp(&mut self) -> io::Result<std::net::UdpSocket> {
