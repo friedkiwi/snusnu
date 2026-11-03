@@ -7,13 +7,19 @@
 use crate::{
     config::{parse_cp, ConfiguredLuType},
     remote::{AutoWsHub, WsRoutePort},
-    routing::{PortId, RouteAddress},
+    routing::PortId,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    io,
+use router_core::{
+    route_registry::{LuType, RouteKey, RouteRecord},
+    session::QualifiedName,
 };
+use std::{collections::HashMap, io};
 use transport_ws::wire;
+
+#[cfg(test)]
+use crate::routing::RouteAddress;
+#[cfg(test)]
+use std::collections::HashSet;
 
 #[derive(Clone)]
 struct LocalLlcIdentity {
@@ -44,8 +50,41 @@ pub(crate) struct IncomingLlcSelection {
 }
 
 impl AutoLlcWsBridge {
+    /// The complete verified snapshot for one LLC attachment. Configured LU
+    /// hints enter only after this attachment's CP has been observed.
+    pub(crate) fn route_records(&self, id: &PortId) -> io::Result<Vec<RouteRecord>> {
+        let local = self
+            .local
+            .get(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown LLC attachment"))?;
+        let Some(cp) = &local.cp else {
+            return Ok(Vec::new());
+        };
+        let hosting_cp = qualified_name(cp)?;
+        let mut records = vec![RouteRecord::from(RouteKey::ControlPoint(
+            hosting_cp.clone(),
+        ))];
+        for ((netid, name), types) in &local.lus {
+            let lu = QualifiedName::new(netid, name).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid observed LLC LU")
+            })?;
+            records.push(RouteRecord {
+                key: RouteKey::LogicalUnit {
+                    lu,
+                    hosting_cp: hosting_cp.clone(),
+                },
+                supported_types: types
+                    .iter()
+                    .map(|kind| registry_lu_type(*kind))
+                    .collect::<io::Result<Vec<_>>>()?,
+            });
+        }
+        Ok(records)
+    }
+
     /// Local directory entries remain available even when their NETID is not
     /// eligible for publication on this concentrator connection.
+    #[cfg(test)]
     pub(crate) fn local_addresses(&self, id: &PortId) -> Vec<RouteAddress> {
         let Some(local) = self.local.get(id) else {
             return Vec::new();
@@ -232,6 +271,7 @@ impl AutoLlcWsBridge {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn advertisements(
         &self,
         allowed_netid: &str,
@@ -466,6 +506,28 @@ impl AutoLlcWsBridge {
 
 fn format_name(name: &wire::SnaName) -> String {
     format!("{}.{}", name.netid, name.name)
+}
+
+fn qualified_name(name: &wire::SnaName) -> io::Result<QualifiedName> {
+    QualifiedName::new(&name.netid, &name.name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid observed LLC CP"))
+}
+
+fn registry_lu_type(kind: i32) -> io::Result<LuType> {
+    match kind {
+        x if x == wire::LuType::LuType0 as i32 => Ok(LuType::Lu0),
+        x if x == wire::LuType::LuType1 as i32 => Ok(LuType::Lu1),
+        x if x == wire::LuType::LuType2 as i32 => Ok(LuType::Lu2),
+        x if x == wire::LuType::LuType3 as i32 => Ok(LuType::Lu3),
+        x if x == wire::LuType::LuType4 as i32 => Ok(LuType::Lu4),
+        x if x == wire::LuType::LuType61 as i32 => Ok(LuType::Lu61),
+        x if x == wire::LuType::LuType62 as i32 => Ok(LuType::Lu62),
+        x if x == wire::LuType::LuType7 as i32 => Ok(LuType::Lu7),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported observed LLC LU type",
+        )),
+    }
 }
 
 #[allow(dead_code)] // Used by the pending CP-scoped upstream OPEN path.
