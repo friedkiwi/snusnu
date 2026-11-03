@@ -3,6 +3,7 @@
 use crate::{
     auto_address::AutoProxyMacs,
     auto_gateway_runtime::{confirmed_mptn_transport_failure, AutoMptnGateway},
+    auto_hpr_local_ingress::ReadyLocalLlc,
     auto_llc::{AutoLlcPort, LlcAutoListener, LlcIngressOffer},
     auto_llc_ws::AutoLlcWsBridge,
     auto_local_dispatch::AutoLocalDispatch,
@@ -319,6 +320,7 @@ struct PendingUpstreamLlc {
     source: Option<LocalLlcIngress>,
     reject_pending: bool,
     local_mptn: Option<String>,
+    local_ee: Option<String>,
 }
 
 struct ActiveUpstreamLlc {
@@ -448,6 +450,8 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     mptn_management: Vec<MptnManagementHandoff>,
     mptn_discovery: Vec<(String, crate::mptn_discovery::MptnDiscoverySnapshot)>,
     ee_snapshots: HashMap<String, Vec<RouteRecord>>,
+    ee_llc_targets: HashMap<[u8; 6], (String, QualifiedName)>,
+    ee_llc_handoffs: Vec<ReadyLocalLlc>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -575,6 +579,8 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_management: Vec::new(),
             mptn_discovery: Vec::new(),
             ee_snapshots: HashMap::new(),
+            ee_llc_targets: HashMap::new(),
+            ee_llc_handoffs: Vec::new(),
         })
     }
 
@@ -620,8 +626,147 @@ impl<'a> AutoLocalSessionRunner<'a> {
         self.fabric.directory().local_routes()
     }
 
+    /// CP-only XID3 evidence can select one cold LLC peer in the requested
+    /// NETID. It does not create or publish an LU route before a user BIND.
+    pub(crate) fn cold_llc_candidates(&self) -> io::Result<Vec<(String, QualifiedName)>> {
+        let mut candidates = Vec::new();
+        for attachment in &self.config.llc {
+            let id = PortId::new(&attachment.id);
+            let Some(cp) = self.bridge.observed_cp(&id) else {
+                continue;
+            };
+            match verified_llc_carrier(&self.pending_llc_upstream, &id) {
+                Ok(_) => candidates.push((
+                    attachment.id.clone(),
+                    QualifiedName::new(&cp.netid, &cp.name).map_err(io::Error::other)?,
+                )),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self
+                        .leased_llc
+                        .values()
+                        .any(|carrier| carrier.attachment == id)
+                    {
+                        candidates.push((
+                            attachment.id.clone(),
+                            QualifiedName::new(&cp.netid, &cp.name).map_err(io::Error::other)?,
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(candidates)
+    }
+
     pub(crate) fn take_unhandled_llc_offers(&mut self) -> Vec<(String, LlcIngressOffer)> {
         std::mem::take(&mut self.unhandled_llc)
+    }
+
+    /// The EE attachment owns this proxy address, while this runner remains
+    /// the sole owner of every LLC2 socket and its XID3 identity proof.
+    pub(crate) fn register_ee_llc_target(
+        &mut self,
+        id: &str,
+        proxy_mac: [u8; 6],
+        peer_cp: QualifiedName,
+    ) -> io::Result<()> {
+        if self.ee_llc_targets.contains_key(&proxy_mac) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "EE LLC proxy MAC already has an owner",
+            ));
+        }
+        self.ee_llc_targets
+            .insert(proxy_mac, (id.to_owned(), peer_cp));
+        Ok(())
+    }
+
+    pub(crate) fn take_ee_llc_handoffs(&mut self) -> Vec<ReadyLocalLlc> {
+        std::mem::take(&mut self.ee_llc_handoffs)
+    }
+
+    pub(crate) fn release_ee_llc_ingress(
+        &mut self,
+        attachment_id: &str,
+        proxy_mac: [u8; 6],
+    ) -> io::Result<()> {
+        let carrier = self
+            .leased_llc
+            .iter()
+            .find_map(|(id, pending)| {
+                (pending.attachment.0 == attachment_id
+                    && pending.proxy_mac == proxy_mac
+                    && pending.local_ee.is_some())
+                .then_some(*id)
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "EE LLC ingress lease is absent")
+            })?;
+        self.abandon_verified_llc(carrier)?;
+        Ok(())
+    }
+
+    pub(crate) fn withdraw_ee_llc_target(
+        &mut self,
+        ee_id: &str,
+        proxy_mac: [u8; 6],
+    ) -> io::Result<()> {
+        let Some((owner, _)) = self.ee_llc_targets.get(&proxy_mac) else {
+            return Ok(());
+        };
+        if owner != ee_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "EE LLC proxy withdrawal owner mismatch",
+            ));
+        }
+        self.ee_llc_targets.remove(&proxy_mac);
+        let pending_ids = self
+            .pending_llc_upstream
+            .iter()
+            .filter_map(|(id, pending)| {
+                (pending.local_ee.as_deref() == Some(ee_id) && pending.proxy_mac == proxy_mac)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        let mut changed = HashSet::new();
+        for id in pending_ids {
+            let mut pending = self.pending_llc_upstream.remove(&id).unwrap();
+            if let Some(source) = pending.source.as_mut() {
+                let _ = source.close();
+            }
+            self.listeners[pending.listener].release(pending.proxy_mac);
+            if self
+                .proofs
+                .withdraw(&pending.attachment, &association("llc_upstream", id))
+            {
+                changed.insert(pending.attachment);
+            }
+        }
+        let mut retained = Vec::new();
+        for mut handoff in self.ee_llc_handoffs.drain(..) {
+            if handoff.target_ee_id == ee_id && handoff.proxy_mac == proxy_mac {
+                let _ = handoff.source.close();
+            } else {
+                retained.push(handoff);
+            }
+        }
+        self.ee_llc_handoffs = retained;
+        let leased_ids = self
+            .leased_llc
+            .iter()
+            .filter_map(|(id, pending)| {
+                (pending.local_ee.as_deref() == Some(ee_id) && pending.proxy_mac == proxy_mac)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in leased_ids {
+            self.abandon_verified_llc(id)?;
+        }
+        if reconcile_proofs(&self.proofs, &mut self.bridge, changed.into_iter())? {
+            refresh_local_addresses(&mut self.fabric, &self.bridge, self.config, &self.proxies)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn take_unhandled_mptn_offers(&mut self) -> Vec<(String, u64, IngressOffer)> {
@@ -995,6 +1140,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 proxy_mac: active.proxy_mac,
                                 reject_pending: false,
                                 local_mptn: None,
+                                local_ee: None,
                             },
                         );
                         continue;
@@ -1031,6 +1177,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 )),
                                 reject_pending: false,
                                 local_mptn: None,
+                                local_ee: None,
                             },
                         );
                         continue;
@@ -1104,6 +1251,8 @@ impl<'a> AutoLocalSessionRunner<'a> {
             leased_llc,
             active_llc_upstream,
             unhandled_llc,
+            ee_llc_targets,
+            ee_llc_handoffs,
             unhandled_mptn,
             pending_mptn,
             mptn_management,
@@ -1142,6 +1291,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                     source: Some(source),
                                     reject_pending: false,
                                     local_mptn: None,
+                                    local_ee: None,
                                 },
                             );
                             continue;
@@ -1238,6 +1388,104 @@ impl<'a> AutoLocalSessionRunner<'a> {
             );
             if matches!(update, Ok(None)) {
                 pending_llc_upstream.insert(id, pending);
+                continue;
+            }
+            if let Some(local_ee_id) = pending.local_ee.clone() {
+                let result = (|| -> io::Result<ReadyLocalLlc> {
+                    let identity = match update.as_ref() {
+                        Ok(Some(SourceUpdate::Event(
+                            router_core::session::SessionEvent::BindRequest(_),
+                        ))) => pending
+                            .source
+                            .as_ref()
+                            .and_then(LocalLlcIngress::identity)
+                            .cloned()
+                            .ok_or_else(|| io::Error::other("EE LLC BIND lacks LU identity"))?,
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "EE LLC carrier closed before user BIND",
+                            ))
+                        }
+                        Err(error) => return Err(io::Error::new(error.kind(), error.to_string())),
+                    };
+                    if identity.target_cp.as_ref() != Some(&pending.target_cp) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "EE LLC BIND target CP differs from proxy owner",
+                        ));
+                    }
+                    let source_cp = identity.source_cp.as_ref().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::PermissionDenied, "EE LLC source CP absent")
+                    })?;
+                    if proofs
+                        .snapshot(&pending.attachment)
+                        .as_ref()
+                        .is_some_and(|snapshot| &snapshot.cp != source_cp)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "EE LLC source CP differs from XID3 proof",
+                        ));
+                    }
+                    let selected = fabric
+                        .directory()
+                        .resolve_lu(&pending.attachment, &identity.target_lu)?;
+                    if selected.0 != local_ee_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "EE LLC BIND target LU selected another attachment",
+                        ));
+                    }
+                    if ee_llc_handoffs.len() >= MAX_PENDING_HANDOFFS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "EE LLC handoff queue full",
+                        ));
+                    }
+                    Ok(ReadyLocalLlc {
+                        ingress_id: pending.attachment.0.clone(),
+                        target_ee_id: local_ee_id.clone(),
+                        proxy_mac: pending.proxy_mac,
+                        identity,
+                        source: Box::new(pending.source.take().unwrap()),
+                    })
+                })();
+                match result {
+                    Ok(ready) => {
+                        leased_llc.insert(id, pending);
+                        ee_llc_handoffs.push(ready);
+                        if reconcile_proofs(proofs, bridge, changed_proofs.drain())? {
+                            refresh_local_addresses(fabric, bridge, config, proxies)?;
+                            exports_changed = true;
+                        }
+                        tracing::info!(carrier = id, ee = %local_ee_id,
+                            "verified LLC user BIND handed to EE adapter");
+                    }
+                    Err(error) => {
+                        tracing::warn!(carrier = id, ee = %local_ee_id, error = %error,
+                            "EE LLC user BIND rejected");
+                        if ready
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+                            )
+                        {
+                            pending.reject_pending = true;
+                            pending_llc_upstream.insert(id, pending);
+                        } else {
+                            if let Some(source) = pending.source.as_mut() {
+                                let _ = source.close();
+                            }
+                            listeners[pending.listener].release(pending.proxy_mac);
+                            if proofs
+                                .withdraw(&pending.attachment, &association("llc_upstream", id))
+                            {
+                                changed_proofs.insert(pending.attachment);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             if let Some(local_gateway_id) = pending.local_mptn.clone() {
@@ -1705,6 +1953,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                     )),
                                     reject_pending: false,
                                     local_mptn: None,
+                                    local_ee: None,
                                 },
                             );
                             tracing::info!(session = id, carrier = carrier_id,
@@ -1828,6 +2077,68 @@ impl<'a> AutoLocalSessionRunner<'a> {
                     PortId::new(&config.remote[0].id)
                 }
                 Err(error) if !config.ee.is_empty() && error.kind() == io::ErrorKind::NotFound => {
+                    if let Some((ee_id, target_cp)) = ee_llc_targets.get(&ingress_proxy).cloned() {
+                        let offered_cp = offer.peer_cp.clone();
+                        let parked = (|| -> io::Result<()> {
+                            if pending_llc_upstream.len() >= MAX_PENDING_HANDOFFS {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "EE LLC carrier queue is full",
+                                ));
+                            }
+                            let offered_cp = offered_cp.as_deref().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "EE LLC carrier has no verified XID3 CP",
+                                )
+                            })?;
+                            let id = next_id.checked_add(1).ok_or_else(|| {
+                                io::Error::other("automatic LLC carrier IDs exhausted")
+                            })?;
+                            let source = LocalLlcIngress::from_offer(
+                                offer,
+                                target_cp.clone(),
+                                &ingress_id.0,
+                            )?;
+                            proofs.observe_cp(
+                                &ingress_id,
+                                association("llc_upstream", id),
+                                offered_cp,
+                            )?;
+                            pending_llc_upstream.insert(
+                                id,
+                                PendingUpstreamLlc {
+                                    attachment: ingress_id.clone(),
+                                    listener: ingress,
+                                    proxy_mac: ingress_proxy,
+                                    target_cp: target_cp.clone(),
+                                    source: Some(source),
+                                    reject_pending: false,
+                                    local_mptn: None,
+                                    local_ee: Some(ee_id.clone()),
+                                },
+                            );
+                            next_id = id;
+                            if reconcile_proofs(
+                                proofs,
+                                bridge,
+                                std::iter::once(ingress_id.clone()),
+                            )? {
+                                refresh_local_addresses(fabric, bridge, config, proxies)?;
+                                exports_changed = true;
+                            }
+                            tracing::info!(carrier = id, attachment = %ingress_id.0,
+                                ee = %ee_id, peer_cp = offered_cp,
+                                "EE LLC dialout carrier parked with verified CP proof");
+                            Ok(())
+                        })();
+                        if let Err(error) = parked {
+                            tracing::warn!(attachment = %ingress_id.0, ee = %ee_id,
+                                error = %error, "EE LLC dialout carrier rejected");
+                            listeners[ingress].release(ingress_proxy);
+                        }
+                        continue;
+                    }
                     if unhandled_llc.len() < MAX_PENDING_HANDOFFS {
                         unhandled_llc.push((ingress_id.0, offer));
                     } else {
@@ -1895,6 +2206,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 source: Some(source),
                                 reject_pending: false,
                                 local_mptn: Some(gateway.id().to_owned()),
+                                local_ee: None,
                             },
                         );
                         next_id = id;
@@ -2014,6 +2326,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                                 source: Some(source),
                                 reject_pending: false,
                                 local_mptn: None,
+                                local_ee: None,
                             },
                         );
                         next_id = id;
