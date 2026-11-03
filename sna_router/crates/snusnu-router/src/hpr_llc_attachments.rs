@@ -243,9 +243,10 @@ impl HprLlcAttachments {
     }
 
     /// Exclusively reserve a previously XID-verified attachment for a
-    /// concentrator SessionV1 open. The old probe's source CP may belong to
-    /// a different NETID, so it is closed before a new source-specific probe
-    /// opens. Reachability is withdrawn until that new proof succeeds.
+    /// concentrator SessionV1 open. The old probe is closed before a new
+    /// source-specific probe opens. Its verified destination CP remains
+    /// published while this exclusive reservation is active: withdrawing the
+    /// route would invalidate the circuit that just opened against it.
     pub(crate) fn reserve_external(
         &mut self,
         attachment_id: &str,
@@ -275,7 +276,7 @@ impl HprLlcAttachments {
         let mut probe = attachment.probe.take().unwrap();
         probe.close()?;
         attachment.active_user = true;
-        attachment.active_cp = None;
+        attachment.active_cp = Some(verified_cp.clone());
         attachment.ready_logged = false;
         Ok(Some(ReservedLlcPeer {
             attachment_id: attachment.id.clone(),
@@ -286,8 +287,7 @@ impl HprLlcAttachments {
         }))
     }
 
-    /// Reinstate local reachability only after the new source-specific
-    /// association has independently completed XID and management.
+    /// Confirm the new association's destination CP before it carries BIND.
     pub(crate) fn mark_external_verified(
         &mut self,
         attachment_id: &str,
@@ -331,4 +331,49 @@ fn mac(mac: [u8; 6]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusive_reservation_keeps_verified_route_until_release() {
+        let cp: QualifiedName = "SOLNET.SNAA".parse().unwrap();
+        let lu: QualifiedName = "SOLNET.SNAA".parse().unwrap();
+        let mut attachments = HprLlcAttachments {
+            attachments: vec![Attachment {
+                id: "v4".into(),
+                interface: "tap0".into(),
+                guest_mac: [2, 0, 0, 0, 0, 1],
+                proxy_mac: [6, 0, 0, 0, 0, 1],
+                expected_cp: Some(cp.clone()),
+                probe: None,
+                active_user: true,
+                active_cp: Some(cp.clone()),
+                ready_logged: false,
+                retry_at: Instant::now(),
+            }],
+            candidates: vec![ConfiguredCandidate {
+                lu: lu.clone(),
+                cp_hint: Some(cp.clone()),
+                attachment_id: "v4".into(),
+                carrier: CandidateCarrier::Llc,
+            }],
+            source_cp: "SOLNET.SNAB".parse().unwrap(),
+            seed: Vec::new(),
+        };
+        assert_eq!(
+            attachments.verified_routes(),
+            vec![(
+                lu,
+                Destination::Llc {
+                    hosting_cp: cp,
+                    attachment_id: "v4".into(),
+                }
+            )]
+        );
+        attachments.release("v4");
+        assert!(attachments.verified_routes().is_empty());
+    }
 }
