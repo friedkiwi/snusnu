@@ -7,6 +7,7 @@
 use std::{collections::VecDeque, io};
 
 use router_core::{
+    fid2_bind::{classify_reduced_bind, BindClass},
     hpr_control_bootstrap::HprControlBootstrap,
     hpr_route_setup_initiator::DirectLinkMetrics,
     hpr_rtp_outbound_setup::UserSetupConfig,
@@ -20,6 +21,7 @@ use crate::{
     auto_hpr_reverse::ReverseHprUser,
     auto_hpr_runtime::{from_session_wire, to_session_wire},
     ee_ldlc_endpoint::EeLdlcEndpoint,
+    hpr_management_initiator::HprManagementInitiator,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     hpr_session_source::{SessionSource, SourceUpdate},
     remote::{SessionWsPort, SessionWsUpdate},
@@ -96,6 +98,9 @@ enum Phase {
     AwaitBind,
     SendRoute,
     AwaitRoute,
+    SendManagement,
+    AwaitManagementCie,
+    ManagementActive,
     SendUser,
     AwaitUserCie,
     Active,
@@ -116,6 +121,7 @@ pub(crate) struct ReverseRuntime {
     phase: Phase,
     reverse: Option<ReverseHprUser>,
     user_config: Option<UserSetupConfig>,
+    management: Option<HprManagementInitiator>,
     pending_credit: Option<SessionEvent>,
     early_user: VecDeque<RtpIngress>,
     early_user_bytes: usize,
@@ -176,6 +182,7 @@ impl ReverseRuntime {
             phase: Phase::AwaitBind,
             reverse: None,
             user_config: None,
+            management: None,
             pending_credit: None,
             early_user: VecDeque::new(),
             early_user_bytes: 0,
@@ -220,11 +227,56 @@ impl ReverseRuntime {
                 let config =
                     reverse.accept_route_reply(message.observation.generation, &message.bytes)?;
                 self.user_config = Some(config);
-                self.phase = Phase::SendUser;
+                let bind = reverse.bind_request();
+                let bind_identity = classify_reduced_bind(bind.rh().try_into().unwrap(), bind.ru())
+                    .map_err(|error| invalid(format!("reverse management BIND mode: {error:?}")))?
+                    .ok_or_else(|| invalid("reverse HPR source has no BIND identity"))?;
+                let mode = match bind_identity.class {
+                    BindClass::NamedLu62 { mode } => mode,
+                    BindClass::Undetermined => String::new(),
+                    BindClass::Management { .. } => {
+                        return Err(invalid("reverse HPR source used a management BIND"));
+                    }
+                };
+                let source_cp = self
+                    .identity
+                    .source_cp
+                    .as_ref()
+                    .ok_or_else(|| invalid("reverse HPR source CP missing"))?;
+                let mut token = [0u8; 7];
+                token[0] = 0x23;
+                token[1..].copy_from_slice(&self.handle.to_be_bytes()[2..]);
+                self.management = Some(HprManagementInitiator::new(
+                    source_cp,
+                    &self.bootstrap.peer.cp,
+                    (1u64 << 63) | (1u64 << 61) | self.handle,
+                    self.pcid,
+                    token,
+                    &mode,
+                )?);
+                self.phase = Phase::SendManagement;
                 tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
-                    target_lu = %self.identity.target_lu, pcid = ?self.pcid,
-                    "reverse HPR RouteSetup reply accepted");
+                    target_lu = %self.identity.target_lu, mode = %mode, pcid = ?self.pcid,
+                    "reverse HPR RouteSetup reply accepted; beginning CP management");
                 Ok(())
+            }
+            RtpIngressKind::UserOut
+                if matches!(
+                    self.phase,
+                    Phase::AwaitManagementCie | Phase::ManagementActive
+                ) =>
+            {
+                if self.phase == Phase::AwaitManagementCie {
+                    if self.early_user.len() >= MAX_EARLY_USER_BIUS
+                        || message.bytes.len() > MAX_EARLY_USER_BYTES - self.early_user_bytes
+                    {
+                        return Err(invalid("reverse HPR early management BIU backlog full"));
+                    }
+                    self.early_user_bytes += message.bytes.len();
+                    self.early_user.push_back(message);
+                    return Ok(());
+                }
+                self.management.as_mut().unwrap().observe(&message.bytes)
             }
             RtpIngressKind::UserOut if self.phase == Phase::AwaitUserCie => {
                 if self.early_user.len() >= MAX_EARLY_USER_BIUS
@@ -266,6 +318,43 @@ impl ReverseRuntime {
                 tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
                     target_lu = %self.identity.target_lu, pcid = ?self.pcid,
                     "reverse HPR RouteSetup sent to EE peer");
+            }
+        }
+        if self.phase == Phase::SendManagement {
+            let first = self.management.as_ref().unwrap().prepared()?.unwrap();
+            let route = self.user_config.as_ref().unwrap().clone();
+            if rtp.open_user_out(link, &first, route, now_us)? {
+                self.phase = Phase::AwaitManagementCie;
+                tracing::info!(handle = self.handle, source_cp = ?self.identity.source_cp,
+                    target_cp = %self.bootstrap.peer.cp,
+                    "reverse HPR SNASVCMG BIND sent to EE peer");
+            }
+        }
+        if self.phase == Phase::AwaitManagementCie && rtp.user_out_scope().is_some() {
+            let first = self.management.as_ref().unwrap().prepared()?.unwrap();
+            self.management.as_mut().unwrap().confirm_sent(&first)?;
+            self.phase = Phase::ManagementActive;
+        }
+        while self.phase == Phase::ManagementActive {
+            let Some(message) = self.early_user.front().cloned() else {
+                break;
+            };
+            self.management.as_mut().unwrap().observe(&message.bytes)?;
+            self.early_user.pop_front();
+            self.early_user_bytes -= message.bytes.len();
+        }
+        if self.phase == Phase::ManagementActive {
+            if let Some(prepared) = self.management.as_ref().unwrap().prepared()? {
+                if rtp.send_user_out(link, &prepared, now_us)? {
+                    self.management.as_mut().unwrap().confirm_sent(&prepared)?;
+                }
+            }
+            if self.management.as_ref().unwrap().complete() {
+                rtp.reset_user_out();
+                self.phase = Phase::SendUser;
+                tracing::info!(handle = self.handle, source_cp = ?self.identity.source_cp,
+                    target_cp = %self.bootstrap.peer.cp,
+                    "reverse HPR CNOS/BIS completed; starting user BIND");
             }
         }
         if self.phase == Phase::SendUser {
