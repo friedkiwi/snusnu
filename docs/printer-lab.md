@@ -161,8 +161,27 @@ guest, but was rejected before QRMTWSC CNOS. FID2 address pair `(2,1)` and
 SLU `SOLNET.S1054504`. The equal address pair is valid as a wire shape:
 the guest itself sent a BIND using `(2,2)`. These responses do not establish
 that the guest accepted the source session or printer service. The next
-native gate is finding the correct source-session activation and delivering
-the separate NMVT Reply PSID to the guest's management-services path.
+native gate is finding the correct source-session activation.
+
+The direct NMVT path is now confirmed on LLC. A QA-only short hardware PSID
+with FID2 addresses `00/00`, RH `0B 80 00`, and address-01 status
+`09 82 04 10 00 01 03 20 01` received a positive IBM i response:
+
+```text
+2C FF 00 00 00 01  8B 80 00  41 03 8D
+```
+
+IBM i subsequently sent `2F 00 01 00 00 00 6B 80 00 0D 01 01`, an
+address-01 ACTLU on the native link. The QA probe returned the architected
+available-printer response `0D 01 01 00 84 00 00 00`. This is a real guest
+response to a constructed probe record, not a captured physical 5494.
+The `3812` VPD fields and address-list prefix in the probe were chosen for
+the lab and remain unverified against hardware. The configured remote
+workstation controller `SNUPRT` and device `SNUPRT01` still report
+`VARY ON PENDING`; no LU4 BIND or SCS print data has followed. The guest
+rejected a shared-session QRMTWSC Attach with `80050000` after its default
+management session ended, so the source CNOS/session association remains
+the next blocker.
 
 ### Live V5R4 AnyNet controller trace, 2026-11-03
 
@@ -196,15 +215,15 @@ address `01`, and its LU type is 7 rather than 4. The controller remains
 `VARY ON PENDING`; the guest has queued spool files but has not sent an
 address-01 printer BIND or SCS data. No spool has reached the concentrator.
 
-The next protocol gate is delivering the firmware-derived address-01 NMVT
-Reply PSID over its independent network-management FID2 path, then observing
-the host's printer-session BIND and private `D824` records. The current
+The next protocol gate is activating the 5494 controller session and
+observing the host's printer-session BIND and private `D824` records. The current
 AnyNet reverse gateway completes and releases its separate SNASVCMG
 management association before the controller session, so it cannot yet carry
 that NMVT. A lab-only attempt to send the PSID as a TCP62 normal record on
 this association after CNOS/BIS received no IBM i response and did not change
 the subsequent controller exchange; that experiment was removed from the
-router source. An LLC route has not yet been verified.
+router source. The native LLC path is verified for XID3, SNASVCMG, and the
+direct NMVT, as described above.
 
 The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
 provide a direct source for the missing controller sender code. In
