@@ -72,8 +72,9 @@ pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
 
 struct MultiEeSlot<'a> {
     attachment: &'a EeConfig,
-    link: StandaloneEeLink,
+    link: Option<StandaloneEeLink>,
     active: Option<DirectHprRuntime<'a>>,
+    retry_at: Instant,
 }
 
 /// Poll every EE socket from one coordinator while LLC and TCP62 retain one
@@ -88,8 +89,9 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
         .map(|attachment| {
             Ok(MultiEeSlot {
                 attachment,
-                link: StandaloneEeLink::bind(attachment)?,
+                link: Some(StandaloneEeLink::bind(attachment)?),
                 active: None,
+                retry_at: Instant::now(),
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -98,7 +100,31 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
         while !STOP.load(Ordering::Relaxed) {
             local.poll_local(None)?;
             for slot in &mut slots {
-                match slot.link.poll(Instant::now())? {
+                if slot.link.is_none() && Instant::now() >= slot.retry_at {
+                    match StandaloneEeLink::bind(slot.attachment) {
+                        Ok(link) => slot.link = Some(link),
+                        Err(error) => {
+                            tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                                "standalone EE listener restart failed");
+                            slot.retry_at = Instant::now() + RESTART_BACKOFF;
+                        }
+                    }
+                }
+                let Some(link) = slot.link.as_mut() else {
+                    continue;
+                };
+                let event = match link.poll(Instant::now()) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                            "standalone EE link failed; withdrawing only this attachment");
+                        retire_slot(slot, &mut local, &mut shared)?;
+                        slot.link = None;
+                        slot.retry_at = Instant::now() + RESTART_BACKOFF;
+                        continue;
+                    }
+                };
+                match event {
                     Some(StandaloneEvent::Activated(bootstrap)) => {
                         retire_slot(slot, &mut local, &mut shared)?;
                         let peer_cp = bootstrap.peer.cp.clone();
@@ -112,11 +138,14 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                     }
                     Some(StandaloneEvent::Datagram(datagram)) => {
                         if let Some(runtime) = slot.active.as_mut() {
-                            runtime.on_datagram(
-                                slot.link.link(),
+                            let result = runtime.on_datagram(
+                                slot.link.as_ref().unwrap().link(),
                                 &datagram,
                                 clock.elapsed().as_micros() as u64,
-                            )?;
+                            );
+                            if let Err(error) = result {
+                                fail_slot(slot, &mut local, &mut shared, error)?;
+                            }
                         }
                     }
                     Some(StandaloneEvent::Deactivated) => {
@@ -129,7 +158,12 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
             let mut ee_routes = Vec::new();
             for slot in &mut slots {
                 if let Some(runtime) = slot.active.as_mut() {
-                    runtime.refresh_shared_local(&mut local, &mut shared, config)?;
+                    if let Err(error) =
+                        runtime.refresh_shared_local(&mut local, &mut shared, config)
+                    {
+                        fail_slot(slot, &mut local, &mut shared, error)?;
+                        continue;
+                    }
                     let export = runtime.ee_owner_export();
                     for record in &export.records {
                         if let RouteKey::LogicalUnit { lu, hosting_cp } = &record.key {
@@ -174,7 +208,7 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                     if let Some(runtime) = slot.active.as_mut() {
                         if let Err(error) = runtime.accept_shared_source(
                             ready,
-                            slot.link.link(),
+                            slot.link.as_ref().unwrap().link(),
                             &mut shared,
                             &mut local,
                         ) {
@@ -188,14 +222,19 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
             for slot in &mut slots {
                 if let Some(runtime) = slot.active.as_mut() {
                     let now_us = clock.elapsed().as_micros() as u64;
-                    runtime.tick(slot.link.link(), now_us)?;
-                    let mut access = SharedLocalAccess {
-                        shared: &mut shared,
-                        runner: &mut local,
-                        config,
-                    };
-                    runtime.pump(slot.link.link(), None, now_us, Some(&mut access))?;
-                    handoffs.extend(runtime.take_ee_handoffs());
+                    let link = slot.link.as_ref().unwrap();
+                    let result = runtime.tick(link.link(), now_us).and_then(|()| {
+                        let mut access = SharedLocalAccess {
+                            shared: &mut shared,
+                            runner: &mut local,
+                            config,
+                        };
+                        runtime.pump(link.link(), None, now_us, Some(&mut access))
+                    });
+                    match result {
+                        Ok(()) => handoffs.extend(runtime.take_ee_handoffs()),
+                        Err(error) => fail_slot(slot, &mut local, &mut shared, error)?,
+                    }
                 }
             }
             for ready in handoffs {
@@ -209,7 +248,7 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                     if let Some(runtime) = slot.active.as_mut() {
                         if let Err(error) = runtime.accept_shared_source(
                             ready,
-                            slot.link.link(),
+                            slot.link.as_ref().unwrap().link(),
                             &mut shared,
                             &mut local,
                         ) {
@@ -239,6 +278,20 @@ fn retire_slot(
     }
     shared.withdraw_ee(local, &slot.attachment.id)?;
     local.withdraw_ee_records(&slot.attachment.id)?;
+    Ok(())
+}
+
+fn fail_slot(
+    slot: &mut MultiEeSlot<'_>,
+    local: &mut AutoLocalSessionRunner<'_>,
+    shared: &mut HprSharedLocal,
+    error: io::Error,
+) -> io::Result<()> {
+    tracing::warn!(attachment = %slot.attachment.id, error = %error,
+        "standalone EE attachment failed; other attachments remain active");
+    retire_slot(slot, local, shared)?;
+    slot.link = None;
+    slot.retry_at = Instant::now() + RESTART_BACKOFF;
     Ok(())
 }
 
@@ -381,6 +434,10 @@ impl StandaloneEeLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use router_core::{
+        route_registry::{LuType, RouteRecord},
+        session::QualifiedName,
+    };
 
     #[test]
     fn standalone_link_binds_without_concentrator_and_waits_for_peer_xid() {
@@ -409,5 +466,56 @@ mod tests {
         assert!(b.poll(Instant::now()).unwrap().is_none());
         assert_ne!(a.link().phase(), Phase::Active);
         assert_ne!(b.link().phase(), Phase::Active);
+    }
+
+    #[test]
+    fn one_ee_failure_withdraws_only_its_route() {
+        let config: RouterConfig = toml::from_str(
+            "[[hpr_ip]]\nid = 'ee-a'\nlocal_ip = '127.89.1.1'\npeer_ip = '127.89.1.2'\nlocal_cp = 'SOLNET.RTRA'\n\
+             [[hpr_ip]]\nid = 'ee-b'\nlocal_ip = '127.89.2.1'\npeer_ip = '127.89.2.2'\nlocal_cp = 'SOLNET.RTRB'\n",
+        )
+        .unwrap();
+        let mut local = AutoLocalSessionRunner::new(&config).unwrap();
+        let mut shared = HprSharedLocal::new(&config).unwrap();
+        let cp_a: QualifiedName = "SOLNET.RTRA".parse().unwrap();
+        let cp_b: QualifiedName = "SOLNET.RTRB".parse().unwrap();
+        let lu_a: QualifiedName = "SOLNET.LUA".parse().unwrap();
+        let lu_b: QualifiedName = "SOLNET.LUB".parse().unwrap();
+        for (id, lu, cp) in [("ee-a", lu_a.clone(), cp_a), ("ee-b", lu_b.clone(), cp_b)] {
+            local
+                .replace_ee_records(
+                    id,
+                    vec![RouteRecord {
+                        key: RouteKey::LogicalUnit { lu, hosting_cp: cp },
+                        supported_types: vec![LuType::Lu62],
+                    }],
+                )
+                .unwrap();
+        }
+        let mut slot = MultiEeSlot {
+            attachment: &config.ee[0],
+            link: Some(StandaloneEeLink::bind(&config.ee[0]).unwrap()),
+            active: None,
+            retry_at: Instant::now(),
+        };
+        fail_slot(
+            &mut slot,
+            &mut local,
+            &mut shared,
+            io::Error::other("test reset"),
+        )
+        .unwrap();
+        let exports = local.local_exports("SOLNET");
+        assert!(exports.iter().all(|route| route.key
+            != RouteKey::LogicalUnit {
+                lu: lu_a.clone(),
+                hosting_cp: "SOLNET.RTRA".parse().unwrap(),
+            }));
+        assert!(exports.iter().any(|route| route.key
+            == RouteKey::LogicalUnit {
+                lu: lu_b.clone(),
+                hosting_cp: "SOLNET.RTRB".parse().unwrap(),
+            }));
+        assert!(slot.link.is_none());
     }
 }
