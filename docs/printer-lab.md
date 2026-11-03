@@ -709,3 +709,30 @@ printer session.
 4. Print from the guest through AnyNet and LLC separately, capturing each
    router-to-concentrator circuit and confirming the received spool and both
    renderings. Passing APING or `VFYAPPCCNN` alone is insufficient.
+
+### 3 November relay and recovery check
+
+The verbose 20:37 CET LLC run proves that QA's 75-byte NMVT PIU crossed the
+router: `/tmp/snusnu-printer-qa-jobwatch.log` records the send on circuit
+`99e70429-3427-43a6-a5c7-6f847f953e59`; the matching router log records the
+same bytes received over WebSocket and then sent as an LLC Ethernet frame.
+The guest's 12-byte positive `8B 80 00 41 03 8D` PIU traveled back through the
+router to QA. This proves delivery and response routing for that NMVT; it does
+not prove that IBM i accepted the proposed printer identity.
+
+An isolated trial changed only the Attach allocation byte after `03 20 01`
+from `00` to `01` with `SNUSNU_PRINTER_PROBE_PIP_BYTE=1`. The first fresh circuit
+reached XID and outer ACTLU, but no controller BIND or Attach followed. Guest
+controller `LLCPRT` later entered `FAILED` state, so this trial did not test the
+new PIP value. The probe also ignored the guest's `DACTLU` during the reset;
+it now returns the architected positive DACTLU RU `0E`. The Go pre-commit gate
+passed for that fix. After a clean guest IPL, the controller did not auto-vary
+on, leaving the PIP trial pending an authorized guest sign-on and vary-on.
+
+For the AnyNet leg, an existing LU6.2 TCP association cannot carry a separate
+SSCP-PU PIU by changing its FID2 addresses. The
+[IBM AnyNet guide](https://publibz.boulder.ibm.com/epubs/pdf/f1ap6000.pdf)
+describes dependent-LU management as encapsulated SSCP-PU and SSCP-LU flows
+over dedicated `CPSVRMGR` sessions. Whether the 5494-style Reply PSID in this
+IBM i scenario uses that path still needs a guest capture; the current router
+rejects the direct NMVT on the unrelated LU6.2 association.
