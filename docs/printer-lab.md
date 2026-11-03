@@ -13,9 +13,9 @@ requires an APPC controller and a separate remote workstation controller on
 IBM i. Its LU 6.2 sessions use mode `QRMTWSC`, with a controller-management
 session and printer sessions. A printer device can be `3812` model `1` with
 class `*RMT`, attached to the remote workstation controller. The host sends
-SCS in printer records; [RFC 4777 section 11](https://www.rfc-editor.org/rfc/rfc4777.html#section-11)
-documents the related TN5250E GDS `12A0` pass-through record shape and a print
-completion response. [Microsoft's APPC printing documentation](https://learn.microsoft.com/en-us/host-integration-server/core/as-400-appc-printing1)
+SCS in encapsulated LU 4 PIUs. [RFC 4777 section 11](https://www.rfc-editor.org/rfc/rfc4777.html#section-11)
+describes TN5250E printer records and does not apply to this SNA path.
+[Microsoft's APPC printing documentation](https://learn.microsoft.com/en-us/host-integration-server/core/as-400-appc-printing1)
 describes SCS and optional Host Print Transform. The first implementation
 target is SCS text; an HPT or IPDS stream needs a separate renderer.
 
@@ -28,11 +28,11 @@ LU 6.2 device session. The service therefore needs both session directions
 and the controller notification before a writer can send spool data.
 
 The transport-independent Go `sna/services/printer` package now parses the
-RFC 4777 printer pass-through record shape and renders common SCS fixed-pitch
-text. The pass-through shape has not yet been verified against an actual 5494
-device session; the 5494's encapsulated LU 4 data may require a different
-envelope. The package does not perform APPC session management, store jobs, or
-produce a PDF. The concentrator now has owner-scoped durable raw SCS storage,
+IBM-defined inner LU 4 FID3 PIU header, classifies a printer BIND, builds an
+available-printer ACTLU response RU, and renders common SCS fixed-pitch text.
+The enclosing LU 6.2 controller and device GDS envelopes remain unknown.
+The package does not perform APPC session management, store jobs, or produce a
+PDF. The concentrator now has owner-scoped durable raw SCS storage,
 a searchable print list, a monospace preview, and a greenbar PDF writer. These
 are not connected to a live 5494 printer conversation yet. The renderer
 retains no information about font, forms, or graphics orders, so raw SCS is
@@ -83,9 +83,10 @@ session, including `QRMTWSC` application records.
 ## Remaining acceptance work
 
 1. Capture the actual V5R4 `QRMTWSC` control and printer sessions against a
-   compatible 5494 or APPC printer peer. Identify the Attach TP, startup,
-   print, completion, and teardown records rather than treating APING as a
-   printer protocol.
+   compatible 5494 or APPC printer peer. IBM documents the inner LU 4 protocol
+   but omits the controller power-on announcement and its correlation with the
+   parallel device session. The likely controller Attach TP is `30F0F6F6`;
+   it still needs trace confirmation.
 2. Generalize the router's service-directed BIND admission and both transport
    adapters for the printer's session profile. The concentrator local service
    registry can now open an outbound circuit from its own LU, but the router's

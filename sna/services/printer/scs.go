@@ -12,6 +12,7 @@ var ErrSCS = errors.New("unsupported or malformed SCS print stream")
 const Columns = 132
 const Rows = 66
 const MaxPages = 1000
+const MaxJobBytes = 32 << 20
 
 // Page is a fixed-pitch image of one SCS page. Unused trailing cells and
 // lines are omitted when Lines is called.
