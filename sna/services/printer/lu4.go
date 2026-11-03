@@ -29,7 +29,8 @@ const (
 // correlate the address with an authenticated printer device.
 func ParseLU4PIU(data []byte) (LU4PIU, error) {
 	if len(data) < 5 || len(data) > 1029 || (data[0] != 0x3c && data[0] != 0x3d) ||
-		(data[1]&0xc0 != 0x40 && data[1]&0xc0 != 0xc0) || data[2]&0x08 != 0 || data[4]&^byte(0x20) != 0 {
+		(data[1]&0xc0 != 0x40 && data[1]&0xc0 != 0xc0) ||
+		(data[2]&0x08 != 0 && data[2] != 0x6b && data[2] != 0xeb) || data[4]&^byte(0x20) != 0 {
 		return LU4PIU{}, ErrLU4
 	}
 	if data[2]&0x80 != 0 && data[2]&3 != 3 {
@@ -43,7 +44,8 @@ func ParseLU4PIU(data []byte) (LU4PIU, error) {
 // request's shared-address and pacing bits when constructing responses.
 func (p LU4PIU) Encode() ([]byte, error) {
 	if p.Address > 63 || (p.Session != LU4SystemSession && p.Session != LU4PrintSession) ||
-		p.RH[0]&0x08 != 0 || p.RH[2]&^byte(0x20) != 0 || (p.Response && p.RH[0]&0x83 != 0x83) || len(p.RU) > 1024 {
+		(p.RH[0]&0x08 != 0 && p.RH[0] != 0x6b && p.RH[0] != 0xeb) ||
+		p.RH[2]&^byte(0x20) != 0 || (p.Response && p.RH[0]&0x83 != 0x83) || len(p.RU) > 1024 {
 		return nil, ErrLU4
 	}
 	first := byte(0x3c)

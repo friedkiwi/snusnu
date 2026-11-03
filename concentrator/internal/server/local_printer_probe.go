@@ -4,12 +4,15 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"sync"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/friedkiwi/snusnu/sna"
 	"github.com/friedkiwi/snusnu/sna/lu62"
 	"github.com/friedkiwi/snusnu/sna/piu"
+	"github.com/friedkiwi/snusnu/sna/services/printer"
 	"github.com/friedkiwi/snusnu/sna/xid3"
 )
 
@@ -347,16 +350,65 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		// VG10's controller Attach carries a fixed QND5MAIN TPN and one
 		// length-qualified PIP GDS. The byte after the 03 20 prefix is a
 		// runtime controller value; zero probes the documented boundary.
+		pipByte := byte(0)
+		if raw := os.Getenv("SNUSNU_PRINTER_PROBE_PIP_BYTE"); raw != "" {
+			value, err := strconv.ParseUint(raw, 0, 8)
+			if err != nil {
+				return fmt.Errorf("invalid printer probe PIP byte %q: %w", raw, err)
+			}
+			pipByte = byte(value)
+		}
 		attach := []byte{
 			0x2e, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20,
 			0x11, 5, 2, 0xff, 8, 3, 0xd0, 0, 0, 4,
 			0x30, 0xf0, 0xf6, 0xf6, 0, 0, 0,
 			0, 0x12, 0x12, 0xf5, 0, 0x0e, 0x12, 0xe2,
-			3, 0x20, 1, 0, 0x38, 4, 4, 0xd4, 7, 0x30,
+			3, 0x20, 1, pipByte, 0x38, 4, 4, 0xd4, 7, 0x30,
 		}
 		log.Printf("printer probe controller Attach: circuit=%s piu=%x", id, attach)
 		c.managementPhase = 6
 		return p.sendInformation(id, attach)
+	case 6:
+		outer, err := piu.ParseFID2(data)
+		if err != nil || len(outer.RU) < 9 || outer.RU[2] != 0xd8 || outer.RU[3] != 0x24 {
+			return nil
+		}
+		if int(outer.RU[0])<<8|int(outer.RU[1]) != len(outer.RU) {
+			return nil
+		}
+		inner, err := printer.ParseLU4PIU(outer.RU[4:])
+		if err != nil || inner.Address != 56 || len(inner.RU) < 3 {
+			return nil
+		}
+		var ru []byte
+		switch {
+		case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0d:
+			ru, err = printer.ACTLUResponseRU(inner.RU)
+		case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && inner.RU[14] == 7:
+			ru = append([]byte(nil), inner.RU...)
+		default:
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		response, err := printer.PositiveLU4Response(inner, ru)
+		if err != nil {
+			return err
+		}
+		encoded, err := response.Encode()
+		if err != nil {
+			return err
+		}
+		gds := append([]byte{0, 0, 0xd8, 0x24}, encoded...)
+		gds[0], gds[1] = byte(len(gds)>>8), byte(len(gds))
+		reply := piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}
+		packet, err := reply.Bytes()
+		if err != nil {
+			return err
+		}
+		log.Printf("printer probe controller device response: circuit=%s address=%d command=%02x piu=%x", id, inner.Address, inner.RU[0], packet)
+		return p.sendInformation(id, packet)
 	}
 	return nil
 }
