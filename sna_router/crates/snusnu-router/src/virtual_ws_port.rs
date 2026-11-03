@@ -435,6 +435,15 @@ impl<P: RoutePort> VirtualWsPort<P> {
         self.udp_user_completion.take()
     }
 
+    /// The native teardown gate owns the admitted user FQPCID and target LU.
+    /// Return its canonical local X'83' body for an HPR/IP short UNBIND.
+    pub(crate) fn canonical_user_abort(&self) -> io::Result<Vec<u8>> {
+        self.user_teardown
+            .as_ref()
+            .ok_or_else(|| protocol("TCP62 user teardown absent"))?
+            .canonical_udp_abort()
+    }
+
     /// The gateway validates association, sequence and reduced X'83' body.
     /// The positive UDP response is held until native +RSP(UNBIND) arrives.
     pub(crate) fn submit_udp_abort(&mut self, sequence: u16, reduced: &[u8]) -> io::Result<bool> {

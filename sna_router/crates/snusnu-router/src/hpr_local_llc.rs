@@ -50,6 +50,33 @@ fn validate_lu_cp_pair(
     Ok(())
 }
 
+/// TCP62 already carries a full X'83' UNBIND envelope. HPR/IP carries a
+/// shorter FID5 form; bind it to this exact user's FQPCID before translating
+/// to the native teardown gate's canonical local envelope.
+fn local_abort_body(
+    unit: &SessionUnit,
+    user_fqpcid: &[u8],
+    canonical: &[u8],
+) -> io::Result<Vec<u8>> {
+    if unit.rh() != [0x6b, 0x80, 0] || unit.ru().first() != Some(&0x32) {
+        return Err(invalid("local LLC UNBIND has unsupported SNA header"));
+    }
+    let mut reduced = unit.as_reduced().to_vec();
+    reduced[..2].fill(0);
+    if unit.ru().get(1..3) == Some(&[0x0f, 0x08][..]) {
+        // ReverseUserTeardown still validates the complete extended body.
+        return Ok(reduced);
+    }
+    if unit.ru().get(..6) != Some(&[0x32, 1, 0, 0, 0, 0][..])
+        || unit.ru().get(6..) != Some(user_fqpcid)
+    {
+        return Err(invalid(
+            "local LLC HPR UNBIND FQPCID or profile differs from BIND",
+        ));
+    }
+    Ok(canonical.to_vec())
+}
+
 /// Convert a complete, validated HPR user BIND to an internal native egress
 /// offer. The native V5 profile starts its own FID2 sequence at zero. The
 /// caller must retain the original HPR SNF and restore it on BIND response.
@@ -112,6 +139,7 @@ pub(crate) struct HprToLlcSession {
     port: VirtualWsPort<LlcPort>,
     bind: SessionUnit,
     offer: Option<IngressOffer>,
+    user_fqpcid: Vec<u8>,
     started: bool,
     bound: bool,
     pending: Option<PendingEvent>,
@@ -229,6 +257,7 @@ impl HprToLlcSession {
         Ok(Self {
             port,
             bind: bind.clone(),
+            user_fqpcid: offer.fqpcid().to_vec(),
             offer: Some(offer),
             started: false,
             bound: false,
@@ -280,8 +309,8 @@ impl HprToLlcSession {
                 if !self.bound || self.abort_snf.is_some() {
                     return Ok(false);
                 }
-                let mut reduced = unit.as_reduced().to_vec();
-                reduced[..2].fill(0);
+                let canonical = self.port.canonical_user_abort()?;
+                let reduced = local_abort_body(unit, &self.user_fqpcid, &canonical)?;
                 if !self.port.submit_udp_abort(self.abort_sequence, &reduced)? {
                     return Ok(false);
                 }
@@ -439,6 +468,17 @@ impl HprToLlcSession {
 mod tests {
     use super::*;
     use router_core::hpr_fid5::Fid5WholeBiu;
+    use transport_ip_sna::{
+        mptn_reverse_user_bind::NativeAddress, mptn_reverse_user_teardown::ReverseUserTeardown,
+    };
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+            .collect()
+    }
 
     #[test]
     fn captured_v5r4_second_bind_admits_internal_llc_offer() {
@@ -487,6 +527,57 @@ mod tests {
             .unwrap_err()
             .kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn captured_ee_unbind_uses_same_fqpcid_and_prepares_native_teardown() {
+        // V5R4 QABOB.SNAB -> SOLNET.SNAA user BIND and subsequent short
+        // FID5 UNBIND, captured on sol9 during the EE -> QA -> LLC trial.
+        let bind = hex(concat!(
+            "5d00000080020300f0f100026b800031001307b0b0513303838c8c83030602000000000000009443",
+            "40000ad8c1c2d6c24be2d5c1c22c000902404040404040404009030125f4ebb6af80000b04d8c1c2",
+            "d6c24be2d5c1c20a1300b025f4ebb6af8000000be2d6d3d5c5e34be2d5c1c16013e8e772dd240702",
+            "7e0ad8c1c2d6c24be2d5c1c22c0a01087bc3d6d5d5c5c3e3",
+        ));
+        let unbind = hex(concat!(
+            "5d00000000000000000000026b80003201000000006013e8e772dd2407027e0ad8c1c2d6c24be2d5",
+            "c1c2",
+        ));
+        let bind = Fid5WholeBiu::parse_complete(&bind)
+            .unwrap()
+            .session_unit()
+            .unwrap();
+        let unbind = Fid5WholeBiu::parse_complete(&unbind)
+            .unwrap()
+            .session_unit()
+            .unwrap();
+        let offer = offer_from_bind(&bind, "QABOB.SNAB", "SOLNET.SNAA", [1; 8]).unwrap();
+        assert_eq!(&unbind.ru()[6..], offer.fqpcid());
+        let mut teardown = ReverseUserTeardown::from_user_offer(
+            &offer,
+            NativeAddress {
+                daf: 2,
+                oaf: 2,
+                odai: true,
+            },
+        )
+        .unwrap();
+        let canonical = teardown.canonical_udp_abort().unwrap();
+        let reduced = local_abort_body(&unbind, offer.fqpcid(), &canonical).unwrap();
+        assert_eq!(reduced, canonical);
+        let native = teardown.prepare_udp_abort(&reduced).unwrap();
+        assert_eq!(&native[..4], &[0x2f, 0, 2, 2]);
+        assert_eq!(&native[4..], reduced);
+        let mut wrong = unbind.as_reduced().to_vec();
+        let last = wrong.len() - 1;
+        wrong[last] ^= 1;
+        let wrong = SessionUnit::from_reduced(&wrong).unwrap();
+        assert!(local_abort_body(&wrong, offer.fqpcid(), &canonical).is_err());
+        let tcp62 = SessionUnit::from_reduced(&canonical).unwrap();
+        assert_eq!(
+            local_abort_body(&tcp62, offer.fqpcid(), &canonical).unwrap(),
+            canonical
         );
     }
 }
