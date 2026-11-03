@@ -109,6 +109,9 @@ impl HprManagementInitiator {
         if fid5.session_address != (self.initial_sa & !(1u64 << 63)).to_be_bytes() {
             return Err(invalid("HPR management response has wrong session address"));
         }
+        if phase == Phase::AwaitBindResponse && fid5.rh == [0x83, 1, 0] && fid5.ru.is_empty() {
+            return Ok(());
+        }
         if self.phase() == Phase::AwaitBindResponse {
             if fid5.ru.len() < 10 || fid5.ru[fid5.ru.len() - 10..fid5.ru.len() - 8] != [0x62, 8] {
                 return Err(invalid("HPR management BIND response lacks assigned SA"));
@@ -193,5 +196,28 @@ mod tests {
         }
         assert!(initiator.complete());
         assert!(!initiator.prepared().unwrap().is_some());
+    }
+
+    #[test]
+    fn wrong_fid5_response_address_cannot_advance_management() {
+        let mut initiator = HprManagementInitiator::new(
+            &"QAALICE.SNAA".parse().unwrap(),
+            &"QABOB.SNAB".parse().unwrap(),
+            0x8000_0000_0000_0001,
+            [1; 8],
+            [0x23, 1, 1, 1, 1, 1, 1],
+            "",
+        )
+        .unwrap();
+        let bind = initiator.prepared().unwrap().unwrap();
+        initiator.confirm_sent(&bind).unwrap();
+        let mut wrong = vec![0x5d, 0, 0, 0];
+        wrong.extend_from_slice(&2u64.to_be_bytes());
+        wrong.extend_from_slice(&[0xeb, 0x80, 0, 0x31]);
+        assert_eq!(
+            initiator.observe(&wrong).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(initiator.phase(), Phase::AwaitBindResponse);
     }
 }
