@@ -22,6 +22,25 @@ fn invalid(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
 }
 
+/// The EE user adapter implements fixed one-stage windows, not adaptive IPM.
+/// Decline the PLU's adaptive offer on this hop while retaining its offered
+/// fixed window. The SLU may then select fixed pacing in +RSP(BIND).
+fn fixed_pacing_offer(bind: SessionUnit) -> io::Result<SessionUnit> {
+    let ru = bind.ru();
+    if ru.len() < 27 || ru[0] != 0x31 || ru[9] & 0x7f == 0 {
+        return Err(invalid(
+            "reverse HPR BIND has no supported fixed pacing offer",
+        ));
+    }
+    if ru[9] & 0x80 == 0 {
+        return Ok(bind);
+    }
+    let mut reduced = bind.as_reduced().to_vec();
+    reduced[5 + 9] &= 0x7f;
+    SessionUnit::from_reduced(&reduced)
+        .map_err(|error| invalid(format!("reverse HPR fixed pacing offer: {error:?}")))
+}
+
 pub(crate) struct ReverseHprUser {
     bootstrap: HprControlBootstrap,
     identity: SessionIdentity,
@@ -70,6 +89,9 @@ impl ReverseHprUser {
                 "reverse HPR BIND differs from authenticated routes",
             ));
         }
+        let bind_request = fixed_pacing_offer(bind_request)?;
+        let initial_bind = encode_whole_biu(local_sa.to_be_bytes(), Flow::Expedited, &bind_request)
+            .map_err(|error| invalid(format!("reverse HPR fixed BIND encoding: {error:?}")))?;
         let route_setup = DirectRouteSetupInitiator::new(
             bootstrap.clone(),
             identity.target_lu.clone(),
@@ -233,6 +255,8 @@ mod tests {
         };
         let mut ru = vec![0; 27];
         ru[..4].copy_from_slice(&[0x31, 0, 0x13, 7]);
+        ru[8..10].copy_from_slice(&[3, 3]);
+        ru[12..14].copy_from_slice(&[0x83, 3]);
         ru[14..16].copy_from_slice(&[6, 2]);
         let plu = name(&identity.source_lu);
         let slu = name(&identity.target_lu);
@@ -265,6 +289,40 @@ mod tests {
         .unwrap();
         let bind = bind(&identity);
         (bootstrap, identity, bind)
+    }
+
+    #[test]
+    fn reverse_ee_declines_adaptive_pacing_without_changing_source_bind() {
+        let (bootstrap, identity, bind) = setup();
+        let mut source = bind.as_reduced().to_vec();
+        source[5 + 8] = 0x83;
+        source[5 + 9] = 0x83;
+        source[5 + 12] = 0x83;
+        source[5 + 13] = 0x03;
+        let source = SessionUnit::from_reduced(&source).unwrap();
+        let reverse = ReverseHprUser::new(
+            bootstrap,
+            identity,
+            source.clone(),
+            1,
+            [1; 8],
+            vec![0xa4, 1],
+            [0, 0, 0, 5],
+            0x8000_0000_0000_0023,
+            DirectLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(source.ru()[9], 0x83);
+        assert_eq!(reverse.bind_request().ru()[9], 0x03);
+        assert_eq!(reverse.bind_request().ru()[8], 0x83);
+        assert_eq!(reverse.bind_request().ru()[12], 0x83);
+        assert_eq!(reverse.bind_request().ru()[13], 0x03);
+        let on_wire = Fid5WholeBiu::parse_complete(reverse.initial_bind_fid5()).unwrap();
+        assert_eq!(on_wire.session_unit().unwrap(), *reverse.bind_request());
     }
 
     #[test]
