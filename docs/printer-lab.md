@@ -535,6 +535,14 @@ request. A second `D823/02` after the final fragment also received a positive
 SNA response, but no address-01 LU4 printer session followed. The 5494's
 correct station-56 completion behavior remains to be established.
 
+A later LLC trial corrected the experimental Reply-PSID FID2 TH byte 1
+from `FF` to `00`, matching the reserved byte in the 5494 reference and
+firmware. The verbose router log shows the corrected `2C 00 ... 41 03 8D`
+PIU crossing the LLC link and IBM i returning `8B 80 00 41 03 8D` through
+the router to QA. `SNUPRT` and `SNUPRT01` still showed `VARY ON PENDING`;
+there was no address-01 BIND. This response proves SNA receipt, not
+workstation activation.
+
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
 four-byte `04 D4 07 30` subvector identifying the 5494 controller family.

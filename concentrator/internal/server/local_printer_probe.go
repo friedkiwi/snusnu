@@ -484,7 +484,7 @@ func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
 		},
 		DateTime: [6]byte{0x26, 11, 3, 14, 0, 0},
 	}
-	out, err := psid.EncodeNMVTPIU([6]byte{0x2c, 0xff, 0, 0, 0, 1}, 0x80, 0)
+	out, err := psid.EncodeNMVTPIU([6]byte{0x2c, 0, 0, 0, 0, 1}, 0x80, 0)
 	if err != nil {
 		return err
 	}
