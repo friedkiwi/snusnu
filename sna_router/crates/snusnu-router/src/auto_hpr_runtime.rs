@@ -964,6 +964,9 @@ impl<'a> DirectHprRuntime<'a> {
             ));
         }
         let Some(target_name) = request.destination_lu_name.as_deref() else {
+            if request.path_switch && self.try_live_path_switch(hub, &request, message)? {
+                return Ok(());
+            }
             let tg = link
                 .tg_number()
                 .ok_or_else(|| protocol("HPR route has no active TG"))?;
@@ -1052,6 +1055,64 @@ impl<'a> DirectHprRuntime<'a> {
         ));
         self.route_targets.insert(target, destination);
         Ok(())
+    }
+
+    fn try_live_path_switch(
+        &mut self,
+        hub: Option<&AutoWsHub>,
+        request: &RouteSetupGds<'_>,
+        message: &RtpIngress,
+    ) -> io::Result<bool> {
+        let Some(nce_label) = request
+            .vectors
+            .iter()
+            .find(|vector| vector.key == 0x26)
+            .and_then(|vector| vector.wire.get(2..))
+        else {
+            return Ok(false);
+        };
+        let Some(active) = self.rtp.active_authorized_route_for_nce(nce_label) else {
+            return Ok(false);
+        };
+        let target = active.target_lu.clone();
+        let Some(destination) = self.route_targets.get(&target) else {
+            return Ok(false);
+        };
+        let live = match destination {
+            Destination::Llc { .. } | Destination::Mptn { .. } => {
+                self.local_directory.resolve_lu(&target) == Some(destination.clone())
+            }
+            Destination::Ws { .. } => {
+                self.resolve_target(hub, &target).ok().as_ref() == Some(destination)
+            }
+            Destination::Ee { .. } => false,
+        };
+        if !live {
+            tracing::warn!(target_lu = %target, pcid = ?request.pcid,
+                "HPR path-switch target lost live route proof");
+            return Ok(false);
+        }
+        let Some(service) = self.route_setup.get_mut(&target) else {
+            return Ok(false);
+        };
+        match service.prepare_path_switch_reply(
+            message.observation.generation,
+            &message.bytes,
+            &active,
+        ) {
+            Ok(reply) => {
+                self.route_reply = Some((target.clone(), reply));
+                tracing::info!(target_lu = %target, pcid = ?request.pcid,
+                    generation = message.observation.generation.get(),
+                    "HPR path-switch matched live authorized user route");
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::warn!(target_lu = %target, pcid = ?request.pcid,
+                    error = ?error, "HPR path-switch rejected by route proof");
+                Ok(false)
+            }
+        }
     }
 
     fn try_route_reply(&mut self, link: &EeLdlcEndpoint, now_us: u64) -> io::Result<()> {

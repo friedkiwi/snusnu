@@ -165,6 +165,23 @@ impl HprRtpPort {
         self.user_targets.get(&scope.initial_plu_tcid)
     }
 
+    /// A path-switch request can omit the LU. Resolve its destination only
+    /// through a previously authorized NCE whose user RTP is still live.
+    pub(crate) fn active_authorized_route_for_nce(
+        &self,
+        nce_label: &[u8],
+    ) -> Option<AuthorizedUserRoute> {
+        let scopes = self.active_user_scopes();
+        let mut matches = self.authorized_user_routes.iter().filter(|route| {
+            route.local_nce_label == nce_label
+                && scopes.iter().any(|scope| {
+                    self.user_targets.get(&scope.initial_plu_tcid) == Some(&route.target_lu)
+                })
+        });
+        let route = matches.next()?.clone();
+        matches.next().is_none().then_some(route)
+    }
+
     pub(crate) fn route_setup_scope(&self) -> Option<RtpAssociationScope> {
         self.scope_for(self.route_setup.as_ref()?)
     }
