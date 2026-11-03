@@ -41,6 +41,8 @@ stored with each preview.
 
 The reusable `sna/lu62` package also constructs candidate `QRMTWSC` CNOS and
 controller BIND requests with dynamic LU names, CP name, and FQPCID. Its
+CNOS reply validator checks the accepted-pending service, mode, session limits,
+and reversed FID2 addresses before the controller can proceed. Its
 binary architecture-TP Attach parser can retain the likely controller TPN
 `30F0F6F6` without treating it as an EBCDIC application name. These requests
 have not been accepted by a live IBM i controller session. Building the

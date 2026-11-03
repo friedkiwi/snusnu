@@ -27,3 +27,33 @@ func TestCapturedCNOSSetLimits(t *testing.T) {
 		t.Fatal("duplicate CNOS")
 	}
 }
+
+func TestOutboundQRMTWSCCNOSReply(t *testing.T) {
+	want := CNOS{Service: 2, SessionLimit: 57, SourceWinners: 56, TargetWinners: 1, Mode: "QRMTWSC", ModeWidth: 8}
+	request, err := CandidateCNOSAttach(1, 2, 1, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responder, err := NewCNOSResponder("QRMTWSC", 57)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := responder.AcceptAttach(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ValidateCNOSReply(request, reply)
+	if err != nil || got.SessionLimit != 57 || got.SourceWinners != 56 || got.TargetWinners != 1 || got.Mode != "QRMTWSC" {
+		t.Fatalf("CNOS acceptance: %+v %v", got, err)
+	}
+	badRoute := append([]byte(nil), reply...)
+	badRoute[2] = 3
+	if _, err := ValidateCNOSReply(request, badRoute); err == nil {
+		t.Fatal("reply from a different session accepted")
+	}
+	badLimit := append([]byte(nil), reply...)
+	badLimit[9+9], badLimit[9+10] = 0, 58
+	if _, err := ValidateCNOSReply(request, badLimit); err == nil {
+		t.Fatal("expanded session limit accepted")
+	}
+}

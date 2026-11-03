@@ -109,6 +109,36 @@ func CandidateCNOSAttach(daf, oaf byte, sequence uint16, c CNOS) ([]byte, error)
 	return append(piu, gds...), nil
 }
 
+// ValidateCNOSReply checks the accepted-pending GDS returned for an outbound
+// source CNOS Attach. The caller still owns pacing, confirmation, and the
+// decision to proceed with a controller BIND.
+func ValidateCNOSReply(request, reply []byte) (CNOS, error) {
+	var empty CNOS
+	req, err := piu.ParseFID2(request)
+	if err != nil || len(req.RU) < 12 ||
+		!bytes.Equal(req.RU[:12], []byte{0x0c, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}) ||
+		req.RH != [3]byte{0x0b, 0x91, 0x20} {
+		return empty, ErrCNOS
+	}
+	requested, err := ParseCNOS(req.RU[12:])
+	if err != nil || requested.Service != 2 {
+		return empty, ErrCNOS
+	}
+	rsp, err := piu.ParseFID2(reply)
+	if err != nil || rsp.TH[2] != req.TH[3] || rsp.TH[3] != req.TH[2] ||
+		rsp.RH != [3]byte{3, 0x91, 1} {
+		return empty, ErrCNOS
+	}
+	accepted, err := ParseCNOS(rsp.RU)
+	if err != nil || accepted.Service != 0x0a || accepted.Modifier != 0 ||
+		accepted.Mode != requested.Mode || accepted.ModeWidth != requested.ModeWidth ||
+		accepted.SessionLimit > requested.SessionLimit ||
+		accepted.SourceWinners > requested.SourceWinners || accepted.TargetWinners > requested.TargetWinners {
+		return empty, ErrCNOS
+	}
+	return accepted, nil
+}
+
 type CNOSResponder struct {
 	phase       byte
 	mode        string
