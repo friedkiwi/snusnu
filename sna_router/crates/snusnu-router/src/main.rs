@@ -137,6 +137,9 @@ mod native_probe;
 #[cfg(target_os = "linux")]
 mod native_type1;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Wired into the one-hub runtime when EE joins the shared session loop.
+mod publication;
+#[cfg(target_os = "linux")]
 mod remote;
 #[cfg(target_os = "linux")]
 mod routing;
