@@ -2353,7 +2353,8 @@ fn open_incoming_llc_session(
                     ws,
                     selected.attachment.0.clone(),
                     native,
-                ),
+                )
+                .with_log_context(id, Some(carrier_id)),
                 listener: index,
                 proxy_mac: selected.proxy_mac,
                 verified_logged: true,
@@ -2414,7 +2415,8 @@ fn open_incoming_llc_session(
             peer,
             &adjacent_cp,
             seed.as_bytes(),
-        )?;
+        )?
+        .with_log_context(id, None);
         *next_id = id;
         circuits.insert(
             id,

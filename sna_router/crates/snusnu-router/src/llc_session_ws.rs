@@ -10,6 +10,10 @@ use std::{
 };
 
 use router_core::session::{QualifiedName, SessionEvent, SessionIdentity};
+use router_core::{
+    native_management::Phase as ResponderPhase,
+    native_management_initiator::Phase as ManagementPhase,
+};
 
 use crate::{
     auto_hpr_runtime::{from_session_wire, to_session_wire},
@@ -152,6 +156,9 @@ pub(crate) struct LlcSessionWs {
     opened_at: Instant,
     bound: bool,
     verified: bool,
+    log_session: Option<u64>,
+    log_carrier: Option<u64>,
+    last_management: Option<(Option<ManagementPhase>, Option<ResponderPhase>)>,
 }
 
 impl LlcSessionWs {
@@ -179,6 +186,9 @@ impl LlcSessionWs {
             opened_at: Instant::now(),
             bound: false,
             verified: false,
+            log_session: None,
+            log_carrier: None,
+            last_management: None,
         })
     }
 
@@ -201,7 +211,16 @@ impl LlcSessionWs {
             opened_at: Instant::now(),
             bound: false,
             verified: true,
+            log_session: None,
+            log_carrier: None,
+            last_management: None,
         }
+    }
+
+    pub(crate) fn with_log_context(mut self, session: u64, carrier: Option<u64>) -> Self {
+        self.log_session = Some(session);
+        self.log_carrier = carrier;
+        self
     }
 
     pub(crate) fn attachment_id(&self) -> &str {
@@ -242,6 +261,13 @@ impl LlcSessionWs {
             match self.ws.poll()? {
                 Some(SessionWsUpdate::Event(wire)) => {
                     let event = from_session_wire(wire)?;
+                    if matches!(event, SessionEvent::BindRequest(_)) {
+                        tracing::info!(attachment = %self.attachment_id,
+                            session = ?self.log_session, carrier = ?self.log_carrier,
+                            source_lu = %self.identity.source_lu,
+                            target_lu = %self.identity.target_lu,
+                            "incoming LLC SessionV1 BIND received");
+                    }
                     let charged = !matches!(event, SessionEvent::Credit { .. });
                     self.pending_ws = Some((event, charged));
                     self.pending_since = Some(Instant::now());
@@ -282,6 +308,9 @@ impl LlcSessionWs {
                         &self.identity.target_lu,
                         bind,
                     )?);
+                    tracing::info!(attachment = %self.attachment_id,
+                        session = ?self.log_session, carrier = ?self.log_carrier,
+                        "reverse LLC session attached to verified adjacency");
                 } else if self
                     .probe
                     .as_ref()
@@ -309,6 +338,11 @@ impl LlcSessionWs {
                 false
             };
             if accepted {
+                if matches!(event, SessionEvent::BindRequest(_)) {
+                    tracing::info!(attachment = %self.attachment_id,
+                        session = ?self.log_session, carrier = ?self.log_carrier,
+                        "reverse LLC user BIND queued after management exchange");
+                }
                 if *charged {
                     self.ws.complete_received(1)?;
                 }
@@ -323,6 +357,16 @@ impl LlcSessionWs {
             } else {
                 self.session.as_mut().unwrap().poll()?
             };
+            if let Some(session) = self.reverse_session.as_ref() {
+                let phases = session.management_phases();
+                if self.last_management != Some(phases) {
+                    tracing::info!(attachment = %self.attachment_id,
+                        session = ?self.log_session, carrier = ?self.log_carrier,
+                        initiator = ?phases.0, reciprocal = ?phases.1,
+                        "reverse LLC management state changed");
+                    self.last_management = Some(phases);
+                }
+            }
             if let Some(event) = event {
                 let Some(wire) = to_session_wire(&event) else {
                     if !self.uses_live_adjacency() {
@@ -337,6 +381,9 @@ impl LlcSessionWs {
                         self.session.as_mut().unwrap().confirm_polled()?;
                     }
                     if let SessionEvent::BindResult { accepted, .. } = event {
+                        tracing::info!(attachment = %self.attachment_id,
+                            session = ?self.log_session, carrier = ?self.log_carrier,
+                            accepted, "reverse LLC user BIND result sent upstream");
                         if accepted {
                             self.bound = true;
                         } else {

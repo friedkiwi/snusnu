@@ -466,6 +466,10 @@ impl<P: RoutePort> HprToLlcSession<P> {
 }
 
 impl HprToLlcSession<NativePeerPort> {
+    pub(crate) fn management_phases(&self) -> (Option<ManagementPhase>, Option<ResponderPhase>) {
+        self.port.management_phases()
+    }
+
     pub(crate) fn verified_user_closed(&self) -> bool {
         self.pending.is_none() && self.port.verified_user_closed()
     }
