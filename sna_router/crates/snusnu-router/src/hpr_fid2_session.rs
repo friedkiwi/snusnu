@@ -75,7 +75,7 @@ impl NativeFid2Session {
             || piu.len() < 4 + 5 + 27
             || piu[0] & 0xfc != 0x2c
             || piu[1] != 0
-            || piu[6..9] != [0x6b, 0x85, 0]
+            || !matches!(&piu[6..9], [0x6b, 0x85, 0] | [0x6b, 0x80, 0])
         {
             return Err(invalid("unsupported native user BIND profile"));
         }
@@ -409,6 +409,34 @@ mod tests {
             .unwrap();
         assert_eq!(piu.unwrap(), native_response);
         opened
+    }
+
+    #[test]
+    fn v4r4_user_bind_without_rh_pacing_bit_is_converted() {
+        // The V4R4 LLC capture uses RH 6b8000 on its 143-byte user BIND;
+        // another validated capture uses 6b8500. Both carry the same fixed
+        // LU 6.2 BIND profile and normalize to the SessionV1 request.
+        let mut native_bind = bind();
+        native_bind[7] = 0x80;
+        let (_, identity, event) = NativeFid2Session::from_user_bind(
+            &native_bind,
+            &"SOLNET.SNAA".parse().unwrap(),
+            Some("SOLNET.SNAB".parse().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(identity.source_lu.to_string(), "SOLNET.SNAA");
+        assert_eq!(identity.target_lu.to_string(), "SOLNET.SNAB");
+        let SessionEvent::BindRequest(bind) = event else {
+            panic!("BIND expected")
+        };
+        assert_eq!(bind.rh(), [0x6b, 0x80, 0]);
+        native_bind[7] = 0x84;
+        assert!(NativeFid2Session::from_user_bind(
+            &native_bind,
+            &"SOLNET.SNAA".parse().unwrap(),
+            Some("SOLNET.SNAB".parse().unwrap()),
+        )
+        .is_err());
     }
 
     #[test]
