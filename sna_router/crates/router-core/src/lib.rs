@@ -40,6 +40,7 @@ pub mod llc_type1;
 pub mod native_management;
 pub mod native_management_initiator;
 pub mod packet_log;
+pub mod route_registry;
 pub mod session;
 pub mod session_fabric;
 pub mod user_bind;
