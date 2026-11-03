@@ -6,12 +6,14 @@ import "encoding/binary"
 // into the IBM 5494 Release 3.2 controller Attach at runtime.
 var controllerAttachTPN = [4]byte{0x30, 0xf0, 0xf6, 0xf6}
 
-// Encode5494ControllerAttachRU reproduces the 17-byte FMH-5 prefix observed
-// in the 5494 controller sender and appends the caller's allocation/PIP data.
+// Candidate5494ControllerAttachRU copies the 17-byte DIA-initialized FMH-5
+// work area after the 5494 overwrites its TPN with 30F0F6F6, then appends the
+// caller's allocation/PIP data. Firmware proves the TPN overwrite and append
+// boundary, but does not prove that all other initialized bytes reach the wire.
 // The buffer begins with a big-endian length that includes those two bytes.
 // Its contents remain runtime-specific. The caller supplies the session TH/RH,
 // pacing and confirmation; this function does not emit a complete PIU.
-func Encode5494ControllerAttachRU(allocation []byte) ([]byte, error) {
+func Candidate5494ControllerAttachRU(allocation []byte) ([]byte, error) {
 	if len(allocation) < 2 || len(allocation) > 1024 ||
 		int(binary.BigEndian.Uint16(allocation[:2])) != len(allocation) {
 		return nil, ErrAttach
