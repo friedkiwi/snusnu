@@ -171,13 +171,24 @@ impl<P: RoutePort> VirtualWsPort<P> {
             && self.udp_abort_output.is_none()
     }
 
-    pub(crate) fn into_verified_inner(self) -> io::Result<P> {
+    pub(crate) fn into_verified_inner(
+        self,
+    ) -> io::Result<(P, Option<router_core::fid2_session_control::ManagementBind>)> {
         if !self.verified_user_closed() {
             return Err(protocol(
                 "verified native user session has not completed teardown",
             ));
         }
-        Ok(self.inner)
+        let completed_management = self
+            .management
+            .as_ref()
+            .map(|management| {
+                management.completed_bind().cloned().ok_or_else(|| {
+                    protocol("native management proof is incomplete at user session return")
+                })
+            })
+            .transpose()?;
+        Ok((self.inner, completed_management))
     }
 
     /// The inner native port has already verified XID3 and completed

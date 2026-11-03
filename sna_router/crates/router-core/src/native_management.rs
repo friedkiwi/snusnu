@@ -95,6 +95,19 @@ pub struct ManagementSession {
 }
 
 impl ManagementSession {
+    /// Adopt a completed, locally initiated SNASVCMG exchange on the same
+    /// verified LLC association. No responder frames remain in flight.
+    pub fn from_completed_initiator(
+        remote_plu: String,
+        local_slu: String,
+        bind: ManagementBind,
+    ) -> Self {
+        let mut session = Self::new(remote_plu, local_slu);
+        session.bind = Some(bind);
+        session.phase = Phase::Closed;
+        session
+    }
+
     pub fn new(remote_plu: String, local_slu: String) -> Self {
         Self {
             remote_plu,

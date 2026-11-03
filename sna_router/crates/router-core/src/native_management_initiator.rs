@@ -224,6 +224,11 @@ impl NativeManagementInitiator {
     pub fn address_pair(&self) -> (u8, u8) {
         (self.daf, self.oaf)
     }
+    /// The BIND proof remains tied to this LLC association after the
+    /// initiator has completed its management UNBIND.
+    pub fn completed_bind(&self) -> Option<&ManagementBind> {
+        (self.phase == Phase::Complete).then_some(&self.bind)
+    }
     pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
     }
@@ -492,6 +497,7 @@ mod tests {
     #[test]
     fn direct_v4r4_management_bind_and_control_bytes_match_capture() {
         let mut session = direct();
+        assert!(session.completed_bind().is_none());
         let bind = hex(concat!(
             "2f00010200006b850031001307b0b0513307878686870706020000000000000094434000",
             "0be2d6d3d5c5e34be2d5c1c12d000902e2d5c1e2e5c3d4c709030123506947a10000",
@@ -578,6 +584,16 @@ mod tests {
         session.observe(&hex("2f0002010000eb800032")).unwrap();
         assert_eq!(session.phase(), Phase::Complete);
         assert!(session.prepared().is_none());
+        let returned = crate::native_management::ManagementSession::from_completed_initiator(
+            session.remote_cp().to_owned(),
+            session.local_cp().to_owned(),
+            session
+                .completed_bind()
+                .expect("completed BIND proof")
+                .clone(),
+        );
+        assert_eq!(returned.phase(), crate::native_management::Phase::Closed);
+        assert_eq!(returned.bind().unwrap().fqpcid(), session.fqpcid());
     }
 
     #[test]
