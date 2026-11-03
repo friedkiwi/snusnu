@@ -519,7 +519,11 @@ impl<'a> DirectHprRuntime<'a> {
         } else {
             let proxy_mac = access
                 .shared
-                .ee_proxy_mac()
+                .ee_proxy_mac(
+                    self.ee_attachment_id
+                        .as_deref()
+                        .ok_or_else(|| protocol("EE attachment ID absent"))?,
+                )
                 .ok_or_else(|| protocol("EE proxy MAC is unavailable for LLC egress"))?;
             if !access.runner.reserve_llc(attachment_id, proxy_mac)? {
                 return Ok(None);
@@ -2664,7 +2668,7 @@ fn run_connected(
                     }
                     runtime.release_shared_llc(local)?;
                 }
-                shared.withdraw_ee(local)?;
+                shared.withdraw_ee(local, &attachment.id)?;
                 local.withdraw_ee_records(&attachment.id)?;
                 publish_shared_routes(local, hub, &mut published)?;
                 ee = None;
@@ -2705,7 +2709,7 @@ fn run_connected(
                     if let Some(mut previous) = active.take() {
                         previous.release_shared_llc(local)?;
                         let _ = previous.detach_local_mptn();
-                        shared.withdraw_ee(local)?;
+                        shared.withdraw_ee(local, &attachment.id)?;
                         local.withdraw_ee_records(&attachment.id)?;
                     }
                     let bootstrap = ee
@@ -2733,7 +2737,7 @@ fn run_connected(
                 }
                 let _ = runtime.detach_local_mptn();
                 runtime.release_shared_llc(local)?;
-                shared.withdraw_ee(local)?;
+                shared.withdraw_ee(local, &attachment.id)?;
                 local.withdraw_ee_records(&attachment.id)?;
                 tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
             }
@@ -2841,7 +2845,7 @@ fn run_connected(
         let _ = runtime.release_shared_llc(local);
         let _ = runtime.detach_local_mptn();
     }
-    let _ = shared.withdraw_ee(local);
+    let _ = shared.withdraw_ee(local, &attachment.id);
     let _ = local.withdraw_ee_records(&attachment.id);
     result
 }

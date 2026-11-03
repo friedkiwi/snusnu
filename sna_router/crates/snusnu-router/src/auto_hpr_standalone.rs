@@ -83,7 +83,7 @@ fn run_link<'a>(
                     if let Some(mut previous) = active.take() {
                         previous.release_shared_llc(local)?;
                     }
-                    shared.withdraw_ee(local)?;
+                    shared.withdraw_ee(local, &attachment.id)?;
                     local.withdraw_ee_records(&attachment.id)?;
                     let peer_cp = bootstrap.peer.cp.clone();
                     let generation = bootstrap.generation;
@@ -111,7 +111,7 @@ fn run_link<'a>(
                     if let Some(mut runtime) = active.take() {
                         runtime.release_shared_llc(local)?;
                     }
-                    shared.withdraw_ee(local)?;
+                    shared.withdraw_ee(local, &attachment.id)?;
                     local.withdraw_ee_records(&attachment.id)?;
                     tracing::warn!(attachment = %attachment.id,
                     "standalone EE peer deactivated; local sessions withdrawn");
@@ -140,7 +140,7 @@ fn run_link<'a>(
     if let Some(mut runtime) = active.take() {
         let _ = runtime.release_shared_llc(local);
     }
-    let _ = shared.withdraw_ee(local);
+    let _ = shared.withdraw_ee(local, &attachment.id);
     let _ = local.withdraw_ee_records(&attachment.id);
     result
 }
