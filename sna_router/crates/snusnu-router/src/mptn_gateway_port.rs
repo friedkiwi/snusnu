@@ -32,7 +32,7 @@ use transport_ip_sna::{
         Action as FallbackAction, Completion as FallbackCompletion, Fallback, Purpose,
     },
     mptn_oob_sequence::{Delivery, SequenceWindow},
-    mptn_reverse_management::classify_reverse_management_connect,
+    mptn_reverse_management::classify_reverse_management_connect_with_cp,
 };
 
 const MAX_INCOMING: usize = MAX_RECORD * 2;
@@ -132,6 +132,7 @@ pub(crate) struct DetachedUserAssociation {
 
 pub(crate) struct MptnGatewayPort {
     config: GatewayConfig,
+    expected_peer_cp: Option<String>,
     dynamic_lus: bool,
     listener: TcpListener,
     udp: UdpSocket,
@@ -287,6 +288,7 @@ impl MptnGatewayPort {
         let listener = listen_tcp(config.local)?;
         Ok(Self {
             config,
+            expected_peer_cp: None,
             dynamic_lus,
             listener,
             udp,
@@ -305,6 +307,12 @@ impl MptnGatewayPort {
     #[cfg(test)]
     pub(crate) fn management_ready(&self) -> bool {
         self.management_ready
+    }
+
+    /// The management FQPCID names the initiating CP, which may differ from
+    /// the initiating LU named by the Connect and BIND.
+    pub(crate) fn set_expected_peer_cp(&mut self, cp: String) {
+        self.expected_peer_cp = Some(cp);
     }
 
     /// The last completed management exchange yields its validated LU pair
@@ -975,13 +983,17 @@ impl MptnGatewayPort {
                     available_compensations: self.config.available_compensations,
                     forbidden_fqpcid: None,
                 })?;
+                if let Some(cp) = &self.expected_peer_cp {
+                    ingress.set_expected_peer_cp(cp.clone());
+                }
                 let offer = ingress.receive(&record.bytes)?.clone();
                 match offer.kind() {
                     IngressKind::Management => {
-                        let admitted = classify_reverse_management_connect(
+                        let admitted = classify_reverse_management_connect_with_cp(
                             offer.connect().clone(),
                             source_lu,
                             destination_lu,
+                            self.expected_peer_cp.as_deref().unwrap_or(source_lu),
                             None,
                         )?;
                         let token = fresh_token()?;

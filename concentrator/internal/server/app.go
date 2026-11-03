@@ -45,6 +45,7 @@ type App struct {
 	webauthn          *webauthn.WebAuthn
 	client            *http.Client
 	hub               *routerHub
+	printerProbe      *localPrinterProbe
 	maintenance       *maintenanceManager
 	circuitHistory    *dynamicQueue[circuitHistoryRecord]
 	routerLogs        *dynamicQueue[store.LogEntry]

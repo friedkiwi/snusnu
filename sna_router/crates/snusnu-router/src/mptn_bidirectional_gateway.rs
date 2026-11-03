@@ -266,6 +266,7 @@ pub(crate) fn run_once(config: &BidirectionalGatewayConfig<'_>) -> io::Result<()
         cnos_limit: 8,
         allow_resumed_user: true,
     })?;
+    listener.set_expected_peer_cp(gateway.local_cp.clone());
     tracing::info!(
         local_ip=%gateway.local_ip, peer_ip=%gateway.peer_ip,
         source_lu=%gateway.source_lu, target_lu=%gateway.destination_lu,

@@ -1066,9 +1066,10 @@ impl<P: RoutePort> VirtualWsPort<P> {
                     self.reset_cp()?;
                     output.push(event);
                 }
-                RouterEvent::ManagedMac(_) => {
-                    return Err(protocol("virtual native peer has no local LLC MAC"));
-                }
+                // The concentrator publishes managed CP bindings on the
+                // WebSocket control plane. A virtual native session has no
+                // local LLC MAC to update, so this metadata is harmless.
+                RouterEvent::ManagedMac(_) => {}
             }
         }
         Ok(output)

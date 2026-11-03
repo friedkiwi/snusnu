@@ -73,6 +73,25 @@ pub fn classify_reverse_management_connect(
     expected_local_lu: &str,
     forbidden_fqpcid: Option<&[u8]>,
 ) -> io::Result<ReverseManagementConnect> {
+    classify_reverse_management_connect_with_cp(
+        request,
+        expected_peer_lu,
+        expected_local_lu,
+        expected_peer_lu,
+        forbidden_fqpcid,
+    )
+}
+
+/// Admit a management BIND when the initiating CP has a different name from
+/// its LU. The FQPCID carries the CP name, whereas the BIND PLU/SLU fields
+/// carry LU names; IBM i does not require them to be equal.
+pub fn classify_reverse_management_connect_with_cp(
+    request: Connect,
+    expected_peer_lu: &str,
+    expected_local_lu: &str,
+    expected_peer_cp: &str,
+    forbidden_fqpcid: Option<&[u8]>,
+) -> io::Result<ReverseManagementConnect> {
     request.encode()?; // also validates public fields on constructed values
     if request.direction != Direction::Request
         || request.correlator.len() != 8
@@ -154,7 +173,7 @@ pub fn classify_reverse_management_connect(
     cursor += 2 + destination.len();
     let fqpcid =
         fqpcid_at(data, cursor).map_err(|_| invalid("reverse management FQPCID invalid"))?;
-    if fqpcid[11..] != *source
+    if fqpcid[11..] != *ebcdic_lu(expected_peer_cp)?
         || data.get(cursor + fqpcid.len()..)
             != Some(
                 &[
@@ -288,6 +307,49 @@ mod tests {
         .unwrap();
         assert!(admitted.request().matches_response(&response));
         assert_eq!(response.connection_data().len(), 85);
+    }
+
+    #[test]
+    fn accepts_distinct_lu_and_cp_in_fqpcid() {
+        let source_lu = ebcdic_lu("SOLNET.S1054504").unwrap();
+        let source_cp = ebcdic_lu("SOLNET.PRTGUEST").unwrap();
+        let mut fqpcid = vec![0x60, (9 + source_lu.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(source_lu.len() as u8);
+        fqpcid.extend_from_slice(&source_lu);
+        let initiated = ManagementInitiator::new(
+            "SOLNET.S1054504",
+            "SNUSNU.PRINTER",
+            fqpcid.clone(),
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let mut request = Connect::decode(initiated.connect_request()).unwrap();
+        let data = &mut request.options[1].value;
+        let offset = data
+            .windows(fqpcid.len())
+            .position(|window| window == fqpcid)
+            .unwrap();
+        data[offset + 11..offset + 11 + source_cp.len()].copy_from_slice(&source_cp);
+        assert!(classify_reverse_management_connect_with_cp(
+            request.clone(),
+            "SOLNET.S1054504",
+            "SNUSNU.PRINTER",
+            "SOLNET.PRTGUEST",
+            None,
+        )
+        .is_ok());
+        assert!(classify_reverse_management_connect_with_cp(
+            request,
+            "SOLNET.S1054504",
+            "SNUSNU.PRINTER",
+            "SOLNET.OTHER",
+            None,
+        )
+        .is_err());
     }
 
     #[test]

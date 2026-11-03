@@ -115,14 +115,24 @@ does not itself make a 5494-like printer available to the guest. The service
 must initiate the controller session and accept the host-initiated printer
 session, including `QRMTWSC` application records.
 
-The QA binary can also take `-printer-probe-dial SOLNET.SNAB` to make one
-outbound SessionV1 open when the guest LU is advertised. A direct AnyNet lab
-attempt on V5R4 could not yet exercise this path: an additional `ANYPRT`
-controller for `SNUSNU.SVC` was created, but IBM i refused to vary it on while
-the existing `EETOA` low-entry-node controller for that same remote CP was
-active (message CPD2628, reason 00002217). The active EE controller was left
-in place. An LLC null XID sent to the guest's MAC elicited no LLC response;
-the guest currently has no active matching LLC controller for this target.
+The QA binary can also take `-printer-probe-dial NETID.LU` to make one
+outbound native DLC circuit open when the guest LU is advertised. An isolated
+V5R4 clone on `sol10` now uses `SOLNET.PRTGUEST` as its CP,
+`SOLNET.S1054504` as its default LU, and `10.99.6.2` as its IP address. Its
+`ANYSVC` AnyNet controller targets `SNUSNU.SVC` through a router listener at
+`10.99.6.1:397`. A `VFYAPPCCNN` to `SNUSNU.PRINTER` emitted real SNASVCMG and
+user TCP62 Connect requests. The router admitted both after separating the
+FQPCID CP name from the LU name; the user request opened a native DLC circuit
+to the QA printer probe. A separate QA outbound circuit reached XID3 with the
+same router. These are connection probes, not printer traffic. The QA probe
+still needs to complete the management exchange, controller BIND/Attach,
+NMVT, and the LU4 data path before a spool file can be accepted.
+
+The original V5R4 B guest still has an `ANYPRT` controller varied off because
+its active `EETOA` low-entry-node controller already targets `SNUSNU.SVC`
+(CPD2628 reason 00002217). It was left untouched. An LLC null XID sent to
+that guest elicited no response; the isolated clone is the current capture
+target for both media.
 
 ## Remaining acceptance work
 

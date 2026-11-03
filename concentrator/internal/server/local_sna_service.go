@@ -69,6 +69,7 @@ func (a *App) StartLocalSNA(ctx context.Context) error {
 func (a *App) StartLocalSNAPrinterProbe(ctx context.Context) error {
 	aping := newLocalSNAService(a.hub)
 	probe := newLocalPrinterProbe(a.hub)
+	a.printerProbe = probe
 	return a.hub.registerLocalServices(ctx,
 		localService{LU: "PING", Types: []wire.LuType{wire.LuType_LU_TYPE_6_2},
 			AcceptSource: func(route *wire.RouteExport, _ wire.CircuitProfile) bool { return sourceLUSupports62(route) },
@@ -86,8 +87,11 @@ func (a *App) DialLocalSNAPrinterProbe(ctx context.Context, netID, lu string) {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
-			if target := a.hub.findLocalProbeTarget(netID, lu); target != nil {
-				requestID, err := a.hub.localServices.openFrom(3, target, wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1)
+			if target, peer := a.hub.findLocalProbeTarget(netID, lu); target != nil {
+				if a.printerProbe != nil {
+					a.printerProbe.setOutboundPeer(peer)
+				}
+				requestID, err := a.hub.localServices.openFrom(3, target, wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC)
 				log.Printf("printer probe outbound open: target=%s.%s request=%d err=%v", netID, lu, requestID, err)
 				return
 			}

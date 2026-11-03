@@ -1223,7 +1223,11 @@ impl WsRoutePort {
                     );
                     let next_target = binding.candidates.into_iter().next();
                     let target_changed = self.target_lu.is_none() && self.target != next_target;
-                    let changed = target_changed || self.managed_mac != Some(mac);
+                    // A route selected by target LU does not depend on the
+                    // CP's virtual LLC MAC. Its binding can arrive during an
+                    // Open without invalidating that request.
+                    let changed = target_changed
+                        || (self.target_lu.is_none() && self.managed_mac != Some(mac));
                     if self.target_lu.is_none() {
                         self.target = next_target;
                         self.sync_gateway_target();

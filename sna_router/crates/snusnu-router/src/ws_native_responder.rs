@@ -425,7 +425,12 @@ impl WsNativeResponder<WsRoutePort> {
             return Err(invalid("native responder is already armed or closed"));
         }
         if let Some(events) = self.inner.poll(false)? {
-            if !events.is_empty() {
+            // Managed CP bindings are route metadata delivered independently
+            // of a circuit. They can arrive before the first inbound Open.
+            if events
+                .into_iter()
+                .any(|event| !matches!(event, RouterEvent::ManagedMac(_)))
+            {
                 return Err(invalid("native circuit data arrived before inbound Open"));
             }
         }

@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/friedkiwi/snusnu/sna"
@@ -11,23 +12,28 @@ import (
 )
 
 type printerProbeCircuit struct {
-	peer      sna.Peer
-	xid       *xid3.Activation
-	profile   wire.CircuitProfile
-	allowance uint64
+	peer              sna.Peer
+	xid               *xid3.Activation
+	profile           wire.CircuitProfile
+	allowance         uint64
+	xidReadyReplySent bool
+	linkReadySent     bool
 }
 
 type localPrinterProbe struct {
 	hub      *routerHub
 	circuits map[string]*printerProbeCircuit
+	mu       sync.Mutex
+	outbound LocalPeer
 }
 
 func newLocalPrinterProbe(h *routerHub) *localPrinterProbe {
 	return &localPrinterProbe{hub: h, circuits: make(map[string]*printerProbeCircuit)}
 }
 
-func (h *routerHub) findLocalProbeTarget(netID, lu string) *wire.RouteReference {
+func (h *routerHub) findLocalProbeTarget(netID, lu string) (*wire.RouteReference, LocalPeer) {
 	var target *wire.RouteReference
+	var peer LocalPeer
 	h.clients.Range(func(_, value any) bool {
 		session := value.(*routerSession)
 		session.mu.Lock()
@@ -37,15 +43,22 @@ func (h *routerHub) findLocalProbeTarget(netID, lu string) *wire.RouteReference 
 		}
 		for _, route := range session.snapshot.Routes {
 			unit := route.GetLogicalUnit()
-			if unit == nil || unit.Lu == nil || unit.Lu.Netid != netID || unit.Lu.Name != lu || !sourceLUSupports62(route) {
+			if unit == nil || unit.Lu == nil || unit.HostingCp == nil || unit.Lu.Netid != netID || unit.Lu.Name != lu || !sourceLUSupports62(route) {
 				continue
 			}
 			target = &wire.RouteReference{RouterId: uuidBytes(session.router.ID), Epoch: uuidBytes(session.epoch), RouteId: route.Id, RouteGeneration: route.Generation}
+			peer = LocalPeer{RouterID: session.router.ID, OwnerID: session.router.OwnerID, NetID: unit.Lu.Netid, CP: unit.HostingCp.Name, LU: unit.Lu.Name}
 			return false
 		}
 		return true
 	})
-	return target
+	return target, peer
+}
+
+func (p *localPrinterProbe) setOutboundPeer(peer LocalPeer) {
+	p.mu.Lock()
+	p.outbound = peer
+	p.mu.Unlock()
 }
 
 func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) {
@@ -129,11 +142,16 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 
 func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source LocalPeer) {
 	id, ok := uuidString(result.CircuitId)
+	if !source.SNAPeer().Valid() {
+		p.mu.Lock()
+		source = p.outbound
+		p.mu.Unlock()
+	}
 	peer := source.SNAPeer()
 	if !ok || !peer.Valid() || len(p.circuits) >= 64 {
 		return
 	}
-	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
+	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Primary)
 	if err != nil {
 		return
 	}
@@ -141,7 +159,7 @@ func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source Local
 	if err != nil {
 		return
 	}
-	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_SESSION_V1, allowance: 1500}
+	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC, allowance: 1500}
 }
 
 func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
@@ -152,7 +170,7 @@ func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
 		_ = p.hub.decision(p.hub.local, &wire.OpenDecision{CircuitId: open.CircuitId, Reason: wire.OpenFailure_OPEN_FAILURE_FORBIDDEN})
 		return
 	}
-	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Secondary)
+	local, err := xid3.NewLocal("SNUSNU.SVC", "SVC", [4]byte{0xff, 0xf1, 0x23, 0x46}, 1, xid3.Primary)
 	if err != nil {
 		log.Printf("printer probe XID: %v", err)
 		return
@@ -178,6 +196,12 @@ func (p *localPrinterProbe) type1(id string, c *printerProbeCircuit, input *wire
 	var err error
 	switch input.Kind {
 	case wire.Type1Kind_TYPE1_KIND_XID:
+		if c.xid.Ready() && (input.Response || c.xidReadyReplySent) {
+			return nil
+		}
+		if c.xid.Ready() {
+			c.xidReadyReplySent = true
+		}
 		if len(input.Information) == 0 {
 			out, err = c.xid.OnNull()
 		} else {
@@ -199,7 +223,13 @@ func (p *localPrinterProbe) type1(id string, c *printerProbeCircuit, input *wire
 		return err
 	}
 	if input.Kind == wire.Type1Kind_TYPE1_KIND_XID {
-		return c.xid.ConfirmSent(out)
+		if err := c.xid.ConfirmSent(out); err != nil {
+			return err
+		}
+		if c.xid.Ready() && c.xidReadyReplySent && !c.linkReadySent {
+			c.linkReadySent = true
+			return p.hub.event(p.hub.local, &wire.CircuitEvent{CircuitId: uuidBytes(id), Event: &wire.CircuitEvent_LinkReady{LinkReady: &wire.LinkReady{}}})
+		}
 	}
 	return nil
 }

@@ -818,6 +818,7 @@ func (h *routerHub) refreshBindings(c *routerSession, origins map[string]publish
 		}
 	}
 	c.mu.Unlock()
+	h.a.debugSNA("managed_cp_bindings router=%s revision=%d bindings=%+v", c.router.ID, revision, bindings)
 	if h.send(c, &wire.WsEnvelope{Body: &wire.WsEnvelope_ManagedCpBindings{ManagedCpBindings: next}}, "", 0) {
 		c.mu.Lock()
 		c.binding = next
@@ -877,6 +878,7 @@ func (h *routerHub) handle(c *routerSession, e *wire.WsEnvelope) error {
 	return nil
 }
 func (h *routerHub) publish(c *routerSession, snapshot *wire.RouteSnapshot) error {
+	h.a.debugSNA("route_snapshot router=%s epoch=%x revision=%d routes=%+v", c.router.ID, snapshot.GetEpoch(), snapshot.GetRevision(), snapshot.GetRoutes())
 	c.mu.Lock()
 	if len(c.history) > 4096 {
 		c.mu.Unlock()
