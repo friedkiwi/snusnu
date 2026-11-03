@@ -535,6 +535,16 @@ request. A second `D823/02` after the final fragment also received a positive
 SNA response, but no address-01 LU4 printer session followed. The 5494's
 correct station-56 completion behavior remains to be established.
 
+VG0F's `D823/02` builder at image `0x1537` (file `0x1953`) first checks a
+per-station record's state byte `+3` for `01`; only that branch allocates a
+five-byte `00 05 D8 23 02` record (instructions `0x15C2..0x15D2`). Its
+`D824` receive path at image `0x2AF9` checks the GDS length and subtype
+before dispatch. The QA trial did not establish that station 56 was in that
+state when either reply was sent. Positive SNA acknowledgements to those
+replies therefore do not validate the timing or the application exchange.
+The next wire trial should derive the station state transition and send one
+reply at the firmware-defined point.
+
 A later LLC trial corrected the experimental Reply-PSID FID2 TH byte 1
 from `FF` to `00`, matching the reserved byte in the 5494 reference and
 firmware. The verbose router log shows the corrected `2C 00 ... 41 03 8D`
@@ -557,6 +567,16 @@ was encoded as hex `26`, or binary 38, and its fixed time was stale. QA now
 uses the process's current local date and time as binary fields. A live LLC
 trial with this date, zero PRID, and TH byte 1 zero received the same positive
 SNA response, but still produced no address-01 BIND or SCS data.
+
+The V5R4 guest's `DSPDEVD SNUPRT01` confirms a 3812 model 1 printer at
+location address `01` under `SNUPRT`; `DSPCTLD SNUPRT` confirms a 5494 remote
+controller for `SNUSNU.SVC`. IBM's [5494 configuration guide](https://www.ibm.com/support/pages/configuring-5494-remote-control-units)
+says the controller model field is for reference only, so its displayed model
+1 does not explain the failure despite the probe's XID3 product model 002.
+The latest QSYSOPR controller-failure message was sent at 19:59:09, before
+the corrected 20:01 NMVT trial. The existing `SNUPRT01 not available` writer
+message was sent at 13:12:38; neither is evidence of a new rejection of the
+corrected NMVT. Both controller and printer remain `VARY ON PENDING`.
 
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
