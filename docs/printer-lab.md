@@ -39,6 +39,12 @@ are not connected to a live 5494 printer conversation yet. The renderer
 retains no information about font, forms, or graphics orders, so raw SCS is
 stored with each preview.
 
+The reusable `sna/lu62` package also constructs a candidate `QRMTWSC`
+controller BIND with dynamic LU names, CP name, and FQPCID. Its fixed fields
+come from the IBM 5494 BIND table; it has not been accepted by a live IBM i
+controller session. CNOS initiation, the likely controller Attach TP
+`30F0F6F6`, and the private power-on notification remain to be implemented.
+
 ## V5R4 guest setup and probe
 
 The writable V5R4 B clone from the [EE APING lab](ee-aping-lab.md) has a
