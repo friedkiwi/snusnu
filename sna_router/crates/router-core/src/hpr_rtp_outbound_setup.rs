@@ -171,7 +171,12 @@ pub fn encode_user_setup(
         .classify_bind()
         .map_err(|_| OutboundSetupError::InvalidBind)?
         .ok_or(OutboundSetupError::InvalidBind)?;
-    if matches!(identity.class, BindClass::Management { .. })
+    let external_cp_management = matches!(
+        &identity.class,
+        BindClass::Management { mode } if mode == "SNASVCMG"
+            && identity.slu == bootstrap.peer.cp.to_string()
+    );
+    if (matches!(identity.class, BindClass::Management { .. }) && !external_cp_management)
         || identity.slu != config.target_lu
         || identity.slu.split_once('.').map(|(netid, _)| netid)
             != Some(bootstrap.peer.cp.netid.as_str())
@@ -377,7 +382,7 @@ mod tests {
         }
     }
 
-    fn user_bind(plu: &str, slu: &str) -> Vec<u8> {
+    fn bind_with_mode(plu: &str, slu: &str, mode: Option<&str>) -> Vec<u8> {
         let name = |value: &str| {
             let (netid, lu) = value.split_once('.').unwrap();
             let mut value = encode_network_name_component(netid).unwrap();
@@ -392,7 +397,15 @@ mod tests {
         ru[14..16].copy_from_slice(&[6, 2]);
         ru.push(plu.len() as u8);
         ru.extend_from_slice(&plu);
-        ru.extend_from_slice(&[1, 0, 0]);
+        if let Some(mode) = mode {
+            let encoded = encode_network_name_component(mode).unwrap();
+            ru.push((encoded.len() + 3) as u8);
+            ru.extend_from_slice(&[0, (encoded.len() + 1) as u8, 2]);
+            ru.extend_from_slice(&encoded);
+        } else {
+            ru.extend_from_slice(&[1, 0]);
+        }
+        ru.push(0); // no user request correlation data
         ru.push(slu.len() as u8);
         ru.extend_from_slice(&slu);
         let mut reduced = vec![0x80, 1, 0x6b, 0x80, 0];
@@ -477,7 +490,7 @@ mod tests {
             maximum_packet_size: bootstrap.max_packet_size,
         };
         // APPN can route a source LU in a different NETID through this CP.
-        let bind = user_bind("QAALICE.PING", "SOLNET.SNAB");
+        let bind = bind_with_mode("QAALICE.PING", "SOLNET.SNAB", None);
         let bytes = encode_user_setup(&bootstrap, 1, ASSIGNOR | 0x1234, &bind, &config).unwrap();
         let packet = RtpPacket::parse(&bytes).unwrap();
         assert_eq!(packet.data, bind);
@@ -499,6 +512,13 @@ mod tests {
             RtpSetupTopic::User {
                 cos_tpf: cos_tpf.clone()
             }
+        );
+        let management = bind_with_mode("QAALICE.SNAA", "SOLNET.SNAB", Some("SNASVCMG"));
+        assert!(encode_user_setup(&bootstrap, 1, ASSIGNOR | 0x1235, &management, &config).is_ok());
+        let other_management = bind_with_mode("QAALICE.SNAA", "SOLNET.SNAB", Some("CPSVCMG"));
+        assert_eq!(
+            encode_user_setup(&bootstrap, 1, ASSIGNOR | 0x1236, &other_management, &config),
+            Err(OutboundSetupError::InvalidBind)
         );
         let guest_view = HprControlBootstrap::new(generation, guest, local).unwrap();
         let route = AuthorizedUserRoute {
