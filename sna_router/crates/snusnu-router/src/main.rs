@@ -96,6 +96,9 @@ mod lab;
 #[cfg(all(test, target_os = "linux"))]
 mod llc_discovery_regression_tests;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Activated when the automatic runtime adopts association-scoped proofs.
+mod llc_proof_registry;
+#[cfg(target_os = "linux")]
 mod llc_session_ws;
 #[cfg(target_os = "linux")]
 mod llc_target_identity;
