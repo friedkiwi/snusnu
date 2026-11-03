@@ -543,6 +543,14 @@ the router to QA. `SNUPRT` and `SNUPRT01` still showed `VARY ON PENDING`;
 there was no address-01 BIND. This response proves SNA receipt, not
 workstation activation.
 
+IBM [SNA Formats](https://www.bitsavers.org/pdf/ibm/sna/GA27-3136-8_SNA_Formats_Jun87.pdf)
+requires the procedure related ID in an unsolicited NMVT
+to be zero. The QA probe previously sent `0001`, despite its unsolicited
+flag, and the Go PSID encoder rejected zero. A subsequent LLC trial sent
+`2C 00 ... 41 03 8D 00 00 00 00 10 ...`; IBM i returned a positive
+NMVT response, but SNUPRT and SNUPRT01 remained pending and no address-01
+BIND followed. The library now requires zero for its unsolicited form.
+
 The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
 offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
 four-byte `04 D4 07 30` subvector identifying the 5494 controller family.

@@ -474,7 +474,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 // from its attached device and maintain the independent SSCP-PU flow.
 func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
 	psid := printer.ReplyPSID{
-		ProcedureID: 1,
+		ProcedureID: 0,
 		Address:     1, Station: 1,
 		VPD: printer.HardwarePSID{
 			MachineType: [4]byte{0xf3, 0xf8, 0xf1, 0xf2},
