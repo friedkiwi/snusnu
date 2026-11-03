@@ -58,8 +58,14 @@ configurations.
 - Multiple EE attachments and their bounded shared session bridge are
   implemented and code-gated. No live session between two EE guests through
   that path has passed yet. Local MPTN↔MPTN needs separate live acceptance.
-- Short native UNBIND and source-close handling have focused code gates.
-  Normal teardown and route retention after close still need a live retest.
+- On master `ef8c033`, a controlled V5R4 EE source `ENDJOB` closed one QA
+  circuit; the router returned the same verified V4R4 LLC carrier and
+  accepted a reverse call about 10 ms later without new XID or SNASVCMG.
+  The reverse call reached V5R4 remote Sign On. This proves immediate
+  same-link reuse after source close. Alice's controlled `ENDJOB` then closed
+  the reverse QA circuit at 19:54:12 UTC; native user UNBIND completed and
+  the verified LLC adjacency remained available. The guest's idle LLC DISC
+  about 32 seconds after the first return can limit later reuse.
 
 See [router runtime](router-runtime.md), [HPR/IP gateway](hpr-gateway.md),
 [route advertisements](route-advertisements.md), and the

@@ -36,22 +36,33 @@ attachments.
    remote Sign On screen. The circuit carried user BIND, information and
    pacing in both directions. Ending the request closed the upstream circuit,
    but an earlier LLC native UNBIND response variant led the adapter to
-   restart discovery. Short native UNBIND and source-close fixes are now
-   code-gated; a live normal-close and route-retention retest is pending.
+   restart discovery. Later short native UNBIND and source-close fixes were
+   code-gated and exercised in the same-link QA test below.
 3. The reverse V4R4 LLC2 → Rust → Go → Rust → V5R4 EE path completed EE
    external SNASVCMG management, CNOS/BIS, user BIND and first display
    traffic. At 18:23:36 UTC the V4R4 console displayed the V5R4 remote
    Sign On. The QA circuit was `b38611ed` (prefix). An earlier positive user
    BIND response exposed a pacing mode bit that Rust rejected; the corrected
-   parser allowed this live session. Normal teardown and repeated sessions
-   in this direction still need verification.
+   parser allowed this live session. A later reverse controlled close
+   completed native user UNBIND, as described below.
 4. Without a concentrator, V4R4 LLC2 → Rust → V5R4 EE reached remote
    Sign On at 19:16:06 UTC. V5R4 EE → Rust → V4R4 LLC2 reached remote
    Sign On at 19:32:13 UTC. The latter session borrowed an existing verified
-   LLC dialout adjacency; returning it after close remains part of the
-   pending live teardown retest.
-   Both results demonstrate local gateway routing to the first display, not
-   a completed normal teardown or a two-EE guest bridge.
+   LLC dialout adjacency. Both results demonstrate local gateway routing to
+   the first display; local teardown and a two-EE guest bridge need separate
+   live results.
+5. A later QA same-link test on master `ef8c033` reached Alice's V4R4 Sign
+   On from Bob's V5R4 EE session. A controlled Bob `ENDJOB` closed circuit
+   `6ac65e7c` at 19:52:53.851 UTC. Alice returned the same verified LLC
+   carrier (`4`), then initiated a reverse session about 10 ms later without
+   a new XID or SNASVCMG exchange. QA circuit `4c80e742` received a positive
+   BIND response, and Alice displayed Bob's remote Sign On around 19:52:54.
+   Alice's controlled `ENDJOB` closed reverse circuit `4c80e742` at
+   19:54:12 UTC. Native user UNBIND completed, and the verified LLC
+   adjacency remained available. This proves immediate carrier reuse after
+   Bob's source close and native teardown of the reverse session. The guest
+   also sent idle LLC DISC roughly 32 seconds after the first carrier return,
+   which can limit later reuse.
 
 These are session gateway tests, distinct from the older configured EE UDP
 relay and direct [EE lab](ee-lab.md). The [cross-NETID lab](cross-netid-lab.md)
@@ -60,10 +71,10 @@ outside the repository.
 
 ## Next test gates
 
-1. Retest EE → LLC2 normal teardown with a synchronized V4R4 capture. Check
-   the short native UNBIND and source-close fixes, and verify that the idle
-   LLC2 adjacency and published route survive. Also exercise remote reset
-   and peer loss.
+1. Test repeated sessions after the guest's idle LLC DISC, plus remote reset
+   and peer loss. The same-link QA test above verified native user UNBIND on
+   reverse controlled close; other teardown circumstances still need their
+   own live checks.
 2. Repeat the embedded APING test after the reverse-path fixes, then test
    local EE↔MPTN without a concentrator. Check routing among
    different local NETIDs, route withdrawal, reconnect and duplicate-route

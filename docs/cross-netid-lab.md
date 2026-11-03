@@ -387,10 +387,10 @@ Alice initiated again. QA opened circuit `b38611ed` (prefix), and at
 18:23:36 UTC Alice's V4 console displayed Bob V5R4's remote Sign On. This
 proves the reverse gateway path through the first display, including the
 external management and user BIND exchanges. EE → LLC2 request end closed
-its QA circuit, but the V4 native UNBIND response still needs a synchronized
-capture and parser fix. The live successes prove the stated directions
-through the first remote display or APING reply; they do not prove normal
-teardown, simultaneous sessions, or every carrier combination.
+its QA circuit; later short native UNBIND and source-close fixes were tested
+with a controlled same-link return described below. These first-display
+successes alone do not prove teardown, simultaneous sessions, or every
+carrier combination.
 
 The automatic runner also leases a verified LLC dialout carrier when a local
 MPTN ingress selects it, and releases the lease after the session while
@@ -418,8 +418,8 @@ two calls establish both local MPTN↔LLC initiation directions through the
 first display. A local MPTN↔MPTN session remains a separate acceptance test.
 
 The current Rust tree also has focused tests for short native UNBIND and
-source-close handling. A synchronized live teardown retest is still needed
-to confirm that a normal close retains the idle LLC2 adjacency and route.
+source-close handling. A later controlled close and reverse session verified
+native user UNBIND and retention of the same LLC adjacency, as recorded below.
 Multiple EE attachments and their bounded session event bridge are
 code-gated, but no two-EE guest session through that bridge has been
 observed yet.
@@ -435,3 +435,25 @@ verified LLC dialout adjacency; it did not require a new XID/controller
 cycle. These two calls establish both local EE↔LLC initiation directions to
 the first display. They do not prove normal teardown, repeated or
 simultaneous user sessions, local EE↔MPTN, or a two-EE guest session.
+
+## QA same-link close and immediate reverse use, 2026-11-03
+
+On master `ef8c033`, Bob V5R4 initiated EE → Bob Rust → QA concentrator →
+Alice Rust → Alice V4R4 LLC2 and reached Alice's remote Sign On. Bob's
+controlled `ENDJOB` closed QA circuit `6ac65e7c` (prefix) at 19:52:53.851
+UTC. The Alice router returned the **same** verified LLC carrier, ID `4`,
+to its local discovery owner. About 10 ms later the Alice watcher initiated
+reverse `STRPASTHR` on that carrier. No new XID or SNASVCMG management
+exchange occurred. QA circuit `4c80e742` (prefix) received a positive user
+BIND response, and Alice displayed Bob V5R4's remote Sign On (`S1054504`)
+at about 19:52:54 UTC.
+
+At 19:54:12 UTC, Alice's controlled `ENDJOB` closed reverse QA circuit
+`4c80e742`. Native user UNBIND completed, and the same verified LLC
+adjacency remained available. Together these tests verify immediate reverse
+reuse after Bob's source close and the native teardown of that reverse
+session, with the completed management proof retained. The guest sent an
+idle LLC DISC roughly 32 seconds after the first carrier return, which can
+limit later reuse even when the router retains its route. That guest timer
+must be accounted for when testing repeated sessions. QA remains available on
+`0.0.0.0:8081` so its logs and state can be inspected.
