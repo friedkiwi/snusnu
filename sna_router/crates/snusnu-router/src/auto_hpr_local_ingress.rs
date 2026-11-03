@@ -38,7 +38,6 @@ pub(crate) struct LocalToHprRuntime {
     target_ee_id: String,
     target_cp: QualifiedName,
     target_proxy_mac: [u8; 6],
-    seed: Vec<u8>,
     listeners: Vec<Listener>,
     pending: Vec<Pending>,
     active: HashSet<(usize, [u8; 6])>,
@@ -50,10 +49,9 @@ impl LocalToHprRuntime {
         target_ee_id: &str,
         target_cp: QualifiedName,
         target_proxy_mac: [u8; 6],
-        seed: &[u8],
     ) -> io::Result<Self> {
-        if target_ee_id.is_empty() || seed.is_empty() {
-            return Err(invalid("local EE target ID or identity seed is empty"));
+        if target_ee_id.is_empty() {
+            return Err(invalid("local EE target ID is empty"));
         }
         let mut listeners = Vec::with_capacity(llc.len());
         for attachment in llc {
@@ -71,7 +69,6 @@ impl LocalToHprRuntime {
             target_ee_id: target_ee_id.to_owned(),
             target_cp,
             target_proxy_mac,
-            seed: seed.to_vec(),
             listeners,
             pending: Vec::new(),
             active: HashSet::new(),
@@ -94,7 +91,7 @@ impl LocalToHprRuntime {
                 continue;
             }
             let proxy_mac = offer.proxy_mac;
-            match LocalLlcIngress::from_offer(offer, self.target_cp.clone(), &self.seed) {
+            match LocalLlcIngress::from_offer(offer, self.target_cp.clone(), &listener.id) {
                 Ok(source) => self.pending.push(Pending {
                     listener: index,
                     proxy_mac,

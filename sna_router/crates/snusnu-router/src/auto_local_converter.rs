@@ -5,7 +5,7 @@
 //! UDP/397 lease, keeping native pacing and TCP62 credit within this session.
 
 use crate::{
-    auto_gateway_runtime::virtual_xid, auto_llc::LlcIngressOffer, config, mptn_llc_reverse,
+    auto_llc::LlcIngressOffer, llc_target_identity::LlcTargetIdentity, mptn_llc_reverse,
     mptn_outbound_port::OutboundEndpoint, native_llc_port::NativeLlcPort,
 };
 use router_core::xid3::Xid3;
@@ -22,8 +22,13 @@ use transport_ws::wire;
 /// different NETIDs. When no target CP is known, routing must wait for an
 /// advertised hosting CP or an explicit attachment hint.
 pub(crate) fn virtual_xid_for_target(target_cp: &wire::SnaName, seed: &[u8]) -> io::Result<Xid3> {
-    config::parse_cp(&format!("{}.{}", target_cp.netid, target_cp.name))?;
-    virtual_xid(target_cp, seed, None, None, 1)
+    let attachment_id = std::str::from_utf8(seed).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LLC identity seed is not UTF-8",
+        )
+    })?;
+    LlcTargetIdentity::from_wire(Some(target_cp), attachment_id)?.xid()
 }
 
 /// The virtual XID CP and target MPTN attachment must already be selected by

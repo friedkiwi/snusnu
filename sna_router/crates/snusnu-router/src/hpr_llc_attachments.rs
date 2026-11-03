@@ -19,6 +19,7 @@ use crate::{
         configured_candidates, CandidateCarrier, ConfiguredCandidate, Destination,
     },
     hpr_local_llc::{HprToLlcProbe, HprToLlcSession},
+    llc_target_identity::LlcTargetIdentity,
     runtime::LlcPeer,
 };
 
@@ -30,6 +31,7 @@ struct Attachment {
     guest_mac: [u8; 6],
     proxy_mac: [u8; 6],
     expected_cp: Option<QualifiedName>,
+    node_seed: Vec<u8>,
     probe: Option<HprToLlcProbe>,
     active_user: bool,
     active_cp: Option<QualifiedName>,
@@ -41,7 +43,6 @@ pub(crate) struct HprLlcAttachments {
     attachments: Vec<Attachment>,
     candidates: Vec<ConfiguredCandidate>,
     source_cp: QualifiedName,
-    seed: Vec<u8>,
 }
 
 /// Owned endpoint parameters for one exclusive, remotely sourced LLC user
@@ -65,15 +66,7 @@ impl ReservedLlcPeer {
 }
 
 impl HprLlcAttachments {
-    pub(crate) fn adjacent_cp(&self) -> &QualifiedName {
-        &self.source_cp
-    }
-
-    pub(crate) fn new(
-        config: &RouterConfig,
-        source_cp: &QualifiedName,
-        seed: &[u8],
-    ) -> io::Result<Self> {
+    pub(crate) fn new(config: &RouterConfig, source_cp: &QualifiedName) -> io::Result<Self> {
         let proxy_macs = AutoProxyMacs::from_ids(config.llc.iter().map(|llc| llc.id.as_str()))?;
         let attachments = config
             .llc
@@ -87,6 +80,9 @@ impl HprLlcAttachments {
                         .get(&llc.id)
                         .ok_or_else(|| invalid("LLC proxy MAC missing"))?,
                     expected_cp: llc.local_cp.as_deref().map(parse_name).transpose()?,
+                    node_seed: LlcTargetIdentity::new(Some(source_cp), &llc.id)?
+                        .node_seed()
+                        .to_vec(),
                     probe: None,
                     active_user: false,
                     active_cp: None,
@@ -103,7 +99,6 @@ impl HprLlcAttachments {
             attachments,
             candidates,
             source_cp: source_cp.clone(),
-            seed: seed.to_vec(),
         })
     }
 
@@ -125,7 +120,7 @@ impl HprLlcAttachments {
                     guest_mac: attachment.guest_mac,
                     proxy_mac: attachment.proxy_mac,
                 };
-                match HprToLlcProbe::new(peer, &self.source_cp, target_cp, &self.seed) {
+                match HprToLlcProbe::new(peer, &self.source_cp, target_cp, &attachment.node_seed) {
                     Ok(probe) => attachment.probe = Some(probe),
                     Err(error) => {
                         attachment.retry_at = now + RETRY_DELAY;
@@ -348,6 +343,7 @@ mod tests {
                 guest_mac: [2, 0, 0, 0, 0, 1],
                 proxy_mac: [6, 0, 0, 0, 0, 1],
                 expected_cp: Some(cp.clone()),
+                node_seed: b"v4".to_vec(),
                 probe: None,
                 active_user: true,
                 active_cp: Some(cp.clone()),
@@ -361,7 +357,6 @@ mod tests {
                 carrier: CandidateCarrier::Llc,
             }],
             source_cp: "SOLNET.SNAB".parse().unwrap(),
-            seed: Vec::new(),
         };
         assert_eq!(
             attachments.verified_routes(),

@@ -6,15 +6,14 @@
 use std::io;
 
 use crate::{
-    auto_gateway_runtime::virtual_xid,
     auto_llc::LlcIngressOffer,
     hpr_fid2_session::NativeFid2Session,
     hpr_session_source::{SessionSource, SourceUpdate},
+    llc_target_identity::LlcTargetIdentity,
     native_peer_port::{NativeLlcEvent, NativePeerPort},
     routing::RoutePort,
 };
 use router_core::session::{QualifiedName, SessionEvent, SessionIdentity};
-use transport_ws::wire;
 
 pub(crate) struct LocalLlcNative {
     port: NativePeerPort,
@@ -36,9 +35,9 @@ impl LocalLlcIngress {
     pub(crate) fn from_offer(
         offer: LlcIngressOffer,
         target_cp: QualifiedName,
-        seed: &[u8],
+        attachment_id: &str,
     ) -> io::Result<Self> {
-        let native = LocalLlcNative::from_offer(offer, &target_cp, seed)?;
+        let native = LocalLlcNative::from_offer(offer, &target_cp, attachment_id)?;
         Ok(Self {
             native,
             target_cp,
@@ -196,15 +195,11 @@ impl LocalLlcNative {
     /// has completed inside `NativePeerPort`.
     pub(crate) fn from_offer(
         offer: LlcIngressOffer,
-        ee_peer_cp: &QualifiedName,
-        seed: &[u8],
+        target_cp: &QualifiedName,
+        attachment_id: &str,
     ) -> io::Result<Self> {
         let interface = offer.interface.clone();
-        let cp = wire::SnaName {
-            netid: ee_peer_cp.netid.clone(),
-            name: ee_peer_cp.name.clone(),
-        };
-        let xid = virtual_xid(&cp, seed, None, None, 1)?;
+        let xid = LlcTargetIdentity::new(Some(target_cp), attachment_id)?.xid()?;
         let (endpoint, first_events, observed_cp) = offer.into_endpoint()?;
         let port = NativePeerPort::open_dynamic_converter_from_endpoint(
             endpoint,
