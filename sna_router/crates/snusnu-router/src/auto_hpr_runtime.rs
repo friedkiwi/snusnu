@@ -30,13 +30,16 @@ use crate::{
     ee_peer_lus::EePeerLus,
     hpr_destination_directory::{Destination, HprDestinationDirectory},
     hpr_llc_attachments::HprLlcAttachments,
+    hpr_local_llc::{HprToLlcProbe, HprToLlcSession},
     hpr_local_session::HprLocalSession,
     hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     hpr_shared_local::{HprSharedLocal, ReadyLocalHpr},
     llc_session_ws::LlcSessionWs,
+    llc_target_identity::LlcTargetIdentity,
     publication::EeOwnerExport,
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
+    runtime::LlcPeer,
     session_switch::{SessionSwitch, SwitchError, HPR_ADAPTER, LOCAL_ADAPTER, WS_ADAPTER},
     STOP,
 };
@@ -50,7 +53,7 @@ use router_core::{
     hpr_route_setup_reply::{encode_stale_path_switch_negative, ReverseLinkMetrics},
     hpr_route_setup_service::{DirectRouteSetupService, PreparedRouteSetupReply},
     hpr_session_adapter::{negotiated_fixed_windows, HprSessionAdapter, HprSessionRole},
-    route_registry::{LuType, RouteKey, RouteRecord},
+    route_registry::{LuType, RouteKey, RouteOrigin, RouteRecord, RouteSelection},
     session::{Flow, SessionEvent, SessionIdentity, SessionUnit},
     session_fabric::{AdapterId, FabricError, FabricSessionId, Reachability},
     ConnectionGeneration,
@@ -192,9 +195,49 @@ struct ActiveHprSession {
     pending_local_grant: bool,
 }
 
+struct PendingSharedLlc {
+    attachment_id: String,
+    target_lu: router_core::session::QualifiedName,
+    target_cp: router_core::session::QualifiedName,
+    source_lu: router_core::session::QualifiedName,
+    source_cp: router_core::session::QualifiedName,
+    proxy_mac: [u8; 6],
+    probe: HprToLlcProbe,
+    started: Instant,
+}
+
 pub(crate) struct SharedLocalAccess<'a, 'b> {
-    shared: &'a mut HprSharedLocal,
-    runner: &'a mut AutoLocalSessionRunner<'b>,
+    pub(crate) shared: &'a mut HprSharedLocal,
+    pub(crate) runner: &'a mut AutoLocalSessionRunner<'b>,
+    pub(crate) config: &'a RouterConfig,
+}
+
+fn discovered_llc_routes<'a>(
+    exports: impl IntoIterator<Item = RouteSelection>,
+    attachment_ids: impl IntoIterator<Item = &'a str>,
+) -> Vec<(router_core::session::QualifiedName, Destination)> {
+    let attachment_ids = attachment_ids.into_iter().collect::<HashSet<_>>();
+    exports
+        .into_iter()
+        .filter_map(|selection| {
+            if selection.origin != RouteOrigin::Local
+                || !selection.supported_types.contains(&LuType::Lu62)
+                || !attachment_ids.contains(selection.attachment.as_str())
+            {
+                return None;
+            }
+            let RouteKey::LogicalUnit { lu, hosting_cp } = selection.key else {
+                return None;
+            };
+            Some((
+                lu,
+                Destination::Llc {
+                    hosting_cp,
+                    attachment_id: selection.attachment.as_str().to_owned(),
+                },
+            ))
+        })
+        .collect()
 }
 
 pub(crate) struct DirectHprRuntime<'a> {
@@ -230,6 +273,8 @@ pub(crate) struct DirectHprRuntime<'a> {
     reverse_mptn_reservation: Option<String>,
     local_ws: Vec<LlcSessionWs>,
     shared_publication: bool,
+    pending_shared_llc: Option<PendingSharedLlc>,
+    active_shared_llc: HashMap<String, [u8; 6]>,
 }
 
 impl<'a> DirectHprRuntime<'a> {
@@ -271,11 +316,39 @@ impl<'a> DirectHprRuntime<'a> {
             reverse_mptn_reservation: None,
             local_ws: Vec::new(),
             shared_publication: false,
+            pending_shared_llc: None,
+            active_shared_llc: HashMap::new(),
         }
     }
 
-    fn use_shared_publication(&mut self) {
+    pub(crate) fn use_shared_publication(&mut self) {
         self.shared_publication = true;
+    }
+
+    pub(crate) fn poll_shared_local(
+        &mut self,
+        link: &EeLdlcEndpoint,
+        shared: &mut HprSharedLocal,
+        runner: &mut AutoLocalSessionRunner<'_>,
+        config: &RouterConfig,
+        netid: &str,
+    ) -> io::Result<()> {
+        self.refresh_shared_llc_routes(runner, config, netid)?;
+        self.reconcile_pending_shared_llc(runner)?;
+        let routes = shared.trusted_mptn_routes(runner)?;
+        self.local_directory.replace_owner("mptn", routes)?;
+        let can_accept = link.phase() == router_core::hpr_ip_activation::Phase::Active
+            && self.reverse.is_none()
+            && self
+                .reciprocal_cp
+                .as_ref()
+                .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active);
+        if let Some(ready) = shared.poll(runner, &self.local_directory, can_accept)? {
+            if let Err(error) = self.accept_shared_source(ready, link, shared, runner) {
+                tracing::warn!(error = %error, "shared local source could not enter EE session");
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn configure_peer_lus(
@@ -360,6 +433,181 @@ impl<'a> DirectHprRuntime<'a> {
             }
             self.local_directory
                 .replace_owner("llc", llc.verified_routes())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_shared_llc_routes(
+        &mut self,
+        runner: &AutoLocalSessionRunner<'_>,
+        config: &RouterConfig,
+        netid: &str,
+    ) -> io::Result<()> {
+        let routes = discovered_llc_routes(
+            runner.local_exports(netid),
+            config.llc.iter().map(|peer| peer.id.as_str()),
+        );
+        self.local_directory.replace_owner("llc", routes)
+    }
+
+    fn clear_pending_shared_llc(
+        &mut self,
+        runner: &mut AutoLocalSessionRunner<'_>,
+    ) -> io::Result<()> {
+        if let Some(mut pending) = self.pending_shared_llc.take() {
+            if let Err(error) = pending.probe.close() {
+                tracing::warn!(attachment = %pending.attachment_id, error = %error,
+                    "pending LLC egress probe close failed");
+            }
+            runner.release_llc(&pending.attachment_id, pending.proxy_mac)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_pending_shared_llc(
+        &mut self,
+        runner: &mut AutoLocalSessionRunner<'_>,
+    ) -> io::Result<()> {
+        let stale = self.pending_shared_llc.as_ref().is_some_and(|pending| {
+            self.local_directory.resolve_lu(&pending.target_lu)
+                != Some(Destination::Llc {
+                    hosting_cp: pending.target_cp.clone(),
+                    attachment_id: pending.attachment_id.clone(),
+                })
+        });
+        if stale {
+            self.clear_pending_shared_llc(runner)?;
+        }
+        Ok(())
+    }
+
+    fn take_shared_llc_session(
+        &mut self,
+        access: &mut SharedLocalAccess<'_, '_>,
+        attachment_id: &str,
+        identity: &SessionIdentity,
+        bind: &SessionUnit,
+    ) -> io::Result<Option<HprToLlcSession>> {
+        let target_cp = identity
+            .target_cp
+            .as_ref()
+            .ok_or_else(|| protocol("HPR LLC destination has no hosting CP"))?;
+        let source_cp = identity
+            .source_cp
+            .as_ref()
+            .ok_or_else(|| protocol("HPR LLC source has no CP"))?;
+        if self.local_directory.resolve_lu(&identity.target_lu)
+            != Some(Destination::Llc {
+                hosting_cp: target_cp.clone(),
+                attachment_id: attachment_id.to_owned(),
+            })
+        {
+            self.clear_pending_shared_llc(access.runner)?;
+            return Err(protocol("HPR LLC route proof changed before BIND"));
+        }
+        if let Some(pending) = self.pending_shared_llc.as_ref() {
+            if pending.attachment_id != attachment_id
+                || pending.target_lu != identity.target_lu
+                || pending.target_cp != *target_cp
+                || pending.source_lu != identity.source_lu
+                || pending.source_cp != *source_cp
+            {
+                return Ok(None);
+            }
+        } else {
+            let proxy_mac = access
+                .shared
+                .ee_proxy_mac()
+                .ok_or_else(|| protocol("EE proxy MAC is unavailable for LLC egress"))?;
+            if !access.runner.reserve_llc(attachment_id, proxy_mac)? {
+                return Ok(None);
+            }
+            let result = (|| {
+                let peer = access
+                    .config
+                    .llc
+                    .iter()
+                    .find(|entry| entry.id == attachment_id)
+                    .ok_or_else(|| protocol("LLC egress attachment is absent"))?;
+                let guest_mac = crate::config::parse_mac(&peer.guest_mac)?;
+                let seed = LlcTargetIdentity::new(Some(&self.bootstrap.peer.cp), attachment_id)?;
+                HprToLlcProbe::new_with_management(
+                    LlcPeer {
+                        interface: &peer.interface,
+                        guest_mac,
+                        proxy_mac,
+                    },
+                    &self.bootstrap.peer.cp,
+                    target_cp,
+                    source_cp,
+                    seed.node_seed(),
+                )
+            })();
+            let probe = match result {
+                Ok(probe) => probe,
+                Err(error) => {
+                    access.runner.release_llc(attachment_id, proxy_mac)?;
+                    return Err(error);
+                }
+            };
+            self.pending_shared_llc = Some(PendingSharedLlc {
+                attachment_id: attachment_id.to_owned(),
+                target_lu: identity.target_lu.clone(),
+                target_cp: target_cp.clone(),
+                source_lu: identity.source_lu.clone(),
+                source_cp: source_cp.clone(),
+                proxy_mac,
+                probe,
+                started: Instant::now(),
+            });
+        }
+        let timed_out = self
+            .pending_shared_llc
+            .as_ref()
+            .is_some_and(|pending| pending.started.elapsed() >= Duration::from_secs(60));
+        if timed_out {
+            self.clear_pending_shared_llc(access.runner)?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HPR LLC egress XID/management timed out",
+            ));
+        }
+        let ready = match self.pending_shared_llc.as_mut().unwrap().probe.pump() {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.clear_pending_shared_llc(access.runner)?;
+                return Err(error);
+            }
+        };
+        if !ready {
+            return Ok(None);
+        }
+        let pending = self.pending_shared_llc.take().unwrap();
+        let session =
+            match pending
+                .probe
+                .into_session(&identity.source_lu, &identity.target_lu, bind)
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    access
+                        .runner
+                        .release_llc(attachment_id, pending.proxy_mac)?;
+                    return Err(error);
+                }
+            };
+        self.active_shared_llc
+            .insert(attachment_id.to_owned(), pending.proxy_mac);
+        Ok(Some(session))
+    }
+
+    pub(crate) fn release_shared_llc(
+        &mut self,
+        runner: &mut AutoLocalSessionRunner<'_>,
+    ) -> io::Result<()> {
+        self.clear_pending_shared_llc(runner)?;
+        for (id, mac) in self.active_shared_llc.drain() {
+            runner.release_llc(&id, mac)?;
         }
         Ok(())
     }
@@ -1912,16 +2160,19 @@ impl<'a> DirectHprRuntime<'a> {
                 (ws, None, None)
             }
             Destination::Llc { attachment_id, .. } => {
-                let session = self
-                    .llc
-                    .as_mut()
-                    .ok_or_else(|| protocol("HPR local LLC attachments unavailable"))?
-                    .take_session(
-                        attachment_id,
-                        &identity.source_lu,
-                        &identity.target_lu,
-                        &bind_request,
-                    );
+                let session = if let Some(access) = shared.as_deref_mut() {
+                    self.take_shared_llc_session(access, attachment_id, &identity, &bind_request)
+                } else {
+                    self.llc
+                        .as_mut()
+                        .ok_or_else(|| protocol("HPR local LLC attachments unavailable"))?
+                        .take_session(
+                            attachment_id,
+                            &identity.source_lu,
+                            &identity.target_lu,
+                            &bind_request,
+                        )
+                };
                 let session =
                     match session {
                         Ok(session) => session,
@@ -1939,7 +2190,13 @@ impl<'a> DirectHprRuntime<'a> {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "LLC probe busy"));
                 };
                 if let Err(error) = self.switch.bind_egress(fabric_id, LOCAL_ADAPTER, handle) {
-                    self.llc.as_mut().unwrap().release(attachment_id);
+                    if let Some(access) = shared.as_deref_mut() {
+                        if let Some(mac) = self.active_shared_llc.remove(attachment_id) {
+                            access.runner.release_llc(attachment_id, mac)?;
+                        }
+                    } else {
+                        self.llc.as_mut().unwrap().release(attachment_id);
+                    }
                     self.switch
                         .discard_unopened(HPR_ADAPTER, handle)
                         .map_err(|failure| {
@@ -2075,7 +2332,11 @@ impl<'a> DirectHprRuntime<'a> {
                             mptn.release(&gateway_id);
                         }
                     } else if let Some(attachment_id) = session.local_attachment_id.as_deref() {
-                        if let Some(llc) = self.llc.as_mut() {
+                        if let Some(access) = shared.as_deref_mut() {
+                            if let Some(mac) = self.active_shared_llc.remove(attachment_id) {
+                                access.runner.release_llc(attachment_id, mac)?;
+                            }
+                        } else if let Some(llc) = self.llc.as_mut() {
                             llc.release(attachment_id);
                         }
                     }
@@ -2383,6 +2644,7 @@ fn run_connected(
                     if let Some(peer_lus) = runtime.peer_lus.as_mut() {
                         peer_lus.deactivate();
                     }
+                    runtime.release_shared_llc(local)?;
                 }
                 shared.withdraw_ee(local)?;
                 local.withdraw_ee_records(&attachment.id)?;
@@ -2393,29 +2655,13 @@ fn run_connected(
                 continue;
             }
             if let Some(runtime) = active.as_mut() {
-                let routes = shared.trusted_mptn_routes(local)?;
-                runtime.local_directory.replace_owner("mptn", routes)?;
-                let can_accept = ee.as_ref().is_some_and(AuthorizedEeAttachment::is_active)
-                    && runtime.reverse.is_none()
-                    && runtime
-                        .reciprocal_cp
-                        .as_ref()
-                        .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active);
-                if let Some(ready) = shared.poll(local, &runtime.local_directory, can_accept)? {
-                    let access = SharedLocalAccess {
-                        shared,
-                        runner: local,
-                    };
-                    if let Err(error) = runtime.accept_shared_source(
-                        ready,
-                        ee.as_ref().unwrap().link(),
-                        access.shared,
-                        access.runner,
-                    ) {
-                        tracing::warn!(attachment = %attachment.id, error = %error,
-                            "shared local source could not enter EE session");
-                    }
-                }
+                runtime.poll_shared_local(
+                    ee.as_ref().unwrap().link(),
+                    shared,
+                    local,
+                    config,
+                    hub.allowed_netid(),
+                )?;
             } else {
                 shared.poll(local, &HprDestinationDirectory::new(), false)?;
             }
@@ -2445,6 +2691,7 @@ fn run_connected(
                     .is_none_or(|runtime| runtime.bootstrap.generation != ee.link().generation())
                 {
                     if let Some(mut previous) = active.take() {
+                        previous.release_shared_llc(local)?;
                         let _ = previous.detach_local_mptn();
                         shared.withdraw_ee(local)?;
                         local.withdraw_ee_records(&attachment.id)?;
@@ -2455,7 +2702,6 @@ fn run_connected(
                         .ok_or_else(|| protocol("active EE link lacks control bootstrap"))?;
                     let mut runtime = DirectHprRuntime::new(bootstrap);
                     runtime.configure_peer_lus(attachment)?;
-                    runtime.configure_local_llc(config)?;
                     runtime.use_shared_publication();
                     shared.configure_ee(
                         local,
@@ -2474,6 +2720,7 @@ fn run_connected(
                     peer_lus.deactivate();
                 }
                 let _ = runtime.detach_local_mptn();
+                runtime.release_shared_llc(local)?;
                 shared.withdraw_ee(local)?;
                 local.withdraw_ee_records(&attachment.id)?;
                 tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
@@ -2556,6 +2803,7 @@ fn run_connected(
                 let mut access = SharedLocalAccess {
                     shared,
                     runner: local,
+                    config,
                 };
                 runtime.pump(
                     ee.link(),
@@ -2578,6 +2826,7 @@ fn run_connected(
         Ok(())
     })();
     if let Some(mut runtime) = active.take() {
+        let _ = runtime.release_shared_llc(local);
         let _ = runtime.detach_local_mptn();
     }
     let _ = shared.withdraw_ee(local);
@@ -2641,6 +2890,7 @@ pub(crate) fn from_session_wire(value: wire::SessionEvent) -> io::Result<Session
 #[cfg(test)]
 mod tests {
     use super::*;
+    use router_core::route_registry::{AttachmentId, OwnerId, OwnerVersion, RouteRegistry};
     use router_core::session::{Flow, QualifiedName};
     use router_core::{
         hpr_control_bootstrap::ControlAdvertisement,
@@ -2648,6 +2898,42 @@ mod tests {
         hpr_session_address::RtpObservation,
         ConnectionGeneration,
     };
+
+    #[test]
+    fn discovered_llc_lu62_routes_need_no_configured_lu_hint() {
+        let mut registry = RouteRegistry::new();
+        let cp = q("LOCAL.CP");
+        let lu = q("LOCAL.USER");
+        registry
+            .replace_records(
+                OwnerId::new("llc-association").unwrap(),
+                AttachmentId::new("llc0").unwrap(),
+                RouteOrigin::Local,
+                OwnerVersion::new(1, 1).unwrap(),
+                vec![
+                    RouteRecord::from(RouteKey::ControlPoint(cp.clone())),
+                    RouteRecord {
+                        key: RouteKey::LogicalUnit {
+                            lu: lu.clone(),
+                            hosting_cp: cp.clone(),
+                        },
+                        supported_types: vec![LuType::Lu62],
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            discovered_llc_routes(registry.local_exports("LOCAL"), ["llc0"]),
+            vec![(
+                lu,
+                Destination::Llc {
+                    hosting_cp: cp,
+                    attachment_id: "llc0".into(),
+                },
+            )]
+        );
+        assert!(discovered_llc_routes(registry.local_exports("LOCAL"), ["other"]).is_empty());
+    }
 
     #[test]
     fn captured_guest_route_reply_uses_inbound_route_setup_topic() {
