@@ -19,7 +19,7 @@ use transport_ip_sna::mptn_ingress::IngressOffer;
 
 use crate::{
     auto_gateway_runtime::AutoMptnGateway,
-    config::RouterConfig,
+    config::{MptnGatewayConfig, RouterConfig},
     hpr_destination_directory::{
         configured_candidates, CandidateCarrier, ConfiguredCandidate, Destination,
     },
@@ -30,6 +30,13 @@ use crate::{
 
 struct Attachment<'a> {
     gateway: AutoMptnGateway<'a>,
+    state: HprMptnPeerState,
+}
+
+/// EE-specific proof and session lease state for one TCP62 gateway. The
+/// physical gateway may be owned and polled by a shared local runner.
+pub(crate) struct HprMptnPeerState {
+    gateway_id: String,
     trusted_peer_cp: Option<QualifiedName>,
     management_source_lu: Option<QualifiedName>,
     management_target_lu: Option<QualifiedName>,
@@ -65,28 +72,9 @@ impl<'a> HprMptnAttachments<'a> {
             .mptn_gateway
             .iter()
             .map(|entry| {
-                let trusted_peer_cp = if entry.peer_cp.is_empty() {
-                    None
-                } else {
-                    Some(parse_name(&entry.peer_cp)?)
-                };
-                let management_source_lu = (!entry.source_lu.is_empty())
-                    .then(|| parse_name(&entry.source_lu))
-                    .transpose()?;
-                let management_target_lu = (!entry.destination_lu.is_empty())
-                    .then(|| parse_name(&entry.destination_lu))
-                    .transpose()?;
                 Ok(Attachment {
                     gateway: AutoMptnGateway::bind(entry)?,
-                    trusted_peer_cp,
-                    management_source_lu,
-                    management_target_lu,
-                    probe_result: None,
-                    probe_worker: None,
-                    retry_at: Instant::now(),
-                    poll_retry_at: Instant::now(),
-                    observed_peer_lus: HashSet::new(),
-                    active_user: false,
+                    state: HprMptnPeerState::new(entry)?,
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -106,43 +94,8 @@ impl<'a> HprMptnAttachments<'a> {
     pub(crate) fn poll_once(&mut self) -> io::Result<Vec<MptnIngressOffer>> {
         let mut offered = Vec::new();
         for attachment in &mut self.attachments {
-            let bind = if Instant::now() < attachment.poll_retry_at {
-                None
-            } else {
-                match attachment.gateway.poll_once() {
-                    Ok(bind) => bind,
-                    Err(error) => {
-                        attachment.observed_peer_lus.clear();
-                        attachment.poll_retry_at = Instant::now() + Duration::from_secs(1);
-                        tracing::warn!(gateway = attachment.gateway.id(), error = %error,
-                            "MPTN gateway poll failed; learned routes withdrawn");
-                        None
-                    }
-                }
-            };
-            for (peer_lu, local_lu) in attachment.gateway.take_management_lus() {
-                let peer_lu = parse_name(&peer_lu)?;
-                let local_lu = parse_name(&local_lu)?;
-                if let Some(trusted_cp) = &attachment.trusted_peer_cp {
-                    if peer_lu.netid != trusted_cp.netid {
-                        tracing::warn!(gateway = attachment.gateway.id(), peer_lu = %peer_lu,
-                            configured_peer_cp = %trusted_cp,
-                            "MPTN management peer NETID disagrees with operator CP assertion");
-                        continue;
-                    }
-                }
-                tracing::info!(gateway = attachment.gateway.id(), peer_lu = %peer_lu,
-                    local_lu = %local_lu, "MPTN management disclosed adjacent LU");
-                attachment.observed_peer_lus.insert(peer_lu);
-            }
-            attachment.poll_probe();
-            attachment.start_probe_if_needed()?;
-            if let Some((association, offer)) = bind {
-                offered.push(MptnIngressOffer {
-                    gateway_id: attachment.gateway.id().to_owned(),
-                    association,
-                    offer,
-                });
+            if let Some(offer) = attachment.state.poll_gateway(&mut attachment.gateway)? {
+                offered.push(offer);
             }
         }
         Ok(offered)
@@ -166,8 +119,8 @@ impl<'a> HprMptnAttachments<'a> {
     /// listener and independently observed management peers survive.
     pub(crate) fn release_all_users(&mut self) {
         for attachment in &mut self.attachments {
-            if attachment.active_user {
-                attachment.active_user = false;
+            if attachment.state.active_user {
+                attachment.state.active_user = false;
                 attachment.gateway.release_udp();
             }
         }
@@ -179,19 +132,10 @@ impl<'a> HprMptnAttachments<'a> {
     pub(crate) fn trusted_routes(&self) -> Vec<(QualifiedName, Destination)> {
         self.attachments
             .iter()
-            .filter(|attachment| !attachment.active_user && attachment.gateway.udp_available())
             .flat_map(|attachment| {
-                let gateway_id = attachment.gateway.id();
-                self.candidates
-                    .iter()
-                    .filter(move |candidate| candidate.attachment_id == gateway_id)
-                    .filter_map(move |candidate| {
-                        route_for_candidate(
-                            candidate,
-                            attachment.trusted_peer_cp.as_ref(),
-                            &attachment.observed_peer_lus,
-                        )
-                    })
+                attachment
+                    .state
+                    .trusted_routes(&attachment.gateway, &self.candidates)
             })
             .collect()
     }
@@ -208,14 +152,18 @@ impl<'a> HprMptnAttachments<'a> {
             .iter_mut()
             .find(|entry| entry.gateway.id() == gateway_id)
             .ok_or_else(|| invalid("unknown MPTN attachment"))?;
-        if attachment.active_user || !attachment.gateway.udp_available() {
+        if attachment.state.active_user || !attachment.gateway.udp_available() {
             return Ok(None);
         }
         let cp = attachment
+            .state
             .trusted_peer_cp
             .as_ref()
             .ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
-        if !attachment.observed_peer_lus.contains(&identity.target_lu)
+        if !attachment
+            .state
+            .observed_peer_lus
+            .contains(&identity.target_lu)
             || identity.target_cp.as_ref() != Some(cp)
             || !self.candidates.iter().any(|candidate| {
                 candidate.attachment_id == gateway_id
@@ -236,7 +184,7 @@ impl<'a> HprMptnAttachments<'a> {
                 return Err(error);
             }
         };
-        attachment.active_user = true;
+        attachment.state.active_user = true;
         Ok(Some(session))
     }
 
@@ -249,7 +197,7 @@ impl<'a> HprMptnAttachments<'a> {
             .iter_mut()
             .find(|entry| entry.gateway.id() == offered.gateway_id)
             .ok_or_else(|| invalid("unknown MPTN ingress gateway"))?;
-        if attachment.active_user {
+        if attachment.state.active_user {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "MPTN UDP lease is busy",
@@ -275,7 +223,7 @@ impl<'a> HprMptnAttachments<'a> {
                 return Err(error);
             }
         };
-        attachment.active_user = true;
+        attachment.state.active_user = true;
         Ok(session)
     }
 
@@ -299,7 +247,7 @@ impl<'a> HprMptnAttachments<'a> {
                 .iter()
                 .find(|entry| entry.gateway.id() == offered.gateway_id)
                 .ok_or_else(|| invalid("unknown MPTN ingress gateway"))?;
-            if attachment.active_user || !attachment.gateway.udp_available() {
+            if attachment.state.active_user || !attachment.gateway.udp_available() {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "MPTN UDP lease is busy",
@@ -308,8 +256,8 @@ impl<'a> HprMptnAttachments<'a> {
             trusted_source_identity(
                 source_lu,
                 target_lu,
-                attachment.trusted_peer_cp.as_ref(),
-                &attachment.observed_peer_lus,
+                attachment.state.trusted_peer_cp.as_ref(),
+                &attachment.state.observed_peer_lus,
                 directory,
             )
         })();
@@ -339,7 +287,7 @@ impl<'a> HprMptnAttachments<'a> {
             .iter_mut()
             .find(|entry| entry.gateway.id() == gateway_id)
         {
-            attachment.active_user = false;
+            attachment.state.active_user = false;
             attachment.gateway.release_udp();
         }
     }
@@ -388,7 +336,109 @@ fn trusted_source_identity(
     Ok((identity, attachment_id))
 }
 
-impl Attachment<'_> {
+impl HprMptnPeerState {
+    pub(crate) fn new(entry: &MptnGatewayConfig) -> io::Result<Self> {
+        let trusted_peer_cp = (!entry.peer_cp.is_empty())
+            .then(|| parse_name(&entry.peer_cp))
+            .transpose()?;
+        let management_source_lu = (!entry.source_lu.is_empty())
+            .then(|| parse_name(&entry.source_lu))
+            .transpose()?;
+        let management_target_lu = (!entry.destination_lu.is_empty())
+            .then(|| parse_name(&entry.destination_lu))
+            .transpose()?;
+        Ok(Self {
+            gateway_id: entry.id.clone(),
+            trusted_peer_cp,
+            management_source_lu,
+            management_target_lu,
+            probe_result: None,
+            probe_worker: None,
+            retry_at: Instant::now(),
+            poll_retry_at: Instant::now(),
+            observed_peer_lus: HashSet::new(),
+            active_user: false,
+        })
+    }
+
+    /// Compatibility wrapper while the shared runner takes over gateway
+    /// polling. The state methods below can consume observations supplied by
+    /// a different socket owner without opening another TCP62 listener.
+    pub(crate) fn poll_gateway(
+        &mut self,
+        gateway: &mut AutoMptnGateway<'_>,
+    ) -> io::Result<Option<MptnIngressOffer>> {
+        let bind = if Instant::now() < self.poll_retry_at {
+            None
+        } else {
+            match gateway.poll_once() {
+                Ok(bind) => bind,
+                Err(error) => {
+                    self.observed_peer_lus.clear();
+                    self.poll_retry_at = Instant::now() + Duration::from_secs(1);
+                    tracing::warn!(gateway = %self.gateway_id, error = %error,
+                        "MPTN gateway poll failed; learned routes withdrawn");
+                    None
+                }
+            }
+        };
+        self.observe_management(gateway.take_management_lus())?;
+        self.poll_probes(gateway)?;
+        Ok(bind.map(|(association, offer)| MptnIngressOffer {
+            gateway_id: self.gateway_id.clone(),
+            association,
+            offer,
+        }))
+    }
+
+    pub(crate) fn observe_management(
+        &mut self,
+        observations: impl IntoIterator<Item = (String, String)>,
+    ) -> io::Result<()> {
+        for (peer_lu, local_lu) in observations {
+            let peer_lu = parse_name(&peer_lu)?;
+            let local_lu = parse_name(&local_lu)?;
+            if let Some(trusted_cp) = &self.trusted_peer_cp {
+                if peer_lu.netid != trusted_cp.netid {
+                    tracing::warn!(gateway = %self.gateway_id, peer_lu = %peer_lu,
+                        configured_peer_cp = %trusted_cp,
+                        "MPTN management peer NETID disagrees with operator CP assertion");
+                    continue;
+                }
+            }
+            tracing::info!(gateway = %self.gateway_id, peer_lu = %peer_lu,
+                local_lu = %local_lu, "MPTN management disclosed adjacent LU");
+            self.observed_peer_lus.insert(peer_lu);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poll_probes(&mut self, gateway: &AutoMptnGateway<'_>) -> io::Result<()> {
+        self.poll_probe();
+        self.start_probe_if_needed(gateway)
+    }
+
+    pub(crate) fn trusted_routes(
+        &self,
+        gateway: &AutoMptnGateway<'_>,
+        candidates: &[ConfiguredCandidate],
+    ) -> Vec<(QualifiedName, Destination)> {
+        if self.active_user || !gateway.udp_available() {
+            return Vec::new();
+        }
+        candidates
+            .iter()
+            .filter(|candidate| candidate.attachment_id == self.gateway_id)
+            .filter_map(|candidate| {
+                route_for_candidate(
+                    candidate,
+                    self.trusted_peer_cp.as_ref(),
+                    &self.observed_peer_lus,
+                )
+            })
+            .collect()
+    }
+
     fn poll_probe(&mut self) {
         let Some(receiver) = self.probe_result.as_ref() else {
             return;
@@ -403,10 +453,7 @@ impl Attachment<'_> {
         self.probe_result = None;
         if let Some(worker) = self.probe_worker.take() {
             if worker.join().is_err() {
-                tracing::warn!(
-                    gateway = self.gateway.id(),
-                    "MPTN management probe panicked"
-                );
+                tracing::warn!(gateway = %self.gateway_id, "MPTN management probe panicked");
                 self.retry_at = Instant::now() + Duration::from_secs(5);
                 return;
             }
@@ -419,24 +466,24 @@ impl Attachment<'_> {
                     .as_ref()
                     .is_some_and(|cp| cp.netid != target.netid)
                 {
-                    tracing::warn!(gateway = self.gateway.id(), target_lu = %target,
+                    tracing::warn!(gateway = %self.gateway_id, target_lu = %target,
                         "MPTN management probe LU NETID differs from configured peer CP");
                     self.retry_at = Instant::now() + Duration::from_secs(5);
                     return;
                 }
-                tracing::info!(gateway = self.gateway.id(), target_lu = %target,
+                tracing::info!(gateway = %self.gateway_id, target_lu = %target,
                     "outbound MPTN management proved adjacent LU");
                 self.observed_peer_lus.insert(target.clone());
             }
             Err(error) => {
-                tracing::debug!(gateway = self.gateway.id(), error = %error,
+                tracing::debug!(gateway = %self.gateway_id, error = %error,
                     "outbound MPTN management probe did not establish LU reachability");
                 self.retry_at = Instant::now() + Duration::from_secs(5);
             }
         }
     }
 
-    fn start_probe_if_needed(&mut self) -> io::Result<()> {
+    fn start_probe_if_needed(&mut self, gateway: &AutoMptnGateway<'_>) -> io::Result<()> {
         let (Some(source), Some(target)) = (
             self.management_source_lu.as_ref(),
             self.management_target_lu.as_ref(),
@@ -451,7 +498,7 @@ impl Attachment<'_> {
         }
         let source = source.to_string();
         let target = target.to_string();
-        let endpoint = self.gateway.outbound_endpoint();
+        let endpoint = gateway.outbound_endpoint();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("sna-mptn-management-probe".into())
