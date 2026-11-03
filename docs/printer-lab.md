@@ -203,8 +203,9 @@ probe record, not a captured physical 5494.
 The `3812` VPD fields and address-list prefix in the probe were chosen for
 the lab and remain unverified against hardware. The configured remote
 workstation controller `SNUPRT` and device `SNUPRT01` still report
-`VARY ON PENDING`; no LU4 BIND or SCS print data has followed. The guest
-rejected a shared-session QRMTWSC Attach with `80050000` after its default
+`VARY ON PENDING`; no inner FID3 address-01 ACTLU, LU4 BIND, or SCS print
+data has followed in the recorded trials. The guest rejected a
+shared-session QRMTWSC Attach with `80050000` after its default
 management session ended, so the source CNOS/session association remains
 the next blocker.
 
