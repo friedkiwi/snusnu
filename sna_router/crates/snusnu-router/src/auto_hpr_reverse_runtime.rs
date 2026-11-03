@@ -4,7 +4,11 @@
 //! guest-originated sessions. The first BIND is held as a leased fabric event
 //! until RouteSetup and user RTP have actually carried it to the peer.
 
-use std::{collections::VecDeque, io};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use router_core::{
     fid2_bind::{classify_reduced_bind, BindClass},
@@ -30,6 +34,7 @@ use crate::{
 
 const MAX_EARLY_USER_BIUS: usize = 16;
 const MAX_EARLY_USER_BYTES: usize = 64 * 1024;
+const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn invalid(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
@@ -122,6 +127,7 @@ pub(crate) struct ReverseRuntime {
     reverse: Option<ReverseHprUser>,
     user_config: Option<UserSetupConfig>,
     management: Option<HprManagementInitiator>,
+    management_started: Option<Instant>,
     pending_credit: Option<SessionEvent>,
     early_user: VecDeque<RtpIngress>,
     early_user_bytes: usize,
@@ -183,6 +189,7 @@ impl ReverseRuntime {
             reverse: None,
             user_config: None,
             management: None,
+            management_started: None,
             pending_credit: None,
             early_user: VecDeque::new(),
             early_user_bytes: 0,
@@ -254,6 +261,7 @@ impl ReverseRuntime {
                     token,
                     &mode,
                 )?);
+                self.management_started = Some(Instant::now());
                 self.phase = Phase::SendManagement;
                 tracing::info!(handle = self.handle, source_lu = %self.identity.source_lu,
                     target_lu = %self.identity.target_lu, mode = %mode, pcid = ?self.pcid,
@@ -303,6 +311,22 @@ impl ReverseRuntime {
         now_us: u64,
     ) -> io::Result<()> {
         if self.phase == Phase::Done {
+            return self.finish(rtp);
+        }
+        if matches!(
+            self.phase,
+            Phase::SendManagement | Phase::AwaitManagementCie | Phase::ManagementActive
+        ) && self
+            .management_started
+            .is_some_and(|started| started.elapsed() >= MANAGEMENT_TIMEOUT)
+        {
+            tracing::warn!(handle = self.handle, source_cp = ?self.identity.source_cp,
+                target_cp = %self.bootstrap.peer.cp, phase = ?self.phase,
+                "reverse HPR CP management timed out");
+            switch
+                .discard_unopened(self.source_adapter, self.handle)
+                .map_err(|error| switch_error("reverse HPR management timeout", error))?;
+            self.phase = Phase::Done;
             return self.finish(rtp);
         }
         self.poll_source(switch)?;
