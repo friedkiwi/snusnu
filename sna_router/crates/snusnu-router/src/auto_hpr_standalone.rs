@@ -129,12 +129,23 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                         retire_slot(slot, &mut local, &mut shared)?;
                         let peer_cp = bootstrap.peer.cp.clone();
                         let mut runtime = DirectHprRuntime::new(*bootstrap);
-                        runtime.configure_peer_lus(slot.attachment)?;
-                        runtime.use_shared_publication();
-                        shared.configure_ee(&mut local, config, &slot.attachment.id, peer_cp)?;
-                        let export = runtime.ee_owner_export();
-                        local.replace_ee_records(&export.owner, export.records)?;
-                        slot.active = Some(runtime);
+                        let activated = (|| -> io::Result<()> {
+                            runtime.configure_peer_lus(slot.attachment)?;
+                            runtime.use_shared_publication();
+                            shared.configure_ee(
+                                &mut local,
+                                config,
+                                &slot.attachment.id,
+                                peer_cp,
+                            )?;
+                            let export = runtime.ee_owner_export();
+                            local.replace_ee_records(&export.owner, export.records)?;
+                            Ok(())
+                        })();
+                        match activated {
+                            Ok(()) => slot.active = Some(runtime),
+                            Err(error) => fail_slot(slot, &mut local, &mut shared, error)?,
+                        }
                     }
                     Some(StandaloneEvent::Datagram(datagram)) => {
                         if let Some(runtime) = slot.active.as_mut() {
@@ -194,7 +205,7 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
             }
             for slot in &mut slots {
                 if let Some(runtime) = slot.active.as_mut() {
-                    runtime.replace_other_ee_routes(
+                    let update = runtime.replace_other_ee_routes(
                         ee_routes
                             .iter()
                             .filter(|(_, destination)| {
@@ -202,7 +213,10 @@ fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
                             })
                             .cloned()
                             .collect(),
-                    )?;
+                    );
+                    if let Err(error) = update {
+                        fail_slot(slot, &mut local, &mut shared, error)?;
+                    }
                 }
             }
             let can_accept = slots.iter().any(|slot| {
