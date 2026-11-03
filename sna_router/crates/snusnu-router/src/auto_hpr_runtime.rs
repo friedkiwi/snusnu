@@ -24,14 +24,13 @@ use crate::{
     auto_hpr_identity::AuthorizedEeIdentity,
     auto_hpr_local_ingress::LocalToHprRuntime,
     auto_hpr_reverse_runtime::ReverseRuntime,
-    auto_runtime::AutoLocalSessionRunner,
+    auto_runtime::{AutoLocalSessionRunner, OpenDisposition},
     config::RouterConfig,
     ee_ldlc_endpoint::EeLdlcEndpoint,
     ee_peer_lus::EePeerLus,
     hpr_destination_directory::{Destination, HprDestinationDirectory},
     hpr_llc_attachments::HprLlcAttachments,
     hpr_local_session::HprLocalSession,
-    hpr_local_session_runner::HprLocalSessionRunner,
     hpr_mptn_attachments::HprMptnAttachments,
     hpr_rtp_port::{HprRtpPort, RtpIngress, RtpIngressKind},
     hpr_shared_local::{HprSharedLocal, ReadyLocalHpr},
@@ -2273,22 +2272,40 @@ pub(crate) fn run_hpr(config: &RouterConfig) -> io::Result<()> {
         .remote
         .first()
         .ok_or_else(|| protocol("HPR runtime requires one concentrator"))?;
-    let mut local = HprLocalSessionRunner::new(config)?;
+    let mut local = AutoLocalSessionRunner::new(config)?;
+    let mut shared = HprSharedLocal::new(config)?;
     while !STOP.load(Ordering::Relaxed) {
         match AutoWsHub::connect(&remote.url, &remote.bearer_token()?, &[], &[]) {
             Ok(mut hub) => {
-                if let Err(error) = run_connected(config, attachment, &mut hub, &mut local) {
+                if let Err(error) =
+                    run_connected(config, attachment, &mut hub, &mut local, &mut shared)
+                {
                     tracing::warn!(attachment = %attachment.id, error = %error,
                         "HPR upstream or EE adjacency reset");
                 }
+                local.on_hub_lost()?;
             }
             Err(error) => tracing::warn!(attachment = %attachment.id, error = %error,
                 "HPR concentrator connection failed"),
         }
         if !STOP.load(Ordering::Relaxed) {
-            local.poll_idle()?;
+            local.poll_local(None)?;
+            shared.poll(&mut local, &HprDestinationDirectory::new(), false)?;
             thread::sleep(CONNECT_BACKOFF);
         }
+    }
+    Ok(())
+}
+
+fn publish_shared_routes(
+    runner: &AutoLocalSessionRunner<'_>,
+    hub: &mut AutoWsHub,
+    last: &mut (Vec<wire::SnaName>, Vec<wire::LuReachability>),
+) -> io::Result<()> {
+    let current = runner.exports(hub.allowed_netid());
+    if current != *last {
+        hub.publish_local(&current.0, &current.1)?;
+        *last = current;
     }
     Ok(())
 }
@@ -2325,15 +2342,77 @@ fn run_connected(
     config: &RouterConfig,
     attachment: &crate::config::EeConfig,
     hub: &mut AutoWsHub,
-    local: &mut HprLocalSessionRunner<'_>,
+    local: &mut AutoLocalSessionRunner<'_>,
+    shared: &mut HprSharedLocal,
 ) -> io::Result<()> {
     let mut ee: Option<AuthorizedEeAttachment> = None;
     let mut active: Option<DirectHprRuntime> = None;
+    let mut published = (Vec::new(), Vec::new());
+    local.sync_upstream(hub)?;
+    publish_shared_routes(local, hub, &mut published)?;
     let result = (|| -> io::Result<()> {
         while !STOP.load(Ordering::Relaxed) {
+            local.sync_upstream(hub)?;
+            let local_poll = local.poll_local(Some(hub))?;
+            if local_poll.hub_lost {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "concentrator session closed",
+                ));
+            }
+            if ee
+                .as_ref()
+                .map(|attachment| attachment.authorized(hub))
+                .transpose()?
+                == Some(false)
+            {
+                if let Some(mut runtime) = active.take() {
+                    if let Some(peer_lus) = runtime.peer_lus.as_mut() {
+                        peer_lus.deactivate();
+                    }
+                }
+                shared.withdraw_ee(local)?;
+                local.withdraw_ee_records(&attachment.id)?;
+                publish_shared_routes(local, hub, &mut published)?;
+                ee = None;
+                tracing::warn!(attachment = %attachment.id,
+                    "HPR EE proxy CP route withdrawn; awaiting reauthorization on current concentrator connection");
+                continue;
+            }
+            if let Some(runtime) = active.as_mut() {
+                let routes = shared.trusted_mptn_routes(local)?;
+                runtime.local_directory.replace_owner("mptn", routes)?;
+                let can_accept = ee.as_ref().is_some_and(AuthorizedEeAttachment::is_active)
+                    && runtime.reverse.is_none()
+                    && runtime
+                        .reciprocal_cp
+                        .as_ref()
+                        .is_some_and(|cp| cp.phase() == CpInitiatorPhase::Active);
+                if let Some(ready) = shared.poll(local, &runtime.local_directory, can_accept)? {
+                    let access = SharedLocalAccess {
+                        shared,
+                        runner: local,
+                    };
+                    if let Err(error) = runtime.accept_shared_source(
+                        ready,
+                        ee.as_ref().unwrap().link(),
+                        access.shared,
+                        access.runner,
+                    ) {
+                        tracing::warn!(attachment = %attachment.id, error = %error,
+                            "shared local source could not enter EE session");
+                    }
+                }
+            } else {
+                shared.poll(local, &HprDestinationDirectory::new(), false)?;
+            }
+            publish_shared_routes(local, hub, &mut published)?;
             if ee.is_none() {
-                poll_unsolicited(hub)?;
-                local.poll_idle()?;
+                if let Some(open) = hub.poll_incoming()? {
+                    if let OpenDisposition::Unhandled(open) = local.accept_upstream(hub, open)? {
+                        hub.reject_incoming(&open, wire::OpenFailure::Unsupported)?;
+                    }
+                }
                 if let Some(identity) = AuthorizedEeIdentity::resolve(hub, attachment)? {
                     let authorized = AuthorizedEeAttachment::bind(attachment, identity)?;
                     tracing::info!(attachment = %attachment.id, local_ip = %attachment.local_ip,
@@ -2342,19 +2421,6 @@ fn run_connected(
                     ee = Some(authorized);
                 }
                 thread::sleep(IDLE_POLL);
-                continue;
-            }
-            if !ee.as_ref().unwrap().authorized(hub)? {
-                if let Some(mut runtime) = active.take() {
-                    if let Some(peer_lus) = runtime.peer_lus.as_mut() {
-                        peer_lus.deactivate();
-                    }
-                    local.return_from_ee(runtime.detach_local_mptn());
-                    hub.publish_local(&[], &[])?;
-                }
-                ee = None;
-                tracing::warn!(attachment = %attachment.id,
-                    "HPR EE proxy CP route withdrawn; awaiting reauthorization on current concentrator connection");
                 continue;
             }
             let ee = ee.as_mut().unwrap();
@@ -2366,7 +2432,9 @@ fn run_connected(
                     .is_none_or(|runtime| runtime.bootstrap.generation != ee.link().generation())
                 {
                     if let Some(mut previous) = active.take() {
-                        local.return_from_ee(previous.detach_local_mptn());
+                        let _ = previous.detach_local_mptn();
+                        shared.withdraw_ee(local)?;
+                        local.withdraw_ee_records(&attachment.id)?;
                     }
                     let bootstrap = ee
                         .link()
@@ -2375,12 +2443,15 @@ fn run_connected(
                     let mut runtime = DirectHprRuntime::new(bootstrap);
                     runtime.configure_peer_lus(attachment)?;
                     runtime.configure_local_llc(config)?;
-                    runtime.configure_local_ingress(config, attachment)?;
-                    runtime.attach_local_mptn(local.lease_for_ee());
-                    if let Err(error) = runtime.publish_reachability(hub, None) {
-                        local.return_from_ee(runtime.detach_local_mptn());
-                        return Err(error);
-                    }
+                    runtime.use_shared_publication();
+                    shared.configure_ee(
+                        local,
+                        config,
+                        &attachment.id,
+                        runtime.bootstrap.peer.cp.clone(),
+                    )?;
+                    let export = runtime.ee_owner_export();
+                    local.replace_ee_records(&export.owner, export.records)?;
                     active = Some(runtime);
                     tracing::info!(attachment = %attachment.id, generation = ee.link().generation().get(),
                     peer_cp = ?ee.link().peer_cp(), "HPR EE link activated");
@@ -2389,24 +2460,14 @@ fn run_connected(
                 if let Some(peer_lus) = runtime.peer_lus.as_mut() {
                     peer_lus.deactivate();
                 }
-                local.return_from_ee(runtime.detach_local_mptn());
-                hub.publish_local(&[], &[])?;
+                let _ = runtime.detach_local_mptn();
+                shared.withdraw_ee(local)?;
+                local.withdraw_ee_records(&attachment.id)?;
                 tracing::warn!(attachment = %attachment.id, "HPR EE link deactivated; sessions withdrawn");
             }
-            local.poll_idle()?;
+            publish_shared_routes(local, hub, &mut published)?;
             if let Some(open) = hub.poll_incoming()? {
-                let local_llc = active
-                    .as_ref()
-                    .and_then(|runtime| local_llc_target(runtime, hub, &open));
-                if let Some((target_lu, target_cp, attachment_id)) = local_llc {
-                    active.as_mut().unwrap().accept_local_llc(
-                        hub,
-                        open,
-                        target_lu,
-                        target_cp,
-                        attachment_id,
-                    )?;
-                } else {
+                if let OpenDisposition::Unhandled(open) = local.accept_upstream(hub, open)? {
                     let ready = active.as_ref().is_some_and(|runtime| {
                         runtime.reverse.is_none()
                             && runtime
@@ -2479,7 +2540,19 @@ fn run_connected(
             if let Some(runtime) = active.as_mut() {
                 runtime.tick(ee.link(), ee.elapsed().as_micros() as u64)?;
                 let started = Instant::now();
-                runtime.pump(ee.link(), Some(hub), ee.elapsed().as_micros() as u64, None)?;
+                let mut access = SharedLocalAccess {
+                    shared,
+                    runner: local,
+                };
+                runtime.pump(
+                    ee.link(),
+                    Some(hub),
+                    ee.elapsed().as_micros() as u64,
+                    Some(&mut access),
+                )?;
+                let export = runtime.ee_owner_export();
+                local.replace_ee_records(&export.owner, export.records)?;
+                publish_shared_routes(local, hub, &mut published)?;
                 let elapsed = started.elapsed();
                 if elapsed > Duration::from_millis(500) {
                     tracing::warn!(attachment = %attachment.id,
@@ -2492,16 +2565,11 @@ fn run_connected(
         Ok(())
     })();
     if let Some(mut runtime) = active.take() {
-        local.return_from_ee(runtime.detach_local_mptn());
+        let _ = runtime.detach_local_mptn();
     }
+    let _ = shared.withdraw_ee(local);
+    let _ = local.withdraw_ee_records(&attachment.id);
     result
-}
-
-fn poll_unsolicited(hub: &mut AutoWsHub) -> io::Result<()> {
-    if let Some(open) = hub.poll_incoming()? {
-        hub.reject_incoming(&open, wire::OpenFailure::Unsupported)?;
-    }
-    Ok(())
 }
 
 /// The `session_v1` WebSocket profile carries the same complete reduced SNA
