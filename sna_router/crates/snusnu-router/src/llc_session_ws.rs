@@ -311,7 +311,15 @@ impl LlcSessionWs {
                 Some(SessionWsUpdate::Opened) | None => {}
             }
         } else if self.ws.poll_control()? {
-            if !self.uses_live_adjacency() {
+            if self.uses_live_adjacency() {
+                self.pending_ws = None;
+                self.pending_since = None;
+                self.remote_closed_at = Some(Instant::now());
+                tracing::info!(attachment = %self.attachment_id,
+                    session = ?self.log_session, carrier = ?self.log_carrier,
+                    "remote SessionV1 closed with pending event; draining native user session");
+                return Ok(true);
+            } else {
                 self.close()?;
             }
             return Ok(false);
