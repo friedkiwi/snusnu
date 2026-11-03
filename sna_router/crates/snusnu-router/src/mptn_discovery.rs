@@ -2,7 +2,7 @@
 //!
 //! TCP62 management connections normally close after the exchange, so their
 //! close is not evidence that the configured peer IP became unreachable.
-//! Instead, validated LU observations have a bounded freshness lease. The
+//! Instead, validated LU and CP observations have a bounded freshness lease. The
 //! attachment withdraws all evidence on a transport failure, and its runtime
 //! polls the lease clock even when no new TCP connection arrives.
 
@@ -22,13 +22,13 @@ pub(crate) const DISCOVERY_LEASE: Duration = Duration::from_secs(600);
 #[allow(dead_code)] // Consumed when the shared route registry replaces per-runtime export maps.
 pub(crate) struct MptnDiscoverySnapshot {
     pub(crate) revision: u64,
-    pub(crate) lus: Vec<QualifiedName>,
+    pub(crate) routes: Vec<(QualifiedName, QualifiedName)>,
 }
 
 #[derive(Debug)]
 pub(crate) struct MptnDiscovery {
     lease: Duration,
-    lus: HashMap<QualifiedName, Instant>,
+    routes: HashMap<QualifiedName, (QualifiedName, Instant)>,
     revision: u64,
     changed: bool,
 }
@@ -43,44 +43,81 @@ impl MptnDiscovery {
         }
         Ok(Self {
             lease,
-            lus: HashMap::new(),
+            routes: HashMap::new(),
             revision: 0,
             changed: false,
         })
     }
 
-    /// Refresh one LU learned from a validated TCP62 management exchange or
-    /// user BIND. CP ownership is intentionally absent: TCP62 does not prove
-    /// the adjacent CP, which remains a separate operator assertion.
-    pub(crate) fn observe(&mut self, lu: QualifiedName, now: Instant) -> io::Result<()> {
+    /// Publish an LU/CP pair only after the full SNASVCMG exchange completes.
+    /// The CP is taken from its structurally validated X'60' FQPCID.
+    pub(crate) fn observe(
+        &mut self,
+        lu: QualifiedName,
+        cp: QualifiedName,
+        now: Instant,
+    ) -> io::Result<()> {
+        if lu.netid != cp.netid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MPTN LU/CP NETID mismatch",
+            ));
+        }
         let expires_at = now.checked_add(self.lease).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "MPTN discovery lease overflows clock",
             )
         })?;
-        if self.lus.insert(lu, expires_at).is_none() {
+        let changed = self
+            .routes
+            .get(&lu)
+            .is_none_or(|(known_cp, _)| known_cp != &cp);
+        self.routes.insert(lu, (cp, expires_at));
+        if changed {
             self.mark_changed()?;
         }
         Ok(())
     }
 
+    /// A user BIND can renew an existing management proof, but cannot create one.
+    pub(crate) fn refresh_if_known(
+        &mut self,
+        lu: &QualifiedName,
+        cp: &QualifiedName,
+        now: Instant,
+    ) -> io::Result<bool> {
+        let Some((known_cp, expires_at)) = self.routes.get_mut(lu) else {
+            return Ok(false);
+        };
+        if known_cp != cp || *expires_at <= now {
+            return Ok(false);
+        }
+        *expires_at = now.checked_add(self.lease).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MPTN discovery lease overflows clock",
+            )
+        })?;
+        Ok(true)
+    }
+
     pub(crate) fn expire(&mut self, now: Instant) -> io::Result<()> {
-        let before = self.lus.len();
-        self.lus.retain(|_, expires_at| *expires_at > now);
-        if self.lus.len() != before {
+        let before = self.routes.len();
+        self.routes.retain(|_, (_, expires_at)| *expires_at > now);
+        if self.routes.len() != before {
             self.mark_changed()?;
         }
         Ok(())
     }
 
     pub(crate) fn next_expiry(&self) -> Option<Instant> {
-        self.lus.values().copied().min()
+        self.routes.values().map(|(_, expiry)| *expiry).min()
     }
 
     pub(crate) fn withdraw_all(&mut self) -> io::Result<()> {
-        if !self.lus.is_empty() {
-            self.lus.clear();
+        if !self.routes.is_empty() {
+            self.routes.clear();
             self.mark_changed()?;
         }
         Ok(())
@@ -92,11 +129,17 @@ impl MptnDiscovery {
         if !std::mem::take(&mut self.changed) {
             return None;
         }
-        let mut lus = self.lus.keys().cloned().collect::<Vec<_>>();
-        lus.sort_by(|left, right| (&left.netid, &left.name).cmp(&(&right.netid, &right.name)));
+        let mut routes = self
+            .routes
+            .iter()
+            .map(|(lu, (cp, _))| (lu.clone(), cp.clone()))
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| {
+            (&left.0.netid, &left.0.name).cmp(&(&right.0.netid, &right.0.name))
+        });
         Some(MptnDiscoverySnapshot {
             revision: self.revision,
-            lus,
+            routes,
         })
     }
 
@@ -122,10 +165,16 @@ mod tests {
     fn refreshed_lu_survives_old_deadline_without_extra_revision() {
         let start = Instant::now();
         let mut discovery = MptnDiscovery::new(Duration::from_secs(10)).unwrap();
-        discovery.observe(lu("NETA.LUA"), start).unwrap();
+        discovery
+            .observe(lu("NETA.LUA"), lu("NETA.CPA"), start)
+            .unwrap();
         assert_eq!(discovery.take_changed_snapshot().unwrap().revision, 1);
         discovery
-            .observe(lu("NETA.LUA"), start + Duration::from_secs(8))
+            .observe(
+                lu("NETA.LUA"),
+                lu("NETA.CPA"),
+                start + Duration::from_secs(8),
+            )
             .unwrap();
         assert_eq!(
             discovery.next_expiry(),
@@ -138,7 +187,7 @@ mod tests {
             discovery.take_changed_snapshot().unwrap(),
             MptnDiscoverySnapshot {
                 revision: 2,
-                lus: Vec::new(),
+                routes: Vec::new(),
             }
         );
     }
@@ -147,21 +196,56 @@ mod tests {
     fn failure_withdraws_entire_attachment_atomically() {
         let start = Instant::now();
         let mut discovery = MptnDiscovery::new(Duration::from_secs(10)).unwrap();
-        discovery.observe(lu("NETA.LUB"), start).unwrap();
-        discovery.observe(lu("NETA.LUA"), start).unwrap();
+        discovery
+            .observe(lu("NETA.LUB"), lu("NETA.CPA"), start)
+            .unwrap();
+        discovery
+            .observe(lu("NETA.LUA"), lu("NETA.CPA"), start)
+            .unwrap();
         assert_eq!(
-            discovery.take_changed_snapshot().unwrap().lus,
-            vec![lu("NETA.LUA"), lu("NETA.LUB")]
+            discovery.take_changed_snapshot().unwrap().routes,
+            vec![
+                (lu("NETA.LUA"), lu("NETA.CPA")),
+                (lu("NETA.LUB"), lu("NETA.CPA"))
+            ]
         );
         discovery.withdraw_all().unwrap();
         assert_eq!(
             discovery.take_changed_snapshot().unwrap(),
             MptnDiscoverySnapshot {
                 revision: 3,
-                lus: Vec::new(),
+                routes: Vec::new(),
             }
         );
         discovery.withdraw_all().unwrap();
         assert!(discovery.take_changed_snapshot().is_none());
+    }
+
+    #[test]
+    fn user_bind_only_refreshes_matching_completed_management_identity() {
+        let start = Instant::now();
+        let mut discovery = MptnDiscovery::new(Duration::from_secs(10)).unwrap();
+        let peer_lu = lu("NETA.LUA");
+        let peer_cp = lu("NETA.CPA");
+        assert!(!discovery
+            .refresh_if_known(&peer_lu, &peer_cp, start)
+            .unwrap());
+        discovery
+            .observe(peer_lu.clone(), peer_cp.clone(), start)
+            .unwrap();
+        assert!(!discovery
+            .refresh_if_known(&peer_lu, &lu("NETA.CPB"), start + Duration::from_secs(5))
+            .unwrap());
+        assert!(discovery
+            .refresh_if_known(&peer_lu, &peer_cp, start + Duration::from_secs(5))
+            .unwrap());
+        assert_eq!(
+            discovery.next_expiry(),
+            Some(start + Duration::from_secs(15))
+        );
+        discovery.expire(start + Duration::from_secs(16)).unwrap();
+        assert!(!discovery
+            .refresh_if_known(&peer_lu, &peer_cp, start + Duration::from_secs(16))
+            .unwrap());
     }
 }

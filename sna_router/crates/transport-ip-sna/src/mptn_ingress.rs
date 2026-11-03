@@ -13,7 +13,7 @@ use crate::{
     mptn_bind_negotiation::fqpcid_at,
     mptn_compensations::{required_from_connect, CompensationSet},
     mptn_connect::{Connect, Direction},
-    mptn_reverse_management::classify_reverse_management_connect_with_cp,
+    mptn_reverse_management::{classify_reverse_management_connect_discover_cp, fqpcid_peer_cp},
 };
 
 const USER_FIXED: [u8; 27] = [
@@ -71,6 +71,7 @@ pub struct IngressOffer {
     connect: Connect,
     kind: IngressKind,
     fqpcid: Vec<u8>,
+    peer_cp: String,
 }
 
 impl IngressOffer {
@@ -82,6 +83,9 @@ impl IngressOffer {
     }
     pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
+    }
+    pub fn peer_cp(&self) -> &str {
+        &self.peer_cp
     }
 }
 
@@ -145,7 +149,7 @@ fn user_fqpcid(
     data: &[u8],
     source: &[u8],
     destination: &[u8],
-    source_cp: &[u8],
+    expected_source_cp: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     // The fixed V5R4 profile is preserved while PLU, SLU, user subfield and
     // X'60' CV lengths follow their explicitly encoded network-qualified names.
@@ -160,7 +164,7 @@ fn user_fqpcid(
         return Err(invalid("unsupported V5R4 user BIND profile"));
     }
     fixed[25] = 0;
-    if data.len() != 93 + 2 * source.len() + destination.len() + source_cp.len()
+    if data.len() < 93 + 2 * source.len() + destination.len()
         || data[..5] != [0, 0, 0x6b, 0x80, 0]
         || fixed.as_slice() != USER_FIXED
     {
@@ -202,11 +206,25 @@ fn user_fqpcid(
     }
     cursor += 2 + destination.len();
     let fqpcid = fqpcid_at(data, cursor).map_err(|_| invalid("malformed user BIND FQPCID"))?;
+    let peer_cp = fqpcid_peer_cp(fqpcid)?;
+    let encoded_cp = name(&peer_cp)?;
+    let source_netid_end = source
+        .iter()
+        .position(|byte| *byte == 0x4b)
+        .ok_or_else(|| invalid("source LU NETID missing"))?;
+    let cp_netid_end = encoded_cp
+        .iter()
+        .position(|byte| *byte == 0x4b)
+        .ok_or_else(|| invalid("CP NETID missing"))?;
+    if source[..source_netid_end] != encoded_cp[..cp_netid_end] {
+        return Err(invalid("user BIND CP NETID mismatch"));
+    }
     let trailer = data
         .get(cursor + fqpcid.len()..)
         .ok_or_else(|| invalid("user BIND trailer is truncated"))?;
-    if fqpcid[2..10].iter().all(|byte| *byte == 0)
-        || fqpcid[11..] != *source_cp
+    if data.len() != 93 + 2 * source.len() + destination.len() + fqpcid.len() - 11
+        || fqpcid[2..10].iter().all(|byte| *byte == 0)
+        || expected_source_cp.is_some_and(|expected| fqpcid[11..] != *expected)
         || trailer.len() != 12
         || trailer[..4] != [0x2c, 10, 1, 8]
         || trailer[4..] != CONNECT_TAIL
@@ -308,45 +326,42 @@ impl IngressSession {
         if bind.plu != self.policy.source_lu || bind.slu != self.policy.destination_lu {
             return Err(invalid("inbound BIND LU names disagree with Connect"));
         }
-        let (kind, fqpcid) = match bind.class {
+        let (kind, fqpcid, peer_cp) = match bind.class {
             BindClass::Management { mode } if mode == "SNASVCMG" => {
-                let admitted = classify_reverse_management_connect_with_cp(
+                let admitted = classify_reverse_management_connect_discover_cp(
                     connect.clone(),
                     &self.policy.source_lu,
                     &self.policy.destination_lu,
-                    self.expected_peer_cp
-                        .as_deref()
-                        .unwrap_or(&self.policy.source_lu),
+                    self.expected_peer_cp.as_deref(),
                     self.policy.forbidden_fqpcid.as_deref(),
                 )?;
-                (IngressKind::Management, admitted.fqpcid().to_vec())
+                (
+                    IngressKind::Management,
+                    admitted.fqpcid().to_vec(),
+                    admitted.peer_cp().to_owned(),
+                )
             }
             BindClass::Management { .. } => return Err(invalid("unsupported management mode")),
             BindClass::NamedLu62 { mode }
                 if self.policy.user_mode.as_deref() == Some(mode.as_str()) =>
             {
-                let source_cp = self
-                    .expected_peer_cp
-                    .as_deref()
-                    .map(name)
-                    .transpose()?
-                    .unwrap_or_else(|| self.source.clone());
-                let fqpcid = user_fqpcid(data, &self.source, &self.destination, &source_cp)?;
-                (IngressKind::User { mode }, fqpcid)
+                let source_cp = self.expected_peer_cp.as_deref().map(name).transpose()?;
+                let fqpcid =
+                    user_fqpcid(data, &self.source, &self.destination, source_cp.as_deref())?;
+                let peer_cp = fqpcid_peer_cp(&fqpcid)?;
+                (IngressKind::User { mode }, fqpcid, peer_cp)
             }
             BindClass::Undetermined if self.policy.allow_blank_user_mode => {
-                let source_cp = self
-                    .expected_peer_cp
-                    .as_deref()
-                    .map(name)
-                    .transpose()?
-                    .unwrap_or_else(|| self.source.clone());
-                let fqpcid = user_fqpcid(data, &self.source, &self.destination, &source_cp)?;
+                let source_cp = self.expected_peer_cp.as_deref().map(name).transpose()?;
+                let fqpcid =
+                    user_fqpcid(data, &self.source, &self.destination, source_cp.as_deref())?;
+                let peer_cp = fqpcid_peer_cp(&fqpcid)?;
                 (
                     IngressKind::User {
                         mode: String::new(),
                     },
                     fqpcid,
+                    peer_cp,
                 )
             }
             _ => {
@@ -362,6 +377,7 @@ impl IngressSession {
             connect,
             kind,
             fqpcid,
+            peer_cp,
         })
     }
 

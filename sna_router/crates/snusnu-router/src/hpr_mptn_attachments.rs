@@ -1,13 +1,11 @@
 //! Live TCP62 attachments for EE's local session switch.
 //!
-//! TCP62 management proves the peer LU and NETID, but its FQPCID repeats that
-//! LU and does not disclose a separate CP. A configured `peer_cp` is therefore
-//! an operator trust anchor. Routes remain unpublished until management has
-//! disclosed the exact configured target LU on the same gateway, and an unset
-//! `peer_cp` never becomes an inferred CP.
+//! Completed TCP62 SNASVCMG management proves the peer LU and its asserted CP
+//! from the BIND's X'60' FQPCID. Optional configured names are guards. The
+//! attachment publishes only fresh, complete management observations.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     io,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
@@ -37,7 +35,7 @@ struct Attachment<'a> {
     probe_worker: Option<JoinHandle<()>>,
     retry_at: Instant,
     poll_retry_at: Instant,
-    observed_peer_lus: HashSet<QualifiedName>,
+    observed_peer_lus: HashMap<QualifiedName, QualifiedName>,
     active_user: bool,
 }
 
@@ -85,7 +83,7 @@ impl<'a> HprMptnAttachments<'a> {
                     probe_worker: None,
                     retry_at: Instant::now(),
                     poll_retry_at: Instant::now(),
-                    observed_peer_lus: HashSet::new(),
+                    observed_peer_lus: HashMap::new(),
                     active_user: false,
                 })
             })
@@ -120,11 +118,12 @@ impl<'a> HprMptnAttachments<'a> {
                     }
                 }
             };
-            for (peer_lu, local_lu) in attachment.gateway.take_management_lus() {
+            for (peer_lu, local_lu, peer_cp) in attachment.gateway.take_management_lus() {
                 let peer_lu = parse_name(&peer_lu)?;
                 let local_lu = parse_name(&local_lu)?;
+                let peer_cp = parse_name(&peer_cp)?;
                 if let Some(trusted_cp) = &attachment.trusted_peer_cp {
-                    if peer_lu.netid != trusted_cp.netid {
+                    if &peer_cp != trusted_cp {
                         tracing::warn!(gateway = attachment.gateway.id(), peer_lu = %peer_lu,
                             configured_peer_cp = %trusted_cp,
                             "MPTN management peer NETID disagrees with operator CP assertion");
@@ -132,10 +131,21 @@ impl<'a> HprMptnAttachments<'a> {
                     }
                 }
                 tracing::info!(gateway = attachment.gateway.id(), peer_lu = %peer_lu,
-                    local_lu = %local_lu, "MPTN management disclosed adjacent LU");
-                attachment.observed_peer_lus.insert(peer_lu);
+                    local_lu = %local_lu, peer_cp = %peer_cp, "MPTN management disclosed adjacent LU and CP");
             }
             attachment.poll_probe();
+            if let Some(snapshot) = attachment.gateway.take_discovery_snapshot() {
+                attachment.observed_peer_lus = snapshot
+                    .routes
+                    .into_iter()
+                    .filter(|(_, cp)| {
+                        attachment
+                            .trusted_peer_cp
+                            .as_ref()
+                            .is_none_or(|expected| expected == cp)
+                    })
+                    .collect();
+            }
             attachment.start_probe_if_needed()?;
             if let Some((association, offer)) = bind {
                 offered.push(MptnIngressOffer {
@@ -148,24 +158,42 @@ impl<'a> HprMptnAttachments<'a> {
         Ok(offered)
     }
 
-    /// Only live management LU evidence plus an explicit operator CP
-    /// assertion may create an EE RouteSetup destination. The CP is not
-    /// claimed to have come from TCP62's wire format.
+    /// Only live, completed management LU/CP evidence creates a destination.
     pub(crate) fn trusted_routes(&self) -> Vec<(QualifiedName, Destination)> {
         self.attachments
             .iter()
             .filter(|attachment| !attachment.active_user && attachment.gateway.udp_available())
             .flat_map(|attachment| {
                 let gateway_id = attachment.gateway.id();
-                self.candidates
+                attachment
+                    .observed_peer_lus
                     .iter()
-                    .filter(move |candidate| candidate.attachment_id == gateway_id)
-                    .filter_map(move |candidate| {
-                        route_for_candidate(
-                            candidate,
-                            attachment.trusted_peer_cp.as_ref(),
-                            &attachment.observed_peer_lus,
-                        )
+                    .filter_map(move |(lu, cp)| {
+                        if attachment
+                            .management_target_lu
+                            .as_ref()
+                            .is_some_and(|expected| expected != lu)
+                            || attachment
+                                .trusted_peer_cp
+                                .as_ref()
+                                .is_some_and(|expected| expected != cp)
+                            || !self
+                                .candidates
+                                .iter()
+                                .filter(|candidate| candidate.attachment_id == gateway_id)
+                                .all(|candidate| {
+                                    candidate.lu != *lu || candidate.verify_cp(cp).is_some()
+                                })
+                        {
+                            return None;
+                        }
+                        Some((
+                            lu.clone(),
+                            Destination::Mptn {
+                                hosting_cp: cp.clone(),
+                                attachment_id: gateway_id.to_owned(),
+                            },
+                        ))
                     })
             })
             .collect()
@@ -187,16 +215,23 @@ impl<'a> HprMptnAttachments<'a> {
             return Ok(None);
         }
         let cp = attachment
-            .trusted_peer_cp
+            .observed_peer_lus
+            .get(&identity.target_lu)
+            .ok_or_else(|| invalid("MPTN target LU has no completed management proof"))?;
+        if attachment
+            .management_target_lu
             .as_ref()
-            .ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
-        if !attachment.observed_peer_lus.contains(&identity.target_lu)
+            .is_some_and(|expected| expected != &identity.target_lu)
             || identity.target_cp.as_ref() != Some(cp)
-            || !self.candidates.iter().any(|candidate| {
-                candidate.attachment_id == gateway_id
-                    && candidate.lu == identity.target_lu
-                    && candidate.verify_cp(cp).is_some()
-            })
+            || self
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.attachment_id == gateway_id)
+                .any(|candidate| {
+                    candidate.attachment_id == gateway_id
+                        && candidate.lu == identity.target_lu
+                        && candidate.verify_cp(cp).is_none()
+                })
         {
             return Err(invalid(
                 "MPTN target LU has no live management and trusted CP binding",
@@ -281,10 +316,11 @@ impl<'a> HprMptnAttachments<'a> {
                 ));
             }
             trusted_source_identity(
-                source_lu,
+                source_lu.clone(),
                 target_lu,
-                attachment.trusted_peer_cp.as_ref(),
+                attachment.observed_peer_lus.get(&source_lu),
                 &attachment.observed_peer_lus,
+                &parse_name(offered.offer.peer_cp())?,
                 directory,
             )
         })();
@@ -338,12 +374,16 @@ fn trusted_source_identity(
     source_lu: QualifiedName,
     target_lu: QualifiedName,
     trusted_peer_cp: Option<&QualifiedName>,
-    observed_peer_lus: &HashSet<QualifiedName>,
+    observed_peer_lus: &HashMap<QualifiedName, QualifiedName>,
+    offered_cp: &QualifiedName,
     directory: &crate::hpr_destination_directory::HprDestinationDirectory,
 ) -> io::Result<(SessionIdentity, String)> {
     let source_cp =
-        trusted_peer_cp.ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
-    if source_lu.netid != source_cp.netid || !observed_peer_lus.contains(&source_lu) {
+        trusted_peer_cp.ok_or_else(|| invalid("MPTN peer CP has no completed management proof"))?;
+    if source_lu.netid != source_cp.netid
+        || observed_peer_lus.get(&source_lu) != Some(source_cp)
+        || offered_cp != source_cp
+    {
         return Err(invalid(
             "MPTN source LU lacks live management and trusted CP binding",
         ));
@@ -401,7 +441,12 @@ impl Attachment<'_> {
                 }
                 tracing::info!(gateway = self.gateway.id(), target_lu = %target,
                     "outbound MPTN management proved adjacent LU");
-                self.observed_peer_lus.insert(target.clone());
+                if let Some(cp) = self.trusted_peer_cp.clone() {
+                    if let Err(error) = self.gateway.observe_configured_probe(target.clone(), cp) {
+                        tracing::warn!(gateway = self.gateway.id(), error = %error,
+                            "outbound management proof could not enter MPTN discovery");
+                    }
+                }
             }
             Err(error) => {
                 tracing::debug!(gateway = self.gateway.id(), error = %error,
@@ -412,6 +457,9 @@ impl Attachment<'_> {
     }
 
     fn start_probe_if_needed(&mut self) -> io::Result<()> {
+        if self.trusted_peer_cp.is_none() {
+            return Ok(());
+        }
         let (Some(source), Some(target)) = (
             self.management_source_lu.as_ref(),
             self.management_target_lu.as_ref(),
@@ -419,7 +467,7 @@ impl Attachment<'_> {
             return Ok(());
         };
         if self.probe_result.is_some()
-            || self.observed_peer_lus.contains(target)
+            || self.observed_peer_lus.contains_key(target)
             || Instant::now() < self.retry_at
         {
             return Ok(());
@@ -445,13 +493,14 @@ impl Attachment<'_> {
     }
 }
 
+#[cfg(test)]
 fn route_for_candidate(
     candidate: &ConfiguredCandidate,
     trusted_cp: Option<&QualifiedName>,
-    observed_lus: &HashSet<QualifiedName>,
+    observed_lus: &HashMap<QualifiedName, QualifiedName>,
 ) -> Option<(QualifiedName, Destination)> {
     let cp = trusted_cp?;
-    if candidate.carrier != CandidateCarrier::Mptn || !observed_lus.contains(&candidate.lu) {
+    if candidate.carrier != CandidateCarrier::Mptn || observed_lus.get(&candidate.lu) != Some(cp) {
         return None;
     }
     candidate.verify_cp(cp)
@@ -482,9 +531,9 @@ mod tests {
         };
         let cp: QualifiedName = "SOLNET.CP400".parse().unwrap();
         let wrong_cp: QualifiedName = "OTHER.CP400".parse().unwrap();
-        let mut observed = HashSet::new();
+        let mut observed = HashMap::new();
         assert!(route_for_candidate(&candidate, Some(&cp), &observed).is_none());
-        observed.insert(lu.clone());
+        observed.insert(lu.clone(), cp.clone());
         assert!(route_for_candidate(&candidate, None, &observed).is_none());
         assert!(route_for_candidate(&candidate, Some(&wrong_cp), &observed).is_none());
         let mut conflicting_hint = candidate.clone();
@@ -521,12 +570,13 @@ mod tests {
                 )],
             )
             .unwrap();
-        let observed = HashSet::from([source.clone()]);
+        let observed = HashMap::from([(source.clone(), source_cp.clone())]);
         let (identity, attachment) = trusted_source_identity(
             source.clone(),
             target.clone(),
             Some(&source_cp),
             &observed,
+            &source_cp,
             &directory,
         )
         .unwrap();
@@ -538,6 +588,7 @@ mod tests {
             target.clone(),
             None,
             &observed,
+            &source_cp,
             &directory
         )
         .is_err());
@@ -545,7 +596,8 @@ mod tests {
             source.clone(),
             target.clone(),
             Some(&source_cp),
-            &HashSet::new(),
+            &HashMap::new(),
+            &source_cp,
             &directory
         )
         .is_err());
@@ -555,13 +607,19 @@ mod tests {
             target.clone(),
             Some(&wrong_cp),
             &observed,
+            &wrong_cp,
             &directory
         )
         .is_err());
         directory.withdraw_owner("ee");
-        assert!(
-            trusted_source_identity(source, target, Some(&source_cp), &observed, &directory)
-                .is_err()
-        );
+        assert!(trusted_source_identity(
+            source,
+            target,
+            Some(&source_cp),
+            &observed,
+            &source_cp,
+            &directory
+        )
+        .is_err());
     }
 }

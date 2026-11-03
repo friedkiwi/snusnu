@@ -576,7 +576,7 @@ fn run_attachments(config: &RouterConfig, proxies: AutoProxyMacs) -> io::Result<
         }
         for gateway in &mut gateways {
             let offered = gateway.poll_once()?;
-            for (source, destination) in gateway.take_management_lus() {
+            for (source, destination, _peer_cp) in gateway.take_management_lus() {
                 let source = config::parse_cp(&source)?;
                 let destination = config::parse_cp(&destination)?;
                 tracing::info!(gateway = gateway.id(),
