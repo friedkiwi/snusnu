@@ -7,6 +7,7 @@ use crate::{
     mptn_session::{BindPolicy, GatewaySession, Phase as GatewayPhase},
 };
 use router_core::{
+    fid2_bind::{classify_bind, BindClass},
     fid2_session_control::ManagementBind,
     user_bind::UserBindOffer,
     user_pacing::{FirstAttachRoute, UserPacingSession},
@@ -148,10 +149,19 @@ impl Bridge {
         if self.phase != Phase::Idle {
             return Err(wrong_phase());
         }
+        let mode = match classify_bind(piu)
+            .map_err(|_| invalid("invalid native user BIND"))?
+            .ok_or_else(|| invalid("native user PIU is not a BIND"))?
+            .class
+        {
+            BindClass::NamedLu62 { mode } if self.mode.is_empty() => mode,
+            BindClass::Undetermined if self.mode.is_empty() => String::new(),
+            _ => self.mode.clone(),
+        };
         let policy = router_core::user_bind::UserBindPolicy {
             plu: &self.user_plu,
             slu: &self.user_slu,
-            mode: &self.mode,
+            mode: &mode,
         };
         let offer = if management_closed {
             UserBindOffer::from_request_after_management(piu, &self.management, policy)
@@ -167,6 +177,7 @@ impl Bridge {
         .map_err(|_| invalid("native user BIND cannot negotiate fixed pacing"))?;
         // GatewaySession checks the full required X'19' capability set here.
         let record = self.gateway.begin_native_bind(piu, template)?;
+        self.mode = mode;
         self.offer = Some(offer);
         self.pacing = Some(pacing);
         self.phase = Phase::AwaitConnect;

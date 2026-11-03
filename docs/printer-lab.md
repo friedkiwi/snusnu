@@ -125,8 +125,13 @@ user TCP62 Connect requests. The router admitted both after separating the
 FQPCID CP name from the LU name; the user request opened a native DLC circuit
 to the QA printer probe. A separate QA outbound circuit reached XID3 with the
 same router. These are connection probes, not printer traffic. The QA probe
-still needs to complete the management exchange, controller BIND/Attach,
-NMVT, and the LU4 data path before a spool file can be accepted.
+now completes native SNASVCMG BIND, CNOS, BIS, and UNBIND with the router's
+responder. The router then completes a separate outbound AnyNet management
+exchange with the isolated V5R4 guest. The guest's positive BIND response
+used instance marker `25`, which the TCP62 validator now accepts. The next
+QA controller BIND reached the router and exposed its fixed default-mode
+profile restriction; QRMTWSC BIND negotiation, controller Attach, NMVT, and
+the LU4 data path still need completion before a spool file can be accepted.
 
 The original V5R4 B guest still has an `ANYPRT` controller varied off because
 its active `EETOA` low-entry-node controller already targets `SNUSNU.SVC`

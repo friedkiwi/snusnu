@@ -44,6 +44,7 @@ pub(crate) struct ReverseWsConfig {
     pub(crate) local_node_id: [u8; 4],
     pub(crate) tg_number: u8,
     pub(crate) user_tp: [u8; 4],
+    pub(crate) user_mode: Option<String>,
     pub(crate) endpoint: OutboundEndpoint,
     /// Maximum time to establish the native circuit and management session.
     pub(crate) timeout: Duration,
@@ -76,6 +77,15 @@ impl ReverseWsConfig {
             || self.local_station.is_empty()
             || self.tg_number == 0
             || (fixed_tp && self.user_tp == [0; 4])
+            || self.user_mode.as_ref().is_some_and(|mode| {
+                mode.is_empty()
+                    || mode.len() > 8
+                    || !mode.bytes().all(|b| {
+                        b.is_ascii_uppercase()
+                            || b.is_ascii_digit()
+                            || matches!(b, b'@' | b'#' | b'$')
+                    })
+            })
             || self.timeout.is_zero()
             || self.timeout > Duration::from_secs(600)
             || self.endpoint.local_ip.is_unspecified()
@@ -277,7 +287,7 @@ impl AutoReverseWsSession {
                     BindPolicy {
                         plu: self.config.source_lu.clone(),
                         slu: self.config.hosted_lu.clone(),
-                        mode: None,
+                        mode: self.config.user_mode.clone(),
                         allow_blank_mode: true,
                         max_pending_bytes: MAX_RECORD,
                     },
@@ -455,7 +465,7 @@ pub(crate) fn run_from_open(
     let policy = BindPolicy {
         plu: config.source_lu.clone(),
         slu: config.hosted_lu.clone(),
-        mode: None,
+        mode: config.user_mode.clone(),
         allow_blank_mode: true,
         max_pending_bytes: MAX_RECORD,
     };
@@ -529,6 +539,7 @@ mod tests {
             local_node_id: [0xff, 0xf1, 0x23, 0x45],
             tg_number: 1,
             user_tp: *b"QCMD",
+            user_mode: None,
             endpoint: OutboundEndpoint {
                 local_ip: "10.99.4.11".parse().unwrap(),
                 peer_ip: "10.99.4.3".parse().unwrap(),

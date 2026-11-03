@@ -11,6 +11,7 @@ use crate::{
     virtual_native_cp::VirtualNativeCp,
 };
 use router_core::{
+    fid2_bind::{classify_bind, BindClass},
     native_management::{ManagementSession, Phase as ManagementPhase},
     user_bind::{UserBindOffer, UserBindPolicy},
     user_fmh5::parse_first_user_attach,
@@ -198,10 +199,19 @@ impl<P: RoutePort> WsNativeResponder<P> {
             .management
             .bind()
             .ok_or_else(|| invalid("management BIND absent"))?;
+        let mode = match classify_bind(piu)
+            .map_err(protocol)?
+            .ok_or_else(|| invalid("native user PIU is not a BIND"))?
+            .class
+        {
+            BindClass::NamedLu62 { mode } => mode,
+            BindClass::Undetermined => String::new(),
+            BindClass::Management { .. } => return Err(invalid("management mode on user session")),
+        };
         let policy = UserBindPolicy {
             plu: &self.source_lu,
             slu: &self.destination_lu,
-            mode: "",
+            mode: &mode,
         };
         let offer = if self.management.phase() == ManagementPhase::Closed {
             UserBindOffer::from_request_after_management(piu, management, policy)

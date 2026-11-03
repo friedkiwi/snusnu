@@ -636,6 +636,7 @@ impl<'a> AutoMptnGateway<'a> {
             local_node_id: xid.node_id(),
             tg_number: self.config.tg_number,
             user_tp: [0; 4],
+            user_mode: None,
             endpoint: OutboundEndpoint {
                 local_ip: self.config.local_ip,
                 peer_ip: self.config.peer_ip,

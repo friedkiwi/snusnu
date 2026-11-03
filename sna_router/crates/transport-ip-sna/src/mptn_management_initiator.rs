@@ -250,9 +250,9 @@ impl ManagementInitiator {
             || response.connection_data().len() != 63 + self.request.destination.node.len() + self.fqpcid.len()
             || response.connection_data()[5..32] != RESPONSE_FIXED
             || response.connection_data()[50 + self.request.destination.node.len()..54 + self.request.destination.node.len()] != [10, 0x13, 0, 0xb0]
-            // V5R4 can issue either X'23' or X'24' for its fresh response
-            // instance. FQPCID and the request correlator remain mandatory.
-            || !matches!(response.connection_data()[54 + self.request.destination.node.len()], 0x23 | 0x24)
+            // V5R4 has issued X'23', X'24', and X'25' for fresh response
+            // instances. FQPCID and the request correlator remain mandatory.
+            || !matches!(response.connection_data()[54 + self.request.destination.node.len()], 0x23..=0x25)
             // Both the direct V5R4 response and B's reply to our minted
             // instance end X'13' in zero; its preceding dynamic flag was
             // X'80' in the former and X'00' in the latter.
@@ -503,6 +503,17 @@ mod tests {
         let request = Connect::decode(peer.connect_request()).unwrap();
         let mut response = Connect::decode(&positive(&request)).unwrap();
         response.options[1].value[54 + request.destination.node.len()] = 0x24;
+        assert!(peer
+            .accept_connect_response(&response.encode().unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn accepts_isolated_printer_guest_response_instance_type_25() {
+        let mut peer = session();
+        let request = Connect::decode(peer.connect_request()).unwrap();
+        let mut response = Connect::decode(&positive(&request)).unwrap();
+        response.options[1].value[54 + request.destination.node.len()] = 0x25;
         assert!(peer
             .accept_connect_response(&response.encode().unwrap())
             .is_ok());

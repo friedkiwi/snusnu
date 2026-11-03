@@ -203,6 +203,8 @@ pub(crate) struct RouteConfig {
     pub(crate) destination_lu: Option<String>,
     /// Required for a native LLC or concentrator initiated MPTN session.
     pub(crate) user_tp_hex: Option<String>,
+    /// Optional LU 6.2 mode admitted on this application route.
+    pub(crate) user_mode: Option<String>,
     /// Bounded lifetime for one native LLC initiated MPTN circuit.
     pub(crate) timeout_seconds: Option<u64>,
 }
@@ -564,6 +566,7 @@ impl RouterConfig {
                 .to_be_bytes(),
             tg_number: gateway.tg_number,
             user_tp: parse_tp(user_tp_hex)?,
+            user_mode: route.user_mode.clone(),
             endpoint: OutboundEndpoint {
                 local_ip: gateway.local_ip,
                 peer_ip: gateway.peer_ip,

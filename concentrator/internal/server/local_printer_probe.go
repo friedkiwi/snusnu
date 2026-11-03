@@ -1,12 +1,14 @@
 package server
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
 	"sync"
 
 	wire "github.com/friedkiwi/snusnu/concentrator/internal/wire/routesv1"
 	"github.com/friedkiwi/snusnu/sna"
+	"github.com/friedkiwi/snusnu/sna/lu62"
 	"github.com/friedkiwi/snusnu/sna/piu"
 	"github.com/friedkiwi/snusnu/sna/xid3"
 )
@@ -18,6 +20,10 @@ type printerProbeCircuit struct {
 	allowance         uint64
 	xidReadyReplySent bool
 	linkReadySent     bool
+	initiated         bool
+	managementPhase   uint8
+	fqpcid            []byte
+	peerIPR           bool
 }
 
 type localPrinterProbe struct {
@@ -120,6 +126,9 @@ func (p *localPrinterProbe) handle(envelope *wire.WsEnvelope, source LocalPeer) 
 			log.Printf("printer probe PIU: circuit=%s th=%x rh=%x ru=%x", id, parsed.TH, parsed.RH, parsed.RU)
 			c.allowance += uint64(len(value.SnaInformation))
 			err = p.hub.credit(p.hub.local, &wire.CircuitCredit{CircuitId: idBytes, AllowanceBytes: c.allowance})
+			if err == nil && c.initiated {
+				err = p.managementInformation(id, c, value.SnaInformation)
+			}
 		}
 	case *wire.CircuitEvent_SessionEvent:
 		cost, wireErr := validateSessionWireEvent(value.SessionEvent)
@@ -159,7 +168,7 @@ func (p *localPrinterProbe) acceptOutbound(result *wire.OpenResult, source Local
 	if err != nil {
 		return
 	}
-	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC, allowance: 1500}
+	p.circuits[id] = &printerProbeCircuit{peer: peer, xid: xid, profile: wire.CircuitProfile_CIRCUIT_PROFILE_NATIVE_DLC, allowance: 1500, initiated: true}
 }
 
 func (p *localPrinterProbe) open(open *wire.IncomingOpen, source LocalPeer) {
@@ -228,7 +237,108 @@ func (p *localPrinterProbe) type1(id string, c *printerProbeCircuit, input *wire
 		}
 		if c.xid.Ready() && c.xidReadyReplySent && !c.linkReadySent {
 			c.linkReadySent = true
-			return p.hub.event(p.hub.local, &wire.CircuitEvent{CircuitId: uuidBytes(id), Event: &wire.CircuitEvent_LinkReady{LinkReady: &wire.LinkReady{}}})
+			if err := p.hub.event(p.hub.local, &wire.CircuitEvent{CircuitId: uuidBytes(id), Event: &wire.CircuitEvent_LinkReady{LinkReady: &wire.LinkReady{}}}); err != nil {
+				return err
+			}
+			if c.initiated {
+				return p.beginManagement(id, c)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) error {
+	var random [14]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return err
+	}
+	var instance [8]byte
+	copy(instance[:], random[:8])
+	var token [7]byte
+	token[0] = 0x23
+	copy(token[1:], random[8:])
+	bind, err := lu62.CandidateManagementBind("SNUSNU.SVC", c.peer.NetID+"."+c.peer.CP, 1, 2, instance, token)
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe management BIND: circuit=%s piu=%x", id, bind)
+	if err := p.sendInformation(id, bind); err != nil {
+		return err
+	}
+	c.fqpcid, err = lu62.RequestFQPCID(bind)
+	if err != nil {
+		return err
+	}
+	c.managementPhase = 1
+	return nil
+}
+
+func (p *localPrinterProbe) sendInformation(id string, data []byte) error {
+	return p.hub.event(p.hub.local, &wire.CircuitEvent{CircuitId: uuidBytes(id), Event: &wire.CircuitEvent_SnaInformation{SnaInformation: data}})
+}
+
+func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCircuit, data []byte) error {
+	switch c.managementPhase {
+	case 1:
+		if len(data) < 37 || data[6] != 0xeb || data[9] != 0x31 || data[2] != 2 || data[3] != 1 {
+			return nil
+		}
+		gds, err := lu62.EncodeCNOS(lu62.CNOS{Service: 2, SessionLimit: 8, SourceWinners: 4, TargetWinners: 4, ModeWidth: 8})
+		if err != nil {
+			return err
+		}
+		attach := []byte{0x2e, 0, 1, 2, 0, 1, 0x0b, 0x91, 0x20, 12, 5, 2, 0xff, 0, 3, 0xd0, 0, 0, 2, 6, 0xf1}
+		attach = append(attach, gds...)
+		log.Printf("printer probe management CNOS: circuit=%s piu=%x", id, attach)
+		if err := p.sendInformation(id, attach); err != nil {
+			return err
+		}
+		c.managementPhase = 2
+	case 2:
+		if len(data) < 13 || data[6] != 3 || data[7] != 0x91 || data[8] != 1 {
+			return nil
+		}
+		if _, err := lu62.ParseCNOS(data[9:]); err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, []byte{0x2e, 0, 1, 2, 0, 0, 0x83, 1, 0}); err != nil {
+			return err
+		}
+		if err := p.sendInformation(id, []byte{0x2e, 0, 1, 2, 0, 2, 0x4b, 0x91, 0, 0x70}); err != nil {
+			return err
+		}
+		log.Printf("printer probe management CNOS accepted: circuit=%s", id)
+		c.managementPhase = 3
+	case 3:
+		if len(data) == 9 && data[6] == 0x83 {
+			c.peerIPR = true
+			return nil
+		}
+		if len(data) != 10 || data[6] != 0x4b || data[9] != 0x70 || !c.peerIPR {
+			return nil
+		}
+		runbind := []byte{0x2f, 0, 1, 2, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0}
+		runbind = append(runbind, c.fqpcid...)
+		if err := p.sendInformation(id, runbind); err != nil {
+			return err
+		}
+		log.Printf("printer probe management BIS accepted: circuit=%s", id)
+		c.managementPhase = 4
+	case 4:
+		if len(data) == 10 && data[6] == 0xeb && data[9] == 0x32 {
+			c.managementPhase = 5
+			log.Printf("printer probe management complete: circuit=%s", id)
+			var pcid [8]byte
+			if _, err := rand.Read(pcid[:]); err != nil {
+				return err
+			}
+			bind, err := lu62.Candidate5494ControllerBind("SNUSNU.PRINTER", c.peer.NetID+"."+c.peer.LU, "SNUSNU.SVC", 1, 2, 0x86, pcid)
+			if err != nil {
+				return err
+			}
+			log.Printf("printer probe controller BIND: circuit=%s piu=%x", id, bind)
+			return p.sendInformation(id, bind)
 		}
 	}
 	return nil
