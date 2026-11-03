@@ -16,21 +16,39 @@ use crate::{
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const BIND_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn bind_result_expired(sent: Option<Instant>, bound: bool, now: Instant) -> bool {
+    !bound && sent.is_some_and(|sent| now.duration_since(sent) >= BIND_RESULT_TIMEOUT)
+}
 
 pub(crate) struct LlcSourceWs {
+    attachment_id: String,
+    session_id: u64,
     source: LocalLlcIngress,
     ws: SessionWsPort,
     pending_ws: Option<(SessionEvent, bool, Instant)>,
     opened_at: Instant,
+    bind_sent_at: Option<Instant>,
+    bound: bool,
 }
 
 impl LlcSourceWs {
-    pub(crate) fn new(source: LocalLlcIngress, ws: SessionWsPort) -> Self {
+    pub(crate) fn new(
+        source: LocalLlcIngress,
+        ws: SessionWsPort,
+        attachment_id: String,
+        session_id: u64,
+    ) -> Self {
         Self {
+            attachment_id,
+            session_id,
             source,
             ws,
             pending_ws: None,
             opened_at: Instant::now(),
+            bind_sent_at: None,
+            bound: false,
         }
     }
 
@@ -51,10 +69,26 @@ impl LlcSourceWs {
                 "LLC SessionV1 native egress stalled",
             ));
         }
+        if bind_result_expired(self.bind_sent_at, self.bound, Instant::now()) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "LLC SessionV1 remote BIND result timed out",
+            ));
+        }
         if self.pending_ws.is_none() {
             match self.ws.poll()? {
                 Some(SessionWsUpdate::Event(wire)) => {
                     let event = from_session_wire(wire)?;
+                    if let SessionEvent::BindResult { accepted, .. } = &event {
+                        tracing::info!(session = self.session_id,
+                            attachment = %self.attachment_id, accepted,
+                            elapsed_ms = self.bind_sent_at.map(|sent| sent.elapsed().as_millis()),
+                            "LLC SessionV1 remote BIND result received");
+                        self.bound = *accepted;
+                        if !accepted {
+                            self.bind_sent_at = None;
+                        }
+                    }
                     let charged = !matches!(event, SessionEvent::Credit { .. });
                     self.pending_ws = Some((event, charged, Instant::now()));
                 }
@@ -84,6 +118,12 @@ impl LlcSourceWs {
                         return Ok(false);
                     };
                     if self.ws.send(wire)? {
+                        if matches!(event, SessionEvent::BindRequest(_)) {
+                            self.bind_sent_at = Some(Instant::now());
+                            tracing::info!(session = self.session_id,
+                                attachment = %self.attachment_id,
+                                "LLC SessionV1 user BIND sent to concentrator");
+                        }
                         self.source
                             .complete_received(!matches!(event, SessionEvent::Credit { .. }))?;
                     }
@@ -101,5 +141,19 @@ impl LlcSourceWs {
     pub(crate) fn close(&mut self) -> io::Result<()> {
         self.source.close()?;
         self.ws.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unanswered_bind_is_bounded_after_open() {
+        let now = Instant::now();
+        assert!(!bind_result_expired(None, false, now));
+        let sent = now - BIND_RESULT_TIMEOUT;
+        assert!(bind_result_expired(Some(sent), false, now));
+        assert!(!bind_result_expired(Some(sent), true, now));
     }
 }
