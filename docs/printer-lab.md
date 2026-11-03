@@ -347,6 +347,46 @@ relayed to the guest, while the ACK only establishes TCP62 delivery. No
 address-01 LU4 BIND or SCS spool data followed in this run. The QA reply
 logic remains experimental and disabled without the environment flag.
 
+A contemporaneous guest status check showed `ANYSVC` and its APPC device
+`SVC00` active, with `QRMTWSC` marked `ACTIVE/TARGET`. `DSPMODD QRMTWSC`
+showed the IBM-recommended 57 sessions, 57 conversations, and 56 locally
+controlled sessions. Yet `WRKCFGSTS` still showed `SNUPRT` and `SNUPRT01`
+as `VARY ON PENDING`. The mode's capacity and the AnyNet controller
+association are therefore present; the address-01 device announcement and
+its follow-on LU4 session remain the live acceptance gate. IBM's
+[5494 configuration instructions](https://www.ibm.com/support/pages/configuring-5494-remote-control-units)
+also distinguish the APPC controller description from the remote workstation
+controller description and specify those QRMTWSC limits.
+
+A simultaneous-media probe kept the AnyNet controller circuit open and
+started a second QA listener plus LLC router on `sol10`, intending to send
+the address-01 NMVT over LLC. The LLC router published its managed MAC, but
+the guest's `LLCPRT` APPC controller was varied off. `VRYCFG` to vary it on
+returned `Controller LLCPRT Vary Configuration failed`; no LLC XID or NMVT
+followed. The second QA/router pair was stopped, leaving the AnyNet circuit
+untouched. This trial establishes no cross-media correlation and gives no
+evidence that the guest accepted simultaneous paths to `SNUSNU.SVC`.
+
+The [TCP62 transport draft](https://datatracker.ietf.org/doc/html/draft-ietf-tn3270e-tcp62-00.txt)
+specifies LU 6.2 application conversion, whereas IBM's
+[management-services guide](https://public.dhe.ibm.com/software/network/commserver/publications/cslin_64/czx41100.pdf)
+places NMVT on the PU–SSCP management session. The router's current TCP62
+controller association is an LU 6.2 session, and its normal-record decoder
+reconstructs that association's FID2 addresses. Reusing it for the
+address-01 NMVT would lose the direct management-session addressing. The
+AnyNet acceptance path therefore needs an identified management transport
+or a captured OEM controller exchange; the existing LU 6.2 record converter
+does not establish either one. This is a transport finding, not proof that
+IBM i cannot support an AnyNet printer.
+
+An independent vendor's [I-O print-server guide](https://products.iocorp.com/ftp/Host_Print/Manuals/Print%20Servers%20User%27s%20Guide.pdf)
+documents an AnyNet printer configuration that creates a 5494 remote
+controller and printer device on IBM i. This is evidence that an AnyNet
+acceptance path exists in shipped equipment; the guide does not publish
+the network-management wire format or a reusable trace. Its firmware
+download instructions refer to the former `ftp.iocorp.com` archive, but
+that archive was not reachable in this investigation.
+
 The publicly archived [5494 Release 3.2 base diskette files](https://www.ardent-tool.com/5494/Files.html)
 provide a direct source for the missing controller sender code. In
 `5494_Base.zip`, `VG*.BIN` contains 16-bit x86 code. `VG1C.BIN` is the only
