@@ -28,6 +28,7 @@ pub(crate) struct LocalLlcIngress {
     candidate: Option<NativeFid2Session>,
     pending: Option<SourceUpdate>,
     pending_grant: Option<(NativeFid2Session, Vec<u8>)>,
+    local_unbind_queued: bool,
     closed: bool,
 }
 
@@ -46,6 +47,7 @@ impl LocalLlcIngress {
             candidate: None,
             pending: None,
             pending_grant: None,
+            local_unbind_queued: false,
             closed: false,
         })
     }
@@ -109,6 +111,7 @@ impl LocalLlcIngress {
             candidate: None,
             pending: None,
             pending_grant: None,
+            local_unbind_queued: false,
             closed: false,
         }
     }
@@ -127,6 +130,71 @@ impl LocalLlcIngress {
         self.pending = None;
         self.pending_grant = None;
         Ok(true)
+    }
+
+    /// A bound fabric circuit ended without an UNBIND. Send a short native
+    /// user UNBIND on the existing LLC2 association and retain that carrier
+    /// only after the guest's correlated positive response arrives.
+    pub(crate) fn drain_bound_user(&mut self) -> io::Result<bool> {
+        if self.closed {
+            return Err(invalid("native LLC user association already closed"));
+        }
+        self.pending = None;
+        self.candidate = None;
+        self.pending_grant = None;
+        self.native.discard_pending();
+        let codec = self
+            .codec
+            .as_ref()
+            .ok_or_else(|| invalid("bound LLC session has no native codec"))?;
+        if codec.is_closed() {
+            self.finish_bound_user()?;
+            return Ok(true);
+        }
+        if !self.local_unbind_queued {
+            let (candidate, piu) = codec.preview_local_unbind()?;
+            if !self.native.send_piu(&piu)? {
+                return Ok(false);
+            }
+            self.codec = Some(candidate);
+            self.local_unbind_queued = true;
+        }
+        for _ in 0..8 {
+            let Some(event) = self.native.poll_native()? else {
+                return Ok(false);
+            };
+            match event {
+                NativeLlcEvent::UserInformation(piu) => {
+                    let (candidate, update) = self.codec.as_ref().unwrap().preview_native(piu)?;
+                    let complete = matches!(update, Some(SessionEvent::Unbind(ref unit)) if unit.rh() == [0xeb, 0x80, 0]);
+                    self.native.confirm_native()?;
+                    self.codec = Some(candidate);
+                    if complete {
+                        self.finish_bound_user()?;
+                        return Ok(true);
+                    }
+                }
+                NativeLlcEvent::BindResponseAck | NativeLlcEvent::EgressAck(_) => {
+                    self.native.confirm_native()?;
+                }
+                NativeLlcEvent::Closed => {
+                    return Err(invalid("native LLC link closed during user UNBIND"))
+                }
+                _ => return Err(invalid("unexpected native LLC event during user UNBIND")),
+            }
+        }
+        Ok(false)
+    }
+
+    fn finish_bound_user(&mut self) -> io::Result<()> {
+        self.native.port.finish_converter_user_session()?;
+        self.identity = None;
+        self.codec = None;
+        self.candidate = None;
+        self.pending = None;
+        self.pending_grant = None;
+        self.local_unbind_queued = false;
+        Ok(())
     }
 
     /// Advance SNASVCMG teardown while a user BIND remains leased for a

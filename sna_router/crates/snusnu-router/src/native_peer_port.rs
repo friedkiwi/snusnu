@@ -307,6 +307,30 @@ impl NativePeerPort {
         Ok(true)
     }
 
+    /// The guest acknowledged a router-origin user UNBIND. Keep LLC2 and its
+    /// verified CP management while releasing only the user BIND lease.
+    pub(crate) fn finish_converter_user_session(&mut self) -> io::Result<()> {
+        if !self.link_established()
+            || self.converter_offer.is_none()
+            || !self.converter_bind_response_acked
+            || self.management.as_ref().map(ManagementSession::phase)
+                != Some(ManagementPhase::Closed)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native user UNBIND cannot release an unverified LLC session",
+            ));
+        }
+        self.converter_offer = None;
+        self.converter_bind_waits_for_bis_ack = false;
+        self.converter_bind_response_pending = false;
+        self.converter_negative_bind_pending = false;
+        self.converter_bind_response_acked = false;
+        self.converter_first_attach_seen = false;
+        self.converter_events.clear();
+        Ok(())
+    }
+
     pub(crate) fn replay_converter_user_bind(&mut self, piu: Vec<u8>) -> io::Result<()> {
         if self
             .converter_offer

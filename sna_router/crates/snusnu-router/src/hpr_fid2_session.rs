@@ -12,7 +12,7 @@ use router_core::{
     fixed_pacing::{is_canonical_ipr, FixedPacing, PacingError, IPR_RH},
     session::{Flow, QualifiedName, SessionEvent, SessionIdentity, SessionUnit},
 };
-use transport_ip_sna::mptn_bind_negotiation::validate_positive_response;
+use transport_ip_sna::mptn_bind_negotiation::{request_fqpcid, validate_positive_response};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -62,6 +62,24 @@ impl NativeFid2Session {
     pub(crate) fn is_closed(&self) -> bool {
         self.phase == Phase::Closed
     }
+    /// Prepare a normal user UNBIND after the fabric circuit disappears.
+    /// The FQPCID comes from the already validated BIND; commit the returned
+    /// candidate only after the native LLC queue accepts its PIU.
+    pub(crate) fn preview_local_unbind(&self) -> io::Result<(Self, Vec<u8>)> {
+        if self.phase != Phase::Open {
+            return Err(invalid("native user session is not open for local UNBIND"));
+        }
+        let fqpcid = request_fqpcid(self.bind_request.as_reduced()).map_err(io::Error::other)?;
+        let mut reduced = vec![0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0];
+        reduced.extend_from_slice(fqpcid);
+        let unit = unit(&reduced)?;
+        let (candidate, piu) = self.preview_event(&SessionEvent::Unbind(unit), None)?;
+        Ok((
+            candidate,
+            piu.ok_or_else(|| invalid("local user UNBIND has no PIU"))?,
+        ))
+    }
+
     /// Consume the native converter's already validated user BIND. The CP
     /// must have been observed on this same LLC association's XID3 exchange.
     pub(crate) fn from_user_bind(
@@ -443,6 +461,25 @@ mod tests {
             .unwrap();
         assert_eq!(piu.unwrap(), native_response);
         opened
+    }
+
+    #[test]
+    fn local_unbind_uses_bound_fqpcid_and_waits_for_correlated_response() {
+        let codec = opened();
+        let fqpcid = request_fqpcid(codec.bind_request.as_reduced()).unwrap();
+        let (awaiting, piu) = codec.preview_local_unbind().unwrap();
+        assert_eq!(
+            &piu[..15],
+            &[0x2d, 0, 2, 1, 0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0]
+        );
+        assert_eq!(&piu[15..], fqpcid);
+        assert!(!awaiting.is_closed());
+        let wrong = [0x2d, 0, 1, 2, 0, 1, 0xeb, 0x80, 0, 0x32];
+        assert!(awaiting.preview_native(&wrong).is_err());
+        let response = [0x2d, 0, 1, 2, 0, 0, 0xeb, 0x80, 0, 0x32];
+        let (closed, event) = awaiting.preview_native(&response).unwrap();
+        assert!(closed.is_closed());
+        assert!(matches!(event, Some(SessionEvent::Unbind(_))));
     }
 
     #[test]
