@@ -7,7 +7,7 @@
 use std::{collections::HashSet, io};
 
 use crate::{
-    auto_llc::LlcAutoListener,
+    auto_llc::{LlcAutoListener, LlcIngressOffer},
     config::{self, LlcConfig},
     hpr_destination_directory::{Destination, HprDestinationDirectory},
     hpr_local_llc_ingress::LocalLlcIngress,
@@ -21,7 +21,7 @@ struct Listener {
 }
 
 struct Pending {
-    listener: usize,
+    ingress_id: String,
     proxy_mac: [u8; 6],
     source: LocalLlcIngress,
 }
@@ -35,12 +35,20 @@ pub(crate) struct ReadyLocalLlc {
 }
 
 pub(crate) struct LocalToHprRuntime {
+    state: LocalToHprState,
+    listeners: Vec<Listener>,
+}
+
+/// Session state for LLC offers handed off by the single attachment owner.
+/// This object never opens or polls a packet socket. The owner must release
+/// each reservation returned by `take_releases`.
+pub(crate) struct LocalToHprState {
     target_ee_id: String,
     target_cp: QualifiedName,
     target_proxy_mac: [u8; 6],
-    listeners: Vec<Listener>,
     pending: Vec<Pending>,
-    active: HashSet<(usize, [u8; 6])>,
+    active: HashSet<(String, [u8; 6])>,
+    releases: Vec<(String, [u8; 6])>,
 }
 
 impl LocalToHprRuntime {
@@ -50,9 +58,6 @@ impl LocalToHprRuntime {
         target_cp: QualifiedName,
         target_proxy_mac: [u8; 6],
     ) -> io::Result<Self> {
-        if target_ee_id.is_empty() {
-            return Err(invalid("local EE target ID is empty"));
-        }
         let mut listeners = Vec::with_capacity(llc.len());
         for attachment in llc {
             let mut port = LlcAutoListener::open(
@@ -66,44 +71,97 @@ impl LocalToHprRuntime {
             });
         }
         Ok(Self {
-            target_ee_id: target_ee_id.to_owned(),
-            target_cp,
-            target_proxy_mac,
+            state: LocalToHprState::new(target_ee_id, target_cp, target_proxy_mac)?,
             listeners,
-            pending: Vec::new(),
-            active: HashSet::new(),
         })
     }
 
-    /// Poll one offer per listener, then advance bounded pending associations.
-    /// A returned source retains its first BIND until ReverseRuntime accepts
-    /// it into SessionFabric. Other sessions remain owned by this manager.
     pub(crate) fn poll_ready(
         &mut self,
         directory: &HprDestinationDirectory,
     ) -> io::Result<Option<ReadyLocalLlc>> {
-        for (index, listener) in self.listeners.iter_mut().enumerate() {
-            let Some(offer) = listener.port.poll_offer()? else {
-                continue;
-            };
-            if offer.proxy_mac != self.target_proxy_mac {
-                listener.port.release(offer.proxy_mac);
-                continue;
-            }
-            let proxy_mac = offer.proxy_mac;
-            match LocalLlcIngress::from_offer(offer, self.target_cp.clone(), &listener.id) {
-                Ok(source) => self.pending.push(Pending {
-                    listener: index,
-                    proxy_mac,
-                    source,
-                }),
-                Err(error) => {
-                    listener.port.release(proxy_mac);
-                    tracing::warn!(attachment = %listener.id, error = %error,
-                        "LLC-to-EE native association rejected");
-                }
+        for listener in &mut self.listeners {
+            if let Some(offer) = listener.port.poll_offer()? {
+                self.state.accept_offer(&listener.id, offer);
             }
         }
+        let ready = self.state.poll_ready(directory);
+        self.release_completed();
+        ready
+    }
+
+    pub(crate) fn release(&mut self, ingress_id: &str, proxy_mac: [u8; 6]) -> io::Result<()> {
+        self.state.release(ingress_id, proxy_mac)?;
+        self.release_completed();
+        Ok(())
+    }
+
+    fn release_completed(&mut self) {
+        for (ingress_id, proxy_mac) in self.state.take_releases() {
+            if let Some(listener) = self
+                .listeners
+                .iter_mut()
+                .find(|entry| entry.id == ingress_id)
+            {
+                listener.port.release(proxy_mac);
+            }
+        }
+    }
+}
+
+impl Drop for LocalToHprRuntime {
+    fn drop(&mut self) {
+        self.state.shutdown();
+        self.release_completed();
+    }
+}
+
+impl LocalToHprState {
+    pub(crate) fn new(
+        target_ee_id: &str,
+        target_cp: QualifiedName,
+        target_proxy_mac: [u8; 6],
+    ) -> io::Result<Self> {
+        if target_ee_id.is_empty() {
+            return Err(invalid("local EE target ID is empty"));
+        }
+        Ok(Self {
+            target_ee_id: target_ee_id.to_owned(),
+            target_cp,
+            target_proxy_mac,
+            pending: Vec::new(),
+            active: HashSet::new(),
+            releases: Vec::new(),
+        })
+    }
+
+    /// The caller owns the listener's proxy reservation until this state
+    /// reports its release. A wrong target or failed converter is closed here.
+    pub(crate) fn accept_offer(&mut self, ingress_id: &str, offer: LlcIngressOffer) {
+        let proxy_mac = offer.proxy_mac;
+        if proxy_mac != self.target_proxy_mac {
+            self.releases.push((ingress_id.to_owned(), proxy_mac));
+            return;
+        }
+        match LocalLlcIngress::from_offer(offer, self.target_cp.clone(), ingress_id) {
+            Ok(source) => self.pending.push(Pending {
+                ingress_id: ingress_id.to_owned(),
+                proxy_mac,
+                source,
+            }),
+            Err(error) => {
+                self.releases.push((ingress_id.to_owned(), proxy_mac));
+                tracing::warn!(attachment = %ingress_id, error = %error,
+                    "LLC-to-EE native association rejected");
+            }
+        }
+    }
+
+    /// Advance pending native associations without polling any socket owner.
+    pub(crate) fn poll_ready(
+        &mut self,
+        directory: &HprDestinationDirectory,
+    ) -> io::Result<Option<ReadyLocalLlc>> {
         let mut index = 0;
         while index < self.pending.len() {
             let result = self.pending[index].source.poll();
@@ -119,8 +177,9 @@ impl LocalToHprRuntime {
                         continue;
                     }
                     let pending = self.pending.remove(index);
-                    self.active.insert((pending.listener, pending.proxy_mac));
-                    let ingress_id = self.listeners[pending.listener].id.clone();
+                    self.active
+                        .insert((pending.ingress_id.clone(), pending.proxy_mac));
+                    let ingress_id = pending.ingress_id;
                     tracing::info!(ingress = %ingress_id, target = %self.target_ee_id,
                         source_lu = %identity.source_lu, target_lu = %identity.target_lu,
                         "verified local LLC session selected for EE");
@@ -140,7 +199,7 @@ impl LocalToHprRuntime {
                 }
                 Ok(None) => index += 1,
                 Err(error) => {
-                    tracing::warn!(attachment = %self.listeners[self.pending[index].listener].id,
+                    tracing::warn!(attachment = %self.pending[index].ingress_id,
                         error = %error, "LLC-to-EE association failed before user BIND");
                     self.reject(index, "LLC association failed")?;
                 }
@@ -150,27 +209,37 @@ impl LocalToHprRuntime {
     }
 
     pub(crate) fn release(&mut self, ingress_id: &str, proxy_mac: [u8; 6]) -> io::Result<()> {
-        let index = self
-            .listeners
-            .iter()
-            .position(|listener| listener.id == ingress_id)
-            .ok_or_else(|| invalid("unknown LLC ingress attachment"))?;
-        if !self.active.remove(&(index, proxy_mac)) {
+        if !self.active.remove(&(ingress_id.to_owned(), proxy_mac)) {
             return Err(invalid("LLC ingress reservation is not active"));
         }
-        self.listeners[index].port.release(proxy_mac);
+        self.releases.push((ingress_id.to_owned(), proxy_mac));
         Ok(())
+    }
+
+    pub(crate) fn take_releases(&mut self) -> Vec<(String, [u8; 6])> {
+        std::mem::take(&mut self.releases)
+    }
+
+    /// Tear down a retired EE generation before the shared listener accepts
+    /// another route. The caller releases every returned proxy reservation.
+    pub(crate) fn shutdown(&mut self) {
+        while !self.pending.is_empty() {
+            let _ = self.reject(0, "EE route withdrawn");
+        }
+        for reservation in self.active.drain() {
+            self.releases.push(reservation);
+        }
     }
 
     fn reject(&mut self, index: usize, reason: &'static str) -> io::Result<()> {
         let mut pending = self.pending.remove(index);
-        let listener = &mut self.listeners[pending.listener];
         if let Err(error) = pending.source.close() {
-            tracing::warn!(attachment = %listener.id, error = %error,
+            tracing::warn!(attachment = %pending.ingress_id, error = %error,
                 "failed to close rejected LLC-to-EE association");
         }
-        listener.port.release(pending.proxy_mac);
-        tracing::warn!(attachment = %listener.id, proxy_mac = ?pending.proxy_mac, reason,
+        self.releases
+            .push((pending.ingress_id.clone(), pending.proxy_mac));
+        tracing::warn!(attachment = %pending.ingress_id, proxy_mac = ?pending.proxy_mac, reason,
             "LLC-to-EE association rejected");
         Ok(())
     }
