@@ -1139,7 +1139,11 @@ impl RoutePort for NativePeerPort {
     }
 
     fn has_capacity(&self) -> bool {
-        self.reverse_user_mode && self.endpoint.has_capacity() || !self.reached_management_bind
+        if self.reverse_user_mode {
+            self.endpoint.has_capacity()
+        } else {
+            !self.reached_management_bind
+        }
     }
 
     fn available_receive_slots(&self) -> usize {
