@@ -147,9 +147,7 @@ impl DirectRouteSetupService {
         reverse_metrics: ReverseLinkMetrics,
         max_cached_replies: usize,
     ) -> Result<Self, ServiceError> {
-        if target_lu.netid == bootstrap.local.cp.netid
-            || target_lu.netid != verified_target_cp.netid
-        {
+        if verified_target_cp == bootstrap.local.cp || target_lu.netid != verified_target_cp.netid {
             return Err(ServiceError::InvalidIdentity);
         }
         Self::new_scoped(
@@ -640,5 +638,53 @@ mod tests {
             service.prepare_reply(bootstrap.generation, &wrong_request),
             Err(ServiceError::Reply(DirectReplyError::WrongDestination)),
         );
+    }
+
+    #[test]
+    fn verified_adjacent_cp_may_share_proxy_netid() {
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            advertisement("SNUSNU.SVC", 2),
+            advertisement("SOLNET.SNAB", 1),
+        )
+        .unwrap();
+        let metrics = ReverseLinkMetrics {
+            transmission_time_us: 276,
+            capacity_kbps: 4300,
+            liveness_seconds: 0,
+        };
+        let lu = "SNUSNU.APP".parse().unwrap();
+        assert_eq!(
+            DirectRouteSetupService::new_verified_external(
+                bootstrap.clone(),
+                lu,
+                "SNUSNU.SVC".parse().unwrap(),
+                vec![0xa4, 0],
+                [0, 0, 0, 4],
+                1,
+                metrics,
+                2,
+            )
+            .unwrap_err(),
+            ServiceError::InvalidIdentity
+        );
+        let mut service = DirectRouteSetupService::new_verified_external(
+            bootstrap.clone(),
+            "SNUSNU.APP".parse().unwrap(),
+            "SNUSNU.REMOTE".parse().unwrap(),
+            vec![0xa4, 0],
+            [0, 0, 0, 4],
+            1,
+            metrics,
+            2,
+        )
+        .unwrap();
+        let reply = service
+            .prepare_reply(bootstrap.generation, &cross_netid_request("SNUSNU.APP"))
+            .unwrap();
+        let route = service
+            .confirm_reply_sent(bootstrap.generation, reply.pcid, &reply.gds)
+            .unwrap();
+        assert!(route.target_netid_authorized(&bootstrap.local.cp));
     }
 }

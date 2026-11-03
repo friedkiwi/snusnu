@@ -50,7 +50,7 @@ impl AuthorizedUserRoute {
     pub fn target_netid_authorized(&self, local_cp: &QualifiedName) -> bool {
         match &self.verified_external_cp {
             None => self.target_lu.netid == local_cp.netid,
-            Some(cp) => self.target_lu.netid != local_cp.netid && self.target_lu.netid == cp.netid,
+            Some(cp) => cp != local_cp && self.target_lu.netid == cp.netid,
         }
     }
 }
@@ -442,6 +442,14 @@ mod tests {
             Err(PathError::InvalidUserAuthorization)
         );
         external.verified_external_cp = Some("QABOB.SNAB".parse().unwrap());
+        validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&external)).unwrap();
+        external.target_lu = "SNUSNU.APP".parse().unwrap();
+        external.verified_external_cp = Some("SNUSNU.SVC".parse().unwrap());
+        assert_eq!(
+            validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&external)),
+            Err(PathError::InvalidUserAuthorization)
+        );
+        external.verified_external_cp = Some("SNUSNU.REMOTE".parse().unwrap());
         validate_inbound_switching_path(packet, &bootstrap, 1, &topic, Some(&external)).unwrap();
         let mut reserved = bytes.clone();
         let flags = reserved
