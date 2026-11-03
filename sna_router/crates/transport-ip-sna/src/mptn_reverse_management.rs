@@ -195,9 +195,8 @@ pub fn classify_reverse_management_connect_discover_cp(
     let user = &data[cursor..cursor + user_len];
     if user[..11] != [0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]
         || user[11..14] != [9, 3, 1]
-        // Live V5R4 has emitted X'23', X'24', and X'25' PLU-generated
-        // session instances. The matching X'13' copy below binds the token.
-        || !matches!(user[14], 0x23..=0x25)
+        // V5R4 emitted successive X'23' through X'26' session instances.
+        // This is a dynamic value; the matching X'13' copy below binds it.
         // Both X'80' (earlier reverse capture) and X'00' (QABOB-initiated
         // cross-NETID capture) occur in this dynamic token flag.
         || !matches!(user[19], 0 | 0x80)
@@ -435,6 +434,43 @@ mod tests {
             classify_reverse_management_connect(request, "QABOB.SNAB", "QAALICE.SNAA", None)
                 .unwrap();
         assert_eq!(admitted.fqpcid(), fqpcid);
+    }
+
+    #[test]
+    fn admits_live_bob_session_instance_26_only_with_matching_copy() {
+        // V5R4's later TCP/397 Connect used X'26' in both dynamic token
+        // fields. Preserve the equality check when admitting that instance.
+        let source = ebcdic_lu("QABOB.SNAB").unwrap();
+        let mut fqpcid = vec![0x60, (9 + source.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(source.len() as u8);
+        fqpcid.extend_from_slice(&source);
+        let initiated = ManagementInitiator::new(
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            fqpcid,
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
+        let mut request = Connect::decode(initiated.connect_request()).unwrap();
+        let user_start = 32 + 1 + source.len() + 1;
+        request.options[1].value[user_start + 14] = 0x26;
+        request.options[1].value[user_start + 27 + source.len()] = 0x26;
+        assert!(classify_reverse_management_connect(
+            request.clone(),
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            None,
+        )
+        .is_ok());
+        request.options[1].value[user_start + 27 + source.len()] = 0x25;
+        assert!(
+            classify_reverse_management_connect(request, "QABOB.SNAB", "QAALICE.SNAA", None,)
+                .is_err()
+        );
     }
 
     #[test]
