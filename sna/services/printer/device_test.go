@@ -36,4 +36,19 @@ func TestLU4DeviceACTLUAndPrinterBind(t *testing.T) {
 	if err := d.MarkSent(response); err != nil || d.Phase() != DeviceBound {
 		t.Fatalf("printer BIND send: %v", err)
 	}
+	fmd := []byte{0x3c, 0xc1, 0x03, 0x80, 0, 0xc1, 0xc2, 0x0c}
+	if _, err := d.PrepareFMD(fmd, func([]byte) error { return ErrSCS }); err != ErrSCS || d.Phase() != DeviceBound {
+		t.Fatalf("failed durable write acknowledged: phase=%d err=%v", d.Phase(), err)
+	}
+	var stored []byte
+	response, err = d.PrepareFMD(fmd, func(data []byte) error { stored = append(stored, data...); return nil })
+	if err != nil || !bytes.Equal(stored, fmd[5:]) || !bytes.Equal(response, []byte{0x3c, 0xc1, 0x83, 0x80, 0}) || d.Phase() != DeviceAwaitDataAck {
+		t.Fatalf("printer FMD response before durable storage: response=%x stored=%x phase=%d err=%v", response, stored, d.Phase(), err)
+	}
+	if _, err := d.PrepareFMD(fmd, func([]byte) error { t.Fatal("duplicate chain accepted"); return nil }); err == nil {
+		t.Fatal("next chain accepted before the response was sent")
+	}
+	if err := d.MarkSent(response); err != nil || d.Phase() != DeviceBound {
+		t.Fatalf("printer FMD send: %v", err)
+	}
 }

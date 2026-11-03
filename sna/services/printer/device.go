@@ -17,6 +17,7 @@ const (
 	DeviceAwaitBind
 	DeviceAwaitBindAck
 	DeviceBound
+	DeviceAwaitDataAck
 )
 
 // LU4Device handles the architected ACTLU and printer BIND inside one 5494
@@ -27,6 +28,37 @@ type LU4Device struct {
 	maxRU   byte
 	phase   DevicePhase
 	pending []byte
+}
+
+// PrepareFMD accepts one complete, definite-response printer data chain.
+// appendSCS must durably accept the raw SCS bytes before this method can
+// return a positive response, and must deduplicate retransmissions using the
+// enclosing LU 6.2 session's sequence/correlation state. A caller may
+// concatenate multiple chains into one spool file; the LU 4 stream itself
+// does not identify a spool boundary.
+func (d *LU4Device) PrepareFMD(input []byte, appendSCS func([]byte) error) ([]byte, error) {
+	if d == nil || d.phase != DeviceBound || len(d.pending) != 0 || appendSCS == nil {
+		return nil, ErrDeviceState
+	}
+	p, err := ParseLU4PIU(input)
+	if err != nil || p.Address != d.address || p.Session != LU4PrintSession || p.Expedited || p.Response ||
+		p.RH[0]&0xe3 != 0x03 || len(p.RU) == 0 || p.RH[1]&0xa0 == 0 {
+		return nil, ErrDeviceState
+	}
+	response, err := PositiveLU4Response(p, nil)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := response.Encode()
+	if err != nil {
+		return nil, err
+	}
+	if err := appendSCS(append([]byte(nil), p.RU...)); err != nil {
+		return nil, err
+	}
+	d.pending = encoded
+	d.phase = DeviceAwaitDataAck
+	return append([]byte(nil), encoded...), nil
 }
 
 func NewLU4Device(address, maxRU byte) (*LU4Device, error) {
@@ -88,6 +120,8 @@ func (d *LU4Device) MarkSent(response []byte) error {
 	case DeviceAwaitACTLUAck:
 		d.phase = DeviceAwaitBind
 	case DeviceAwaitBindAck:
+		d.phase = DeviceBound
+	case DeviceAwaitDataAck:
 		d.phase = DeviceBound
 	default:
 		return ErrDeviceState
