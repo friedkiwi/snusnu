@@ -311,6 +311,10 @@ pub(crate) enum IdentityObservation {
     /// session control; a CP name must never be substituted for this value.
     #[allow(dead_code)]
     LogicalUnit(String),
+    /// The association that supplied this attachment's identity is gone.
+    /// Discovery owners must withdraw its CP and hosted LUs before accepting
+    /// a new offer on the same MAC.
+    Withdraw,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
