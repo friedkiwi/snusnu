@@ -657,7 +657,8 @@ mod tests {
         assert_eq!(reduced, canonical);
         let native = teardown.prepare_udp_abort(&reduced).unwrap();
         assert_eq!(&native[..4], &[0x2f, 0, 2, 2]);
-        assert_eq!(&native[4..], reduced);
+        assert_eq!(&native[4..15], &[0, 0, 0x6b, 0x80, 0, 0x32, 1, 0, 0, 0, 0]);
+        assert_eq!(&native[15..], offer.fqpcid());
         let mut wrong = unbind.as_reduced().to_vec();
         let last = wrong.len() - 1;
         wrong[last] ^= 1;
