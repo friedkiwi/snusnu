@@ -27,6 +27,16 @@ func TestReplyPSIDAddress01FirmwareLayout(t *testing.T) {
 		t.Fatal("wrong address-01 port/station accepted")
 	}
 	p.Station = 1
+	p.Address, p.Port, p.Station = 7, 1, 0
+	if raw, err := p.EncodeNMVT(); err != nil || raw[21] != 7 ||
+		!bytes.Equal(raw[26:28], []byte{1, 0}) {
+		t.Fatalf("linear address 7 port/station: %x %v", raw, err)
+	}
+	p.Port = 0
+	if _, err := p.EncodeNMVT(); err == nil {
+		t.Fatal("wrong address-07 port accepted")
+	}
+	p.Address, p.Port, p.Station = 1, 0, 1
 	p.VPD.Model = [3]byte{1, 2, 3}
 	if raw, err := p.EncodeNMVT(); err != nil || !bytes.Equal(raw[44:47], []byte{1, 2, 3}) {
 		t.Fatalf("runtime model VPD not preserved: %x %v", raw, err)

@@ -19,7 +19,9 @@ type HardwarePSID struct {
 
 // ReplyPSID holds the runtime fields of the 5494 short, hardware-only NMVT
 // Reply Product Set ID. AddressList is the six-byte SNA address prefix which
-// precedes the final linear workstation address in the Address List.
+// precedes the final linear workstation address in the Address List. Port's
+// high two bits select a shared session; its low six bits and Station must
+// match the address divided by seven.
 type ReplyPSID struct {
 	ProcedureID uint16
 	AddressList [6]byte
@@ -35,9 +37,10 @@ type ReplyPSID struct {
 // make assumptions about IBM i's response. This is the short product branch;
 // an emulator product ID requires the separate extended branch.
 func (p ReplyPSID) EncodeNMVT() ([]byte, error) {
-	if p.ProcedureID == 0 || p.Address == 0 || p.Address > 63 || p.Port > 63 ||
-		p.Station == 0 || p.Station > 7 ||
-		(p.Address == 1 && (p.Port != 0 || p.Station != 1)) ||
+	// VG15 divides the six-bit linear address by seven. The low six port
+	// bits carry the quotient; the top two bits select a shared session.
+	if p.ProcedureID == 0 || p.Address == 0 || p.Address > 63 ||
+		p.Port&0x3f != p.Address/7 || p.Station != p.Address%7 ||
 		!ebcdicDigits(p.VPD.MachineType[:]) || p.VPD.Model == [3]byte{} ||
 		p.VPD.Plant == [2]byte{} || p.VPD.Serial == [7]byte{} {
 		return nil, ErrPSID
