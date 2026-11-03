@@ -545,6 +545,16 @@ replies therefore do not validate the timing or the application exchange.
 The next wire trial should derive the station state transition and send one
 reply at the firmware-defined point.
 
+An isolated LLC trial sent only the first-fragment `D823/02` on the controller
+session, with the corrected date, zero procedure ID, and address-01 NMVT sent
+after Attach. IBM i still delivered all three address-56 fragments and an
+expedited SIGNAL. QA answered the SIGNAL; no address-01 BIND followed, and
+`SNUPRT` and `SNUPRT01` stayed `VARY ON PENDING`. This rules out the second
+`D823/02` as the sole cause of the stalled printer activation, but does not
+establish that the first notice was correctly timed. The verbose evidence is
+in `/tmp/snusnu-printer-qa-first-notice.log` and
+`/tmp/snusnu-printer-router-first-notice.log` on the test host.
+
 A later LLC trial corrected the experimental Reply-PSID FID2 TH byte 1
 from `FF` to `00`, matching the reserved byte in the 5494 reference and
 firmware. The verbose router log shows the corrected `2C 00 ... 41 03 8D`
