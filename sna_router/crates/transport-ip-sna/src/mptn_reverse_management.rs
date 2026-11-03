@@ -129,9 +129,9 @@ pub fn classify_reverse_management_connect(
     let user = &data[cursor..cursor + user_len];
     if user[..11] != [0, 9, 2, 0xe2, 0xd5, 0xc1, 0xe2, 0xe5, 0xc3, 0xd4, 0xc7]
         || user[11..14] != [9, 3, 1]
-        // V5R4 has emitted both X'23' and X'24' PLU-generated session
-        // instances. The matching X'13' copy below still binds the token.
-        || !matches!(user[14], 0x23 | 0x24)
+        // Live V5R4 has emitted X'23', X'24', and X'25' PLU-generated
+        // session instances. The matching X'13' copy below binds the token.
+        || !matches!(user[14], 0x23..=0x25)
         // Both X'80' (earlier reverse capture) and X'00' (QABOB-initiated
         // cross-NETID capture) occur in this dynamic token flag.
         || !matches!(user[19], 0 | 0x80)
@@ -361,6 +361,36 @@ mod tests {
         request.options[1].value[user_start + 27 + source.len()] = 0x23;
         assert!(
             classify_reverse_management_connect(request, "QABOB.SNAB", "QAALICE.SNAA", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn admits_exact_2026_11_03_bob_management_token_25_capture() {
+        // TCP/397 payload from the live QABOB→SOLNET capture. The token is
+        // X'25' in both X'03' and X'13'; all other bytes are unchanged.
+        let wire = hex(concat!(
+            "000000e2800a00de2a0b010ce2d6d3d5c5e34be2d5c1c2010b010bd8c1",
+            "c2d6c24be2d5c1c20109b025bc91e05580000f0000020500000076000000",
+            "7620000508000601010a02008a00006b800031001307b0b051330787868687",
+            "07060200000000000000944300000ad8c1c2d6c24be2d5c1c22c000902e2",
+            "d5c1e2e5c3d4c709030125bc91c1ca80000b04d8c1c2d6c24be2d5c1c2",
+            "0a1300b025bc91c1ca8000000be2d6d3d5c5e34be2d5c1c26013e8e772",
+            "dd2407025d0ad8c1c2d6c24be2d5c1c22c0a04087bc3d6d5d5c5c3e3",
+            "1800000501190a000a0020010310831a00000584"
+        ));
+        assert_eq!(wire.len(), 226);
+        let request = Connect::decode(&wire).unwrap();
+        let admitted =
+            classify_reverse_management_connect(request.clone(), "QABOB.SNAB", "SOLNET.SNAB", None)
+                .unwrap();
+        assert_eq!(admitted.request(), &request);
+        let mut mismatched = request;
+        let source_len = mismatched.source.node.len();
+        let user_start = 32 + 1 + source_len + 1;
+        mismatched.options[1].value[user_start + 27 + source_len] = 0x24;
+        assert!(
+            classify_reverse_management_connect(mismatched, "QABOB.SNAB", "SOLNET.SNAB", None,)
                 .is_err()
         );
     }
