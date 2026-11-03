@@ -51,7 +51,7 @@ impl DirectReplyTarget<'_> {
         &self,
         request: &RouteSetupGds<'_>,
     ) -> Result<Vec<u8>, DirectReplyError> {
-        self.encode_positive_with_route(request, None)
+        self.encode_positive_with_route(request, None, false)
     }
 
     /// A route service may answer for an LU behind a separately verified
@@ -62,18 +62,30 @@ impl DirectReplyTarget<'_> {
         request: &RouteSetupGds<'_>,
         verified_target_cp: &QualifiedName,
     ) -> Result<Vec<u8>, DirectReplyError> {
-        self.encode_positive_with_route(request, Some(verified_target_cp))
+        self.encode_positive_with_route(request, Some(verified_target_cp), false)
+    }
+
+    /// A path switch names the previously allocated LU NCE instead of its
+    /// LU name. The caller must independently prove that this exact NCE is
+    /// still bound to a live authorized RTP route on this link generation.
+    pub(crate) fn encode_positive_path_switch(
+        &self,
+        request: &RouteSetupGds<'_>,
+        verified_target_cp: Option<&QualifiedName>,
+    ) -> Result<Vec<u8>, DirectReplyError> {
+        self.encode_positive_with_route(request, verified_target_cp, true)
     }
 
     fn encode_positive_with_route(
         &self,
         request: &RouteSetupGds<'_>,
         verified_target_cp: Option<&QualifiedName>,
+        path_switch: bool,
     ) -> Result<Vec<u8>, DirectReplyError> {
         if request.kind != RouteSetupKind::Request {
             return Err(DirectReplyError::NotRequest);
         }
-        if request.path_switch {
+        if request.path_switch != path_switch {
             return Err(DirectReplyError::UnsupportedPathSwitch);
         }
         if request.origin_cp_name != self.bootstrap.peer.cp.to_string() {
@@ -83,9 +95,20 @@ impl DirectReplyTarget<'_> {
             None => self.local_lu.netid == self.bootstrap.local.cp.netid,
             Some(cp) => cp.netid == self.local_lu.netid,
         };
-        if request.destination_lu_name.as_deref() != Some(&self.local_lu.to_string())
-            || !valid_lu_scope
-        {
+        if !valid_lu_scope {
+            return Err(DirectReplyError::WrongDestination);
+        }
+        if path_switch {
+            let nce = unique_vector(request, 0x26).ok_or(DirectReplyError::InvalidPathSwitch)?;
+            if request.destination_lu_name.is_some()
+                || nce.len() != 2 + self.lu_nce_label.len()
+                || nce[0] as usize != nce.len()
+                || nce[1] != 0x26
+                || nce[2..] != *self.lu_nce_label
+            {
+                return Err(DirectReplyError::InvalidPathSwitch);
+            }
+        } else if request.destination_lu_name.as_deref() != Some(&self.local_lu.to_string()) {
             return Err(DirectReplyError::WrongDestination);
         }
         let route = unique_vector(request, 0x2b).ok_or(DirectReplyError::InvalidRoute)?;

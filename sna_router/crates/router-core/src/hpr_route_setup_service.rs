@@ -170,6 +170,10 @@ impl DirectRouteSetupService {
         &self.local_lu
     }
 
+    pub fn lu_nce_label(&self) -> &[u8] {
+        &self.lu_nce_label
+    }
+
     pub fn cached_replies(&self) -> usize {
         self.replies.len()
     }
@@ -229,6 +233,88 @@ impl DirectRouteSetupService {
             request: message.to_vec(),
             reply: reply.clone(),
             cos_tpf,
+            sent: false,
+        });
+        Ok(PreparedRouteSetupReply {
+            gds: reply,
+            duplicate: false,
+            pcid: request.pcid,
+        })
+    }
+
+    /// Re-establish a route to an already active LU NCE. A path-switch
+    /// request omits the LU name, so the caller must supply the *live* RTP
+    /// authorization for this exact target, not just a directory entry.
+    pub fn prepare_path_switch_reply(
+        &mut self,
+        generation: ConnectionGeneration,
+        message: &[u8],
+        active: &AuthorizedUserRoute,
+    ) -> Result<PreparedRouteSetupReply, ServiceError> {
+        if generation != self.bootstrap.generation || active.generation != generation {
+            return Err(ServiceError::StaleGeneration);
+        }
+        if message.len() > MAX_REQUEST_BYTES {
+            return Err(ServiceError::InvalidRequest(RouteSetupError::TooLarge));
+        }
+        let request = RouteSetupGds::parse(message).map_err(ServiceError::InvalidRequest)?;
+        if request.kind != RouteSetupKind::Request
+            || !request.path_switch
+            || request.destination_lu_name.is_some()
+        {
+            return Err(ServiceError::NotRequest);
+        }
+        let cos = request
+            .vectors
+            .iter()
+            .filter(|cv| cv.key == 0x2c)
+            .map(|cv| cv.wire)
+            .collect::<Vec<_>>();
+        if cos.len() != 1
+            || active.target_lu != self.local_lu
+            || active.verified_external_cp != self.verified_external_cp
+            || active.local_nce_label != self.lu_nce_label
+            || active.local_nce_instance != self.lu_nce_instance
+            || active.cos_tpf != cos[0]
+            || active.tg_number != self.tg_number
+            || active.return_link_label != self.bootstrap.local.link_label
+            || active.maximum_packet_size != self.bootstrap.max_packet_size
+            || !self
+                .replies
+                .iter()
+                .any(|cached| cached.sent && cached.cos_tpf == cos[0])
+        {
+            return Err(ServiceError::InvalidIdentity);
+        }
+        if let Some(cached) = self.replies.iter().find(|reply| reply.pcid == request.pcid) {
+            if cached.request != message {
+                return Err(ServiceError::ConflictingPcid);
+            }
+            return Ok(PreparedRouteSetupReply {
+                gds: cached.reply.clone(),
+                duplicate: true,
+                pcid: request.pcid,
+            });
+        }
+        let target = DirectReplyTarget {
+            bootstrap: &self.bootstrap,
+            local_lu: &self.local_lu,
+            lu_nce_label: &self.lu_nce_label,
+            lu_nce_instance: self.lu_nce_instance,
+            tg_number: self.tg_number,
+            reverse_metrics: self.reverse_metrics,
+        };
+        let reply = target
+            .encode_positive_path_switch(&request, self.verified_external_cp.as_ref())
+            .map_err(ServiceError::Reply)?;
+        if self.replies.len() == self.limit {
+            self.replies.pop_front();
+        }
+        self.replies.push_back(CachedReply {
+            pcid: request.pcid,
+            request: message.to_vec(),
+            reply: reply.clone(),
+            cos_tpf: cos[0].to_vec(),
             sent: false,
         });
         Ok(PreparedRouteSetupReply {
@@ -329,6 +415,8 @@ mod tests {
     };
 
     const REQUEST: &str = "007012ce0001000000000000000000000e0ef3e2d6d3d5c5e34be2d5c1c2162b010112461080010be2d6d3d5c5e34be2d5c1c2211660cec37477b5dc29970be2d6d3d5c5e34be2d5c1c10c2c01087bc3d6d5d5c5c3e31a800000000005b500000114000010cc00000000066704008002";
+    const LIVE_EXTERNAL_REQUEST: &str = "006f12ce0001000000000000000000000e0ef3e2d6d3d5c5e34be2d5c1c1152b010111460f80010ae2d5e4e2d5e44be2e5c3211660cec370e7b283a34d0be2d6d3d5c5e34be2d5c1c20c2c01087bc3d6d5d5c5c3e31a800000000005b500000114000010cc00000000066704008002";
+    const LIVE_PATH_SWITCH: &str = "006512ce400100000000000000000000152b010111460f80010ae2d5e4e2d5e44be2e5c3211660cec370e7b283a34f0be2d6d3d5c5e34be2d5c1c20c2c01087bc3d6d5d5c5c3e30426a4241a800000000005b500000114000010cc00000000066704008002";
 
     fn unhex(hex: &str) -> Vec<u8> {
         hex.as_bytes()
@@ -389,6 +477,98 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    fn live_external_service() -> DirectRouteSetupService {
+        let mut local = advertisement("SNUSNU.SVC", 3);
+        local.link_label = vec![0x80, 0x80];
+        let bootstrap = HprControlBootstrap::new(
+            ConnectionGeneration::new(1).unwrap(),
+            local,
+            advertisement("SOLNET.SNAB", 2),
+        )
+        .unwrap();
+        DirectRouteSetupService::new_verified_external(
+            bootstrap,
+            "SOLNET.SNAA".parse().unwrap(),
+            "SOLNET.SNAA".parse().unwrap(),
+            vec![0xa4, 0x24],
+            [0xff, 0xfa, 0x77, 0x24],
+            1,
+            ReverseLinkMetrics {
+                transmission_time_us: 1000,
+                capacity_kbps: 100_000,
+                liveness_seconds: 10,
+            },
+            16,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn live_lu_less_path_switch_requires_active_exact_route_and_replies_positive() {
+        let mut service = live_external_service();
+        let generation = service.generation();
+        let initial = service
+            .prepare_reply(generation, &unhex(LIVE_EXTERNAL_REQUEST))
+            .unwrap();
+        let active = service
+            .confirm_reply_sent(generation, initial.pcid, &initial.gds)
+            .unwrap();
+        let switch = unhex(LIVE_PATH_SWITCH);
+        let prepared = service
+            .prepare_path_switch_reply(generation, &switch, &active)
+            .unwrap();
+        assert!(!prepared.duplicate);
+        let parsed = RouteSetupGds::parse(&prepared.gds).unwrap();
+        assert_eq!(parsed.kind, RouteSetupKind::PositiveReply);
+        assert_eq!(parsed.pcid, RouteSetupGds::parse(&switch).unwrap().pcid);
+        assert_eq!(
+            prepared
+                .gds
+                .windows(4)
+                .filter(|part| *part == [4, 0x26, 0xa4, 0x24])
+                .count(),
+            1
+        );
+        assert!(
+            service
+                .prepare_path_switch_reply(generation, &switch, &active)
+                .unwrap()
+                .duplicate
+        );
+        let renewed = service
+            .confirm_reply_sent(generation, prepared.pcid, &prepared.gds)
+            .unwrap();
+        assert_eq!(renewed, active);
+
+        let mut wrong_active = active.clone();
+        wrong_active.verified_external_cp = None;
+        assert_eq!(
+            service.prepare_path_switch_reply(generation, &switch, &wrong_active),
+            Err(ServiceError::InvalidIdentity)
+        );
+        let mut wrong_nce = switch.clone();
+        let nce = wrong_nce
+            .windows(4)
+            .position(|part| part == [4, 0x26, 0xa4, 0x24])
+            .unwrap();
+        wrong_nce[nce + 3] ^= 1;
+        let pcid = wrong_nce
+            .windows(8)
+            .position(|part| part == [0xce, 0xc3, 0x70, 0xe7, 0xb2, 0x83, 0xa3, 0x4f])
+            .unwrap();
+        wrong_nce[pcid + 7] = 0x50;
+        assert_eq!(
+            service.prepare_path_switch_reply(generation, &wrong_nce, &active),
+            Err(ServiceError::Reply(DirectReplyError::InvalidPathSwitch))
+        );
+        let mut wrong_pcid_replay = switch.clone();
+        wrong_pcid_replay[nce + 3] ^= 1;
+        assert_eq!(
+            service.prepare_path_switch_reply(generation, &wrong_pcid_replay, &active),
+            Err(ServiceError::ConflictingPcid)
+        );
     }
 
     fn cross_netid_request(lu: &str) -> Vec<u8> {
