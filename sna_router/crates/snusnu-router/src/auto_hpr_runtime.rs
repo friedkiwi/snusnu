@@ -72,6 +72,23 @@ fn as_wire_name(value: &router_core::session::QualifiedName) -> wire::SnaName {
     }
 }
 
+fn eligible_local_exports(
+    routes: &[(router_core::session::QualifiedName, Destination)],
+    allowed_netid: &str,
+) -> Vec<(
+    router_core::session::QualifiedName,
+    router_core::session::QualifiedName,
+)> {
+    routes
+        .iter()
+        .filter_map(|(lu, destination)| {
+            let cp = destination.hosting_cp();
+            (lu.netid == allowed_netid && cp.netid == allowed_netid)
+                .then(|| (lu.clone(), cp.clone()))
+        })
+        .collect()
+}
+
 fn reciprocal_nonce() -> u64 {
     let seed = *CP_NONCE_SEED.get_or_init(|| {
         let time = SystemTime::now()
@@ -130,6 +147,7 @@ struct DirectHprRuntime<'a> {
     route_setup: HashMap<router_core::session::QualifiedName, DirectRouteSetupService>,
     route_targets: HashMap<router_core::session::QualifiedName, Destination>,
     local_directory: HprDestinationDirectory,
+    local_exports: Vec<(router_core::session::QualifiedName, Destination)>,
     llc: Option<HprLlcAttachments>,
     mptn: Option<HprMptnAttachments<'a>>,
     route_reply: Option<(router_core::session::QualifiedName, PreparedRouteSetupReply)>,
@@ -163,6 +181,7 @@ impl<'a> DirectHprRuntime<'a> {
             route_setup: HashMap::new(),
             route_targets: HashMap::new(),
             local_directory: HprDestinationDirectory::new(),
+            local_exports: Vec::new(),
             llc: None,
             mptn: None,
             route_reply: None,
@@ -232,6 +251,32 @@ impl<'a> DirectHprRuntime<'a> {
         Ok(())
     }
 
+    fn refresh_local_exports(&mut self, hub: &mut AutoWsHub) -> io::Result<()> {
+        let routes = self
+            .local_directory
+            .routes()
+            .into_iter()
+            .filter(|(_, destination)| {
+                matches!(
+                    destination,
+                    Destination::Llc { .. } | Destination::Mptn { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        if routes != self.local_exports {
+            for (lu, destination) in &routes {
+                if lu.netid != hub.allowed_netid() {
+                    tracing::warn!(target_lu = %lu, hosting_cp = %destination.hosting_cp(),
+                        attachment = destination.attachment_id(), allowed_netid = hub.allowed_netid(),
+                        "local route retained but withheld from concentrator NETID");
+                }
+            }
+            self.local_exports = routes;
+            self.publish_reachability(hub, None)?;
+        }
+        Ok(())
+    }
+
     fn resolve_target(
         &self,
         hub: &AutoWsHub,
@@ -286,6 +331,7 @@ impl<'a> DirectHprRuntime<'a> {
     fn pump(&mut self, link: &EeLdlcEndpoint, hub: &mut AutoWsHub, now_us: u64) -> io::Result<()> {
         self.pump_local_llc()?;
         self.pump_local_mptn()?;
+        self.refresh_local_exports(hub)?;
         self.try_open_reciprocal_cp(link, now_us)?;
         self.try_route_reply(link, now_us)?;
         self.try_cp_replies(link, now_us)?;
@@ -747,6 +793,10 @@ impl<'a> DirectHprRuntime<'a> {
             .flat_map(EePeerLus::advertised)
             .map(|lu| (lu, peer_cp.clone()))
             .collect::<HashSet<_>>();
+        for (lu, cp) in eligible_local_exports(&self.local_exports, hub.allowed_netid()) {
+            cps.insert(cp.clone());
+            lus.insert((lu, cp));
+        }
         if self.peer_lus.is_none() {
             for identity in self
                 .sessions
@@ -1816,6 +1866,31 @@ mod tests {
         let reverse = target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], 127).unwrap();
         assert!(!allocations.contains(&reverse));
         assert!(target_nce(&[0xa4, 0xfe], [0, 0, 0, 2], 128).is_err());
+    }
+
+    #[test]
+    fn local_exports_follow_concentrator_netid_without_losing_local_routes() {
+        let routes = vec![
+            (
+                q("SOLNET.SNAA"),
+                Destination::Llc {
+                    hosting_cp: q("SOLNET.SNAA"),
+                    attachment_id: "llc_a".into(),
+                },
+            ),
+            (
+                q("OTHERNET.APP"),
+                Destination::Mptn {
+                    hosting_cp: q("OTHERNET.CP"),
+                    attachment_id: "mptn_b".into(),
+                },
+            ),
+        ];
+        assert_eq!(
+            eligible_local_exports(&routes, "SOLNET"),
+            vec![(q("SOLNET.SNAA"), q("SOLNET.SNAA"))]
+        );
+        assert_eq!(routes.len(), 2);
     }
 
     #[test]

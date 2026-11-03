@@ -239,6 +239,10 @@ The local proxy MAC for each LLC attachment is generated from its ID and must
 be configured as the EE peer's remote adapter address on the LLC guest when
 that guest also dials out. The local web UI shows the generated MAC. LLC-originated
 sessions toward the EE attachment are not yet admitted by this automatic path.
+Verified local LLC and MPTN LUs are published to the concentrator only when
+their NETID matches its assigned NETID; they remain usable for local routes
+when another NETID is assigned. Losing the live peer proof withdraws the
+upstream route.
 
 An EE-originated session can also target a local MPTN gateway. TCP62
 management confirms the peer LU and NETID, but does not identify a separate

@@ -193,6 +193,26 @@ impl HprDestinationDirectory {
         let first = matches.next()?;
         matches.next().is_none().then(|| first.clone())
     }
+
+    /// Only unambiguous, verified routes are eligible for publication. A
+    /// duplicate LU is omitted until one owner withdraws it.
+    pub(crate) fn routes(&self) -> Vec<(QualifiedName, Destination)> {
+        let mut by_lu = HashMap::<QualifiedName, Option<Destination>>::new();
+        for routes in self.owners.values() {
+            for (lu, destination) in routes {
+                by_lu
+                    .entry(lu.clone())
+                    .and_modify(|existing| *existing = None)
+                    .or_insert_with(|| Some(destination.clone()));
+            }
+        }
+        let mut routes = by_lu
+            .into_iter()
+            .filter_map(|(lu, destination)| destination.map(|destination| (lu, destination)))
+            .collect::<Vec<_>>();
+        routes.sort_by(|(a, _), (b, _)| (&a.netid, &a.name).cmp(&(&b.netid, &b.name)));
+        routes
+    }
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -242,8 +262,10 @@ mod tests {
             .replace_owner("llc-b", [(lu.clone(), llc("llc-b"))])
             .unwrap();
         assert!(directory.resolve_lu(&lu).is_none());
+        assert!(directory.routes().is_empty());
         directory.withdraw_owner("llc-b");
         assert_eq!(directory.resolve_lu(&lu), Some(llc("llc-a")));
+        assert_eq!(directory.routes(), vec![(lu, llc("llc-a"))]);
     }
 
     #[test]
