@@ -27,6 +27,7 @@ pub struct ReverseManagementConnect {
     /// Owning it does not authorize a positive response.
     request: Connect,
     fqpcid: Vec<u8>,
+    peer_cp: String,
 }
 
 impl ReverseManagementConnect {
@@ -37,6 +38,34 @@ impl ReverseManagementConnect {
     pub fn fqpcid(&self) -> &[u8] {
         &self.fqpcid
     }
+
+    pub fn peer_cp(&self) -> &str {
+        &self.peer_cp
+    }
+}
+
+/// X'60' carries an eight-byte PCID followed by an EBCDIC NETID.CPNAME.
+pub fn fqpcid_peer_cp(fqpcid: &[u8]) -> io::Result<String> {
+    if fqpcid.len() < 13
+        || fqpcid[0] != 0x60
+        || fqpcid[1] as usize != fqpcid.len() - 2
+        || fqpcid[10] as usize != fqpcid.len() - 11
+    {
+        return Err(invalid("invalid FQPCID CP field"));
+    }
+    let mut name = String::with_capacity(fqpcid.len() - 11);
+    for &byte in &fqpcid[11..] {
+        name.push(match byte {
+            0xc1..=0xc9 => (b'A' + (byte - 0xc1)) as char,
+            0xd1..=0xd9 => (b'J' + (byte - 0xd1)) as char,
+            0xe2..=0xe9 => (b'S' + (byte - 0xe2)) as char,
+            0xf0..=0xf9 => (b'0' + (byte - 0xf0)) as char,
+            0x4b => '.',
+            _ => return Err(invalid("invalid EBCDIC CP name")),
+        });
+    }
+    ebcdic_lu(&name)?;
+    Ok(name)
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -90,6 +119,24 @@ pub fn classify_reverse_management_connect_with_cp(
     expected_peer_lu: &str,
     expected_local_lu: &str,
     expected_peer_cp: &str,
+    forbidden_fqpcid: Option<&[u8]>,
+) -> io::Result<ReverseManagementConnect> {
+    classify_reverse_management_connect_discover_cp(
+        request,
+        expected_peer_lu,
+        expected_local_lu,
+        Some(expected_peer_cp),
+        forbidden_fqpcid,
+    )
+}
+
+/// Validate the complete management BIND and discover its initiating CP.
+/// An optional configured CP is an exact-match guard.
+pub fn classify_reverse_management_connect_discover_cp(
+    request: Connect,
+    expected_peer_lu: &str,
+    expected_local_lu: &str,
+    expected_peer_cp: Option<&str>,
     forbidden_fqpcid: Option<&[u8]>,
 ) -> io::Result<ReverseManagementConnect> {
     request.encode()?; // also validates public fields on constructed values
@@ -173,7 +220,10 @@ pub fn classify_reverse_management_connect_with_cp(
     cursor += 2 + destination.len();
     let fqpcid =
         fqpcid_at(data, cursor).map_err(|_| invalid("reverse management FQPCID invalid"))?;
-    if fqpcid[11..] != *ebcdic_lu(expected_peer_cp)?
+    let peer_cp = fqpcid_peer_cp(fqpcid)?;
+    if peer_cp.split_once('.').map(|(netid, _)| netid)
+        != expected_peer_lu.split_once('.').map(|(netid, _)| netid)
+        || expected_peer_cp.is_some_and(|expected| expected != peer_cp)
         || data.get(cursor + fqpcid.len()..)
             != Some(
                 &[
@@ -187,7 +237,11 @@ pub fn classify_reverse_management_connect_with_cp(
         return Err(invalid("reverse management FQPCID reuses native session"));
     }
     let fqpcid = fqpcid.to_vec();
-    Ok(ReverseManagementConnect { request, fqpcid })
+    Ok(ReverseManagementConnect {
+        request,
+        fqpcid,
+        peer_cp,
+    })
 }
 
 /// Build a structural positive-response *candidate* for the admitted V5R4

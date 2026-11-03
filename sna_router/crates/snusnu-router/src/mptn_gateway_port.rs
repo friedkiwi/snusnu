@@ -32,7 +32,6 @@ use transport_ip_sna::{
         Action as FallbackAction, Completion as FallbackCompletion, Fallback, Purpose,
     },
     mptn_oob_sequence::{Delivery, SequenceWindow},
-    mptn_reverse_management::classify_reverse_management_connect_with_cp,
 };
 
 const MAX_INCOMING: usize = MAX_RECORD * 2;
@@ -105,7 +104,7 @@ struct Association {
     tcp: TcpSession,
     state: SessionState,
     /// Network-qualified identities admitted from this association's Connect.
-    selected_lus: Option<(String, String)>,
+    selected_lus: Option<(String, String, String)>,
     session: Option<SessionContract>,
     incoming: VecDeque<TcpRecord>,
     incoming_bytes: usize,
@@ -143,7 +142,7 @@ pub(crate) struct MptnGatewayPort {
     allowed_routes: Vec<(String, String)>,
     completed_by_association: BTreeMap<u64, usize>,
     management_ready: bool,
-    completed_management_lus: Option<(String, String)>,
+    completed_management_lus: Option<(String, String, String)>,
     completed_user_records: usize,
 }
 
@@ -212,7 +211,7 @@ impl MptnGatewayPort {
                 "offered"
             }
             Some(GatewayEvent::ManagementReady) => {
-                if let Some((source_lu, _)) = &self.completed_management_lus {
+                if let Some((source_lu, _, _)) = &self.completed_management_lus {
                     if !lus.contains(source_lu) {
                         lus.push(source_lu.clone());
                         lus.sort();
@@ -318,7 +317,7 @@ impl MptnGatewayPort {
     /// The last completed management exchange yields its validated LU pair
     /// once. Call after `GatewayEvent::ManagementReady` to publish local
     /// reachability before the peer opens a user session.
-    pub(crate) fn take_management_lus(&mut self) -> Option<(String, String)> {
+    pub(crate) fn take_management_lus(&mut self) -> Option<(String, String, String)> {
         self.completed_management_lus.take()
     }
 
@@ -989,11 +988,11 @@ impl MptnGatewayPort {
                 let offer = ingress.receive(&record.bytes)?.clone();
                 match offer.kind() {
                     IngressKind::Management => {
-                        let admitted = classify_reverse_management_connect_with_cp(
+                        let admitted = transport_ip_sna::mptn_reverse_management::classify_reverse_management_connect_discover_cp(
                             offer.connect().clone(),
                             source_lu,
                             destination_lu,
-                            self.expected_peer_cp.as_deref().unwrap_or(source_lu),
+                            self.expected_peer_cp.as_deref(),
                             None,
                         )?;
                         let token = fresh_token()?;
@@ -1006,8 +1005,11 @@ impl MptnGatewayPort {
                             self.config.cnos_limit,
                         )?;
                         let bytes = responder.connect_response().to_vec();
-                        association.selected_lus =
-                            Some((source_lu.to_string(), destination_lu.to_string()));
+                        association.selected_lus = Some((
+                            source_lu.to_string(),
+                            destination_lu.to_string(),
+                            admitted.peer_cp().to_owned(),
+                        ));
                         association.state = SessionState::Management(responder);
                         Self::queue(
                             association,
@@ -1688,7 +1690,23 @@ mod tests {
             allow_resumed_user: true,
         })
         .unwrap();
-        let mut initiator = request();
+        let peer_cp = [
+            0xd8, 0xc1, 0xc2, 0xd6, 0xc2, 0x4b, 0xc2, 0xd6, 0xc2, 0xc3, 0xd7,
+        ]; // QABOB.BOBCP
+        let mut fqpcid = vec![0x60, (9 + peer_cp.len()) as u8];
+        fqpcid.extend_from_slice(&[0x22; 8]);
+        fqpcid.push(peer_cp.len() as u8);
+        fqpcid.extend_from_slice(&peer_cp);
+        let mut initiator = ManagementInitiator::new(
+            "QABOB.SNAB",
+            "QAALICE.SNAA",
+            fqpcid,
+            [0x11; 8],
+            [0x23, 0x11, 0x11, 0x11, 0x11, 0x80, 0],
+            "",
+            8,
+        )
+        .unwrap();
         let mut peer = peer_socket(port.listener.local_addr().unwrap());
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         peer.write_all(initiator.connect_request()).unwrap();
@@ -1711,7 +1729,11 @@ mod tests {
         ));
         assert_eq!(
             port.take_management_lus(),
-            Some(("QABOB.SNAB".into(), "QAALICE.SNAA".into()))
+            Some((
+                "QABOB.SNAB".into(),
+                "QAALICE.SNAA".into(),
+                "QABOB.BOBCP".into()
+            ))
         );
         assert_eq!(port.take_management_lus(), None);
     }

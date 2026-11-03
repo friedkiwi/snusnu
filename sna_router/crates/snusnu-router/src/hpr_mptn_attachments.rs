@@ -1,13 +1,10 @@
 //! Live TCP62 attachments for EE's local session switch.
 //!
-//! TCP62 management proves the peer LU and NETID, but its FQPCID repeats that
-//! LU and does not disclose a separate CP. A configured `peer_cp` is therefore
-//! an operator trust anchor. Routes remain unpublished until management has
-//! disclosed the exact configured target LU on the same gateway, and an unset
-//! `peer_cp` never becomes an inferred CP.
+//! Completed TCP62 SNASVCMG management discloses the peer LU and its asserted
+//! CP in X'60' FQPCID. Optional configured names guard the learned identity.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     io,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
@@ -44,7 +41,7 @@ pub(crate) struct HprMptnPeerState {
     probe_worker: Option<JoinHandle<()>>,
     retry_at: Instant,
     poll_retry_at: Instant,
-    observed_peer_lus: HashSet<QualifiedName>,
+    observed_peer_lus: HashMap<QualifiedName, QualifiedName>,
     active_user: bool,
 }
 
@@ -126,9 +123,7 @@ impl<'a> HprMptnAttachments<'a> {
         }
     }
 
-    /// Only live management LU evidence plus an explicit operator CP
-    /// assertion may create an EE RouteSetup destination. The CP is not
-    /// claimed to have come from TCP62's wire format.
+    /// Only fresh, completed management LU/CP evidence creates a destination.
     pub(crate) fn trusted_routes(&self) -> Vec<(QualifiedName, Destination)> {
         self.attachments
             .iter()
@@ -209,12 +204,16 @@ fn trusted_source_identity(
     source_lu: QualifiedName,
     target_lu: QualifiedName,
     trusted_peer_cp: Option<&QualifiedName>,
-    observed_peer_lus: &HashSet<QualifiedName>,
+    observed_peer_lus: &HashMap<QualifiedName, QualifiedName>,
+    offered_cp: &QualifiedName,
     directory: &crate::hpr_destination_directory::HprDestinationDirectory,
 ) -> io::Result<(SessionIdentity, String)> {
     let source_cp =
-        trusted_peer_cp.ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
-    if source_lu.netid != source_cp.netid || !observed_peer_lus.contains(&source_lu) {
+        trusted_peer_cp.ok_or_else(|| invalid("MPTN peer CP has no completed management proof"))?;
+    if source_lu.netid != source_cp.netid
+        || observed_peer_lus.get(&source_lu) != Some(source_cp)
+        || offered_cp != source_cp
+    {
         return Err(invalid(
             "MPTN source LU lacks live management and trusted CP binding",
         ));
@@ -254,7 +253,7 @@ impl HprMptnPeerState {
             probe_worker: None,
             retry_at: Instant::now(),
             poll_retry_at: Instant::now(),
-            observed_peer_lus: HashSet::new(),
+            observed_peer_lus: HashMap::new(),
             active_user: false,
         })
     }
@@ -283,6 +282,9 @@ impl HprMptnPeerState {
         };
         self.observe_management(gateway.take_management_lus())?;
         self.poll_probes(gateway)?;
+        if let Some(snapshot) = gateway.take_discovery_snapshot() {
+            self.observe_discovery(snapshot);
+        }
         Ok(bind.map(|(association, offer)| MptnIngressOffer {
             gateway_id: self.gateway_id.clone(),
             association,
@@ -292,29 +294,44 @@ impl HprMptnPeerState {
 
     pub(crate) fn observe_management(
         &mut self,
-        observations: impl IntoIterator<Item = (String, String)>,
+        observations: impl IntoIterator<Item = (String, String, String)>,
     ) -> io::Result<()> {
-        for (peer_lu, local_lu) in observations {
+        for (peer_lu, local_lu, peer_cp) in observations {
             let peer_lu = parse_name(&peer_lu)?;
             let local_lu = parse_name(&local_lu)?;
+            let peer_cp = parse_name(&peer_cp)?;
             if let Some(trusted_cp) = &self.trusted_peer_cp {
-                if peer_lu.netid != trusted_cp.netid {
-                    tracing::warn!(gateway = %self.gateway_id, peer_lu = %peer_lu,
+                if &peer_cp != trusted_cp {
+                    tracing::warn!(gateway = %self.gateway_id, peer_lu = %peer_lu, peer_cp = %peer_cp,
                         configured_peer_cp = %trusted_cp,
-                        "MPTN management peer NETID disagrees with operator CP assertion");
+                        "MPTN management peer CP disagrees with configured guard");
                     continue;
                 }
             }
             tracing::info!(gateway = %self.gateway_id, peer_lu = %peer_lu,
-                local_lu = %local_lu, "MPTN management disclosed adjacent LU");
-            self.observed_peer_lus.insert(peer_lu);
+                local_lu = %local_lu, peer_cp = %peer_cp, "MPTN management disclosed adjacent LU and CP");
         }
         Ok(())
     }
 
-    pub(crate) fn poll_probes(&mut self, gateway: &AutoMptnGateway<'_>) -> io::Result<()> {
+    pub(crate) fn observe_discovery(
+        &mut self,
+        snapshot: crate::mptn_discovery::MptnDiscoverySnapshot,
+    ) {
+        self.observed_peer_lus = snapshot
+            .routes
+            .into_iter()
+            .filter(|(_, cp)| {
+                self.trusted_peer_cp
+                    .as_ref()
+                    .is_none_or(|expected| expected == cp)
+            })
+            .collect();
+    }
+
+    pub(crate) fn poll_probes(&mut self, gateway: &mut AutoMptnGateway<'_>) -> io::Result<()> {
         self.check_gateway(gateway)?;
-        self.poll_probe();
+        self.poll_probe(gateway);
         self.start_probe_if_needed(gateway)
     }
 
@@ -326,15 +343,31 @@ impl HprMptnPeerState {
         if gateway.id() != self.gateway_id || self.active_user || !gateway.udp_available() {
             return Vec::new();
         }
-        candidates
+        self.observed_peer_lus
             .iter()
-            .filter(|candidate| candidate.attachment_id == self.gateway_id)
-            .filter_map(|candidate| {
-                route_for_candidate(
-                    candidate,
-                    self.trusted_peer_cp.as_ref(),
-                    &self.observed_peer_lus,
-                )
+            .filter_map(|(lu, cp)| {
+                if self
+                    .management_target_lu
+                    .as_ref()
+                    .is_some_and(|expected| expected != lu)
+                    || self
+                        .trusted_peer_cp
+                        .as_ref()
+                        .is_some_and(|expected| expected != cp)
+                    || candidates
+                        .iter()
+                        .filter(|candidate| candidate.attachment_id == self.gateway_id)
+                        .any(|candidate| candidate.lu == *lu && candidate.verify_cp(cp).is_none())
+                {
+                    return None;
+                }
+                Some((
+                    lu.clone(),
+                    Destination::Mptn {
+                        hosting_cp: cp.clone(),
+                        attachment_id: self.gateway_id.clone(),
+                    },
+                ))
             })
             .collect()
     }
@@ -352,15 +385,18 @@ impl HprMptnPeerState {
             return Ok(None);
         }
         let cp = self
-            .trusted_peer_cp
+            .observed_peer_lus
+            .get(&identity.target_lu)
+            .ok_or_else(|| invalid("MPTN target LU has no completed management proof"))?;
+        if self
+            .management_target_lu
             .as_ref()
-            .ok_or_else(|| invalid("MPTN peer CP has no operator trust anchor"))?;
-        if !self.observed_peer_lus.contains(&identity.target_lu)
+            .is_some_and(|expected| expected != &identity.target_lu)
             || identity.target_cp.as_ref() != Some(cp)
-            || !candidates.iter().any(|candidate| {
+            || candidates.iter().any(|candidate| {
                 candidate.attachment_id == self.gateway_id
                     && candidate.lu == identity.target_lu
-                    && candidate.verify_cp(cp).is_some()
+                    && candidate.verify_cp(cp).is_none()
             })
         {
             return Err(invalid(
@@ -439,10 +475,11 @@ impl HprMptnPeerState {
                 ));
             }
             trusted_source_identity(
-                source_lu,
+                source_lu.clone(),
                 target_lu,
-                self.trusted_peer_cp.as_ref(),
+                self.observed_peer_lus.get(&source_lu),
                 &self.observed_peer_lus,
+                &parse_name(offered.offer.peer_cp())?,
                 directory,
             )
         })();
@@ -494,7 +531,7 @@ impl HprMptnPeerState {
         }
     }
 
-    fn poll_probe(&mut self) {
+    fn poll_probe(&mut self, gateway: &mut AutoMptnGateway<'_>) {
         let Some(receiver) = self.probe_result.as_ref() else {
             return;
         };
@@ -528,7 +565,12 @@ impl HprMptnPeerState {
                 }
                 tracing::info!(gateway = %self.gateway_id, target_lu = %target,
                     "outbound MPTN management proved adjacent LU");
-                self.observed_peer_lus.insert(target.clone());
+                if let Some(cp) = self.trusted_peer_cp.clone() {
+                    if let Err(error) = gateway.observe_configured_probe(target.clone(), cp) {
+                        tracing::warn!(gateway = %self.gateway_id, error = %error,
+                            "outbound management proof could not enter MPTN discovery");
+                    }
+                }
             }
             Err(error) => {
                 tracing::debug!(gateway = %self.gateway_id, error = %error,
@@ -539,6 +581,9 @@ impl HprMptnPeerState {
     }
 
     fn start_probe_if_needed(&mut self, gateway: &AutoMptnGateway<'_>) -> io::Result<()> {
+        if self.trusted_peer_cp.is_none() {
+            return Ok(());
+        }
         let (Some(source), Some(target)) = (
             self.management_source_lu.as_ref(),
             self.management_target_lu.as_ref(),
@@ -546,7 +591,7 @@ impl HprMptnPeerState {
             return Ok(());
         };
         if self.probe_result.is_some()
-            || self.observed_peer_lus.contains(target)
+            || self.observed_peer_lus.contains_key(target)
             || Instant::now() < self.retry_at
         {
             return Ok(());
@@ -572,13 +617,14 @@ impl HprMptnPeerState {
     }
 }
 
+#[cfg(test)]
 fn route_for_candidate(
     candidate: &ConfiguredCandidate,
     trusted_cp: Option<&QualifiedName>,
-    observed_lus: &HashSet<QualifiedName>,
+    observed_lus: &HashMap<QualifiedName, QualifiedName>,
 ) -> Option<(QualifiedName, Destination)> {
     let cp = trusted_cp?;
-    if candidate.carrier != CandidateCarrier::Mptn || !observed_lus.contains(&candidate.lu) {
+    if candidate.carrier != CandidateCarrier::Mptn || observed_lus.get(&candidate.lu) != Some(cp) {
         return None;
     }
     candidate.verify_cp(cp)
@@ -609,9 +655,9 @@ mod tests {
         };
         let cp: QualifiedName = "SOLNET.CP400".parse().unwrap();
         let wrong_cp: QualifiedName = "OTHER.CP400".parse().unwrap();
-        let mut observed = HashSet::new();
+        let mut observed = HashMap::new();
         assert!(route_for_candidate(&candidate, Some(&cp), &observed).is_none());
-        observed.insert(lu.clone());
+        observed.insert(lu.clone(), cp.clone());
         assert!(route_for_candidate(&candidate, None, &observed).is_none());
         assert!(route_for_candidate(&candidate, Some(&wrong_cp), &observed).is_none());
         let mut conflicting_hint = candidate.clone();
@@ -648,12 +694,13 @@ mod tests {
                 )],
             )
             .unwrap();
-        let observed = HashSet::from([source.clone()]);
+        let observed = HashMap::from([(source.clone(), source_cp.clone())]);
         let (identity, attachment) = trusted_source_identity(
             source.clone(),
             target.clone(),
             Some(&source_cp),
             &observed,
+            &source_cp,
             &directory,
         )
         .unwrap();
@@ -665,6 +712,7 @@ mod tests {
             target.clone(),
             None,
             &observed,
+            &source_cp,
             &directory
         )
         .is_err());
@@ -672,7 +720,8 @@ mod tests {
             source.clone(),
             target.clone(),
             Some(&source_cp),
-            &HashSet::new(),
+            &HashMap::new(),
+            &source_cp,
             &directory
         )
         .is_err());
@@ -682,13 +731,19 @@ mod tests {
             target.clone(),
             Some(&wrong_cp),
             &observed,
+            &wrong_cp,
             &directory
         )
         .is_err());
         directory.withdraw_owner("ee").unwrap();
-        assert!(
-            trusted_source_identity(source, target, Some(&source_cp), &observed, &directory)
-                .is_err()
-        );
+        assert!(trusted_source_identity(
+            source,
+            target,
+            Some(&source_cp),
+            &observed,
+            &source_cp,
+            &directory
+        )
+        .is_err());
     }
 }

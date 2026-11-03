@@ -109,11 +109,10 @@ impl ManagementInitiator {
         let local = name(local_lu)?;
         let remote = name(remote_lu)?;
         let fqpcid = fqpcid.into();
+        let peer_cp = crate::mptn_reverse_management::fqpcid_peer_cp(&fqpcid)?;
         if local == remote
-            || fqpcid.len() != 11 + local.len()
-            || fqpcid[..2] != [0x60, (9 + local.len()) as u8]
-            || fqpcid[10] as usize != local.len()
-            || fqpcid[11..] != local
+            || peer_cp.split_once('.').map(|(netid, _)| netid)
+                != local_lu.split_once('.').map(|(netid, _)| netid)
             || fqpcid[2..10].iter().all(|&byte| byte == 0)
             || correlator.iter().all(|&byte| byte == 0)
             || bind_token[0] != 0x23
@@ -162,7 +161,7 @@ impl ManagementInitiator {
         data.extend_from_slice(&remote);
         data.extend_from_slice(&fqpcid);
         data.extend_from_slice(&TAIL);
-        if data.len() != 93 + 3 * local.len() + remote.len() {
+        if data.len() != 93 + 2 * local.len() + remote.len() + fqpcid.len() - 11 {
             return Err(invalid("V5R4 management BIND length mismatch"));
         }
         let request = Connect {
@@ -207,7 +206,11 @@ impl ManagementInitiator {
         };
         let connect_bytes = request.encode()?;
         if connect_bytes.len()
-            != 164 + 4 * request.source.node.len() + 2 * request.destination.node.len()
+            != 164
+                + 3 * request.source.node.len()
+                + 2 * request.destination.node.len()
+                + fqpcid.len()
+                - 11
         {
             return Err(invalid("V5R4 management Connect length mismatch"));
         }
