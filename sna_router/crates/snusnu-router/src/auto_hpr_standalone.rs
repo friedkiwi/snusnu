@@ -17,12 +17,13 @@ use crate::{
     auto_runtime::AutoLocalSessionRunner,
     config::{EeConfig, RouterConfig},
     ee_ldlc_endpoint::EeLdlcEndpoint,
-    hpr_destination_directory::HprDestinationDirectory,
-    hpr_shared_local::HprSharedLocal,
+    hpr_destination_directory::{Destination, HprDestinationDirectory},
+    hpr_shared_local::{HprSharedLocal, ReadyLocalHpr},
     STOP,
 };
 use router_core::{
-    hpr_control_bootstrap::HprControlBootstrap, hpr_ip_activation::Phase, ConnectionGeneration,
+    hpr_control_bootstrap::HprControlBootstrap, hpr_ip_activation::Phase, route_registry::RouteKey,
+    ConnectionGeneration,
 };
 use transport_ip_sna::ee::Datagram;
 
@@ -44,6 +45,9 @@ const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// Run EE with the same CP/RTP/session engine as the concentrator path. The
 /// live local directory selects LLC and MPTN destinations after peer proof.
 pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
+    if config.ee.len() > 1 {
+        return run_multi_standalone(config);
+    }
     let attachment = config.ee.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -63,6 +67,141 @@ pub(crate) fn run_standalone(config: &RouterConfig) -> io::Result<()> {
             thread::sleep(RESTART_BACKOFF);
         }
     }
+    Ok(())
+}
+
+struct MultiEeSlot<'a> {
+    attachment: &'a EeConfig,
+    link: StandaloneEeLink,
+    active: Option<DirectHprRuntime<'a>>,
+}
+
+/// Poll every EE socket from one coordinator while LLC and TCP62 retain one
+/// process-long owner. A local offer is consumed once and delivered only to
+/// the EE attachment whose verified LU selected it.
+fn run_multi_standalone(config: &RouterConfig) -> io::Result<()> {
+    let mut local = AutoLocalSessionRunner::new(config)?;
+    let mut shared = HprSharedLocal::new(config)?;
+    let mut slots = config
+        .ee
+        .iter()
+        .map(|attachment| {
+            Ok(MultiEeSlot {
+                attachment,
+                link: StandaloneEeLink::bind(attachment)?,
+                active: None,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let clock = Instant::now();
+    let result = (|| -> io::Result<()> {
+        while !STOP.load(Ordering::Relaxed) {
+            local.poll_local(None)?;
+            for slot in &mut slots {
+                match slot.link.poll(Instant::now())? {
+                    Some(StandaloneEvent::Activated(bootstrap)) => {
+                        retire_slot(slot, &mut local, &mut shared)?;
+                        let peer_cp = bootstrap.peer.cp.clone();
+                        let mut runtime = DirectHprRuntime::new(*bootstrap);
+                        runtime.configure_peer_lus(slot.attachment)?;
+                        runtime.use_shared_publication();
+                        shared.configure_ee(&mut local, config, &slot.attachment.id, peer_cp)?;
+                        let export = runtime.ee_owner_export();
+                        local.replace_ee_records(&export.owner, export.records)?;
+                        slot.active = Some(runtime);
+                    }
+                    Some(StandaloneEvent::Datagram(datagram)) => {
+                        if let Some(runtime) = slot.active.as_mut() {
+                            runtime.on_datagram(
+                                slot.link.link(),
+                                &datagram,
+                                clock.elapsed().as_micros() as u64,
+                            )?;
+                        }
+                    }
+                    Some(StandaloneEvent::Deactivated) => {
+                        retire_slot(slot, &mut local, &mut shared)?;
+                    }
+                    None => {}
+                }
+            }
+            let mut directory = HprDestinationDirectory::new();
+            let mut ee_routes = Vec::new();
+            for slot in &mut slots {
+                if let Some(runtime) = slot.active.as_mut() {
+                    runtime.refresh_shared_local(&mut local, &mut shared, config)?;
+                    let export = runtime.ee_owner_export();
+                    for record in &export.records {
+                        if let RouteKey::LogicalUnit { lu, hosting_cp } = &record.key {
+                            ee_routes.push((
+                                lu.clone(),
+                                Destination::Ee {
+                                    hosting_cp: hosting_cp.clone(),
+                                    attachment_id: slot.attachment.id.clone(),
+                                },
+                            ));
+                        }
+                    }
+                    local.replace_ee_records(&export.owner, export.records)?;
+                }
+            }
+            directory.replace_owner("ee", ee_routes)?;
+            let can_accept = slots.iter().any(|slot| {
+                slot.active
+                    .as_ref()
+                    .is_some_and(DirectHprRuntime::can_accept_local)
+            });
+            if let Some(ready) = shared.poll(&mut local, &directory, can_accept)? {
+                let target = match &ready {
+                    ReadyLocalHpr::Llc(source) => &source.target_ee_id,
+                    ReadyLocalHpr::Mptn(source) => &source.target_ee_id,
+                };
+                if let Some(slot) = slots.iter_mut().find(|slot| slot.attachment.id == *target) {
+                    if let Some(runtime) = slot.active.as_mut() {
+                        if let Err(error) = runtime.accept_shared_source(
+                            ready,
+                            slot.link.link(),
+                            &mut shared,
+                            &mut local,
+                        ) {
+                            tracing::warn!(attachment = %slot.attachment.id, error = %error,
+                                "shared local source could not enter EE session");
+                        }
+                    }
+                }
+            }
+            for slot in &mut slots {
+                if let Some(runtime) = slot.active.as_mut() {
+                    let now_us = clock.elapsed().as_micros() as u64;
+                    runtime.tick(slot.link.link(), now_us)?;
+                    let mut access = SharedLocalAccess {
+                        shared: &mut shared,
+                        runner: &mut local,
+                        config,
+                    };
+                    runtime.pump(slot.link.link(), None, now_us, Some(&mut access))?;
+                }
+            }
+            thread::sleep(IDLE_POLL);
+        }
+        Ok(())
+    })();
+    for slot in &mut slots {
+        let _ = retire_slot(slot, &mut local, &mut shared);
+    }
+    result
+}
+
+fn retire_slot(
+    slot: &mut MultiEeSlot<'_>,
+    local: &mut AutoLocalSessionRunner<'_>,
+    shared: &mut HprSharedLocal,
+) -> io::Result<()> {
+    if let Some(mut runtime) = slot.active.take() {
+        runtime.release_shared_llc(local)?;
+    }
+    shared.withdraw_ee(local, &slot.attachment.id)?;
+    local.withdraw_ee_records(&slot.attachment.id)?;
     Ok(())
 }
 
@@ -215,5 +354,23 @@ mod tests {
         let mut link = StandaloneEeLink::bind(&attachment).unwrap();
         assert!(link.poll(Instant::now()).unwrap().is_none());
         assert_ne!(link.link().phase(), Phase::Active);
+    }
+
+    #[test]
+    fn two_ee_links_bind_and_poll_independently() {
+        let first: EeConfig = toml::from_str(
+            "id = 'ee-a'\nlocal_ip = '127.88.1.1'\npeer_ip = '127.88.1.2'\nlocal_cp = 'SOLNET.RTRA'\n",
+        )
+        .unwrap();
+        let second: EeConfig = toml::from_str(
+            "id = 'ee-b'\nlocal_ip = '127.88.2.1'\npeer_ip = '127.88.2.2'\nlocal_cp = 'SOLNET.RTRB'\n",
+        )
+        .unwrap();
+        let mut a = StandaloneEeLink::bind(&first).unwrap();
+        let mut b = StandaloneEeLink::bind(&second).unwrap();
+        assert!(a.poll(Instant::now()).unwrap().is_none());
+        assert!(b.poll(Instant::now()).unwrap().is_none());
+        assert_ne!(a.link().phase(), Phase::Active);
+        assert_ne!(b.link().phase(), Phase::Active);
     }
 }
