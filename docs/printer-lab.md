@@ -193,10 +193,13 @@ with FID2 addresses `00/00`, RH `0B 80 00`, and address-01 status
 2C FF 00 00 00 01  8B 80 00  41 03 8D
 ```
 
-IBM i subsequently sent `2F 00 01 00 00 00 6B 80 00 0D 01 01`, an
-address-01 ACTLU on the native link. The QA probe returned the architected
-available-printer response `0D 01 01 00 84 00 00 00`. This is a real guest
-response to a constructed probe record, not a captured physical 5494.
+IBM i subsequently sent `2F 00 01 00 00 00 6B 80 00 0D 01 01`, a direct
+FID2 ACTLU. Its FID2 address byte `01` identifies the outer LU session, not
+twinax printer address 01. A 5494 workstation address appears in the inner
+FID3 LSID (`41` for the address-01 SS-LU session), which this PIU lacks. The
+QA probe returned `0D 01 01 00 84 00 00 00`, but that response cannot be
+counted as printer activation. This is a real guest response to a constructed
+probe record, not a captured physical 5494.
 The `3812` VPD fields and address-list prefix in the probe were chosen for
 the lab and remain unverified against hardware. The configured remote
 workstation controller `SNUPRT` and device `SNUPRT01` still report
