@@ -474,6 +474,40 @@ impl HprToLlcSession<NativePeerPort> {
         self.pending.is_none() && self.port.verified_user_closed()
     }
 
+    /// Complete a local user UNBIND when the fabric disappears without one.
+    /// The native association remains owned here until its positive response
+    /// has actually arrived; the caller may then return it to discovery.
+    pub(crate) fn drain_after_remote_close(&mut self) -> io::Result<bool> {
+        if self.verified_user_closed() {
+            return Ok(true);
+        }
+        if let Some(event) = self.poll()? {
+            self.confirm_polled()?;
+            if matches!(event, SessionEvent::Unbind(_)) && self.native_abort_snf.is_some() {
+                self.port.complete_udp_abort_response()?;
+                self.native_abort_snf = None;
+            }
+        }
+        if self.bound && self.abort_snf.is_none() && !self.port.user_closed() {
+            let canonical = self.port.canonical_user_abort()?;
+            if self
+                .port
+                .submit_udp_abort(self.abort_sequence, &canonical)?
+            {
+                self.abort_snf = Some(self.bind.snf().try_into().unwrap());
+            }
+        }
+        pump_virtual(&mut self.port)?;
+        if let Some(event) = self.poll()? {
+            self.confirm_polled()?;
+            if matches!(event, SessionEvent::Unbind(_)) && self.native_abort_snf.is_some() {
+                self.port.complete_udp_abort_response()?;
+                self.native_abort_snf = None;
+            }
+        }
+        Ok(self.verified_user_closed())
+    }
+
     pub(crate) fn from_verified_port(
         mut native: NativePeerPort,
         source_cp: &QualifiedName,

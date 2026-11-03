@@ -1751,7 +1751,9 @@ mod tests {
         ]);
         reduced.extend_from_slice(destination);
         reduced.push(0);
-        assert!(port.submit_udp_abort(9, &reduced).unwrap());
+        let canonical = port.canonical_user_abort().unwrap();
+        assert_eq!(canonical, reduced);
+        assert!(port.submit_udp_abort(9, &canonical).unwrap());
         assert!(!port.submit_udp_abort(9, &reduced).unwrap());
         port.drive_user_flow().unwrap();
         let unbind = port.inner.information.last().unwrap();
