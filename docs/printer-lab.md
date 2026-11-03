@@ -105,9 +105,21 @@ EBCDIC `SNASVCMG` constant appears in `VG10.BIN` at offset `0x7236`.
 `6B 80 00 31 00 13 07 B0 B0 D0 B3 00 00 86 86 80 00 06 02` at offset
 `0x7244`. This independently supports the fixed portion built by the Go
 candidate; it does not reveal the dynamically generated names or PCID.
+At `VG10.BIN` offset `0x9288`, a basic-conversation FMH-5 template has binary
+TPN `30F0F5F1` and the PIP-present flag set. Another local constant contains
+`30F0F6F3`. Neither is evidence that the controller uses `30F0F6F6`;
+their callers and purposes still need to be traced.
 `DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
 observations identify a reverse-engineering lead; they do not establish the
 power-on record or a successful 5494 conversation.
+
+The V4R4 host-side `QND5MAIN` analysis found an Attach PIP parser at native
+offset `0xCC14`. It walks length-prefixed subvectors and recognizes a
+four-byte `04 D4 aa bb` subvector, whose final two bytes have not been
+identified. The [research report](https://github.com/friedkiwi/syspass_research/blob/master/docs/sources/ibm-5494-lu62-lu4-printer-wire-protocol.md)
+also gives V5R4 `STRCMNTRC` commands for full LLC and AnyNet captures. This
+subvector is part of Attach PIP; treating it as the printer address or the
+power-on record would be unsupported.
 
 1. Capture the actual V5R4 `QRMTWSC` control and printer sessions against a
    compatible 5494 or APPC printer peer. IBM documents the inner LU 4 protocol
