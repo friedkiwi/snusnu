@@ -12,6 +12,7 @@ use std::{
 use crate::{
     auto_gateway_runtime::virtual_xid,
     mptn_bidirectional_gateway::{fresh_management, pump_virtual},
+    native_peer_port::NativePeerPort,
     routing::RoutePort,
     runtime::{LlcPeer, LlcPort},
     virtual_ws_port::VirtualWsPort,
@@ -135,8 +136,8 @@ struct PendingEvent {
 /// One selected EE-originated LU session to a verified local LLC CP. Native
 /// XID/CNOS, user BIND, pacing and close stay with `VirtualWsPort`; the
 /// temporary TCP62 records remain entirely inside this process.
-pub(crate) struct HprToLlcSession {
-    port: VirtualWsPort<LlcPort>,
+pub(crate) struct HprToLlcSession<P: RoutePort = LlcPort> {
+    port: VirtualWsPort<P>,
     bind: SessionUnit,
     offer: Option<IngressOffer>,
     user_fqpcid: Vec<u8>,
@@ -238,9 +239,9 @@ impl HprToLlcProbe {
     }
 }
 
-impl HprToLlcSession {
+impl<P: RoutePort> HprToLlcSession<P> {
     fn with_port(
-        port: VirtualWsPort<LlcPort>,
+        port: VirtualWsPort<P>,
         source_lu: &QualifiedName,
         target_lu: &QualifiedName,
         bind: &SessionUnit,
@@ -461,6 +462,43 @@ impl HprToLlcSession {
 
     pub(crate) fn close(&mut self) -> io::Result<()> {
         self.port.disconnect()
+    }
+}
+
+impl HprToLlcSession<NativePeerPort> {
+    pub(crate) fn verified_user_closed(&self) -> bool {
+        self.pending.is_none() && self.port.verified_user_closed()
+    }
+
+    pub(crate) fn from_verified_port(
+        mut native: NativePeerPort,
+        target_cp: &QualifiedName,
+        source_lu: &QualifiedName,
+        target_lu: &QualifiedName,
+        bind: &SessionUnit,
+    ) -> io::Result<Self> {
+        if native.converter_peer_cp() != Some(target_cp.to_string().as_str()) {
+            return Err(invalid(
+                "reverse LLC target CP differs from live XID3 proof",
+            ));
+        }
+        let local_xid = native.local_xid().clone();
+        let local_cp = local_xid.cp_name().map_err(io::Error::other)?;
+        let address = native.begin_reverse_user_mode()?;
+        let port = VirtualWsPort::from_verified_native(
+            native,
+            local_xid,
+            &local_cp,
+            &target_cp.to_string(),
+            address,
+        )?;
+        Self::with_port(port, source_lu, target_lu, bind)
+    }
+
+    pub(crate) fn into_verified_port(self) -> io::Result<NativePeerPort> {
+        let mut native = self.port.into_verified_inner()?;
+        native.end_reverse_user_mode()?;
+        Ok(native)
     }
 }
 

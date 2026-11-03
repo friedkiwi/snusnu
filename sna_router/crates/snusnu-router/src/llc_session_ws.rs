@@ -14,7 +14,9 @@ use router_core::session::{QualifiedName, SessionEvent, SessionIdentity};
 use crate::{
     auto_hpr_runtime::{from_session_wire, to_session_wire},
     hpr_local_llc::{HprToLlcProbe, HprToLlcSession},
+    native_peer_port::NativePeerPort,
     remote::{AutoWsHub, SessionWsPort, SessionWsUpdate},
+    routing::RoutePort,
     runtime::LlcPeer,
 };
 use transport_ws::wire::{self, route_export::Resource};
@@ -143,6 +145,8 @@ pub(crate) struct LlcSessionWs {
     ws: SessionWsPort,
     probe: Option<HprToLlcProbe>,
     session: Option<HprToLlcSession>,
+    verified_native: Option<NativePeerPort>,
+    reverse_session: Option<HprToLlcSession<NativePeerPort>>,
     pending_ws: Option<(SessionEvent, bool)>,
     pending_since: Option<Instant>,
     opened_at: Instant,
@@ -168,12 +172,36 @@ impl LlcSessionWs {
             ws,
             probe: Some(probe),
             session: None,
+            verified_native: None,
+            reverse_session: None,
             pending_ws: None,
             pending_since: None,
             opened_at: Instant::now(),
             bound: false,
             verified: false,
         })
+    }
+
+    pub(crate) fn new_from_verified(
+        identity: SessionIdentity,
+        ws: SessionWsPort,
+        attachment_id: String,
+        native: NativePeerPort,
+    ) -> Self {
+        Self {
+            identity,
+            attachment_id,
+            ws,
+            probe: None,
+            session: None,
+            verified_native: Some(native),
+            reverse_session: None,
+            pending_ws: None,
+            pending_since: None,
+            opened_at: Instant::now(),
+            bound: false,
+            verified: true,
+        }
     }
 
     pub(crate) fn attachment_id(&self) -> &str {
@@ -184,6 +212,10 @@ impl LlcSessionWs {
         self.verified
             .then_some(self.identity.target_cp.as_ref())
             .flatten()
+    }
+
+    pub(crate) fn uses_live_adjacency(&self) -> bool {
+        self.verified_native.is_some() || self.reverse_session.is_some()
     }
 
     /// Advance at most one received and one transmitted session event. The
@@ -201,7 +233,9 @@ impl LlcSessionWs {
                 target_lu = %self.identity.target_lu,
                 bound = self.bound, pending = self.pending_ws.is_some(),
                 "SessionV1 LLC setup or pending event timed out");
-            self.close()?;
+            if !self.uses_live_adjacency() {
+                self.close()?;
+            }
             return Ok(false);
         }
         if self.pending_ws.is_none() {
@@ -213,13 +247,17 @@ impl LlcSessionWs {
                     self.pending_since = Some(Instant::now());
                 }
                 Some(SessionWsUpdate::Closed) => {
-                    self.close()?;
+                    if !self.uses_live_adjacency() {
+                        self.close()?;
+                    }
                     return Ok(false);
                 }
                 Some(SessionWsUpdate::Opened) | None => {}
             }
         } else if self.ws.poll_control()? {
-            self.close()?;
+            if !self.uses_live_adjacency() {
+                self.close()?;
+            }
             return Ok(false);
         }
 
@@ -227,9 +265,20 @@ impl LlcSessionWs {
             probe.pump()?;
             self.verified = probe.verified_target_cp().is_some();
         }
-        if self.session.is_none() {
+        if self.session.is_none() && self.reverse_session.is_none() {
             if let Some((SessionEvent::BindRequest(bind), _)) = self.pending_ws.as_ref() {
-                if self
+                if let Some(native) = self.verified_native.take() {
+                    self.reverse_session = Some(HprToLlcSession::from_verified_port(
+                        native,
+                        self.identity
+                            .target_cp
+                            .as_ref()
+                            .ok_or_else(|| invalid("verified LLC target CP missing"))?,
+                        &self.identity.source_lu,
+                        &self.identity.target_lu,
+                        bind,
+                    )?);
+                } else if self
                     .probe
                     .as_ref()
                     .and_then(HprToLlcProbe::verified_target_cp)
@@ -247,10 +296,15 @@ impl LlcSessionWs {
             }
         }
 
-        if let (Some(session), Some((event, charged))) =
-            (self.session.as_mut(), self.pending_ws.as_ref())
-        {
-            if session.send(event)? {
+        if let Some((event, charged)) = self.pending_ws.as_ref() {
+            let accepted = if let Some(session) = self.reverse_session.as_mut() {
+                session.send(event)?
+            } else if let Some(session) = self.session.as_mut() {
+                session.send(event)?
+            } else {
+                false
+            };
+            if accepted {
                 if *charged {
                     self.ws.complete_received(1)?;
                 }
@@ -259,19 +313,32 @@ impl LlcSessionWs {
             }
         }
 
-        if let Some(session) = self.session.as_mut() {
-            if let Some(event) = session.poll()? {
+        if self.session.is_some() || self.reverse_session.is_some() {
+            let event = if let Some(session) = self.reverse_session.as_mut() {
+                session.poll()?
+            } else {
+                self.session.as_mut().unwrap().poll()?
+            };
+            if let Some(event) = event {
                 let Some(wire) = to_session_wire(&event) else {
-                    self.close()?;
+                    if !self.uses_live_adjacency() {
+                        self.close()?;
+                    }
                     return Ok(false);
                 };
                 if self.ws.send(wire)? {
-                    session.confirm_polled()?;
+                    if let Some(session) = self.reverse_session.as_mut() {
+                        session.confirm_polled()?;
+                    } else {
+                        self.session.as_mut().unwrap().confirm_polled()?;
+                    }
                     if let SessionEvent::BindResult { accepted, .. } = event {
                         if accepted {
                             self.bound = true;
                         } else {
-                            self.close()?;
+                            if !self.uses_live_adjacency() {
+                                self.close()?;
+                            }
                             return Ok(false);
                         }
                     }
@@ -279,12 +346,39 @@ impl LlcSessionWs {
             }
         }
         let _ = self.ws.take_completed_send_count();
+        if self
+            .reverse_session
+            .as_ref()
+            .is_some_and(HprToLlcSession::verified_user_closed)
+            && self.pending_ws.is_none()
+        {
+            return Ok(false);
+        }
         Ok(true)
+    }
+
+    pub(crate) fn into_live_adjacency(mut self) -> io::Result<NativePeerPort> {
+        let native = if let Some(native) = self.verified_native.take() {
+            native
+        } else {
+            self.reverse_session
+                .take()
+                .ok_or_else(|| invalid("LLC circuit has no live native association"))?
+                .into_verified_port()?
+        };
+        self.ws.close()?;
+        Ok(native)
     }
 
     pub(crate) fn close(&mut self) -> io::Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.close()?;
+        }
+        if let Some(session) = self.reverse_session.as_mut() {
+            session.close()?;
+        }
+        if let Some(native) = self.verified_native.as_mut() {
+            native.disconnect()?;
         }
         if let Some(probe) = self.probe.as_mut() {
             probe.close()?;

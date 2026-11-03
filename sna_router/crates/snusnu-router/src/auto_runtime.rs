@@ -79,6 +79,8 @@ struct LlcSessionCircuit {
     listener: usize,
     proxy_mac: [u8; 6],
     verified_logged: bool,
+    carrier_id: Option<u64>,
+    carrier_target_cp: Option<QualifiedName>,
 }
 
 struct PendingUpstreamLlc {
@@ -512,6 +514,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             mptn_target_sessions,
             next_mptn_target_id,
             llc_ws_sessions,
+            pending_llc_upstream,
             next_llc_ws_id,
             sessions,
             next_id,
@@ -575,6 +578,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
                             config,
                             listeners,
                             llc_ws_sessions,
+                            pending_llc_upstream,
                             next_llc_ws_id,
                         ) {
                             tracing::warn!(error = %error,
@@ -666,13 +670,44 @@ impl<'a> AutoLocalSessionRunner<'a> {
         }
         for (id, mut circuit) in self.llc_ws_sessions.drain() {
             let attachment = PortId::new(circuit.bridge.attachment_id());
+            if let Some(carrier_id) = circuit.carrier_id {
+                let target_cp = circuit.carrier_target_cp.take().unwrap();
+                match circuit.bridge.into_live_adjacency() {
+                    Ok(native) => {
+                        self.pending_llc_upstream.insert(
+                            carrier_id,
+                            PendingUpstreamLlc {
+                                attachment,
+                                listener: circuit.listener,
+                                proxy_mac: circuit.proxy_mac,
+                                target_cp: target_cp.clone(),
+                                source: Some(LocalLlcIngress::from_verified_port(
+                                    native, target_cp,
+                                )),
+                            },
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(carrier = carrier_id, error = %error,
+                            "concentrator loss closed a leased LLC2 association");
+                        if self
+                            .proofs
+                            .withdraw(&attachment, &association("llc_upstream", carrier_id))
+                        {
+                            changed.insert(attachment.clone());
+                        }
+                    }
+                }
+            } else {
+                let _ = circuit.bridge.close();
+            }
             if self
                 .proofs
                 .withdraw(&attachment, &association("session_v1", id))
             {
                 changed.insert(attachment);
             }
-            let _ = circuit.bridge.close();
             self.listeners[circuit.listener].release(circuit.proxy_mac);
         }
         changed.extend(retire_upstream_pairs(
@@ -1002,10 +1037,43 @@ impl<'a> AutoLocalSessionRunner<'a> {
             if retired {
                 let mut circuit = llc_ws_sessions.remove(&id).unwrap();
                 let attachment = PortId::new(circuit.bridge.attachment_id());
+                if let Some(carrier_id) = circuit.carrier_id {
+                    let target_cp = circuit.carrier_target_cp.take().unwrap();
+                    match circuit.bridge.into_live_adjacency() {
+                        Ok(native) => {
+                            pending_llc_upstream.insert(
+                                carrier_id,
+                                PendingUpstreamLlc {
+                                    attachment: attachment.clone(),
+                                    listener: circuit.listener,
+                                    proxy_mac: circuit.proxy_mac,
+                                    target_cp: target_cp.clone(),
+                                    source: Some(LocalLlcIngress::from_verified_port(
+                                        native, target_cp,
+                                    )),
+                                },
+                            );
+                            tracing::info!(session = id, carrier = carrier_id,
+                                attachment = %attachment.0,
+                                "SessionV1 closed; LLC2 adjacency returned to discovery");
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(session = id, carrier = carrier_id, error = %error,
+                                "SessionV1 could not return the live LLC2 adjacency");
+                            if proofs
+                                .withdraw(&attachment, &association("llc_upstream", carrier_id))
+                            {
+                                changed_proofs.insert(attachment.clone());
+                            }
+                        }
+                    }
+                } else {
+                    let _ = circuit.bridge.close();
+                }
                 if proofs.withdraw(&attachment, &association("session_v1", id)) {
                     changed_proofs.insert(attachment);
                 }
-                let _ = circuit.bridge.close();
                 listeners[circuit.listener].release(circuit.proxy_mac);
             }
         }
@@ -2199,6 +2267,7 @@ fn open_incoming_llc_session(
     config: &RouterConfig,
     listeners: &mut [LlcAutoListener],
     circuits: &mut HashMap<u64, LlcSessionCircuit>,
+    pending_llc_upstream: &mut HashMap<u64, PendingUpstreamLlc>,
     next_id: &mut u64,
 ) -> io::Result<()> {
     let selected = bridge.incoming_selection(hub, &open)?;
@@ -2209,6 +2278,64 @@ fn open_incoming_llc_session(
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "selected LLC attachment is absent")
         })?;
+    if let Some(carrier_id) = pending_llc_upstream
+        .iter()
+        .find(|(_, pending)| {
+            pending.listener == index
+                && pending.attachment == selected.attachment
+                && pending.proxy_mac == selected.proxy_mac
+        })
+        .map(|(id, _)| *id)
+    {
+        let pending = pending_llc_upstream.get(&carrier_id).unwrap();
+        if !pending
+            .source
+            .as_ref()
+            .is_some_and(LocalLlcIngress::can_lease_reverse)
+            || circuits.values().any(|circuit| circuit.listener == index)
+        {
+            hub.reject_incoming(&open, wire::OpenFailure::Busy)?;
+            return Ok(());
+        }
+        let target_lu =
+            QualifiedName::new(&hosted_lu.netid, &hosted_lu.name).map_err(io::Error::other)?;
+        let target_cp =
+            QualifiedName::new(&hosted_cp.netid, &hosted_cp.name).map_err(io::Error::other)?;
+        if bridge.observed_cp(&selected.attachment) != Some(hosted_cp) {
+            hub.reject_incoming(&open, wire::OpenFailure::RouteGone)?;
+            return Ok(());
+        }
+        let Some((identity, ws)) = crate::llc_session_ws::admit(hub, open, &target_lu, &target_cp)?
+        else {
+            return Ok(());
+        };
+        let id = next_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("automatic LLC SessionV1 ID exhausted"))?;
+        let mut pending = pending_llc_upstream.remove(&carrier_id).unwrap();
+        let native = pending.source.take().unwrap().into_verified_port()?;
+        circuits.insert(
+            id,
+            LlcSessionCircuit {
+                bridge: LlcSessionWs::new_from_verified(
+                    identity,
+                    ws,
+                    selected.attachment.0.clone(),
+                    native,
+                ),
+                listener: index,
+                proxy_mac: selected.proxy_mac,
+                verified_logged: true,
+                carrier_id: Some(carrier_id),
+                carrier_target_cp: Some(pending.target_cp),
+            },
+        );
+        *next_id = id;
+        tracing::info!(session = id, carrier = carrier_id,
+            attachment = %selected.attachment.0,
+            "incoming SessionV1 borrowed verified LLC2 adjacency");
+        return Ok(());
+    }
     if circuits.values().any(|circuit| circuit.listener == index)
         || !listeners[index].attachment_idle()
     {
@@ -2260,6 +2387,8 @@ fn open_incoming_llc_session(
                 listener: index,
                 proxy_mac: selected.proxy_mac,
                 verified_logged: false,
+                carrier_id: None,
+                carrier_target_cp: None,
             },
         );
         admitted = true;
