@@ -615,6 +615,16 @@ uses the process's current local date and time as binary fields. A live LLC
 trial with this date, zero PRID, and TH byte 1 zero received the same positive
 SNA response, but still produced no address-01 BIND or SCS data.
 
+The guest also sends controller-conversation `D8 22 00` immediately after
+Attach (the late-NMVT trial received an `00 52 D8 22 00 ...` GDS). VG0F's
+receive handler at image `0x1D1D` checks that subtype, updates local
+controller state through `0x294D`, and invokes the station path at `0x900`.
+For the clock-bearing form, `0x1F37` sets the BIOS date and time. This path
+does not construct an immediate controller-conversation reply to `D8 22 00`.
+QA's lack of such a reply is therefore not, by itself, an identified missing
+packet. The V5R4 `QUSER/SVC` job log after the positive NMVT response still
+says only that `QND5MAIN` is running for `SNUPRT`, without an error message.
+
 The V5R4 guest's `DSPDEVD SNUPRT01` confirms a 3812 model 1 printer at
 location address `01` under `SNUPRT`; `DSPCTLD SNUPRT` confirms a 5494 remote
 controller for `SNUSNU.SVC`. IBM's [5494 configuration guide](https://www.ibm.com/support/pages/configuring-5494-remote-control-units)
