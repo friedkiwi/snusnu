@@ -6,6 +6,7 @@
 //! creating RouteSetup, CP management, or bounded user RTP connections.
 
 use std::{
+    collections::HashMap,
     io,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -22,6 +23,7 @@ use router_core::{
     hpr_rtp_setup::{classify_setup_topic, RtpLocalTarget, RtpSetupTopic},
     hpr_session_address::{RtpAssociationScope, RtpObservation},
     hpr_switching_path::{validate_inbound_switching_path, AuthorizedUserRoute, TrustedReturnPath},
+    session::QualifiedName,
 };
 use transport_ip_sna::ee::{Datagram, LdlcKind};
 
@@ -69,7 +71,8 @@ pub(crate) struct HprRtpPort {
     user: Option<RtpInboundEndpoint>,
     previous_users: Vec<RtpInboundEndpoint>,
     user_out: Option<RtpOutboundEndpoint>,
-    authorized_user_route: Option<AuthorizedUserRoute>,
+    authorized_user_routes: Vec<AuthorizedUserRoute>,
+    user_targets: HashMap<u64, QualifiedName>,
 }
 
 impl HprRtpPort {
@@ -83,25 +86,45 @@ impl HprRtpPort {
             user: None,
             previous_users: Vec::new(),
             user_out: None,
-            authorized_user_route: None,
+            authorized_user_routes: Vec::new(),
+            user_targets: HashMap::new(),
         }
     }
 
     /// Call only after the positive RouteSetup reply has reached the EE
-    /// socket. The RTP user topic's COS/TPF and local NCE are then pinned to
-    /// this link generation; a later link activation creates a new port.
+    /// socket. Each target LU has a distinct local NCE allocation on this
+    /// link generation, so a user setup can be pinned to one authorized LU.
     pub(crate) fn authorize_user_route(&mut self, route: AuthorizedUserRoute) -> io::Result<()> {
-        if self.authorized_user_route.is_some()
-            || self.user.is_some()
-            || route.generation != self.bootstrap.generation
-            || route.target_lu.netid != self.bootstrap.local.cp.netid
+        if route.generation != self.bootstrap.generation
+            || !route.target_netid_authorized(&self.bootstrap.local.cp)
             || route.tg_number == 0
             || route.return_link_label != self.bootstrap.local.link_label
             || route.maximum_packet_size > self.bootstrap.max_packet_size
         {
-            return Err(invalid("invalid or duplicate HPR user route authorization"));
+            return Err(invalid("invalid HPR user route authorization"));
         }
-        self.authorized_user_route = Some(route);
+        if let Some(existing) = self
+            .authorized_user_routes
+            .iter()
+            .find(|existing| existing.target_lu == route.target_lu)
+        {
+            return if existing == &route {
+                Ok(())
+            } else {
+                Err(invalid("conflicting HPR user route authorization"))
+            };
+        }
+        if self.authorized_user_routes.len() >= MAX_INBOUND_USER_RTP
+            || self.authorized_user_routes.iter().any(|existing| {
+                existing.local_nce_label == route.local_nce_label
+                    || existing.local_nce_instance == route.local_nce_instance
+            })
+        {
+            return Err(invalid(
+                "HPR user route authorization limit or NCE collision",
+            ));
+        }
+        self.authorized_user_routes.push(route);
         Ok(())
     }
 
@@ -135,6 +158,11 @@ impl HprRtpPort {
             .chain(&self.previous_users)
             .filter_map(|endpoint| self.scope_for(endpoint))
             .collect()
+    }
+
+    pub(crate) fn user_target_for(&self, observation: &RtpObservation) -> Option<&QualifiedName> {
+        let scope = self.user_scope_for(observation)?;
+        self.user_targets.get(&scope.initial_plu_tcid)
     }
 
     pub(crate) fn route_setup_scope(&self) -> Option<RtpAssociationScope> {
@@ -737,19 +765,37 @@ impl HprRtpPort {
             }
         }
         let tg = ee.tg_number().ok_or_else(|| invalid("EE TG not active"))?;
-        let trusted = validate_inbound_switching_path(
-            packet,
-            &self.bootstrap,
-            tg,
-            &topic,
-            self.authorized_user_route.as_ref(),
-        )
-        .map_err(|error| invalid(format!("untrusted HPR return path: {error:?}")))?;
+        let (trusted, user_route) = if kind == RtpIngressKind::User {
+            let mut match_route = None;
+            for route in &self.authorized_user_routes {
+                if let Ok(path) = validate_inbound_switching_path(
+                    packet,
+                    &self.bootstrap,
+                    tg,
+                    &topic,
+                    Some(route),
+                ) {
+                    if match_route.is_some() {
+                        return Err(invalid("ambiguous HPR user RTP route authorization"));
+                    }
+                    match_route = Some((path, route));
+                }
+            }
+            let (path, route) =
+                match_route.ok_or_else(|| invalid("no authorized HPR user RTP return path"))?;
+            (path, Some(route))
+        } else {
+            (
+                validate_inbound_switching_path(packet, &self.bootstrap, tg, &topic, None)
+                    .map_err(|error| invalid(format!("untrusted HPR return path: {error:?}")))?,
+                None,
+            )
+        };
         let port = 12004 - u16::from(trusted.priority);
         if datagram.port != port {
             return Err(invalid("RTP priority does not match EE UDP port"));
         }
-        let config = self.config_for(kind, &trusted)?;
+        let config = self.config_for(kind, &trusted, user_route)?;
         let mut endpoint = RtpInboundEndpoint::new(config).map_err(endpoint_error)?;
         let reply = endpoint
             .prepare_inbound_setup(&datagram.payload[3..])
@@ -764,7 +810,8 @@ impl HprRtpPort {
                 .origin_tcid()
                 .ok_or_else(|| invalid("RTP setup missing origin identifier"))?,
         };
-        self.install_setup(kind, endpoint, preserve_previous_user);
+        let user_target = user_route.map(|route| route.target_lu.clone());
+        self.install_setup(kind, endpoint, preserve_previous_user, user_target);
         Ok(messages
             .into_iter()
             .map(|bytes| RtpIngress {
@@ -780,22 +827,32 @@ impl HprRtpPort {
         kind: RtpIngressKind,
         endpoint: RtpInboundEndpoint,
         preserve_previous_user: bool,
+        user_target: Option<QualifiedName>,
     ) {
+        let origin_tcid = endpoint.origin_tcid();
         if self.endpoint(kind).is_some() {
             tracing::info!(kind = ?kind, generation = self.bootstrap.generation.get(),
                 preserve_previous_user,
                 "accepted fresh HPR RTP setup on active EE link");
             if kind == RtpIngressKind::RouteSetup {
-                self.authorized_user_route = None;
+                self.authorized_user_routes.clear();
+                self.user_targets.clear();
                 self.user = None;
                 self.previous_users.clear();
             } else if preserve_previous_user {
                 if let Some(previous) = self.user.take() {
                     self.previous_users.push(previous);
                 }
+            } else if kind == RtpIngressKind::User {
+                if let Some(old_origin) = self.user.as_ref().and_then(|user| user.origin_tcid()) {
+                    self.user_targets.remove(&old_origin);
+                }
             }
         }
         *self.slot_mut(kind) = Some(endpoint);
+        if let (Some(origin), Some(target)) = (origin_tcid, user_target) {
+            self.user_targets.insert(origin, target);
+        }
     }
 
     fn on_established_packet(
@@ -869,6 +926,7 @@ impl HprRtpPort {
         &self,
         kind: RtpIngressKind,
         path: &TrustedReturnPath,
+        user_route: Option<&AuthorizedUserRoute>,
     ) -> io::Result<InboundEndpointConfig> {
         let encode = |name: &str| {
             encode_network_name_component(name).map_err(|_| invalid("invalid APPN CP component"))
@@ -880,8 +938,7 @@ impl HprRtpPort {
             | RtpIngressKind::CpSvcMgOut
             | RtpIngressKind::UserOut => return Err(invalid("outbound RTP has separate setup")),
             RtpIngressKind::User => {
-                self.authorized_user_route
-                    .as_ref()
+                user_route
                     .ok_or_else(|| invalid("user RTP lacks RouteSetup authorization"))?
                     .local_nce_instance
             }
@@ -1058,10 +1115,10 @@ mod tests {
     fn config_uses_cp_name_not_fixed_xid_node_id_and_unique_tcid() {
         let port = HprRtpPort::new(bootstrap());
         let first = port
-            .config_for(RtpIngressKind::RouteSetup, &path())
+            .config_for(RtpIngressKind::RouteSetup, &path(), None)
             .unwrap();
         let second = port
-            .config_for(RtpIngressKind::RouteSetup, &path())
+            .config_for(RtpIngressKind::RouteSetup, &path(), None)
             .unwrap();
         assert_eq!(
             first.local_target.network_id,
@@ -1078,7 +1135,9 @@ mod tests {
     #[test]
     fn user_connection_requires_route_authorization() {
         let mut port = HprRtpPort::new(bootstrap());
-        assert!(port.config_for(RtpIngressKind::User, &path()).is_err());
+        assert!(port
+            .config_for(RtpIngressKind::User, &path(), None)
+            .is_err());
         // A distinct peer CV61 link label must not authorize the return
         // path that the guest addressed to this local link generation.
         assert!(port
@@ -1094,7 +1153,7 @@ mod tests {
                 maximum_packet_size: 1461,
             })
             .is_err());
-        port.authorize_user_route(AuthorizedUserRoute {
+        let route = AuthorizedUserRoute {
             generation: ConnectionGeneration::new(1).unwrap(),
             target_lu: "SNUSNU.PING".parse().unwrap(),
             verified_external_cp: None,
@@ -1104,9 +1163,11 @@ mod tests {
             tg_number: 1,
             return_link_label: vec![0x80, 1],
             maximum_packet_size: 1461,
-        })
-        .unwrap();
-        let user = port.config_for(RtpIngressKind::User, &path()).unwrap();
+        };
+        port.authorize_user_route(route.clone()).unwrap();
+        let user = port
+            .config_for(RtpIngressKind::User, &path(), Some(&route))
+            .unwrap();
         assert_eq!(user.local_target.nce_instance, [0, 0, 0, 9]);
         assert_eq!(user.peer.nce_id, None);
         assert!(port
@@ -1132,6 +1193,56 @@ mod tests {
     }
 
     #[test]
+    fn distinct_targets_keep_distinct_user_nce_allocations() {
+        let mut port = HprRtpPort::new(bootstrap());
+        let first = AuthorizedUserRoute {
+            generation: ConnectionGeneration::new(1).unwrap(),
+            target_lu: "SNUSNU.PING".parse().unwrap(),
+            verified_external_cp: None,
+            local_nce_label: vec![0xb0, 1],
+            local_nce_instance: [0, 0, 0, 9],
+            cos_tpf: vec![4, 0x2c, 1, 0],
+            tg_number: 1,
+            return_link_label: vec![0x80, 1],
+            maximum_packet_size: 1461,
+        };
+        let mut second = first.clone();
+        second.target_lu = "SNUSNU.OTHER".parse().unwrap();
+        second.local_nce_label = vec![0xb0, 2];
+        second.local_nce_instance = [0, 0, 0, 10];
+        port.authorize_user_route(first.clone()).unwrap();
+        port.authorize_user_route(second.clone()).unwrap();
+        port.authorize_user_route(first.clone()).unwrap();
+        assert_eq!(port.authorized_user_routes.len(), 2);
+        assert_eq!(
+            port.config_for(RtpIngressKind::User, &path(), Some(&first))
+                .unwrap()
+                .local_target
+                .nce_instance,
+            first.local_nce_instance
+        );
+        assert_eq!(
+            port.config_for(RtpIngressKind::User, &path(), Some(&second))
+                .unwrap()
+                .local_target
+                .nce_instance,
+            second.local_nce_instance
+        );
+        let mut colliding = second;
+        colliding.target_lu = "SNUSNU.THIRD".parse().unwrap();
+        colliding.local_nce_label = first.local_nce_label.clone();
+        assert!(port.authorize_user_route(colliding).is_err());
+
+        let mut external = first;
+        external.target_lu = "QABOB.APP".parse().unwrap();
+        external.local_nce_label = vec![0xb0, 3];
+        external.local_nce_instance = [0, 0, 0, 11];
+        assert!(port.authorize_user_route(external.clone()).is_err());
+        external.verified_external_cp = Some("QABOB.REMOTE".parse().unwrap());
+        port.authorize_user_route(external).unwrap();
+    }
+
+    #[test]
     fn replacing_route_setup_retires_old_user_rtp_and_authorization() {
         let mut port = HprRtpPort::new(bootstrap());
         let route = AuthorizedUserRoute {
@@ -1146,36 +1257,59 @@ mod tests {
             maximum_packet_size: 1461,
         };
         let old_route = RtpInboundEndpoint::new(
-            port.config_for(RtpIngressKind::RouteSetup, &path())
+            port.config_for(RtpIngressKind::RouteSetup, &path(), None)
                 .unwrap(),
         )
         .unwrap();
-        port.install_setup(RtpIngressKind::RouteSetup, old_route, false);
+        port.install_setup(RtpIngressKind::RouteSetup, old_route, false, None);
         port.authorize_user_route(route.clone()).unwrap();
-        let old_user =
-            RtpInboundEndpoint::new(port.config_for(RtpIngressKind::User, &path()).unwrap())
-                .unwrap();
-        port.install_setup(RtpIngressKind::User, old_user, false);
+        let old_user = RtpInboundEndpoint::new(
+            port.config_for(RtpIngressKind::User, &path(), Some(&route))
+                .unwrap(),
+        )
+        .unwrap();
+        port.install_setup(
+            RtpIngressKind::User,
+            old_user,
+            false,
+            Some(route.target_lu.clone()),
+        );
 
-        // The peer can open another RTP while a previous LU session remains
-        // pooled. Keep its endpoint for later data and acknowledgements.
-        let second_user =
-            RtpInboundEndpoint::new(port.config_for(RtpIngressKind::User, &path()).unwrap())
-                .unwrap();
-        port.install_setup(RtpIngressKind::User, second_user, true);
+        let mut other_route = route.clone();
+        other_route.target_lu = "SNUSNU.OTHER".parse().unwrap();
+        other_route.local_nce_label = vec![0xb0, 2];
+        other_route.local_nce_instance = [0, 0, 0, 10];
+        port.authorize_user_route(other_route.clone()).unwrap();
+
+        // A second target gets its own user RTP while the first LU session
+        // remains pooled. Keep the first endpoint for later acknowledgements.
+        let second_user = RtpInboundEndpoint::new(
+            port.config_for(RtpIngressKind::User, &path(), Some(&other_route))
+                .unwrap(),
+        )
+        .unwrap();
+        port.install_setup(
+            RtpIngressKind::User,
+            second_user,
+            true,
+            Some(other_route.target_lu.clone()),
+        );
         assert_eq!(port.previous_users.len(), 1);
         assert!(port.user.is_some());
+        assert_eq!(port.authorized_user_routes.len(), 2);
 
         let new_route = RtpInboundEndpoint::new(
-            port.config_for(RtpIngressKind::RouteSetup, &path())
+            port.config_for(RtpIngressKind::RouteSetup, &path(), None)
                 .unwrap(),
         )
         .unwrap();
-        port.install_setup(RtpIngressKind::RouteSetup, new_route, false);
+        port.install_setup(RtpIngressKind::RouteSetup, new_route, false, None);
         assert!(port.user.is_none());
         assert!(port.previous_users.is_empty());
-        assert!(port.authorized_user_route.is_none());
-        assert!(port.config_for(RtpIngressKind::User, &path()).is_err());
+        assert!(port.authorized_user_routes.is_empty());
+        assert!(port
+            .config_for(RtpIngressKind::User, &path(), None)
+            .is_err());
         port.authorize_user_route(route).unwrap();
     }
 
