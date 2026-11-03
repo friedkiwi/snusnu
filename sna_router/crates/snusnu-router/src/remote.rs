@@ -111,9 +111,7 @@ impl Drop for SharedWs {
                 status.withdraw_origin(origin);
             }
             status.replace_managed_macs(Vec::new());
-            for circuit in &snapshot.circuits {
-                status.remove_circuit(&circuit.id);
-            }
+            remove_owned_circuit_status(status, &self.circuit_owners);
             if let Some(mut concentrator) = snapshot.concentrator {
                 concentrator.state = "disconnected".into();
                 concentrator.connection_epoch = None;
@@ -121,6 +119,15 @@ impl Drop for SharedWs {
                 status.set_concentrator(Some(concentrator));
             }
         }
+    }
+}
+
+fn remove_owned_circuit_status(
+    status: &local_status::LocalStatus,
+    circuit_owners: &HashMap<Vec<u8>, usize>,
+) {
+    for id in circuit_owners.keys() {
+        status.remove_circuit(&format_uuid(id));
     }
 }
 
@@ -2858,6 +2865,29 @@ mod tests {
         http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue},
         Message as WsMessage,
     };
+
+    #[test]
+    fn websocket_disconnect_preserves_local_circuit_status() {
+        let status = local_status::LocalStatus::new();
+        let ws_id = vec![1; 16];
+        let circuit = |id: String| CircuitStatus {
+            id,
+            ingress: "local a".into(),
+            egress: "local b".into(),
+            state: "ready".into(),
+            bytes_in: 0,
+            bytes_out: 0,
+            last_change_ms: 0,
+        };
+        status.upsert_circuit(circuit("auto-7".into()));
+        status.upsert_circuit(circuit(format_uuid(&ws_id)));
+
+        remove_owned_circuit_status(&status, &HashMap::from([(ws_id, 0)]));
+
+        let circuits = status.snapshot().circuits;
+        assert_eq!(circuits.len(), 1);
+        assert_eq!(circuits[0].id, "auto-7");
+    }
 
     #[test]
     fn automatic_snapshot_announces_only_assigned_netid_and_its_hosted_lus() {
