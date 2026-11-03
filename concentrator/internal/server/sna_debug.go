@@ -20,9 +20,11 @@ func (h *routerHub) debugCircuitState(id, action string, c *wsCircuit) {
 	if !h.a.Config.SNADebug {
 		return
 	}
-	h.a.debugSNA("circuit=%s action=%s source=%s target=%s source_route=%v target_route=%v profile=%s pending=%t closed=%t allowance=%v sent=%v events=%v queued_peak=%d",
-		id, action, c.source.router.ID, c.target.router.ID, c.sourceRef, c.targetRef,
-		c.profile, c.pending, c.closed, c.allowance, c.sent, c.events, c.peakQueued)
+	h.a.debugSNA("circuit=%s action=%s source=%s target=%s source_peer=%+v target_peer=%+v request_id=%d source_route=%v target_route=%v profile=%s pending=%t closed=%t counted=%t discard_queued=%t allowance=%v sent=%v events=%v queued_peak=%d opened_at=%s activated_at=%s last_activity_at=%s",
+		id, action, c.source.router.ID, c.target.router.ID,
+		c.sourcePeer, c.targetPeer, c.requestID, c.sourceRef, c.targetRef,
+		c.profile, c.pending, c.closed, c.counted, c.discardQueued.Load(), c.allowance, c.sent, c.events, c.peakQueued,
+		c.openedAt.Format("2006-01-02T15:04:05.000000000Z07:00"), c.activatedAt.Format("2006-01-02T15:04:05.000000000Z07:00"), c.lastActivityAt.Format("2006-01-02T15:04:05.000000000Z07:00"))
 }
 
 func (h *routerHub) debugCircuitEvent(id string, side int, event *wire.CircuitEvent) {
@@ -70,4 +72,13 @@ func (s *localSNAService) debugState(c *localSNACircuit, action string) {
 		c.inboundAllowance, c.outboundBase, c.outboundSent, len(c.acks), len(c.early), len(c.earlySession))
 	s.hub.a.debugSNA("local circuit=%s action=%s xid=%+v management=%+v user=%+v application=%+v",
 		c.id, action, c.xid, c.management, c.user, c.aping)
+	for i, queued := range c.early {
+		s.hub.a.debugSNA("local circuit=%s action=%s queued_piu=%d data=%x", c.id, action, i, queued)
+	}
+	for i, queued := range c.earlySession {
+		s.hub.a.debugSNA("local circuit=%s action=%s queued_session=%d event=%+v", c.id, action, i, queued)
+	}
+	for i, ack := range c.acks {
+		s.hub.a.debugSNA("local circuit=%s action=%s pending_ack=%d end=%d", c.id, action, i, ack.end)
+	}
 }

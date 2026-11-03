@@ -14,7 +14,7 @@ var qrmtwscMode = []byte{0xd8, 0xd9, 0xd4, 0xe3, 0xe6, 0xe2, 0xc3} // QRMTWSC
 // CNOS and must use fresh PCID bytes. The controller Attach and the separate
 // network-management NMVT device announcement are outside this function.
 func Candidate5494ControllerBind(localLU, remoteLU, localCP string, daf, oaf, maxRU byte, pcid [8]byte) ([]byte, error) {
-	if daf == 0 || oaf == 0 || daf == oaf || maxRU < 0x85 || maxRU > 0x87 || pcid == [8]byte{} {
+	if daf == 0 || oaf == 0 || maxRU < 0x85 || maxRU > 0x87 || pcid == [8]byte{} {
 		return nil, ErrControllerBind
 	}
 	plu, err := encodeLUName(localLU)

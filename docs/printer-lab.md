@@ -145,6 +145,25 @@ target for both media.
 
 ## Remaining acceptance work
 
+### Live V5R4 native LLC probe, 2026-11-03
+
+The isolated V5R4 guest at MAC `02:04:ac:05:45:04` connected over 802.3
+LLC2 through the Rust router on `sol10` to the QA concentrator. The guest
+identified itself as `SOLNET.PRTGUEST` with LU `SOLNET.S1054504`. The
+concentrator's QA responder completed the guest-originated SNASVCMG BIND,
+default-mode CNOS, BIS, and UNBIND on this native circuit. This verifies
+the native transport and management path; it has not carried a printer job.
+
+A subsequent concentrator-originated source-management BIND reached the
+guest, but was rejected before QRMTWSC CNOS. FID2 address pair `(2,1)` and
+`(2,3)` returned `80040000` (unrecognized destination); `(2,2)` returned
+`08090000` (mode inconsistency), including with PLU `SNUSNU.PRINTER` and
+SLU `SOLNET.S1054504`. The equal address pair is valid as a wire shape:
+the guest itself sent a BIND using `(2,2)`. These responses do not establish
+that the guest accepted the source session or printer service. The next
+native gate is finding the correct source-session activation and delivering
+the separate NMVT Reply PSID to the guest's management-services path.
+
 ### Live V5R4 AnyNet controller trace, 2026-11-03
 
 An isolated V5R4 clone at `10.99.6.2` accepted `QRMTWSC` source CNOS

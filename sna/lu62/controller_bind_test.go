@@ -29,8 +29,8 @@ func Test5494ControllerBindCandidate(t *testing.T) {
 	if _, err := Candidate5494ControllerBind("OTHER.PRINTER", "SOLNET.SNAB", "SNUSNU.SVC", 1, 2, 0x87, pcid); err == nil {
 		t.Fatal("mismatched LU and CP NETIDs accepted")
 	}
-	if _, err := Candidate5494ControllerBind("SNUSNU.PRINTER", "SOLNET.SNAB", "SNUSNU.SVC", 1, 1, 0x87, pcid); err == nil {
-		t.Fatal("identical FID2 addresses accepted")
+	if same, err := Candidate5494ControllerBind("SNUSNU.PRINTER", "SOLNET.SNAB", "SNUSNU.SVC", 2, 2, 0x87, pcid); err != nil || same[2] != 2 || same[3] != 2 {
+		t.Fatalf("native FID2 address pair rejected: %x %v", same, err)
 	}
 }
 
