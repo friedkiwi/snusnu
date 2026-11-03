@@ -58,3 +58,46 @@ func TestQAStoreIsFreshAndIgnoresProductionDSN(t *testing.T) {
 		t.Fatalf("production database changed: %q %v", data, err)
 	}
 }
+
+func TestQAStoreExplicitReusePreservesTokensAndManagedMAC(t *testing.T) {
+	ctx := context.Background()
+	first, path, err := createQAStore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = qa.Seed(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := first.UserByEmail(ctx, qa.Accounts[1].Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := first.AllocateManagedCP(ctx, owner.ID, owner.NetID, "SNAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = first.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, reused, fresh, err := openQAStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.DB.Close()
+	if fresh || reused != path {
+		t.Fatalf("QA database was not reused: fresh=%t path=%q", fresh, reused)
+	}
+	if err = second.ResetLiveState(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = second.RouterByToken(ctx, qa.Routers[0].Token); err != nil {
+		t.Fatalf("router token lost: %v", err)
+	}
+	retained, err := second.ManagedCPByID(ctx, address.ID)
+	if err != nil || retained.Suffix != address.Suffix {
+		t.Fatalf("managed MAC lost: %+v %v", retained, err)
+	}
+	if _, _, _, err = openQAStore(ctx, filepath.Join(t.TempDir(), "missing.sqlite")); err == nil {
+		t.Fatal("missing reuse database was created")
+	}
+}
