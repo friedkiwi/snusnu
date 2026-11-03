@@ -23,6 +23,7 @@ pub(crate) struct AssociationId {
 pub(crate) struct LlcProofSnapshot {
     pub(crate) cp: QualifiedName,
     pub(crate) lus: Vec<QualifiedName>,
+    pub(crate) lu62: Vec<QualifiedName>,
     pub(crate) associations: Vec<AssociationId>,
 }
 
@@ -30,6 +31,7 @@ pub(crate) struct LlcProofSnapshot {
 struct AssociationProof {
     cp: Option<QualifiedName>,
     lus: HashSet<QualifiedName>,
+    lu62: HashSet<QualifiedName>,
 }
 
 #[derive(Default)]
@@ -54,6 +56,7 @@ impl LlcProofRegistry {
         if proof.cp.as_ref() != Some(&cp) {
             proof.cp = Some(cp);
             proof.lus.clear();
+            proof.lu62.clear();
         }
         Ok(())
     }
@@ -78,6 +81,24 @@ impl LlcProofRegistry {
         Ok(())
     }
 
+    pub(crate) fn observe_lu62(
+        &mut self,
+        attachment: &PortId,
+        association: &AssociationId,
+        lu: &str,
+    ) -> io::Result<()> {
+        self.observe_lu(attachment, association, lu)?;
+        let lu = parse_name(lu)?;
+        self.attachments
+            .get_mut(attachment)
+            .unwrap()
+            .get_mut(association)
+            .unwrap()
+            .lu62
+            .insert(lu);
+        Ok(())
+    }
+
     pub(crate) fn withdraw(&mut self, attachment: &PortId, association: &AssociationId) -> bool {
         let Some(proofs) = self.attachments.get_mut(attachment) else {
             return false;
@@ -96,6 +117,7 @@ impl LlcProofRegistry {
         let proofs = self.attachments.get(attachment)?;
         let mut cp = None;
         let mut lus = HashSet::new();
+        let mut lu62 = HashSet::new();
         let mut associations = Vec::new();
         for (id, proof) in proofs {
             let Some(observed_cp) = &proof.cp else {
@@ -106,14 +128,18 @@ impl LlcProofRegistry {
             }
             cp = Some(observed_cp.clone());
             lus.extend(proof.lus.iter().cloned());
+            lu62.extend(proof.lu62.iter().cloned());
             associations.push(id.clone());
         }
         let mut lus = lus.into_iter().collect::<Vec<_>>();
         lus.sort_by(|a, b| (&a.netid, &a.name).cmp(&(&b.netid, &b.name)));
+        let mut lu62 = lu62.into_iter().collect::<Vec<_>>();
+        lu62.sort_by(|a, b| (&a.netid, &a.name).cmp(&(&b.netid, &b.name)));
         associations.sort();
         Some(LlcProofSnapshot {
             cp: cp?,
             lus,
+            lu62,
             associations,
         })
     }
@@ -217,5 +243,28 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData,
         );
+    }
+
+    #[test]
+    fn lu62_capability_lives_only_while_bound_association_is_live() {
+        let attachment = PortId::new("llc-a");
+        let mut registry = LlcProofRegistry::default();
+        let cp_only = id("fabric", 1);
+        let bound = id("llc_upstream", 2);
+        for owner in [&cp_only, &bound] {
+            registry
+                .observe_cp(&attachment, (*owner).clone(), "LOCAL.CPA")
+                .unwrap();
+        }
+        registry
+            .observe_lu62(&attachment, &bound, "LOCAL.LUA")
+            .unwrap();
+        let snapshot = registry.snapshot(&attachment).unwrap();
+        assert_eq!(snapshot.lu62, vec!["LOCAL.LUA".parse().unwrap()]);
+        registry.withdraw(&attachment, &bound);
+        let snapshot = registry.snapshot(&attachment).unwrap();
+        assert!(snapshot.lu62.is_empty());
+        assert!(snapshot.lus.is_empty());
+        assert_eq!(snapshot.cp, "LOCAL.CPA".parse().unwrap());
     }
 }

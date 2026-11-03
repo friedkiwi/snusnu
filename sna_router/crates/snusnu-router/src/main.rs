@@ -103,6 +103,7 @@ mod llc_discovery_regression_tests;
 mod llc_proof_registry;
 #[cfg(target_os = "linux")]
 mod llc_session_ws;
+mod llc_source_ws;
 #[cfg(target_os = "linux")]
 mod llc_target_identity;
 #[cfg(target_os = "linux")]
