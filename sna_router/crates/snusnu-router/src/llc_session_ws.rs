@@ -271,6 +271,10 @@ impl LlcSessionWs {
                     self.reverse_session = Some(HprToLlcSession::from_verified_port(
                         native,
                         self.identity
+                            .source_cp
+                            .as_ref()
+                            .ok_or_else(|| invalid("verified LLC source CP missing"))?,
+                        self.identity
                             .target_cp
                             .as_ref()
                             .ok_or_else(|| invalid("verified LLC target CP missing"))?,
