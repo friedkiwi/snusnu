@@ -39,6 +39,42 @@ use transport_ws::wire;
 
 const IDLE_POLL: Duration = Duration::from_micros(200);
 const MAX_PENDING_HANDOFFS: usize = 256;
+const MPTN_PROOF_WAIT: Duration = Duration::from_secs(5);
+
+struct PendingMptnOffer {
+    gateway_id: String,
+    association: u64,
+    offer: IngressOffer,
+    deadline: Instant,
+    wait_logged: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MptnSourceProof {
+    Verified,
+    Pending,
+    Mismatch,
+}
+
+fn mptn_source_proof(
+    learned: &HashMap<String, HashMap<QualifiedName, QualifiedName>>,
+    gateway_id: &str,
+    source_lu: &QualifiedName,
+    source_cp: &QualifiedName,
+) -> MptnSourceProof {
+    match learned
+        .get(gateway_id)
+        .and_then(|routes| routes.get(source_lu))
+    {
+        Some(cp) if cp == source_cp => MptnSourceProof::Verified,
+        Some(_) => MptnSourceProof::Mismatch,
+        None => MptnSourceProof::Pending,
+    }
+}
+
+fn mptn_proof_wait_allowed(now: Instant, deadline: Instant, gateway_available: bool) -> bool {
+    gateway_available && now < deadline
+}
 
 fn require_session_v1_target(route: &wire::RouteExport) -> io::Result<()> {
     if matches!(route.resource.as_ref(), Some(wire::route_export::Resource::LogicalUnit(lu))
@@ -213,6 +249,7 @@ pub(crate) struct AutoLocalSessionRunner<'a> {
     active_llc_upstream: HashMap<u64, ActiveUpstreamLlc>,
     unhandled_llc: Vec<(String, LlcIngressOffer)>,
     unhandled_mptn: Vec<(String, u64, IngressOffer)>,
+    pending_mptn: Vec<PendingMptnOffer>,
     mptn_management: Vec<MptnManagementHandoff>,
     mptn_discovery: Vec<(String, crate::mptn_discovery::MptnDiscoverySnapshot)>,
     ee_snapshots: HashMap<String, Vec<RouteRecord>>,
@@ -335,6 +372,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             active_llc_upstream: HashMap::new(),
             unhandled_llc: Vec::new(),
             unhandled_mptn: Vec::new(),
+            pending_mptn: Vec::new(),
             mptn_management: Vec::new(),
             mptn_discovery: Vec::new(),
             ee_snapshots: HashMap::new(),
@@ -766,6 +804,7 @@ impl<'a> AutoLocalSessionRunner<'a> {
             active_llc_upstream,
             unhandled_llc,
             unhandled_mptn,
+            pending_mptn,
             mptn_management,
             mptn_discovery,
             ..
@@ -1513,9 +1552,105 @@ impl<'a> AutoLocalSessionRunner<'a> {
                 refresh_local_addresses(fabric, bridge, config, proxies)?;
                 exports_changed = true;
             }
-            let Some((association, offer)) = offered else {
+            let mut current = offered.map(|(association, offer)| PendingMptnOffer {
+                gateway_id: gateway.id().to_owned(),
+                association,
+                offer,
+                deadline: Instant::now() + MPTN_PROOF_WAIT,
+                wait_logged: false,
+            });
+            if let Some(index) = pending_mptn
+                .iter()
+                .position(|pending| pending.gateway_id == gateway.id())
+            {
+                let older = pending_mptn.remove(index);
+                if let Some(newer) = current.replace(older) {
+                    if pending_mptn.len() + 1 < MAX_PENDING_HANDOFFS {
+                        pending_mptn.push(newer);
+                    } else {
+                        gateway.reject_offer(newer.association, "MPTN proof wait queue is full")?;
+                    }
+                }
+            }
+            let Some(PendingMptnOffer {
+                association,
+                offer,
+                deadline,
+                wait_logged,
+                ..
+            }) = current
+            else {
                 continue;
             };
+            if !gateway.offer_is_pending(association, &offer) {
+                tracing::debug!(
+                    gateway = gateway.id(),
+                    association,
+                    "pending TCP62 user offer closed before management proof"
+                );
+                continue;
+            }
+            let source_identity = AutoMptnGateway::offer_lus(&offer)
+                .and_then(|(source, _)| source.parse().map_err(io::Error::other))
+                .and_then(|source| {
+                    offer
+                        .peer_cp()
+                        .parse()
+                        .map(|cp| (source, cp))
+                        .map_err(io::Error::other)
+                });
+            let (source_lu, source_cp) = match source_identity {
+                Ok(identity) => identity,
+                Err(error) => {
+                    gateway.reject_offer(association, &error.to_string())?;
+                    continue;
+                }
+            };
+            match mptn_source_proof(learned_mptn_lus, gateway.id(), &source_lu, &source_cp) {
+                MptnSourceProof::Verified => {}
+                MptnSourceProof::Mismatch => {
+                    tracing::warn!(gateway = gateway.id(), association, source_lu = %source_lu,
+                        source_cp = %source_cp, "TCP62 source CP disagrees with completed management proof");
+                    gateway.reject_offer(
+                        association,
+                        "TCP62 source CP disagrees with management proof",
+                    )?;
+                    continue;
+                }
+                MptnSourceProof::Pending
+                    if mptn_proof_wait_allowed(
+                        Instant::now(),
+                        deadline,
+                        gateway.discovery_available(),
+                    ) =>
+                {
+                    if pending_mptn.len() < MAX_PENDING_HANDOFFS {
+                        pending_mptn.push(PendingMptnOffer {
+                            gateway_id: gateway.id().to_owned(),
+                            association,
+                            offer,
+                            deadline,
+                            wait_logged: true,
+                        });
+                        if !wait_logged {
+                            tracing::debug!(gateway = gateway.id(), association, source_lu = %source_lu,
+                                source_cp = %source_cp, "TCP62 user offer waiting for management proof");
+                        }
+                    } else {
+                        gateway.reject_offer(association, "MPTN proof wait queue is full")?;
+                    }
+                    continue;
+                }
+                MptnSourceProof::Pending => {
+                    tracing::warn!(gateway = gateway.id(), association, source_lu = %source_lu,
+                        source_cp = %source_cp, "TCP62 user offer timed out waiting for management proof");
+                    gateway.reject_offer(
+                        association,
+                        "TCP62 source LU/CP management proof unavailable",
+                    )?;
+                    continue;
+                }
+            }
             active = true;
             let selection = AutoMptnGateway::offer_lus(&offer)
                 .and_then(|(_, target)| config::parse_cp(&target))
@@ -2467,6 +2602,59 @@ mod session_profile_tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn user_offer_waits_only_for_matching_live_management_proof() {
+        let lu: QualifiedName = "QABOB.SNAB".parse().unwrap();
+        let cp: QualifiedName = "QABOB.BOBCP".parse().unwrap();
+        let other_cp: QualifiedName = "QABOB.OTHERCP".parse().unwrap();
+        let mut learned = HashMap::new();
+        let start = Instant::now();
+        let deadline = start + MPTN_PROOF_WAIT;
+        assert_eq!(
+            mptn_source_proof(&learned, "bob", &lu, &cp),
+            MptnSourceProof::Pending
+        );
+        assert!(mptn_proof_wait_allowed(start, deadline, true));
+        assert!(!mptn_proof_wait_allowed(deadline, deadline, true));
+        assert!(!mptn_proof_wait_allowed(start, deadline, false));
+
+        let mut discovery =
+            crate::mptn_discovery::MptnDiscovery::new(Duration::from_secs(60)).unwrap();
+        discovery.observe(lu.clone(), cp.clone(), start).unwrap();
+        learned.insert(
+            "bob".to_owned(),
+            discovery
+                .take_changed_snapshot()
+                .unwrap()
+                .routes
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            mptn_source_proof(&learned, "bob", &lu, &cp),
+            MptnSourceProof::Verified
+        );
+        assert_eq!(
+            mptn_source_proof(&learned, "bob", &lu, &other_cp),
+            MptnSourceProof::Mismatch
+        );
+
+        discovery.withdraw_all().unwrap();
+        learned.insert(
+            "bob".to_owned(),
+            discovery
+                .take_changed_snapshot()
+                .unwrap()
+                .routes
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            mptn_source_proof(&learned, "bob", &lu, &cp),
+            MptnSourceProof::Pending
         );
     }
 

@@ -136,6 +136,7 @@ pub(crate) struct MptnGatewayPort {
     listener: TcpListener,
     udp: UdpSocket,
     active: Option<Association>,
+    first_association_used: bool,
     associations: BTreeMap<u64, Association>,
     next_association_id: u64,
     poll_cursor: u64,
@@ -292,6 +293,7 @@ impl MptnGatewayPort {
             listener,
             udp,
             active: None,
+            first_association_used: false,
             associations: BTreeMap::new(),
             next_association_id: 1,
             poll_cursor: 0,
@@ -461,7 +463,11 @@ impl MptnGatewayPort {
                     deferred_logical_ack: None,
                     outbound_abort_pending: false,
                 };
-                if self.active.is_none() && self.associations.is_empty() {
+                if !self.first_association_used
+                    && self.active.is_none()
+                    && self.associations.is_empty()
+                {
+                    self.first_association_used = true;
                     self.active = Some(association);
                 } else {
                     let id = self.next_association_id;
@@ -1387,6 +1393,12 @@ impl MptnGatewayPort {
         self.association_ids()
     }
 
+    pub(crate) fn has_pending_offer(&self, id: u64, offer: &IngressOffer) -> bool {
+        self.association(id).is_some_and(|association| {
+            matches!(&association.state, SessionState::UserAwaitResponse(admitted) if admitted == offer)
+        })
+    }
+
     pub(crate) fn close_association_for(&mut self, id: u64) -> io::Result<()> {
         if id == 0 {
             self.active
@@ -2203,6 +2215,27 @@ mod tests {
             peer.read(&mut [0; 1]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+        assert!(port.has_pending_offer(id, &offer));
+        port.close_association_for(id).unwrap();
+        assert!(!port.has_pending_offer(id, &offer));
+        let mut second = peer_socket(port.listener.local_addr().unwrap());
+        second.write_all(&request).unwrap();
+        let (replacement_id, replacement_offer) = (0..1000)
+            .find_map(|_| {
+                let event = port.poll_association_once(true).unwrap();
+                if event.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                match event {
+                    Some((id, GatewayEvent::UserBind(offer))) => Some((id, offer)),
+                    Some((_, GatewayEvent::Rejected(reason))) => panic!("rejected: {reason}"),
+                    _ => None,
+                }
+            })
+            .expect("replacement user offer");
+        assert_ne!(replacement_id, id);
+        assert!(!port.has_pending_offer(id, &offer));
+        assert!(port.has_pending_offer(replacement_id, &replacement_offer));
     }
 
     #[test]
