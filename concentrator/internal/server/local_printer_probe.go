@@ -911,6 +911,9 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			}
 			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" ||
 				os.Getenv("SNUSNU_PRINTER_PROBE_NO_PACING_INDICATOR") == "1" {
+				if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_NODE") == "1" {
+					return p.sendSolicitedNodePSID(id, c)
+				}
 				return p.sendSolicitedPrinterPSID(id, c)
 			}
 			return nil

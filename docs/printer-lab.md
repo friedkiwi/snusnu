@@ -1019,3 +1019,25 @@ controller `D824` record or its session sequencing, not the printer-specific
 status and VPD fields. Neither QA flag is used in normal concentrator mode.
 The next wire experiment should use the firmware's service-13 routing for
 the Reply PSID, not another invented `D824` payload.
+
+### Direct Reply PSID and controller sequence, 4 November
+
+The Release 3.2 5494 firmware routes VG15's completed Reply PSID through
+resident service 13 (VG10). VG10's event-4B handler at raw image offsets
+`0x1F9B..0x1FD3` accepts it only after its Request PSID state reaches 5,
+changes the event to D9, and dispatches to service 14 for the physical
+address-0 session. VG14 then enters its fragment sender. These static paths
+support a separate management transmission, but do not establish every
+lower-link envelope byte.
+
+With `SNUSNU_PRINTER_PROBE_TRACK_SOURCE_SEQUENCE=1`, QA replied to IBM i's
+encapsulated Request PSID using the next controller-session sequence. A direct
+FID2 printer Reply PSID then received positive `8B 80 00 41 03 8D` from IBM i.
+No address-01 ACTLU followed. The next LLC run corrected a QA-only branch
+that skipped the node record when pacing-indicator suppression was enabled.
+QA sent the node Reply PSID first, received positive `8B 80 00 41 03 8D`,
+then sent the address-01 3812 Reply PSID and received the same positive
+response. The verbose router log shows the guest request, QA responses, and
+both host acknowledgements crossing the LLC circuit. `SNUPRT` is ACTIVE but
+`SNUPRT01` remains VARY ON PENDING, and no LU4/SCS print data was received.
+The two positive NMVT responses therefore do not yet prove device activation.
