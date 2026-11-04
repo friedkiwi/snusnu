@@ -213,6 +213,29 @@ the outer pacing indicator did not establish printer readiness. The QA-only
 change was removed; the disposable traces are `qa-actlu-no-pi.log` and
 `router-actlu-no-pi.log`.
 
+The next QA-only trial sent an independent SSCP-PU Reply PSID after the
+address-01 ACTLU, using TH `2C 00 00 01` and the 5494-derived NMVT body.
+V5R4 acknowledged the ACTLU envelope, then rejected the separate PSID with
+negative SNA sense `10030001` against `41 03 8D`. Sending it immediately
+after ACTLU therefore does not make the printer available. The verbose LLC
+router confirmed both records reached the guest. The trace files are
+`qa-direct-psid.log` and `router-direct-psid.log`.
+
+A variant that deferred the independent PSID until the ACTLU envelope's
+positive SNA acknowledgment could not be exercised: subsequent controller
+startups sent a different first application record, `D822 89 08 F8 00 ...`,
+followed by `07 07 08 64 00 00 00`, instead of the earlier `D822 00 00 EC ...`
+form. The 5494 firmware's VG0F handler at image `0x1D2A..0x1D80` requires
+the word at D822 offset `+4` to be zero for its success path; a nonzero word
+is copied into its error state and posted to VG10 as event B1. This is a
+firmware-observed branch, not a decoded IBM i reason for `89 08`.
+`qa-direct-psid-ack.log`, `qa-cold-direct-psid-ack.log`, and `qa-noqnx.log`
+preserve these runs. A clean IPL with QA and the router disconnected until
+sign-on did not by itself restore the zero-status form. The guest's
+auto-created `QNXDEV` 3287 device at address 01 was varied off and removed
+for a separate conflict test; that run reached XID/link activation but not
+the controller application record. No spool was received in these trials.
+
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
 probe does not decode that form and the activation stopped there. Clean IPL
