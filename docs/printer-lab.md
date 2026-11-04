@@ -1428,3 +1428,8 @@ one controller-initiated session. Its negotiated limits were 57 total,
 56 local, and one remote. This rules out exhaustion of the configured APPC
 session limit in this trial; the printer-availability state remains the
 unresolved cause of the writer failure.
+`WRKOBJLCK OBJ(QSYS/SVCPRT01) OBJTYPE(*DEVD)` showed a single `*EXCLRD`
+lock, held by writer job `002809/QSPLJOB/SVCPRT01`. No competing job held
+a lock on this device at the time of inspection. The guest diagnostics thus
+leave a device-readiness/correlation failure as the strongest remaining
+explanation, without identifying its exact protocol exchange.
