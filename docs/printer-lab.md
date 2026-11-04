@@ -579,8 +579,8 @@ Attach. VG0F constructs the 18-byte allocation/PIP area as
 (image `0x1BDB`). `VG1C` initializes that same pointer's `+8` to zero at
 image `0x1751`, so zero is the firmware's initial value. A later runtime
 writer could still change it; the final transmitted work area needs capture.
-Another local constant contains `30F0F6F3`,
-whose purpose still needs to be traced.
+Another local constant contains `30F0F6F3`; the later live device-session
+trial and VG10 parser trace below identify it as an inbound device Attach TP.
 `DUMP5494.DAT` file begins with `CC` filler and is not a useful trace. These
 observations do not establish a successful 5494 conversation.
 
@@ -1160,3 +1160,39 @@ are `qa-node54-chain.log`, `qa-node54-printer-after-ack.log`, and matching
 verbose router logs in the local lab directory. The remaining wire target
 is the controller application's device-available notification or its state
 transition, not the node PSID framing.
+
+### Solicited printer PSID and parallel device session, 4 November
+
+The unsolicited address-01 Reply PSID above carried procedure ID zero. A
+QA-only trial instead retained the host Request-PSID procedure ID in the
+printer Reply PSID. IBM i positively answered the nested NMVT and then sent
+a separate host-initiated `QRMTWSC` LU 6.2 BIND (`TH 2D 00 01 02`). The
+previous unsolicited trial had not produced this BIND. This establishes
+that the solicited device record is needed for this V5R4 bring-up.
+
+The first candidate BIND response had a mode subfield length of nine for
+the seven-character `QRMTWSC` name. IBM i rejected it with `0835001C`.
+Correcting that length moved the rejection to `08350018`, where the response
+still offered the request's `94 43` capability bytes. A response using
+`90 23` in those two fields was accepted: IBM i immediately sent a normal
+flow FMH-5 Attach to architecture TP `30 F0 F6 F3`, with PIP data ending in
+device address `01`. The accepted response is implemented in
+`sna/lu62/printer_bind.go`, with a captured-request regression test.
+
+VG10's Attach parser at image offsets `0x8A1A..0x8A7C` directly compares
+the incoming length-prefixed TPN against an eleven-byte entry containing
+`04 30 F0 F6 F3` at image `0x8E0A`. This resolves the earlier uncertainty
+about the nearby constant: it is a recognized inbound device Attach target.
+The parser selects its session type `02`; the device application behavior
+after that match still needs tracing.
+
+The QA endpoint granted pacing with `83 01 00`. A separate trial also sent
+a zero-length FMD request with change direction, `03 90 20`. The verbose LLC
+router recorded both packets and the guest acknowledged them at LLC2. In
+both trials IBM i sent no further device-session PIU during the observation
+period. `WRKCFGSTS` showed `SNUPRT01` as powered off or not yet available.
+The next required exchange is the 5494 device application's response after
+the host's `30 F0 F6 F3` Attach; the LU4 ACTLU/BIND and SCS print data have
+not yet arrived. The local trace files are `qa-device-bind3.log`,
+`qa-device-attach.log`, `qa-device-turn.log`, and matching verbose router
+logs in the disposable lab directory.

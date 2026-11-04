@@ -35,6 +35,7 @@ type printerProbeCircuit struct {
 	fqpcid             []byte
 	peerIPR            bool
 	device             *printer.LU4Device
+	deviceSessionBound bool
 	chain              *printer.ChainAssembler
 	lu7WSFBytes        int
 	lu7UnbindAwaitAck  bool
@@ -672,8 +673,13 @@ func (p *localPrinterProbe) sendSolicitedNestedNodePSID(id string, c *printerPro
 
 func (p *localPrinterProbe) sendControllerPrinterPower(id string, c *printerProbeCircuit) error {
 	var gds []byte
+	psid := experimentalPrinterPSID()
+	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_PRINTER_SOLICITED") == "1" {
+		psid.Solicited = true
+		psid.ProcedureID = c.psidRequestID
+	}
 	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_FID2_NESTED") == "1" {
-		inner, err := experimentalPrinterPSID().EncodeNMVTPIU(c.nextNMVTTH(), 0x80, 0)
+		inner, err := psid.EncodeNMVTPIU(c.nextNMVTTH(), 0x80, 0)
 		if err != nil {
 			return err
 		}
@@ -682,7 +688,7 @@ func (p *localPrinterProbe) sendControllerPrinterPower(id string, c *printerProb
 		gds[2], gds[3] = 0xd8, 0x24
 		gds = append(gds, inner...)
 	} else {
-		ru, err := experimentalPrinterPSID().EncodeNMVT()
+		ru, err := psid.EncodeNMVT()
 		if err != nil {
 			return err
 		}
@@ -835,6 +841,31 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		outer, err := piu.ParseFID2(data)
 		if err != nil {
 			return nil
+		}
+		if c.deviceSessionBound && outer.TH[2] == 1 && outer.TH[3] == 2 &&
+			outer.RH == [3]byte{0x0b, 0x91, 0x20} && len(outer.RU) >= 14 &&
+			bytes.Equal(outer.RU[10:14], []byte{0x30, 0xf0, 0xf6, 0xf3}) {
+			grant := []byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], 0, 0, 0x83, 1, 0}
+			log.Printf("printer probe device Attach grant: circuit=%s piu=%x", id, grant)
+			if err := p.sendInformation(id, grant); err != nil {
+				return err
+			}
+			if os.Getenv("SNUSNU_PRINTER_PROBE_DEVICE_RETURN_TURN") != "1" {
+				return nil
+			}
+			turn := []byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], 0, 1, 0x03, 0x90, 0x20}
+			log.Printf("printer probe device Attach turn return: circuit=%s piu=%x", id, turn)
+			return p.sendInformation(id, turn)
+		}
+		if bind, bindErr := lu62.ParseBind(data); bindErr == nil && bind != nil && bind.Mode == "QRMTWSC" &&
+			bind.PLU == c.peer.NetID+"."+c.peer.LU && bind.SLU == "SNUSNU.SVC" {
+			response, responseErr := lu62.Candidate5494DeviceResponse(data, bind.PLU, bind.SLU, 1)
+			if responseErr != nil {
+				return responseErr
+			}
+			log.Printf("printer probe host device BIND: circuit=%s piu=%x response=%x", id, data, response)
+			c.deviceSessionBound = true
+			return p.sendInformation(id, response)
 		}
 		if c.lu7UnbindAwaitAck && outer.RH == [3]byte{0x83, 0x01, 0} &&
 			os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_LU7") == "1" {
