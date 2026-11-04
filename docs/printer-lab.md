@@ -237,6 +237,19 @@ remained pending. Its writer reported that the device was not powered on or
 varied on. The next protocol question is how the host correlates the accepted
 NMVT with the remote 5494 controller and address-01 device.
 
+A further firmware comparison found that the controller Reply-PSID builder
+copies fixed `03 20` bytes into its node status subfield. The QA record was
+corrected and again received a positive SNA response, without activating
+`SNUPRT01`. A separate controller-session `D824` power-on trial then failed
+with `UNBIND FE` and sense `20020000` even after using the 5494-originated
+transmit sequence `0002`. That sense denotes a chaining sequence error. The
+[5494 Functions Reference](https://ardent-tool.com/5494/SC30-3533-04_5494_Remote_Control_Unit_Functions_Ref_Rel_3_1_1995.pdf)
+describes workstation notification and SSCP-PU management traffic as carried
+on the LU 6.2 controller session. Thus the positive replies to standalone
+NMVTs do not establish that the closed controller application saw a
+power-on event. The actual controller-session envelope remains the acceptance
+gate.
+
 ### Live V5R4 native LLC probe, 2026-11-03
 
 The isolated V5R4 guest at MAC `02:04:ac:05:45:04` connected over 802.3

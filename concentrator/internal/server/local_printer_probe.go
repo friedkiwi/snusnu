@@ -579,6 +579,9 @@ func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCirc
 	if len(tail) != 51 {
 		return fmt.Errorf("node PSID tail length %d", len(tail))
 	}
+	// VG15:0x567 copies the fixed 03 20 subfield from its 0x14A6
+	// template into the node reply at offsets 36 and 37.
+	tail[36], tail[37] = 0x03, 0x20
 	ru := append([]byte{0x41, 3, 0x8d}, tail...)
 	out, err := (piu.FID2{TH: c.nextNMVTTH(), RH: [3]byte{0x0b, 0x80, 0}, RU: ru}).Bytes()
 	if err != nil {
@@ -586,6 +589,30 @@ func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCirc
 	}
 	log.Printf("printer probe solicited node PSID: circuit=%s piu=%x", id, out)
 	c.psidNodeAwaitAck = true
+	return p.sendInformation(id, out)
+}
+
+func (p *localPrinterProbe) sendControllerPrinterPower(id string, c *printerProbeCircuit) error {
+	ru, err := experimentalPrinterPSID().EncodeNMVT()
+	if err != nil {
+		return err
+	}
+	inner := printer.LU4PIU{Address: 0, Session: printer.LU4PhysicalSession,
+		RH: [3]byte{0x0b, 0x80, 0}, RU: ru}
+	gds, err := printer.EncodeControllerDeviceGDS(inner)
+	if err != nil {
+		return err
+	}
+	th := c.psidRequestTH
+	th[2], th[3] = th[3], th[2]
+	// The source half-session has its own transmit sequence. BIND used zero
+	// and Attach used one; the host's 000C request is not our next number.
+	th[4], th[5] = 0, 2
+	out, err := (piu.FID2{TH: th, RH: [3]byte{0x03, 0x90, 0x20}, RU: gds}).Bytes()
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe controller power-on PSID: circuit=%s piu=%x", id, out)
 	return p.sendInformation(id, out)
 }
 
@@ -736,6 +763,9 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		}
 		if c.psidDeviceAwaitAck && outer.RH == [3]byte{0x8b, 0x80, 0} {
 			c.psidDeviceAwaitAck = false
+			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_POWER_NESTED") == "1" {
+				return p.sendControllerPrinterPower(id, c)
+			}
 			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_POWER_AFTER_REPLY") == "1" {
 				return p.sendExperimentalNMVT(id, c)
 			}
