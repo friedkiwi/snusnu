@@ -949,3 +949,11 @@ Reference](https://bitsavers.trailing-edge.com/pdf/ibm/sna/SC30-3346-2_SNA_Manag
 also confirms that Query Product Set ID and Reply Product Set ID are separate
 NMVT requests, each with its own SNA response; the inner positive response
 must not be filled with product data as a substitute for the Reply PSID.
+
+An IBM [Communications Server for AIX trace](https://ps-2.kev009.com/rs6000/redbook-cd/sg245215.pdf)
+shows a conventional Reply PSID on FID2 address pair `00/00`: the host answers
+`8B 80 00 41 03 8D` and then sends ACTLU for the announced dependent LU.
+That confirms that our `00/00` positive response is the right kind of SNA
+acknowledgment, but IBM i in the 5494 lab did not follow it with address-01
+ACTLU. The missing condition is specific to the 5494 controller/device
+association; an SNA-level PSID acknowledgment alone does not establish it.
