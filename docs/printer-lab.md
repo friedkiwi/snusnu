@@ -202,6 +202,17 @@ The disposable lab retains `qa-off-ready-clean.log`,
 `router-off-ready-clean.log`, `qa-off-ready-delay-clean.log`, and
 `router-off-ready-delay-clean.log` for comparison.
 
+A subsequent clean-IPL trial changed only the outer ACTLU reply RH from
+`03 91 20` to `03 90 20`; the inner available-printer response remained
+`3D 41 EB 80 00 0D 01 01 00 84 00 00 00`. The verbose router logged the
+reply arriving over WebSocket, transmitting it on LLC2, and receiving the
+guest's LLC RR. IBM i accepted the printer as `ACTIVE/WRITER` and took a
+queued `QPDSPLIB` file, but sent no LU4 BIND or SCS. About three minutes
+later it sent SIGNAL `C9 00 01 00 01` and raised `CPA3387` again. Clearing
+the outer pacing indicator did not establish printer readiness. The QA-only
+change was removed; the disposable traces are `qa-actlu-no-pi.log` and
+`router-actlu-no-pi.log`.
+
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
 probe does not decode that form and the activation stopped there. Clean IPL
