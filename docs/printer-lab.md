@@ -304,6 +304,16 @@ SIGNAL `C9 00 01 00 01` and posted `CPA3387` again. The trial is preserved in
 `6fcb47ea-4e01-4d8d-aaa5-7b4faeb04b59`; the experimental Go change was
 removed. Altering that outer response mode alone does not solve readiness.
 
+The firmware's NMVT sender begins with FID2 class `2C` before its resident
+session service patches runtime addressing. A further QA-only LLC run used
+`2C 00 00 00` instead of `2E 00 00 00` for the independent Reply-PSID.
+IBM i positively answered it and proceeded through the same device BIND,
+Attach, and encapsulated address-01 ACTLU. The writer again posted `CPA3387`
+without a LU4 BIND or SCS record. The trial's synthetic zero addressing and
+VPD prevent treating either FID2 form as the real 5494 wire form. The trace is
+`qa-host-assigned.log` / `router-host-assigned.log`, circuit
+`9f8a5c66-e63f-432e-8597-5dd5acc0e5d6`; the QA flag was removed.
+
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
 probe does not decode that form and the activation stopped there. Clean IPL
