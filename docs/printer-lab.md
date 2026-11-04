@@ -1376,3 +1376,34 @@ The QA reply now preserves the incoming device-session TH class (`2C`)
 while reversing DAF/OAF. This correction awaits a clean rerun; no LU4 BIND
 or SCS print data has yet been observed. The wire evidence is in
 `qa-device-d822.log` and `router-llc-device-d822.log` in the local lab.
+
+### Host-created printer and writer result
+
+The clean LLC rerun used the existing V5R4 guest, the verbose Rust router,
+and `concentrator-qa -printer-probe -sna-debug`. The probe sent the
+firmware-derived Reply-PSID with address-01 status
+`09 82 04 10 00 01 03 20 01` and 3812 model-001 VPD. After removing the
+manually defined `SNUPRT01`, IBM i automatically created `SVCPRT01` under
+`SNUPRT`. `DSPDEVD` showed `Automatically created YES`, class `*RMT`, type
+`3812`, model `1`, and local address `01`. `WRKCFGSTS` showed `SVCPRT01`
+varied on. This establishes that the guest accepted the synthetic device
+identity and associated it with the remote workstation controller.
+
+The guest job selected `QUSRSYS/SVCPRT01` as its output queue and created a
+fresh three-page `QPDSPLIB` spool with `DSPLIB LIB(QGPL) OUTPUT(*PRINT)`.
+`STRPRTWTR DEV(SVCPRT01)` started writer job
+`002809/QSPLJOB/SVCPRT01`. After the form-load inquiry was answered `G`,
+the writer logged that it could not allocate `QPSPLPRT` for `SVCPRT01`, then
+posted `CPA3387` (device not available). The same verbose trace contains the
+host's device-session Attach to TP `30F0F6F3`, the probe's `D822` success
+reply, and the host's inner address-01 ACTLU
+`00 0C D8 24 3D 41 6B 80 00 0D 01 01`. The probe replied
+`00 11 D8 24 3D 41 EB 80 00 0D 01 01 00 84 00 00 00`; the host returned
+an outer pacing acknowledgement `83 01 00`. No inner LU4 BIND or SCS
+arrived before the writer's later SIGNAL `C9 00 01 00 01` and `CPA3387`.
+
+The evidence is `qa-autocreate.log`, `router-autocreate.log`, and
+`boot-noqnx.log` in the disposable lab directory. The wire circuit is
+`3adc54dd-0791-48a4-bcbd-4e32e8aa7687`. The remaining gate is after the
+available-printer ACTLU response; the host's pacing acknowledgement alone
+does not prove it accepted that response as printer-ready.
