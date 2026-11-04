@@ -511,6 +511,9 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 // from its attached device and maintain the independent SSCP-PU flow.
 func (c *printerProbeCircuit) nextNMVTTH() [6]byte {
 	c.nmvtSequence++
+	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_DIRECT_CONTROLLER") == "1" {
+		return [6]byte{0x2e, 0, 1, 2, byte(c.nmvtSequence >> 8), byte(c.nmvtSequence)}
+	}
 	return [6]byte{0x2e, 0, 0, 0, byte(c.nmvtSequence >> 8), byte(c.nmvtSequence)}
 }
 
@@ -546,7 +549,8 @@ func (p *localPrinterProbe) sendSolicitedPrinterPSID(id string, c *printerProbeC
 	psid := experimentalPrinterPSID()
 	psid.Solicited = true
 	psid.ProcedureID = c.psidRequestID
-	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_DIRECT") == "1" {
+	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_DIRECT") == "1" ||
+		os.Getenv("SNUSNU_PRINTER_PROBE_PSID_DIRECT_CONTROLLER") == "1" {
 		out, err := psid.EncodeNMVTPIU(c.nextNMVTTH(), 0x80, 0)
 		if err != nil {
 			return err

@@ -913,3 +913,15 @@ crossed the verbose LLC router. IBM i still returned UNBIND FE with sense
 `20020000`, and the printer did not become active. This eliminates that
 sequence gap as the sole cause of the rejected controller record. The flag
 is QA-only and off by default.
+
+A direct-NMVT controller-session trial then sent the firmware-shaped node
+Reply PSID as a complete FID2 PIU with DAF/OAF `01/02` and the independently
+counted controller sequence `000C`. IBM i immediately returned UNBIND FE,
+sense `20020000`, before the attached-device PSID could be sent. The same
+node format on the `00/00` management path had previously received a positive
+SNA response. Thus the controller LU6.2 session does not accept a bare NMVT
+PIU in this state. The QA flag `SNUSNU_PRINTER_PROBE_PSID_DIRECT_CONTROLLER`
+reproduces this trial; it is off by default. The outstanding protocol question
+is the controller-session notification that makes IBM i initiate the separate
+address-01 device session. The 5494 manual describes that notification but
+does not publish its application record.
