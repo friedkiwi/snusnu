@@ -938,3 +938,14 @@ This further narrows the missing step to the controller application state or
 an as-yet-unidentified device notification, not an arbitrary FID2 address
 substitution. `SNUSNU_PRINTER_PROBE_PSID_SS_LU=1` reproduces the test and is
 off by default.
+
+The final LLC comparison in this series combined both corrections: a
+continuous outgoing controller sequence (`000B`, `000C`) and no pacing
+indicator (`03 90 20`) on the positive inner-PSID response and following
+`D824` Reply PSID. IBM i still sent UNBIND FE with `20020000`. Thus neither
+the old sequence gap nor the pacing-indicator bit explains the rejected
+nested record, individually or together. The [SNA Management Services
+Reference](https://bitsavers.trailing-edge.com/pdf/ibm/sna/SC30-3346-2_SNA_Management_Services_Reference_198906.pdf)
+also confirms that Query Product Set ID and Reply Product Set ID are separate
+NMVT requests, each with its own SNA response; the inner positive response
+must not be filled with product data as a substitute for the Reply PSID.
