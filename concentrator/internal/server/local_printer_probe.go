@@ -44,6 +44,7 @@ type printerProbeCircuit struct {
 	psidRequestID      uint16
 	psidRequestTH      [6]byte
 	nmvtSequence       uint16
+	controllerSequence uint16
 	spool              probePrinterSpool
 }
 
@@ -346,6 +347,16 @@ func (p *localPrinterProbe) beginManagement(id string, c *printerProbeCircuit) e
 }
 
 func (p *localPrinterProbe) sendInformation(id string, data []byte) error {
+	if os.Getenv("SNUSNU_PRINTER_PROBE_TRACK_SOURCE_SEQUENCE") == "1" &&
+		len(data) >= 9 && data[0]&0xfc == 0x2c && data[2] == 1 && data[3] == 2 &&
+		data[6]&0x80 == 0 && (data[4] != 0 || data[5] != 0) {
+		if c := p.circuits[id]; c != nil {
+			c.controllerSequence++
+			data = append([]byte(nil), data...)
+			data[4], data[5] = byte(c.controllerSequence>>8), byte(c.controllerSequence)
+			log.Printf("printer probe controller source sequence: circuit=%s sequence=%04x piu=%x", id, c.controllerSequence, data)
+		}
+	}
 	return p.hub.event(p.hub.local, &wire.CircuitEvent{CircuitId: uuidBytes(id), Event: &wire.CircuitEvent_SnaInformation{SnaInformation: data}})
 }
 
@@ -558,10 +569,14 @@ func (p *localPrinterProbe) sendSolicitedPrinterPSID(id string, c *printerProbeC
 	th[2], th[3] = th[3], th[2]
 	th[5]++
 	rh0 := byte(0x03)
+	rh1 := byte(0x91)
 	if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
 		rh0 = 0x01 // last in the controller FMD chain
 	}
-	out, err := (piu.FID2{TH: th, RH: [3]byte{rh0, 0x91, 0x20}, RU: gds}).Bytes()
+	if os.Getenv("SNUSNU_PRINTER_PROBE_NO_PACING_INDICATOR") == "1" {
+		rh1 = 0x90
+	}
+	out, err := (piu.FID2{TH: th, RH: [3]byte{rh0, rh1, 0x20}, RU: gds}).Bytes()
 	if err != nil {
 		return err
 	}
@@ -835,17 +850,23 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
 				responseRH0, responseRH2 = 0x02, 0 // first in chain, keep direction
 			}
+			responseRH1 := byte(0x91)
+			if os.Getenv("SNUSNU_PRINTER_PROBE_NO_PACING_INDICATOR") == "1" {
+				responseRH1 = 0x90
+			}
 			packet, err := (piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]},
-				RH: [3]byte{responseRH0, 0x91, responseRH2}, RU: gds}).Bytes()
+				RH: [3]byte{responseRH0, responseRH1, responseRH2}, RU: gds}).Bytes()
 			if err != nil {
 				return err
 			}
-			c.psidRequestPending = os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") != "1"
+			c.psidRequestPending = os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") != "1" &&
+				os.Getenv("SNUSNU_PRINTER_PROBE_NO_PACING_INDICATOR") != "1"
 			log.Printf("printer probe controller PSID request response: circuit=%s piu=%x", id, packet)
 			if err := p.sendInformation(id, packet); err != nil {
 				return err
 			}
-			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
+			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" ||
+				os.Getenv("SNUSNU_PRINTER_PROBE_NO_PACING_INDICATOR") == "1" {
 				return p.sendSolicitedPrinterPSID(id, c)
 			}
 			return nil

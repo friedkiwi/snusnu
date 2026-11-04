@@ -894,3 +894,22 @@ controller application record, a different response envelope, or another
 session-state rule. The QA flags are `SNUSNU_PRINTER_PROBE_KEEP_PSID_DIRECTION`
 and `SNUSNU_PRINTER_PROBE_CHAIN_PSID`, respectively; neither is enabled in
 normal concentrator operation.
+
+An additional trial removed the outer pacing-indicator bit from both QA
+controller records (`03 90 20`). Without that bit IBM i did not send the
+`83 01 00` pacing grant, so the QA had to send the Reply PSID immediately.
+The guest then sent UNBIND FE with sense `20020000`. This establishes that
+waiting for a grant without requesting one stalls the probe, and that
+removing the pacing bit alone does not make the nested Reply PSID valid.
+
+Verbose traffic also exposed a separate QA sequence gap: IBM i sent a long
+workstation request in two PIUs, sequences `0007` and `0008`, while the QA
+copied `0008` into its next outgoing PIU and skipped outgoing `0007`.
+With `SNUSNU_PRINTER_PROBE_TRACK_SOURCE_SEQUENCE=1`, the QA now counts its
+own controller-session requests independently. The observed outgoing stream
+ran consecutively from `0001` through `000C`; the positive inner PSID
+response used `000B`, and the address-01 Reply PSID used `000C`. Both
+crossed the verbose LLC router. IBM i still returned UNBIND FE with sense
+`20020000`, and the printer did not become active. This eliminates that
+sequence gap as the sole cause of the rejected controller record. The flag
+is QA-only and off by default.
