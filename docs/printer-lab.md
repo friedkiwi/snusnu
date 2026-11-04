@@ -187,6 +187,28 @@ the diagnostic was removed. These are QA probe observations over LLC, not
 successful printer delivery. The next gate is the device-session behavior
 after ACTLU, or a guest-side reason for withholding the LU 4 BIND.
 
+Further clean-IPL LLC trials compared the available-printer ACTLU response
+with the firmware fallback response that reports the printer powered down
+(`0D 01 01 00 84 20 00 00`). After IBM i acknowledged that response, QA sent
+an SS-LU `LUSTAT 00010000` on normal flow with change direction in the inner
+RH (`3C 41 4B 80 20`). One trial sent it immediately; another waited five
+seconds. The verbose router trace confirms delivery of both variants to the
+guest. Neither caused an immediate `UNBIND FE`, and IBM i showed
+`SNUPRT01 VARIED ON`. The writer still claimed the queued three-page file,
+then raised `CPA3387` (device unavailable) without sending a LU 4 BIND or SCS
+data. The timing variant therefore did not establish printer readiness.
+Both variants were QA-only probes and were removed from the Go worktree.
+The disposable lab retains `qa-off-ready-clean.log`,
+`router-off-ready-clean.log`, `qa-off-ready-delay-clean.log`, and
+`router-off-ready-delay-clean.log` for comparison.
+
+Warm controller reactivation also exposed a second startup form: IBM i sent
+`D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
+probe does not decode that form and the activation stopped there. Clean IPL
+and an explicit controller vary-off/on returned the longer `D822` form used
+by the current probe. The short form needs a separate firmware/host analysis;
+it must not be treated as an address-01 printer record.
+
 After the host power loss, a fresh writable V5R4 clone was booted and signed
 in using the lab image's existing QA account. The source image was left
 untouched. The clone uses `SOLNET.PRTGUEST`, `SNUSNU.SVC`, a 5494 remote
