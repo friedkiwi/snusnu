@@ -1417,3 +1417,7 @@ the verbose QA log. The host's message says the device is not powered on,
 varied on, or free for the writer; the status display rules out a simple
 vary-on omission but does not identify which internal availability check
 failed.
+The writer job log identifies the preceding allocation failure as `CPF4128`
+for `QSYS/QPSPLPRT` and device `SVCPRT01`. Its extended text lists a device
+already in use, a device not varied on, or no APPC sessions as possible causes;
+it does not select one cause for this job.
