@@ -40,10 +40,11 @@ envelope remains outside that state machine. The package also encodes the
 short, hardware-only NMVT Reply Product Set ID used
 to announce a powered-on printer, with runtime SNA address and VPD supplied by
 the caller. The candidate ACTLU response has now been exercised against the
-guest for station 56; it led to a host LU 7 BIND. This is not the printer at
-address 01. VG15 itself adds no LU 6.2 GDS envelope to the NMVT; the resident
-session service's final wire framing, live FID2 TH/RH, and printer device
-session's private GDS behavior remain to be established.
+guest for both station 56 and printer address 01. The address-01 response was
+delivered over LLC and acknowledged at the outer SNA level, but the host did
+not send the subsequent LU 4 printer BIND. VG15 itself adds no LU 6.2 GDS
+envelope to the NMVT; the resident session service's final wire framing and
+runtime FID2 TH/RH still require a physical-controller capture.
 The package does not perform APPC session management, store jobs, or produce a
 PDF. The concentrator now has owner-scoped durable raw SCS storage,
 a searchable print list, a monospace preview, and a greenbar PDF writer. These
@@ -161,6 +162,30 @@ target for both media.
 ## Remaining acceptance work
 
 ### Recovered V5R4 lab, 2026-11-04
+
+After the recovered guest's controller and writer were reset, a solicited
+printer PSID inside the controller `D824` exchange made IBM i initiate a
+second, host-controlled `QRMTWSC` LU 6.2 BIND. IBM i accepted the candidate
+device BIND response and sent an Attach to TP `30F0F6F3`. A firmware-derived
+`D822/0000` reply advanced it to an encapsulated address-01 ACTLU. The QA
+responder returned the IBM-defined available-printer RU
+`0D 01 01 00 84 00 00 00` on the host-initiated outer session (TH class
+`2C`). The verbose router trace confirms delivery to IBM i and its positive
+outer SNA acknowledgment. `SNUPRT` became `ACTIVE` and `SNUPRT01` became
+`VARIED ON` on the guest.
+
+The guest printer writer then took a three-page `QPDSPLIB` file from the
+`SNUPRT01` output queue. Its first operator inquiry requested loading form
+type `*STD`; replying `G` advanced the writer to `WTR`. No inner address-01
+LU 4 BIND or SCS data followed. About a minute after the ACTLU exchange,
+IBM i reported `CPA3387` (device not available) to the writer. A new
+solicited/unsolicited PSID pair, an unsolicited power-on PSID after ACTLU,
+and setting the NMVT solicited flag were each acknowledged but did not elicit
+the LU 4 BIND. A diagnostic SS-LU `LUSTAT 00010000` after ACTLU caused
+IBM i to end that device session with `UNBIND FE` and sense `20020000`;
+the diagnostic was removed. These are QA probe observations over LLC, not
+successful printer delivery. The next gate is the device-session behavior
+after ACTLU, or a guest-side reason for withholding the LU 4 BIND.
 
 After the host power loss, a fresh writable V5R4 clone was booted and signed
 in using the lab image's existing QA account. The source image was left
