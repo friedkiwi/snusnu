@@ -925,3 +925,16 @@ reproduces this trial; it is off by default. The outstanding protocol question
 is the controller-session notification that makes IBM i initiate the separate
 address-01 device session. The 5494 manual describes that notification but
 does not publish its application record.
+
+The next direct-NMVT trial used the host-activated SS-LU address pair: IBM i
+sent ACTLU from `01/00`, so QA sent the node Reply PSID from `00/01` with
+host-initiated TH `2C` and source sequence `0001`. IBM i returned a negative
+response with sense `10030001`, echoing `41 03 8D`. IBM's
+[SNA Management Services Reference](https://bitsavers.trailing-edge.com/pdf/ibm/sna/SC30-3346-2_SNA_Management_Services_Reference_198906.pdf)
+defines this exact sense for an NMVT sent to a PU half-session that does not
+support NMVTs. The PSID therefore cannot be sent on this SS-LU pair; the
+previous positive replies at `00/00` belong to the separate management path.
+This further narrows the missing step to the controller application state or
+an as-yet-unidentified device notification, not an arbitrary FID2 address
+substitution. `SNUSNU_PRINTER_PROBE_PSID_SS_LU=1` reproduces the test and is
+off by default.
