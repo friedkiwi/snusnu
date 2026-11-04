@@ -267,6 +267,21 @@ in use. `WRKCFGSTS` showed the device varied on, so the printer-ready state
 is still missing. The clean trace is `qa-actlu-clean-retry.log` /
 `router-actlu-clean-retry.log`. Neither run received SCS print data.
 
+A QA-only combined probe then sent an independent printer NMVT immediately
+after IBM i positively answered the controller-conversation power-on report.
+IBM i positively answered the independent NMVT too, initiated the parallel
+5494 device session, and separately sent a direct FID2 ACTLU with
+`DAF=01/OAF=00`. That direct ACTLU appears to belong to the auto-created
+`QNXDEV` under APPC controller `LLCPRT`; the QA endpoint had previously
+ignored it. A new opt-in QA response returned the documented available
+printer ACTLU RU on the reversed FID2 addresses, while the encapsulated
+address-01 ACTLU on the 5494 device session was also answered. `QNXDEV`
+nevertheless remained `VARY ON PENDING`, and no LU4 printer BIND followed.
+The independent NMVT path still does not establish the 5494 printer's ready
+state. The paired traces are `qa-combined-psid.log` /
+`router-combined-psid.log` and `qa-direct-actlu.log` /
+`router-direct-actlu.log` in the disposable lab directory.
+
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
 probe does not decode that form and the activation stopped there. Clean IPL

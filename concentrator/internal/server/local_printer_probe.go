@@ -21,32 +21,33 @@ import (
 )
 
 type printerProbeCircuit struct {
-	peer               sna.Peer
-	source             LocalPeer
-	xid                *xid3.Activation
-	profile            wire.CircuitProfile
-	allowance          uint64
-	xidReadyReplySent  bool
-	linkReadySent      bool
-	initiated          bool
-	managementPhase    uint8
-	nmvtSent           bool
-	management         *lu62.ManagementSession
-	fqpcid             []byte
-	peerIPR            bool
-	device             *printer.LU4Device
-	deviceSessionBound bool
-	chain              *printer.ChainAssembler
-	lu7WSFBytes        int
-	lu7UnbindAwaitAck  bool
-	psidRequestPending bool
-	psidNodeAwaitAck   bool
-	psidDeviceAwaitAck bool
-	psidRequestID      uint16
-	psidRequestTH      [6]byte
-	nmvtSequence       uint16
-	controllerSequence uint16
-	spool              probePrinterSpool
+	peer                    sna.Peer
+	source                  LocalPeer
+	xid                     *xid3.Activation
+	profile                 wire.CircuitProfile
+	allowance               uint64
+	xidReadyReplySent       bool
+	linkReadySent           bool
+	initiated               bool
+	managementPhase         uint8
+	nmvtSent                bool
+	management              *lu62.ManagementSession
+	fqpcid                  []byte
+	peerIPR                 bool
+	device                  *printer.LU4Device
+	deviceSessionBound      bool
+	chain                   *printer.ChainAssembler
+	lu7WSFBytes             int
+	lu7UnbindAwaitAck       bool
+	psidRequestPending      bool
+	psidNodeAwaitAck        bool
+	psidDeviceAwaitAck      bool
+	controllerPowerAwaitAck bool
+	psidRequestID           uint16
+	psidRequestTH           [6]byte
+	nmvtSequence            uint16
+	controllerSequence      uint16
+	spool                   probePrinterSpool
 }
 
 type localPrinterProbe struct {
@@ -711,6 +712,7 @@ func (p *localPrinterProbe) sendControllerPrinterPower(id string, c *printerProb
 		return err
 	}
 	log.Printf("printer probe controller power-on PSID: circuit=%s piu=%x", id, out)
+	c.controllerPowerAwaitAck = os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_CONTROLLER_POWER_ACK") == "1"
 	return p.sendInformation(id, out)
 }
 
@@ -842,6 +844,24 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if err != nil {
 			return nil
 		}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_DIRECT_ACTLU_REPLY") == "1" &&
+			outer.TH[2] == 1 && outer.TH[3] == 0 && outer.RH == [3]byte{0x6b, 0x80, 0} &&
+			bytes.Equal(outer.RU, []byte{0x0d, 1, 1}) {
+			ru, err := printer.ACTLUResponseRU(outer.RU)
+			if err != nil {
+				return err
+			}
+			reply := piu.FID2{
+				TH: [6]byte{outer.TH[0], outer.TH[1], outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]},
+				RH: [3]byte{0xeb, 0x80, 0}, RU: ru,
+			}
+			packet, err := reply.Bytes()
+			if err != nil {
+				return err
+			}
+			log.Printf("printer probe direct ACTLU reply: circuit=%s piu=%x", id, packet)
+			return p.sendInformation(id, packet)
+		}
 		if c.deviceSessionBound && outer.TH[2] == 1 && outer.TH[3] == 2 &&
 			outer.RH == [3]byte{0x0b, 0x91, 0x20} && len(outer.RU) >= 14 &&
 			bytes.Equal(outer.RU[10:14], []byte{0x30, 0xf0, 0xf6, 0xf3}) {
@@ -924,6 +944,13 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			return nil
 		}
 		if inner.Address == 0 {
+			if c.controllerPowerAwaitAck && inner.Response &&
+				inner.RH == [3]byte{0x8b, 0x80, 0} &&
+				bytes.Equal(inner.RU, []byte{0x41, 3, 0x8d}) {
+				c.controllerPowerAwaitAck = false
+				log.Printf("printer probe controller power-on acknowledged; sending independent NMVT: circuit=%s", id)
+				return p.sendExperimentalNMVT(id, c)
+			}
 			if c.psidNodeAwaitAck && inner.Response &&
 				inner.RH == [3]byte{0x8b, 0x80, 0} &&
 				bytes.Equal(inner.RU, []byte{0x41, 3, 0x8d}) {
