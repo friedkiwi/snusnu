@@ -1407,3 +1407,13 @@ The evidence is `qa-autocreate.log`, `router-autocreate.log`, and
 `3adc54dd-0791-48a4-bcbd-4e32e8aa7687`. The remaining gate is after the
 available-printer ACTLU response; the host's pacing acknowledgement alone
 does not prove it accepted that response as printer-ready.
+
+At 00:29, `WRKCFGSTS CFGTYPE(*CTL) CFGD(SNUPRT)` showed the controller
+`ACTIVE` and `SVCPRT01 ACTIVE/WRITER`. The operator replied `R` to the
+writer's first `CPA3387` inquiry. The writer retried, but posted a second
+`CPA3387` at 00:31:52; `WRKWTR` still showed `Waiting on message: Y`.
+Neither the retry nor the intervening period produced another printer PIU in
+the verbose QA log. The host's message says the device is not powered on,
+varied on, or free for the writer; the status display rules out a simple
+vary-on omission but does not identify which internal availability check
+failed.
