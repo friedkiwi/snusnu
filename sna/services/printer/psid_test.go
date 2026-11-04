@@ -26,6 +26,12 @@ func TestReplyPSIDAddress01FirmwareLayout(t *testing.T) {
 	if _, err := p.EncodeNMVT(); err == nil {
 		t.Fatal("nonzero procedure ID accepted on unsolicited NMVT")
 	}
+	p.Solicited = true
+	if solicited, err := p.EncodeNMVT(); err != nil ||
+		!bytes.Equal(solicited[:12], []byte{0x41, 3, 0x8d, 0, 0, 0, 1, 0x10, 0, 0x3a, 0, 0x90}) {
+		t.Fatalf("solicited Reply PSID did not echo procedure ID: %x %v", solicited, err)
+	}
+	p.Solicited = false
 	p.ProcedureID = 0
 	th := [6]byte{0x2c, 0, 2, 1, 0x12, 0x34}
 	full, err := p.EncodeNMVTPIU(th, 0x80, 0)

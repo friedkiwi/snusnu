@@ -22,13 +22,15 @@ type HardwarePSID struct {
 }
 
 // ReplyPSID holds the runtime fields of the 5494 short, hardware-only NMVT
-// Reply Product Set ID. ProcedureID must be zero for this unsolicited NMVT.
+// Reply Product Set ID. An unsolicited reply uses ProcedureID zero; a
+// solicited reply echoes the request's ProcedureID.
 // AddressList is the six-byte SNA address prefix which
 // precedes the final linear workstation address in the Address List. Port's
 // high two bits select a shared session; its low six bits and Station must
 // match the address divided by seven.
 type ReplyPSID struct {
 	ProcedureID uint16
+	Solicited   bool
 	AddressList [6]byte
 	Address     byte
 	Port        byte
@@ -44,14 +46,18 @@ type ReplyPSID struct {
 func (p ReplyPSID) EncodeNMVT() ([]byte, error) {
 	// VG15 divides the six-bit linear address by seven. The low six port
 	// bits carry the quotient; the top two bits select a shared session.
-	if p.ProcedureID != 0 || p.Address == 0 || p.Address > 63 ||
+	if (!p.Solicited && p.ProcedureID != 0) || p.Address == 0 || p.Address > 63 ||
 		p.Port&0x3f != p.Address/7 || p.Station != p.Address%7 ||
 		!ebcdicDigits(p.VPD.MachineType[:]) || p.VPD.Model == [3]byte{} ||
 		p.VPD.Plant == [2]byte{} || p.VPD.Serial == [7]byte{} {
 		return nil, ErrPSID
 	}
+	// The VG15 attached-device template retains 0x10 even when it is
+	// generated in response to Request PSID. Its preceding node reply uses
+	// 0x80; solicited status is carried by the echoed procedure ID.
+	flags := byte(0x10)
 	ru := []byte{0x41, 0x03, 0x8d, 0, 0, byte(p.ProcedureID >> 8), byte(p.ProcedureID),
-		0x10, 0, 0x3a, 0, 0x90, 0x0a, 4, 1}
+		flags, 0, 0x3a, 0, 0x90, 0x0a, 4, 1}
 	ru = append(ru, p.AddressList[:]...)
 	ru = append(ru, p.Address)
 	ru = append(ru, 9, 0x82, 4, 0x10, p.Port, p.Station, 3, 0x20, 1)

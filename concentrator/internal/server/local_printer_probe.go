@@ -20,23 +20,30 @@ import (
 )
 
 type printerProbeCircuit struct {
-	peer              sna.Peer
-	source            LocalPeer
-	xid               *xid3.Activation
-	profile           wire.CircuitProfile
-	allowance         uint64
-	xidReadyReplySent bool
-	linkReadySent     bool
-	initiated         bool
-	managementPhase   uint8
-	nmvtSent          bool
-	management        *lu62.ManagementSession
-	fqpcid            []byte
-	peerIPR           bool
-	device            *printer.LU4Device
-	chain             *printer.ChainAssembler
-	lu7WSFBytes       int
-	spool             probePrinterSpool
+	peer               sna.Peer
+	source             LocalPeer
+	xid                *xid3.Activation
+	profile            wire.CircuitProfile
+	allowance          uint64
+	xidReadyReplySent  bool
+	linkReadySent      bool
+	initiated          bool
+	managementPhase    uint8
+	nmvtSent           bool
+	management         *lu62.ManagementSession
+	fqpcid             []byte
+	peerIPR            bool
+	device             *printer.LU4Device
+	chain              *printer.ChainAssembler
+	lu7WSFBytes        int
+	lu7UnbindAwaitAck  bool
+	psidRequestPending bool
+	psidNodeAwaitAck   bool
+	psidDeviceAwaitAck bool
+	psidRequestID      uint16
+	psidRequestTH      [6]byte
+	nmvtSequence       uint16
+	spool              probePrinterSpool
 }
 
 type localPrinterProbe struct {
@@ -419,7 +426,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 			return err
 		}
 		if os.Getenv("SNUSNU_PRINTER_PROBE_NMVT") == "1" && os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_ATTACH") != "1" {
-			return p.sendExperimentalNMVT(id)
+			return p.sendExperimentalNMVT(id, c)
 		}
 		return nil
 	case lu62.ManagementCNOSComplete:
@@ -490,9 +497,24 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 // sendExperimentalNMVT is a QA-only wire probe. The VPD and address-list
 // fields below are lab placeholders; a real printer service must obtain them
 // from its attached device and maintain the independent SSCP-PU flow.
-func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
+func (c *printerProbeCircuit) nextNMVTTH() [6]byte {
+	c.nmvtSequence++
+	return [6]byte{0x2c, 0, 0, 0, byte(c.nmvtSequence >> 8), byte(c.nmvtSequence)}
+}
+
+func (p *localPrinterProbe) sendExperimentalNMVT(id string, c *printerProbeCircuit) error {
+	psid := experimentalPrinterPSID()
+	out, err := psid.EncodeNMVTPIU(c.nextNMVTTH(), 0x80, 0)
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe experimental NMVT: circuit=%s piu=%x", id, out)
+	return p.sendInformation(id, out)
+}
+
+func experimentalPrinterPSID() printer.ReplyPSID {
 	now := time.Now()
-	psid := printer.ReplyPSID{
+	return printer.ReplyPSID{
 		ProcedureID: 0,
 		Address:     1, Station: 1,
 		VPD: printer.HardwarePSID{
@@ -506,11 +528,64 @@ func (p *localPrinterProbe) sendExperimentalNMVT(id string) error {
 			byte(now.Hour()), byte(now.Minute()), byte(now.Second()),
 		},
 	}
-	out, err := psid.EncodeNMVTPIU([6]byte{0x2c, 0, 0, 0, 0, 1}, 0x80, 0)
+}
+
+func (p *localPrinterProbe) sendSolicitedPrinterPSID(id string, c *printerProbeCircuit) error {
+	psid := experimentalPrinterPSID()
+	psid.Solicited = true
+	psid.ProcedureID = c.psidRequestID
+	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_DIRECT") == "1" {
+		out, err := psid.EncodeNMVTPIU(c.nextNMVTTH(), 0x80, 0)
+		if err != nil {
+			return err
+		}
+		log.Printf("printer probe solicited direct PSID: circuit=%s piu=%x", id, out)
+		c.psidDeviceAwaitAck = true
+		return p.sendInformation(id, out)
+	}
+	ru, err := psid.EncodeNMVT()
 	if err != nil {
 		return err
 	}
-	log.Printf("printer probe experimental NMVT: circuit=%s piu=%x", id, out)
+	inner := printer.LU4PIU{Address: 0, Session: printer.LU4PhysicalSession,
+		RH: [3]byte{0x0b, 0x80, 0}, RU: ru}
+	gds, err := printer.EncodeControllerDeviceGDS(inner)
+	if err != nil {
+		return err
+	}
+	th := c.psidRequestTH
+	th[2], th[3] = th[3], th[2]
+	th[5]++
+	out, err := (piu.FID2{TH: th, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}).Bytes()
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe solicited controller PSID: circuit=%s piu=%x", id, out)
+	return p.sendInformation(id, out)
+}
+
+// The VG15 node reply is emitted before attached-device replies for an 83
+// Request PSID. This QA fixture keeps the firmware's 46-byte major vector and
+// uses the lab's synthetic controller VPD where runtime 5494 fields would go.
+func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCircuit) error {
+	tail := []byte{
+		0, 0, byte(c.psidRequestID >> 8), byte(c.psidRequestID), 0x80,
+		0, 0x2e, 0, 0x90, 0x23, 0x10, 0, 0x20, 0x11, 1, 0x13,
+		0, 0x12, 0xf5, 0xf4, 0xf9, 0xf4,
+		0xf0, 0xf0, 0xf2, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0,
+		0xf0, 0xf0, 0xf0, 0xf1, 0x0a, 0x0b, 0, 0, 0, 0, 0xf0,
+		0xf0, 0, 0, 0x07, 0x42, 0xef, 0, 0, 0, 0,
+	}
+	if len(tail) != 51 {
+		return fmt.Errorf("node PSID tail length %d", len(tail))
+	}
+	ru := append([]byte{0x41, 3, 0x8d}, tail...)
+	out, err := (piu.FID2{TH: c.nextNMVTTH(), RH: [3]byte{0x0b, 0x80, 0}, RU: ru}).Bytes()
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe solicited node PSID: circuit=%s piu=%x", id, out)
+	c.psidNodeAwaitAck = true
 	return p.sendInformation(id, out)
 }
 
@@ -642,10 +717,33 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if err != nil {
 			return nil
 		}
+		if c.lu7UnbindAwaitAck && outer.RH == [3]byte{0x83, 0x01, 0} &&
+			os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_LU7") == "1" {
+			c.lu7UnbindAwaitAck = false
+			c.nmvtSent = true
+			return p.sendExperimentalNMVT(id, c)
+		}
+		if c.psidRequestPending && outer.RH == [3]byte{0x83, 0x01, 0} {
+			c.psidRequestPending = false
+			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_NODE") == "1" {
+				return p.sendSolicitedNodePSID(id, c)
+			}
+			return p.sendSolicitedPrinterPSID(id, c)
+		}
+		if c.psidNodeAwaitAck && outer.RH == [3]byte{0x8b, 0x80, 0} {
+			c.psidNodeAwaitAck = false
+			return p.sendSolicitedPrinterPSID(id, c)
+		}
+		if c.psidDeviceAwaitAck && outer.RH == [3]byte{0x8b, 0x80, 0} {
+			c.psidDeviceAwaitAck = false
+			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_POWER_AFTER_REPLY") == "1" {
+				return p.sendExperimentalNMVT(id, c)
+			}
+		}
 		if !c.nmvtSent && os.Getenv("SNUSNU_PRINTER_PROBE_NMVT_AFTER_ATTACH") == "1" &&
 			len(outer.RU) >= 4 && outer.RU[2] == 0xd8 && outer.RU[3] == 0x22 {
 			c.nmvtSent = true
-			return p.sendExperimentalNMVT(id)
+			return p.sendExperimentalNMVT(id, c)
 		}
 		if os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && outer.TH[0]&1 != 0 &&
 			outer.RH == [3]byte{0x4b, 0x80, 0} && bytes.Equal(outer.RU, []byte{0xc9, 0, 1, 0, 1}) {
@@ -658,8 +756,34 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			return p.sendInformation(id, response)
 		}
 		inner, err := printer.ParseControllerDeviceGDS(outer.RU)
-		if err != nil || (inner.Address != 56 && inner.Address != 1) || len(inner.RU) == 0 {
+		if err != nil || (inner.Address != 56 && inner.Address != 1 && inner.Address != 0) || len(inner.RU) == 0 {
 			return nil
+		}
+		if inner.Address == 0 {
+			if os.Getenv("SNUSNU_PRINTER_PROBE_CONTROLLER_PSID") != "1" ||
+				inner.Session != printer.LU4PhysicalSession || len(inner.RU) != 17 ||
+				!bytes.Equal(inner.RU[:5], []byte{0x41, 3, 0x8d, 0, 0}) ||
+				!bytes.Equal(inner.RU[7:], []byte{0, 0, 9, 0x80, 0x90, 2, 0x83, 3, 0x85, 1}) {
+				return nil
+			}
+			c.psidRequestID = uint16(inner.RU[5])<<8 | uint16(inner.RU[6])
+			c.psidRequestTH = outer.TH
+			response, err := printer.PositiveLU4Response(inner, []byte{0x41, 3, 0x8d})
+			if err != nil {
+				return err
+			}
+			gds, err := printer.EncodeControllerDeviceGDS(response)
+			if err != nil {
+				return err
+			}
+			packet, err := (piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]},
+				RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}).Bytes()
+			if err != nil {
+				return err
+			}
+			c.psidRequestPending = true
+			log.Printf("printer probe controller PSID request response: circuit=%s piu=%x", id, packet)
+			return p.sendInformation(id, packet)
 		}
 		if inner.Address == 1 {
 			return p.printerDeviceInformation(id, c, outer, inner)
@@ -716,10 +840,13 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 				if err == nil && inner.Address == 56 {
 					ru[5] = 0x80 // LU7 display: type bits 10 in the ACTLU status byte.
 				}
+			case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0e && len(inner.RU) == 1:
+				ru = []byte{0x0e}
 			case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && (inner.RU[14] == 7 || inner.RU[14] == 4):
 				ru = append([]byte(nil), inner.RU...)
 			case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x32 && len(inner.RU) == 2:
 				ru = append([]byte(nil), inner.RU...)
+				c.lu7UnbindAwaitAck = true
 			case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
 				bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 5, 0xd8, 0x20, 2}):
 				// VG03's D820/02 handler copies this 26-byte 5250 Query reply.

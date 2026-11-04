@@ -198,6 +198,44 @@ inner address-56 LU7 `UNBIND`. The QA probe answered that `UNBIND`, and
 V5R4 positively acknowledged each new outbound record. `SNUPRT01` is still
 `VARY ON PENDING`, and no address-01 LU4 BIND or SCS followed. This closes
 the observed address-56 exchange without establishing printer readiness.
+An additional QA trial placed the Reply-PSID directly on the established
+controller-session FID2 address pair `(1,2)` with TH byte `2E`. IBM i
+immediately sent `UNBIND FE` with sense `20020000` (chain error); the trial
+was removed. The earlier zero-address NMVT remains the only form the guest
+has positively acknowledged, and that acknowledgement has not activated the
+configured printer.
+
+The next LLC trace completed the firmware-derived address-56 LU7 exchange,
+including its final DACTLU, and sent a zero-address unsolicited Reply-PSID.
+IBM i positively acknowledged it, then requested Product Set ID with `8090`
+inside a controller `D824` record on SS-PU address `00`. The request contained
+subvectors `02 83` (node and attached devices) and `03 85 01` (unsolicited
+criteria), with procedure ID `0001`. The QA probe positively answered that
+inner request. A Reply-PSID sent inside `D824` caused `UNBIND FE` and sense
+`20020000`. Sending it as a separate FID2 management PIU instead received a
+positive SNA response.
+
+VG15's request handler builds the controller PSID before walking attached
+devices. The QA probe now follows that order: a firmware-shaped controller
+record with `5494` identity and procedure ID `0001`, then an address-01
+`3812` record. Both separate FID2 PIUs received positive responses from the
+V5R4 guest over LLC. The controller and printer VPD values in this probe are
+synthetic lab values; the controller's runtime identity and the printer's
+twinax VPD have not been captured. `SNUPRT01` remained `VARY ON PENDING`, and
+no address-01 BIND or SCS followed. The positive SNA responses establish
+syntactic acceptance by the host communications stack, not activation by the
+remote-workstation-controller application.
+
+A control run omitted the unsolicited power-on report. IBM i still sent the
+same `8090` request after the address-56 LU7 exchange, so that request is a
+controller-setup step rather than proof that the earlier power-on report was
+delivered to the printer application. Another run sent the unsolicited report
+after both solicited replies. The probe allocated distinct FID2 sequence
+numbers `0001`, `0002`, and `0003` to the node reply, device reply, and
+power-on report; IBM i positively acknowledged all three. `SNUPRT01` still
+remained pending. Its writer reported that the device was not powered on or
+varied on. The next protocol question is how the host correlates the accepted
+NMVT with the remote 5494 controller and address-01 device.
 
 ### Live V5R4 native LLC probe, 2026-11-03
 

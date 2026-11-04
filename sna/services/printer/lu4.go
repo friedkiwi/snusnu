@@ -5,7 +5,7 @@ import "errors"
 // ErrLU4 means an encapsulated 5494 LU 4 PIU is malformed or unsupported.
 var ErrLU4 = errors.New("invalid 5494 LU 4 PIU")
 
-// LU4PIU is the FID3 PIU carried inside a 5494 LU 6.2 device session.
+// LU4PIU is the FID3 PIU carried inside a 5494 LU 6.2 controller session.
 // The enclosing APPC GDS is deliberately outside this type: its private
 // layout is not established by the published 5494 reference.
 type LU4PIU struct {
@@ -20,8 +20,9 @@ type LU4PIU struct {
 type LU4Session byte
 
 const (
-	LU4SystemSession LU4Session = 1 // SS-LU, LSID bits 01
-	LU4PrintSession  LU4Session = 3 // LU-LU, LSID bits 11
+	LU4PhysicalSession LU4Session = 0 // SS-PU, LSID 00 for controller management
+	LU4SystemSession   LU4Session = 1 // SS-LU, LSID bits 01
+	LU4PrintSession    LU4Session = 3 // LU-LU, LSID bits 11
 )
 
 // ParseLU4PIU validates the IBM 5494 FID3 header and copies the RU.
@@ -29,8 +30,9 @@ const (
 // correlate the address with an authenticated printer device.
 func ParseLU4PIU(data []byte) (LU4PIU, error) {
 	if len(data) < 5 || len(data) > 1029 || (data[0] != 0x3c && data[0] != 0x3d) ||
-		(data[1]&0xc0 != 0x40 && data[1]&0xc0 != 0xc0) ||
-		(data[2]&0x08 != 0 && data[2] != 0x6b && data[2] != 0xeb) || data[4]&^byte(0x20) != 0 {
+		(data[1]&0xc0 != 0x40 && data[1]&0xc0 != 0xc0 && data[1] != 0) ||
+		(data[2]&0x08 != 0 && data[2] != 0x6b && data[2] != 0xeb &&
+			!(data[1] == 0 && (data[2] == 0x0b || data[2] == 0x8b))) || data[4]&^byte(0x20) != 0 {
 		return LU4PIU{}, ErrLU4
 	}
 	if data[2]&0x80 != 0 && data[2]&3 != 3 {
@@ -43,8 +45,10 @@ func ParseLU4PIU(data []byte) (LU4PIU, error) {
 // Encode reproduces one validated FID3 PIU. Callers must preserve the
 // request's shared-address and pacing bits when constructing responses.
 func (p LU4PIU) Encode() ([]byte, error) {
-	if p.Address > 63 || (p.Session != LU4SystemSession && p.Session != LU4PrintSession) ||
-		(p.RH[0]&0x08 != 0 && p.RH[0] != 0x6b && p.RH[0] != 0xeb) ||
+	if p.Address > 63 || (p.Session != LU4SystemSession && p.Session != LU4PrintSession &&
+		!(p.Session == LU4PhysicalSession && p.Address == 0)) ||
+		(p.RH[0]&0x08 != 0 && p.RH[0] != 0x6b && p.RH[0] != 0xeb &&
+			!(p.Session == LU4PhysicalSession && (p.RH[0] == 0x0b || p.RH[0] == 0x8b))) ||
 		p.RH[2]&^byte(0x20) != 0 || (p.Response && p.RH[0]&0x83 != 0x83) || len(p.RU) > 1024 {
 		return nil, ErrLU4
 	}
