@@ -1133,3 +1133,30 @@ controller path. This is a negative wire result; the address-01 printer
 remains pending and no spool arrived. The remaining comparison is the Axis
 sender's outer RH/bracket state and session selection, which are still
 runtime-derived.
+
+The next QA-only trial corrected the **outer FMD chain** as well: the positive
+inner Request-PSID response used RH `02 91 00` (first in chain), and the
+complete 54-byte node Reply-PSID used RH `01 91 20` (last in chain). The
+guest did not UNBIND. Instead, it returned an inner positive response inside
+`D824`:
+
+```text
+host: 2e000201000d 039020 000cd824 3c00 8b8000 41038d
+```
+
+This is the first observed V5R4 acceptance of the complete node PSID on the
+controller LU 6.2 session. The result supports outer FMD chain framing as
+the cause of the prior `20020000` error: two standalone outer FMD requests
+were not the conversation sequence the host accepted. The verbose LLC router
+recorded the two QA requests and host response in both directions.
+
+After that positive response, QA sent the address-01 printer power-on PSID
+as another `D824` FID3 record. V5R4 returned the same inner positive
+`8B 80 00 41 03 8D` for it. `WRKCFGSTS` still showed `SNUPRT` ACTIVE and
+`SNUPRT01` VARY ON PENDING; no address-01 ACTLU, LU4 BIND, or SCS data
+followed. The positive replies prove acceptance at the SNA PIU level, but
+the printer is not yet associated with the controller application. The logs
+are `qa-node54-chain.log`, `qa-node54-printer-after-ack.log`, and matching
+verbose router logs in the local lab directory. The remaining wire target
+is the controller application's device-available notification or its state
+transition, not the node PSID framing.

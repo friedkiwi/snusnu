@@ -657,11 +657,16 @@ func (p *localPrinterProbe) sendSolicitedNestedNodePSID(id string, c *printerPro
 	th := c.psidRequestTH
 	th[2], th[3] = th[3], th[2]
 	th[5]++
-	out, err := (piu.FID2{TH: th, RH: [3]byte{0x03, 0x90, 0x20}, RU: gds}).Bytes()
+	rh := [3]byte{0x03, 0x90, 0x20}
+	if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
+		rh = [3]byte{0x01, 0x91, 0x20}
+	}
+	out, err := (piu.FID2{TH: th, RH: rh, RU: gds}).Bytes()
 	if err != nil {
 		return err
 	}
 	log.Printf("printer probe solicited nested node PSID: circuit=%s piu=%x", id, out)
+	c.psidNodeAwaitAck = true
 	return p.sendInformation(id, out)
 }
 
@@ -878,6 +883,13 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			return nil
 		}
 		if inner.Address == 0 {
+			if c.psidNodeAwaitAck && inner.Response &&
+				inner.RH == [3]byte{0x8b, 0x80, 0} &&
+				bytes.Equal(inner.RU, []byte{0x41, 3, 0x8d}) {
+				c.psidNodeAwaitAck = false
+				log.Printf("printer probe nested node PSID accepted: circuit=%s", id)
+				return p.sendControllerPrinterPower(id, c)
+			}
 			if os.Getenv("SNUSNU_PRINTER_PROBE_CONTROLLER_PSID") != "1" ||
 				inner.Session != printer.LU4PhysicalSession || len(inner.RU) != 17 ||
 				!bytes.Equal(inner.RU[:5], []byte{0x41, 3, 0x8d, 0, 0}) ||
