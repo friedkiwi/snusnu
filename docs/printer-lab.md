@@ -295,6 +295,15 @@ establish 5494 printer readiness. This run remains in `qa-direct-actlu.log`
 and `router-direct-actlu.log`, circuit
 `1fdf212d-5680-409d-b81f-2439f4c8d7c5`.
 
+A final QA-only LLC trial changed the outer device-conversation response to
+the encapsulated ACTLU from `03 91 20` to `03 80 20` (definite response,
+without the pacing flag). The verbose router delivered that record, but IBM i
+sent no outer response, LU4 BIND, or SCS. After roughly two minutes it sent
+SIGNAL `C9 00 01 00 01` and posted `CPA3387` again. The trial is preserved in
+`qa-definite-device.log` and `router-definite-device.log`, circuit
+`6fcb47ea-4e01-4d8d-aaa5-7b4faeb04b59`; the experimental Go change was
+removed. Altering that outer response mode alone does not solve readiness.
+
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
 probe does not decode that form and the activation stopped there. Clean IPL
