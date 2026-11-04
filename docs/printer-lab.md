@@ -244,7 +244,28 @@ the source session's UNBIND. The guest history log recorded that LLCPRT had
 contacted the Ethernet line and SVC had varied on, without a later specific
 SNA failure reason. This run is `qa-noqnx.log` / `router-noqnx.log`. Removing
 the auto-created device therefore has not demonstrated a restored printer
-startup, and the ACK-timed direct PSID trial remains untested.
+startup.
+
+A later `STRMOD` retry let IBM i initiate the management CNOS. The QA
+responder accepted that CNOS and BIS, then, with its QA-only
+`PASSIVE_THEN_SOURCE` option, initiated the 5494 source CNOS itself. This
+reached the controller BIND and Attach, the solicited printer PSID, the
+host's parallel device BIND and Attach, and address-01 ACTLU. Both the
+verbose QA log and verbose LLC router log show the ACTLU response returning
+to IBM i; the guest sent a positive outer SNA response. This run is
+`qa-passive-then-source.log` / `router-passive-then-source.log`.
+
+The ACK-timed independent PSID in that run was rejected with sense
+`80050000` because its FID2 destination/source address pair did not name an
+active session. A subsequent clean retry removed that PSID entirely and
+again reached the same ACTLU response, with a positive outer acknowledgment.
+No LU4 printer BIND followed. The active `SNUPRT01` writer selected a
+three-page `QPDSPLIB` spool but remained in `QDMCOPEN`/`QWPOPEN`/`QT3REQIO`.
+After about two minutes IBM i sent a SIGNAL and posted `CPA3387`: device
+`SNUPRT01` was unavailable because it was not powered on, varied on, or was
+in use. `WRKCFGSTS` showed the device varied on, so the printer-ready state
+is still missing. The clean trace is `qa-actlu-clean-retry.log` /
+`router-actlu-clean-retry.log`. Neither run received SCS print data.
 
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
