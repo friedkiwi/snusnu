@@ -282,6 +282,19 @@ state. The paired traces are `qa-combined-psid.log` /
 `router-combined-psid.log` and `qa-direct-actlu.log` /
 `router-direct-actlu.log` in the disposable lab directory.
 
+To isolate `QNXDEV`, the disposable V5R4 guest's `LLCPRT` APPC controller
+was changed to `AUTOCRTDEV(*NONE)`, and the auto-created `QNXDEV` was removed.
+The next LLC activation still completed source CNOS, controller BIND/Attach,
+both PSID acknowledgments, the host's device BIND/Attach, and the encapsulated
+address-01 ACTLU. The router and QA debug logs show the available-printer
+response delivered to IBM i and positively acknowledged. No direct FID2
+ACTLU or `QNXDEV` appeared in this run. `WRKCFGSTS` showed `SNUPRT01` Active,
+but the writer received `CPA3387` at 23:53:29, with no LU4 BIND or SCS in the
+trace. Removing the APPC auto-created device therefore does not by itself
+establish 5494 printer readiness. This run remains in `qa-direct-actlu.log`
+and `router-direct-actlu.log`, circuit
+`1fdf212d-5680-409d-b81f-2439f4c8d7c5`.
+
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
 probe does not decode that form and the activation stopped there. Clean IPL
