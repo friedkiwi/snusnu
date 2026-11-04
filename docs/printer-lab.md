@@ -988,3 +988,34 @@ analysis. It does not yet identify the private controller record or activate
 spool has reached the concentrator. The next analysis target is the
 `QND5MAIN` input handling that follows its Attach PIP parser, correlated with
 the firmware's `VG02` and `VG15` device-state paths.
+
+### Isolating the second controller PSID record
+
+The V5R4 guest's `QND5ITRM`, `QND5CDIS`, and `QND5VRYO` programs were also
+saved and extracted with `QND5MAIN` into the local lab's `QND5ALL.SAVF`.
+The firmware's short address-01 PSID template at `VG15` image offset `0x1407`
+contains six zero bytes in the SNA Address List. Its builder patches only
+the final linear address byte at offset `+0x12`; those six zero bytes are
+therefore firmware-defined for this branch, not unresolved runtime data.
+`VG15:0x10E9` obtains a BCD clock value through BIOS interrupt `1A` and
+converts each date/time component to a binary number before transmission.
+The QA's zero address prefix and binary date/time components match those
+firmware operations.
+
+A QA-only `SNUSNU_PRINTER_PROBE_PSID_ACK_ONLY=1` run sent the positive inner
+response to IBM i's controller `D824` Request PSID, with outgoing controller
+sequence `000C`, and withheld the subsequent Reply PSID. The verbose LLC
+router relayed that response. IBM i did not send the immediate `UNBIND FE`
+with sense `20020000` seen in the prior combined runs; the circuit remained
+up for more than 40 seconds, awaiting further traffic. This establishes that
+the first response is accepted at the controller-session level.
+
+A second QA-only run, `SNUSNU_PRINTER_PROBE_PSID_NODE_NESTED=1`, sent the same
+positive response followed by the firmware-shaped **node** Reply PSID as a
+`D824`-encapsulated FID3 NMVT. IBM i immediately returned `UNBIND FE` with
+the same `20020000` sense. The earlier combined run did the same with an
+attached-printer Reply PSID. The fault is thus associated with the second
+controller `D824` record or its session sequencing, not the printer-specific
+status and VPD fields. Neither QA flag is used in normal concentrator mode.
+The next wire experiment should use the firmware's service-13 routing for
+the Reply PSID, not another invented `D824` payload.

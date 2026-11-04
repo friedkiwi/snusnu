@@ -595,7 +595,7 @@ func (p *localPrinterProbe) sendSolicitedPrinterPSID(id string, c *printerProbeC
 // The VG15 node reply is emitted before attached-device replies for an 83
 // Request PSID. This QA fixture keeps the firmware's 46-byte major vector and
 // uses the lab's synthetic controller VPD where runtime 5494 fields would go.
-func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCircuit) error {
+func solicitedNodePSIDRU(c *printerProbeCircuit) ([]byte, error) {
 	tail := []byte{
 		0, 0, byte(c.psidRequestID >> 8), byte(c.psidRequestID), 0x80,
 		0, 0x2e, 0, 0x90, 0x23, 0x10, 0, 0x20, 0x11, 1, 0x13,
@@ -605,18 +605,48 @@ func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCirc
 		0xf0, 0, 0, 0x07, 0x42, 0xef, 0, 0, 0, 0,
 	}
 	if len(tail) != 51 {
-		return fmt.Errorf("node PSID tail length %d", len(tail))
+		return nil, fmt.Errorf("node PSID tail length %d", len(tail))
 	}
 	// VG15:0x567 copies the fixed 03 20 subfield from its 0x14A6
 	// template into the node reply at offsets 36 and 37.
 	tail[36], tail[37] = 0x03, 0x20
-	ru := append([]byte{0x41, 3, 0x8d}, tail...)
+	return append([]byte{0x41, 3, 0x8d}, tail...), nil
+}
+
+func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCircuit) error {
+	ru, err := solicitedNodePSIDRU(c)
+	if err != nil {
+		return err
+	}
 	out, err := (piu.FID2{TH: c.nextNMVTTH(), RH: [3]byte{0x0b, 0x80, 0}, RU: ru}).Bytes()
 	if err != nil {
 		return err
 	}
 	log.Printf("printer probe solicited node PSID: circuit=%s piu=%x", id, out)
 	c.psidNodeAwaitAck = true
+	return p.sendInformation(id, out)
+}
+
+func (p *localPrinterProbe) sendSolicitedNestedNodePSID(id string, c *printerProbeCircuit) error {
+	ru, err := solicitedNodePSIDRU(c)
+	if err != nil {
+		return err
+	}
+	gds, err := printer.EncodeControllerDeviceGDS(printer.LU4PIU{
+		Address: 0, Session: printer.LU4PhysicalSession,
+		RH: [3]byte{0x0b, 0x80, 0}, RU: ru,
+	})
+	if err != nil {
+		return err
+	}
+	th := c.psidRequestTH
+	th[2], th[3] = th[3], th[2]
+	th[5]++
+	out, err := (piu.FID2{TH: th, RH: [3]byte{0x03, 0x90, 0x20}, RU: gds}).Bytes()
+	if err != nil {
+		return err
+	}
+	log.Printf("printer probe solicited nested node PSID: circuit=%s piu=%x", id, out)
 	return p.sendInformation(id, out)
 }
 
@@ -872,6 +902,12 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			log.Printf("printer probe controller PSID request response: circuit=%s piu=%x", id, packet)
 			if err := p.sendInformation(id, packet); err != nil {
 				return err
+			}
+			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_ACK_ONLY") == "1" {
+				return nil
+			}
+			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_NODE_NESTED") == "1" {
+				return p.sendSolicitedNestedNodePSID(id, c)
 			}
 			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" ||
 				os.Getenv("SNUSNU_PRINTER_PROBE_NO_PACING_INDICATOR") == "1" {
