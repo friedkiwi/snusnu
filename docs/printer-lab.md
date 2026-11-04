@@ -160,6 +160,31 @@ target for both media.
 
 ## Remaining acceptance work
 
+### Recovered V5R4 lab, 2026-11-04
+
+After the host power loss, a fresh writable V5R4 clone was booted and signed
+in using the lab image's existing QA account. The source image was left
+untouched. The clone uses `SOLNET.PRTGUEST`, `SNUSNU.SVC`, a 5494 remote
+controller `SNUPRT`, and a `3812-1` printer `SNUPRT01` at location `01`.
+The verbose LLC router and QA concentrator again completed XID3, source
+`QRMTWSC` CNOS, the 5494 controller BIND, and the `30F0F6F6` Attach.
+The guest then sent its address-56 LU7 setup traffic. A three-page `QPDSPLIB`
+spool is queued on `SNUPRT01`; the device is still `VARY ON PENDING`, so no
+address-01 LU4 BIND or SCS print data has been received.
+
+On this clone, `STRMOD` reported a route-selection error when the remote
+network identifier was omitted. The explicit command
+`STRMOD SVC SVC MODE(QRMTWSC) RMTNETID(SNUSNU)` completed successfully and
+immediately led to the source controller exchange. A QA-only Reply-PSID trial
+with FID2 OAF `01` received negative sense `10030001` from V5R4. The
+original zero-address form received a positive SNA response, so the OAF
+trial was removed. The host auto-created `QNXDEV`, a `3287` remote printer
+at local address `01` under APPC controller `LLCPRT`; its relationship to
+the pending 5494 printer remains unproven. This guest also reported that
+`QNXDEV` was not responding normally, with ACTLU response code `00000000`.
+That message and the address-56 exchange need investigation before counting
+any printer activation.
+
 ### Live V5R4 native LLC probe, 2026-11-03
 
 The isolated V5R4 guest at MAC `02:04:ac:05:45:04` connected over 802.3
