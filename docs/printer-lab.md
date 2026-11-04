@@ -235,6 +235,16 @@ sign-on did not by itself restore the zero-status form. The guest's
 auto-created `QNXDEV` 3287 device at address 01 was varied off and removed
 for a separate conflict test; that run reached XID/link activation but not
 the controller application record. No spool was received in these trials.
+After removing `QNXDEV`, the next isolated IPL was started with QA and the
+router disconnected until sign-on. The guest completed XID3 and the router
+reported link ready, but no ACTLU followed. `WRKCFGSTS` showed `LLCPRT` and
+its `SVC` device as `VARY ON PENDING`; an explicit
+`STRMOD SVC SVC MODE(QRMTWSC) RMTNETID(SNUSNU)` completed but produced only
+the source session's UNBIND. The guest history log recorded that LLCPRT had
+contacted the Ethernet line and SVC had varied on, without a later specific
+SNA failure reason. This run is `qa-noqnx.log` / `router-noqnx.log`. Removing
+the auto-created device therefore has not demonstrated a restored printer
+startup, and the ACK-timed direct PSID trial remains untested.
 
 Warm controller reactivation also exposed a second startup form: IBM i sent
 `D822` data beginning `89 08 F8` followed by `07 07 08 64 00 00 00`. The QA
