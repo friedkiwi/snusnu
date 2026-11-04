@@ -593,18 +593,19 @@ func (p *localPrinterProbe) sendSolicitedPrinterPSID(id string, c *printerProbeC
 }
 
 // The VG15 node reply is emitted before attached-device replies for an 83
-// Request PSID. This QA fixture keeps the firmware's 46-byte major vector and
-// uses the lab's synthetic controller VPD where runtime 5494 fields would go.
+// Request PSID. VG15:0x592 transmits 44 bytes from its 51-byte constructed
+// body and VG15:0x5AA subtracts seven from the major-vector length. This QA
+// fixture uses synthetic controller VPD where runtime 5494 fields would go.
 func solicitedNodePSIDRU(c *printerProbeCircuit) ([]byte, error) {
 	tail := []byte{
 		0, 0, byte(c.psidRequestID >> 8), byte(c.psidRequestID), 0x80,
-		0, 0x2e, 0, 0x90, 0x23, 0x10, 0, 0x20, 0x11, 1, 0x13,
+		0, 0x27, 0, 0x90, 0x23, 0x10, 0, 0x20, 0x11, 1, 0x13,
 		0, 0x12, 0xf5, 0xf4, 0xf9, 0xf4,
 		0xf0, 0xf0, 0xf2, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0,
 		0xf0, 0xf0, 0xf0, 0xf1, 0x0a, 0x0b, 0, 0, 0, 0, 0xf0,
-		0xf0, 0, 0, 0x07, 0x42, 0xef, 0, 0, 0, 0,
+		0xf0, 0, 0,
 	}
-	if len(tail) != 51 {
+	if len(tail) != 44 {
 		return nil, fmt.Errorf("node PSID tail length %d", len(tail))
 	}
 	// VG15:0x567 copies the fixed 03 20 subfield from its 0x14A6

@@ -1041,3 +1041,16 @@ response. The verbose router log shows the guest request, QA responses, and
 both host acknowledgements crossing the LLC circuit. `SNUPRT` is ACTIVE but
 `SNUPRT01` remains VARY ON PENDING, and no LU4/SCS print data was received.
 The two positive NMVT responses therefore do not yet prove device activation.
+
+The VG15 node-PSID builder at raw offsets `0x4F2..0x5BF` copies 22 plus 29
+bytes into a buffer, then sets its transmitted body length to `0x2C` (44)
+and subtracts seven from the major-vector length at body offset 5. The old
+QA fixture transmitted all 51 bytes with major-vector length `0x2E` (46),
+including the trailing `07 42 EF 00 00 00 00` that VG15 omits. The corrected
+fixture transmits 44 bytes with major-vector length `0x27` (39). In a fresh
+verbose LLC run, IBM i again positively acknowledged the corrected node and
+address-01 printer PSIDs. A second fresh run also sent an unsolicited
+address-01 power-on PSID after those acknowledgements; IBM i positively
+acknowledged all three records. `SNUPRT` became ACTIVE in both runs, while
+`SNUPRT01` remained VARY ON PENDING. The excess seven node bytes were a real
+fixture error, but correcting them did not activate the printer.
