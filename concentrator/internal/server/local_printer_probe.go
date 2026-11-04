@@ -35,6 +35,7 @@ type printerProbeCircuit struct {
 	peerIPR           bool
 	device            *printer.LU4Device
 	chain             *printer.ChainAssembler
+	lu7WSFBytes       int
 	spool             probePrinterSpool
 }
 
@@ -663,34 +664,78 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		if inner.Address == 1 {
 			return p.printerDeviceInformation(id, c, outer, inner)
 		}
-		if len(inner.RU) < 3 {
+		if len(inner.RU) == 0 {
 			return nil
 		}
 		var ru []byte
 		queryReply := false
-		switch {
-		case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0d:
-			ru, err = printer.ACTLUResponseRU(inner.RU)
-			if err == nil && inner.Address == 56 {
-				ru[5] = 0x80 // LU7 display: type bits 10 in the ACTLU status byte.
+		if os.Getenv("SNUSNU_PRINTER_PROBE_LU7_WSF") == "1" && inner.Session == printer.LU4PrintSession {
+			chainPosition := inner.RH[0] & 0x03
+			if chainPosition == 3 && len(inner.RU) >= 7 &&
+				bytes.Equal(inner.RU[4:7], []byte{0xd8, 0x22, 2}) &&
+				((int(inner.RU[2])<<8)|int(inner.RU[3])) == len(inner.RU)-2 {
+				// VG03's D822/02 path also accepts a complete WSF in
+				// one PIU, following the long chained setup request.
+				ru = []byte{0, 0, 0x88, 0, 5, 0xd8, 0x22, 0x10}
+				queryReply = true
 			}
-		case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && (inner.RU[14] == 7 || inner.RU[14] == 4):
-			ru = append([]byte(nil), inner.RU...)
-		case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
-			bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 5, 0xd8, 0x20, 2}):
-			// VG03's D820/02 handler copies this 26-byte 5250 Query reply.
-			// Bytes 20-21 are runtime capability fields; the disk default is
-			// only a probe value until the device configuration is known.
-			ru = []byte{0, 0, 0x88, 0, 0x17, 0xd8, 0x21, 2, 0, 0x12, 1, 1, 0, 0x0e, 2, 1, 0, 0x0a, 3, 3, 3, 0x10, 0, 4, 0x40, 0xff}
-			queryReply = true
-		case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
-			bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 0x17, 0xd8, 0x21, 0x10, 0, 0x12, 1, 1, 0, 0x0e, 2, 1, 0, 0x0a, 3, 3, 3, 0x10, 0, 4, 0x40, 0xff}):
-			// VG03's D821/10 handler emits its eight-byte station-state
-			// reply template, including the 5250 structured-field AID.
-			ru = []byte{0, 0, 0x88, 0, 5, 0xd8, 0x20, 0x10}
-			queryReply = true
-		default:
-			return nil
+			if chainPosition == 2 && bytes.HasPrefix(inner.RU, []byte{4, 0xf3, 3, 0x18, 0xd8, 0x22, 2}) {
+				c.lu7WSFBytes = len(inner.RU)
+				notice := piu.FID2{
+					TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]},
+					RH: [3]byte{0x03, 0x91, 0x20},
+					RU: []byte{0, 5, 0xd8, 0x23, 2},
+				}
+				packet, err := notice.Bytes()
+				if err != nil {
+					return err
+				}
+				log.Printf("printer probe LU7 WSF first-fragment notice: circuit=%s piu=%x", id, packet)
+				return p.sendInformation(id, packet)
+			}
+			if c.lu7WSFBytes != 0 {
+				c.lu7WSFBytes += len(inner.RU)
+				if chainPosition != 1 {
+					return nil
+				}
+				length := c.lu7WSFBytes
+				c.lu7WSFBytes = 0
+				if length != 794 {
+					return fmt.Errorf("printer probe LU7 WSF chain length %d, want 794", length)
+				}
+				// VG03 image 0x17E41 copies the D822/10 reply template
+				// after the final fragment of this structured field.
+				ru = []byte{0, 0, 0x88, 0, 5, 0xd8, 0x22, 0x10}
+				queryReply = true
+			}
+		}
+		if ru == nil {
+			switch {
+			case inner.Session == printer.LU4SystemSession && inner.RU[0] == 0x0d:
+				ru, err = printer.ACTLUResponseRU(inner.RU)
+				if err == nil && inner.Address == 56 {
+					ru[5] = 0x80 // LU7 display: type bits 10 in the ACTLU status byte.
+				}
+			case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x31 && len(inner.RU) == 26 && (inner.RU[14] == 7 || inner.RU[14] == 4):
+				ru = append([]byte(nil), inner.RU...)
+			case inner.Session == printer.LU4PrintSession && inner.RU[0] == 0x32 && len(inner.RU) == 2:
+				ru = append([]byte(nil), inner.RU...)
+			case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
+				bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 5, 0xd8, 0x20, 2}):
+				// VG03's D820/02 handler copies this 26-byte 5250 Query reply.
+				// Bytes 20-21 are runtime capability fields; the disk default is
+				// only a probe value until the device configuration is known.
+				ru = []byte{0, 0, 0x88, 0, 0x17, 0xd8, 0x21, 2, 0, 0x12, 1, 1, 0, 0x0e, 2, 1, 0, 0x0a, 3, 3, 3, 0x10, 0, 4, 0x40, 0xff}
+				queryReply = true
+			case os.Getenv("SNUSNU_PRINTER_PROBE_LU7_QUERY") == "1" && inner.Session == printer.LU4PrintSession &&
+				bytes.Equal(inner.RU, []byte{4, 0xf3, 0, 0x17, 0xd8, 0x21, 0x10, 0, 0x12, 1, 1, 0, 0x0e, 2, 1, 0, 0x0a, 3, 3, 3, 0x10, 0, 4, 0x40, 0xff}):
+				// VG03's D821/10 handler emits its eight-byte station-state
+				// reply template, including the 5250 structured-field AID.
+				ru = []byte{0, 0, 0x88, 0, 5, 0xd8, 0x20, 0x10}
+				queryReply = true
+			default:
+				return nil
+			}
 		}
 		if err != nil {
 			return err

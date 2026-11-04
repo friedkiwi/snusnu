@@ -178,12 +178,26 @@ network identifier was omitted. The explicit command
 immediately led to the source controller exchange. A QA-only Reply-PSID trial
 with FID2 OAF `01` received negative sense `10030001` from V5R4. The
 original zero-address form received a positive SNA response, so the OAF
-trial was removed. The host auto-created `QNXDEV`, a `3287` remote printer
-at local address `01` under APPC controller `LLCPRT`; its relationship to
-the pending 5494 printer remains unproven. This guest also reported that
+trial was removed. The host auto-created `QNXDEV` at `16:06:09`, the same
+second as the Reply-PSID acknowledgement and a direct FID2 ACTLU. `QNXDEV`
+is a `3287` remote printer at local address `01` under APPC controller
+`LLCPRT`; the trace does not distinguish whether the NMVT or ACTLU response
+caused its creation, and its relationship to the pending 5494 printer remains
+unproven. This guest also reported that
 `QNXDEV` was not responding normally, with ACTLU response code `00000000`.
 That message and the address-56 exchange need investigation before counting
 any printer activation.
+
+A firmware-derived LU7 follow-up was then tested on LLC with both router and
+QA debug traces. `VG0F` emits a controller `D823/02` notice after the first
+fragment of the host's 792-byte address-56 structured field. `VG03` copies
+the eight-byte `00 00 88 00 05 D8 22 10` template after the complete
+three-fragment chain. With these two replies, V5R4 sent a further short
+`D822/02` structured field; the same `D822/10` response advanced it to an
+inner address-56 LU7 `UNBIND`. The QA probe answered that `UNBIND`, and
+V5R4 positively acknowledged each new outbound record. `SNUPRT01` is still
+`VARY ON PENDING`, and no address-01 LU4 BIND or SCS followed. This closes
+the observed address-56 exchange without establishing printer readiness.
 
 ### Live V5R4 native LLC probe, 2026-11-03
 
