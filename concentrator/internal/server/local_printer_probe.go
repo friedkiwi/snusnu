@@ -372,7 +372,16 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 			return err
 		}
 		log.Printf("printer probe ACTLU response: circuit=%s piu=%x", id, response)
-		return p.sendInformation(id, response)
+		if err := p.sendInformation(id, response); err != nil {
+			return err
+		}
+		if os.Getenv("SNUSNU_PRINTER_PROBE_SOURCE_AFTER_ACTLU") == "1" {
+			// Lab-only escape hatch for a host that leaves its APPN device varied
+			// on but does not restart its source CNOS after a link reset.
+			c.initiated = true
+			return p.beginManagement(id, c)
+		}
+		return nil
 	}
 	bind, err := lu62.ParseBind(data)
 	if err != nil {

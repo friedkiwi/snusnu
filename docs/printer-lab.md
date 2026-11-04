@@ -1106,3 +1106,30 @@ and session-state error, but should not be substituted wholesale for IBM
 printer VPD. The next check is the runtime flag at Axis address `0x40258584`
 and the FID3 wrapper's outer send path, correlated with the V5R4 host's
 `QND5MAIN` controller-session receive path.
+
+### Fresh guest retry with the complete nested node record
+
+After an orderly guest restart, V5R4 activated the LLC circuit but did not
+start its LU 6.2 management BIND after ACTLU. A QA-only
+`SNUSNU_PRINTER_PROBE_SOURCE_AFTER_ACTLU=1` branch now initiates source CNOS
+immediately after answering ACTLU. In the local trial, this restored the full
+source CNOS, controller BIND, Attach, and host `D824` Request-PSID exchange.
+The verbose router log shows the ACTLU response sent to the guest and its LLC
+receive acknowledgment; the QA log is `qa-source-after-actlu.log` in the
+untracked lab directory.
+
+QA then returned the positive inner Request-PSID response followed by the
+**complete** 54-byte IBM 5494 node Reply-PSID in `D824`, with consecutive
+controller source sequences `000C` and `000D`:
+
+```text
+response: 2e000102000c 039020 000cd824 3c00 8b8000 41038d
+node:     2e000102000d 039020 0042d824 3c00 0b8000 41038d ...
+```
+
+V5R4 again sent `UNBIND FE` with sense `20020000` immediately after the
+second record. The corrected node length therefore does not fix the nested
+controller path. This is a negative wire result; the address-01 printer
+remains pending and no spool arrived. The remaining comparison is the Axis
+sender's outer RH/bracket state and session selection, which are still
+runtime-derived.
