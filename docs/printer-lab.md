@@ -879,3 +879,18 @@ defines `20020000` as a chaining sequence error, which prevents delivery to
 the intended component. The result excludes this QA record as a working
 controller notification, but it does not resolve whether the real firmware
 uses a different GDS wrapper or a different controller conversation state.
+
+Two more QA-only controller-session trials used the host's encapsulated
+`8090` Request PSID as the trigger. First, the QA sent a positive inner
+`41 03 8D` response with outer RH `03 91 00`, then an address-01 Reply PSID
+with outer RH `03 91 20`. The guest again sent UNBIND FE, sense `20020000`.
+Next, the QA tried a single outer FMD chain: first RH `02 91 00`, final RH
+`01 91 20`, with the two controller `D824` records sent consecutively. Both
+records crossed the LLC router to IBM i, but the guest did not open an
+address-01 device session. It retransmitted its controller Request PSID and
+later the controller BIND; `SNUPRT01` remained `VARY ON PENDING`. The chain
+trial does not establish whether the missing requirement is a different
+controller application record, a different response envelope, or another
+session-state rule. The QA flags are `SNUSNU_PRINTER_PROBE_KEEP_PSID_DIRECTION`
+and `SNUSNU_PRINTER_PROBE_CHAIN_PSID`, respectively; neither is enabled in
+normal concentrator operation.

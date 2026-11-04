@@ -557,7 +557,11 @@ func (p *localPrinterProbe) sendSolicitedPrinterPSID(id string, c *printerProbeC
 	th := c.psidRequestTH
 	th[2], th[3] = th[3], th[2]
 	th[5]++
-	out, err := (piu.FID2{TH: th, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}).Bytes()
+	rh0 := byte(0x03)
+	if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
+		rh0 = 0x01 // last in the controller FMD chain
+	}
+	out, err := (piu.FID2{TH: th, RH: [3]byte{rh0, 0x91, 0x20}, RU: gds}).Bytes()
 	if err != nil {
 		return err
 	}
@@ -822,14 +826,29 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			if err != nil {
 				return err
 			}
+			// Keep the controller's send turn until the solicited Reply PSID
+			// follows this positive inner response. The final record returns CD.
+			responseRH0, responseRH2 := byte(0x03), byte(0x20)
+			if os.Getenv("SNUSNU_PRINTER_PROBE_KEEP_PSID_DIRECTION") == "1" {
+				responseRH2 = 0
+			}
+			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
+				responseRH0, responseRH2 = 0x02, 0 // first in chain, keep direction
+			}
 			packet, err := (piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]},
-				RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}).Bytes()
+				RH: [3]byte{responseRH0, 0x91, responseRH2}, RU: gds}).Bytes()
 			if err != nil {
 				return err
 			}
-			c.psidRequestPending = true
+			c.psidRequestPending = os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") != "1"
 			log.Printf("printer probe controller PSID request response: circuit=%s piu=%x", id, packet)
-			return p.sendInformation(id, packet)
+			if err := p.sendInformation(id, packet); err != nil {
+				return err
+			}
+			if os.Getenv("SNUSNU_PRINTER_PROBE_CHAIN_PSID") == "1" {
+				return p.sendSolicitedPrinterPSID(id, c)
+			}
+			return nil
 		}
 		if inner.Address == 1 {
 			return p.printerDeviceInformation(id, c, outer, inner)
