@@ -850,10 +850,20 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 			if err := p.sendInformation(id, grant); err != nil {
 				return err
 			}
+			if os.Getenv("SNUSNU_PRINTER_PROBE_DEVICE_D822_REPLY") == "1" {
+				reply := []byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], 0, 1,
+					0x03, 0x91, 0x20, 0, 6, 0xd8, 0x22, 0, 0}
+				log.Printf("printer probe device Attach D822 reply: circuit=%s piu=%x", id, reply)
+				return p.sendInformation(id, reply)
+			}
 			if os.Getenv("SNUSNU_PRINTER_PROBE_DEVICE_RETURN_TURN") != "1" {
 				return nil
 			}
-			turn := []byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], 0, 1, 0x03, 0x90, 0x20}
+			turnRH1 := byte(0x90)
+			if os.Getenv("SNUSNU_PRINTER_PROBE_DEVICE_RETURN_TURN_RQE") == "1" {
+				turnRH1 = 0xa0
+			}
+			turn := []byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], 0, 1, 0x03, turnRH1, 0x20}
 			log.Printf("printer probe device Attach turn return: circuit=%s piu=%x", id, turn)
 			return p.sendInformation(id, turn)
 		}
@@ -1130,7 +1140,7 @@ func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeC
 	if err != nil {
 		return err
 	}
-	reply := piu.FID2{TH: [6]byte{0x2e, 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}
+	reply := piu.FID2{TH: [6]byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]}, RH: [3]byte{0x03, 0x91, 0x20}, RU: gds}
 	packet, err := reply.Bytes()
 	if err != nil {
 		return err

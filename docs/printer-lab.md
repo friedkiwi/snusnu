@@ -1196,3 +1196,24 @@ the host's `30 F0 F6 F3` Attach; the LU4 ACTLU/BIND and SCS print data have
 not yet arrived. The local trace files are `qa-device-bind3.log`,
 `qa-device-attach.log`, `qa-device-turn.log`, and matching verbose router
 logs in the disposable lab directory.
+
+### Device Attach result and address-01 ACTLU
+
+The 5494 firmware's inbound `30F0F6F3` handler is at VG0F image
+`0x1FEF..0x21C0`, reached from VG10's `C0` event. It checks the Attach
+PIP `12F5/12E2` envelope and address byte, associates the LU 6.2 session
+with that station, and calls VG0F `0x22ED` for its result. The latter
+constructs `00 06 D8 22` followed by a two-byte status. The healthy path
+leaves the status zero, so the resulting six-byte RU is
+`00 06 D8 22 00 00`. VG10's `B2` handler at `0x494D` submits it on the
+device session.
+
+Sending that firmware-derived `D822` result after the pacing grant changed
+the live guest behavior: IBM i sent an encapsulated address-01 ACTLU,
+`00 0C D8 24 3D 41 6B 80 00 0D 01 01`. The QA printer device returned
+the defined ACTLU response. Its first outer reply mistakenly retained the
+controller session's ODAI (`2E`) and IBM i rejected it with `80050000`.
+The QA reply now preserves the incoming device-session TH class (`2C`)
+while reversing DAF/OAF. This correction awaits a clean rerun; no LU4 BIND
+or SCS print data has yet been observed. The wire evidence is in
+`qa-device-d822.log` and `router-llc-device-d822.log` in the local lab.
