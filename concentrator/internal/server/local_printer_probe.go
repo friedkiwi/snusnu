@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"os"
@@ -593,15 +594,27 @@ func (p *localPrinterProbe) sendSolicitedNodePSID(id string, c *printerProbeCirc
 }
 
 func (p *localPrinterProbe) sendControllerPrinterPower(id string, c *printerProbeCircuit) error {
-	ru, err := experimentalPrinterPSID().EncodeNMVT()
-	if err != nil {
-		return err
-	}
-	inner := printer.LU4PIU{Address: 0, Session: printer.LU4PhysicalSession,
-		RH: [3]byte{0x0b, 0x80, 0}, RU: ru}
-	gds, err := printer.EncodeControllerDeviceGDS(inner)
-	if err != nil {
-		return err
+	var gds []byte
+	if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_FID2_NESTED") == "1" {
+		inner, err := experimentalPrinterPSID().EncodeNMVTPIU(c.nextNMVTTH(), 0x80, 0)
+		if err != nil {
+			return err
+		}
+		gds = make([]byte, 4, len(inner)+4)
+		binary.BigEndian.PutUint16(gds[:2], uint16(len(inner)+4))
+		gds[2], gds[3] = 0xd8, 0x24
+		gds = append(gds, inner...)
+	} else {
+		ru, err := experimentalPrinterPSID().EncodeNMVT()
+		if err != nil {
+			return err
+		}
+		inner := printer.LU4PIU{Address: 0, Session: printer.LU4PhysicalSession,
+			RH: [3]byte{0x0b, 0x80, 0}, RU: ru}
+		gds, err = printer.EncodeControllerDeviceGDS(inner)
+		if err != nil {
+			return err
+		}
 	}
 	th := c.psidRequestTH
 	th[2], th[3] = th[3], th[2]
@@ -765,7 +778,8 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 		}
 		if c.psidDeviceAwaitAck && outer.RH == [3]byte{0x8b, 0x80, 0} {
 			c.psidDeviceAwaitAck = false
-			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_POWER_NESTED") == "1" {
+			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_POWER_NESTED") == "1" ||
+				os.Getenv("SNUSNU_PRINTER_PROBE_PSID_FID2_NESTED") == "1" {
 				return p.sendControllerPrinterPower(id, c)
 			}
 			if os.Getenv("SNUSNU_PRINTER_PROBE_PSID_POWER_AFTER_REPLY") == "1" {

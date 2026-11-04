@@ -869,3 +869,13 @@ address-01, and subsequent unsolicited address-01 PSIDs. The remote printer
 still remained `VARY ON PENDING`. `DSPJOBLOG JOB(SVC)` showed QND5MAIN
 running for `SNUPRT` without a diagnostic message. This rules out the
 direction bit alone as the missing activation step.
+
+The firmware's VG15 builder emits a complete FID2 NMVT PIU, and the 5494
+XID3 advertises no separate SSCP-PU session. A further QA-only trial kept
+that FID2 PIU intact inside controller `D824` instead of converting it to
+FID3. The guest still sent UNBIND FE with sense `20020000` immediately after
+the `00 4F D8 24 2E ... 41 03 8D` record. [IBM's SNA sense table](https://public.dhe.ibm.com/ps/products/db2/info/vr6/htm/db2ap/db2ap12.htm)
+defines `20020000` as a chaining sequence error, which prevents delivery to
+the intended component. The result excludes this QA record as a working
+controller notification, but it does not resolve whether the real firmware
+uses a different GDS wrapper or a different controller conversation state.
