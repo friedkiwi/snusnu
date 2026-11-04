@@ -957,3 +957,34 @@ That confirms that our `00/00` positive response is the right kind of SNA
 acknowledgment, but IBM i in the 5494 lab did not follow it with address-01
 ACTLU. The missing condition is specific to the 5494 controller/device
 association; an SNA-level PSID acknowledgment alone does not establish it.
+
+### V5R4 host program extracted from the running guest
+
+The lab guest is self-contained; no further credential or external system is
+required to inspect its IBM i controller program. At the signed-in QSECOFR
+console, these commands saved the exact V5R4 `QND5MAIN` object:
+
+```text
+CRTSAVF FILE(QGPL/QND5SAV)
+SAVOBJ OBJ(QND5MAIN) LIB(QSYS) DEV(*SAVF) SAVF(QGPL/QND5SAV)
+```
+
+The guest FTP service then exported the save file in binary mode from
+`/QSYS.LIB/QGPL.LIB/QND5SAV.FILE`. The resulting 137 KiB IBM OS/400 save file
+is at `transfer/QND5MAIN.SAVF` inside the local, untracked lab directory.
+`syspass_research/tools/savfx.py extract` parsed it into three program
+segments. The object identifies itself as native PowerPC AS code created for
+V5R4M0. Its EBCDIC traceback data maps `INVEVENT` to native offset `0x9420`,
+`PSIDVPD` to `0xAB2C`, and `WSCINFO` to `0xF850`. Those are V5R4 object
+offsets, distinct from the V4R4 offsets in the research report. The procedure
+table exposes only one native PEP, so the current `pgmdec.py --code` helper
+does not automatically emit the internal code span; the span from `0x1690`
+through `0x1139F` is present in the first extracted segment and can be
+disassembled directly.
+
+This extraction removes the missing-host-object obstacle to further static
+analysis. It does not yet identify the private controller record or activate
+`SNUPRT01`; the last observed IBM i status is still *VARY ON PENDING* and no
+spool has reached the concentrator. The next analysis target is the
+`QND5MAIN` input handling that follows its Attach PIP parser, correlated with
+the firmware's `VG02` and `VG15` device-state paths.
