@@ -861,3 +861,11 @@ the required power-on notification. The next protocol task is to trace the
 VG15 service-13 send boundary and the host's controller application receive
 path, then validate the candidate against this guest before starting the
 AnyNet spool run.
+
+The next LLC trial used TH byte `2E` for controller-originated direct NMVT,
+matching VG15's direction-bit patch, rather than the earlier `2C`. IBM i
+returned `2C ... 8B 80 00 41 03 8D` positive responses to the node,
+address-01, and subsequent unsolicited address-01 PSIDs. The remote printer
+still remained `VARY ON PENDING`. `DSPJOBLOG JOB(SVC)` showed QND5MAIN
+running for `SNUPRT` without a diagnostic message. This rules out the
+direction bit alone as the missing activation step.

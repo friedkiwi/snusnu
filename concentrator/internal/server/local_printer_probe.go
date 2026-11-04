@@ -499,7 +499,7 @@ func (p *localPrinterProbe) passiveManagementInformation(id string, c *printerPr
 // from its attached device and maintain the independent SSCP-PU flow.
 func (c *printerProbeCircuit) nextNMVTTH() [6]byte {
 	c.nmvtSequence++
-	return [6]byte{0x2c, 0, 0, 0, byte(c.nmvtSequence >> 8), byte(c.nmvtSequence)}
+	return [6]byte{0x2e, 0, 0, 0, byte(c.nmvtSequence >> 8), byte(c.nmvtSequence)}
 }
 
 func (p *localPrinterProbe) sendExperimentalNMVT(id string, c *printerProbeCircuit) error {
