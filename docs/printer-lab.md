@@ -1421,3 +1421,10 @@ The writer job log identifies the preceding allocation failure as `CPF4128`
 for `QSYS/QPSPLPRT` and device `SVCPRT01`. Its extended text lists a device
 already in use, a device not varied on, or no APPC sessions as possible causes;
 it does not select one cause for this job.
+`DSPMODD QRMTWSC` showed the IBM-supplied limits of 57 sessions and 56
+locally controlled sessions. The live `LLCPRT/SVC` mode status showed only
+two sessions and two conversations: one host-initiated device session and
+one controller-initiated session. Its negotiated limits were 57 total,
+56 local, and one remote. This rules out exhaustion of the configured APPC
+session limit in this trial; the printer-availability state remains the
+unresolved cause of the writer failure.
