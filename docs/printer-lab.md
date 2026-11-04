@@ -831,3 +831,33 @@ describes dependent-LU management as encapsulated SSCP-PU and SSCP-LU flows
 over dedicated `CPSVRMGR` sessions. Whether the 5494-style Reply PSID in this
 IBM i scenario uses that path still needs a guest capture; the current router
 rejects the direct NMVT on the unrelated LU6.2 association.
+
+### 4 November emulated V5R4 guest and PSID checks
+
+The writable V5R4 guest clone is running in
+`/home/friedkiwi/labs/snusnu-printer-v5r4`. Its console uses the credentials
+provided with the source image; no external credential is needed. The guest
+has `LLCPRT`, `SNUPRT`, and a 3812 model 1 printer `SNUPRT01` at location
+address `01`. A three-page spool is queued for that printer. The QA and router
+were both run with verbose SNA logging for the LLC trials. Their logs confirm
+that controller BIND, Attach `30 F0 F6 F6`, LU7 traffic, and the host's
+encapsulated `8090` Request PSID crossed the router in both directions.
+
+The QA answered the request and sent firmware-shaped node and address-01
+Reply PSIDs on the direct FID2 management path. IBM i returned positive
+`8B 80 00 41 03 8D` responses for both. It also positively answered an
+unsolicited direct address-01 PSID after the solicited responses. `SNUPRT`
+became `ACTIVE`, but `SNUPRT01` stayed `VARY ON PENDING`; starting its writer
+produced the inquiry "Device SNUPRT01 not available." No address-01 LU4
+session or SCS print data reached QA. A positive NMVT response therefore
+establishes SNA-level receipt, not printer activation by QND5MAIN.
+
+A separate QA probe wrapped the power-on PSID as an inner SSCP-PU FID3 PIU in
+controller `D824`. The first attempt reused source sequence `0002` after
+source traffic through `000C`. The corrected attempt used `000D`; IBM i still
+sent UNBIND FE with sense `20020000`. The controller wrapper is not yet
+verified from firmware or capture, so this negative result does not identify
+the required power-on notification. The next protocol task is to trace the
+VG15 service-13 send boundary and the host's controller application receive
+path, then validate the candidate against this guest before starting the
+AnyNet spool run.

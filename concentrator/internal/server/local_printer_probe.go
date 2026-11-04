@@ -605,9 +605,11 @@ func (p *localPrinterProbe) sendControllerPrinterPower(id string, c *printerProb
 	}
 	th := c.psidRequestTH
 	th[2], th[3] = th[3], th[2]
-	// The source half-session has its own transmit sequence. BIND used zero
-	// and Attach used one; the host's 000C request is not our next number.
-	th[4], th[5] = 0, 2
+	// The preceding PSID response used this controller-session sequence.
+	// Continue the same source stream for the unsolicited power-on request.
+	sequence := uint16(th[4])<<8 | uint16(th[5])
+	sequence++
+	th[4], th[5] = byte(sequence>>8), byte(sequence)
 	out, err := (piu.FID2{TH: th, RH: [3]byte{0x03, 0x90, 0x20}, RU: gds}).Bytes()
 	if err != nil {
 		return err
