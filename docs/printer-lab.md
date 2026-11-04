@@ -1043,14 +1043,26 @@ both host acknowledgements crossing the LLC circuit. `SNUPRT` is ACTIVE but
 The two positive NMVT responses therefore do not yet prove device activation.
 
 The VG15 node-PSID builder at raw offsets `0x4F2..0x5BF` copies 22 plus 29
-bytes into a buffer, then sets its transmitted body length to `0x2C` (44)
-and subtracts seven from the major-vector length at body offset 5. The old
-QA fixture transmitted all 51 bytes with major-vector length `0x2E` (46),
-including the trailing `07 42 EF 00 00 00 00` that VG15 omits. The corrected
-fixture transmits 44 bytes with major-vector length `0x27` (39). In a fresh
-verbose LLC run, IBM i again positively acknowledged the corrected node and
-address-01 printer PSIDs. A second fresh run also sent an unsolicited
-address-01 power-on PSID after those acknowledgements; IBM i positively
-acknowledged all three records. `SNUPRT` became ACTIVE in both runs, while
-`SNUPRT01` remained VARY ON PENDING. The excess seven node bytes were a real
-fixture error, but correcting them did not activate the printer.
+bytes into a buffer, sets the retained body length to `0x2C` (44), and
+subtracts seven from the major-vector length. The old QA fixture transmitted
+all 51 template bytes with major-vector length `0x2E` (46), including the
+trailing `07 42 EF 00 00 00 00` that VG15 omits. A first correction sent only
+the 44 retained bytes with major-vector length `0x27` (39). In fresh verbose
+LLC runs, IBM i positively acknowledged that node record, the address-01
+printer PSID, and an optional later unsolicited address-01 power-on PSID.
+`SNUPRT` became ACTIVE while `SNUPRT01` remained VARY ON PENDING.
+
+The first correction was incomplete: VG15's date helper at `0x10E9..0x120C`
+appends `0A 01 08 10` plus six binary date/time bytes at body offset 44,
+then increases the body length and major-vector length by ten. The complete
+node PSID has a 54-byte body and major-vector length `0x31` (49). The QA
+fixture now encodes that complete form. In the next fresh LLC exchange, the
+verbose router relayed the complete node PSID, solicited address-01 printer
+PSID, and later unsolicited power-on PSID. IBM i returned positive
+`8B 80 00 41 03 8D` to all three, but `SNUPRT01` remained VARY ON PENDING.
+The former node-template length error is therefore not the remaining device
+activation gate. The printer record uses VG15's short hardware-product branch:
+its builder shortens the initial major vector by 25 bytes, then appends the
+same ten-byte timestamp, yielding major-vector length `0x3A` (58), matching
+the QA record. Whether a 3812 sets the firmware's runtime short-branch flag
+still requires device VPD evidence.
