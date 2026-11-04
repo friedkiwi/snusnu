@@ -1066,3 +1066,43 @@ its builder shortens the initial major vector by 25 bytes, then appends the
 same ten-byte timestamp, yielding major-vector length `0x3A` (58), matching
 the QA record. Whether a 3812 sets the firmware's runtime short-branch flag
 still requires device VPD evidence.
+
+### Independent Axis 5470e firmware comparison
+
+The [Axis 5470e firmware 6.30](https://ftp.axis.com/pub/axis/software/prt_srv/5470e/6_30/5470_630.bin)
+provides an independent implementation of 5494-compatible SNA printing. The
+downloaded file has SHA-256
+`39400ba9e43c3acb2991a02aa4460c43c3d079b0ebc805f36ebe101fe4a665a0`.
+Its zlib stream begins at file offset `0x6CB7A`; decompression yields a
+2,234,490-byte CRIS image loaded at `0x40000000`. These are static firmware
+observations, not captured traffic. The image and a locally built CRIS
+`objdump` are in the untracked lab directory under `firmware/`.
+
+The image contains separate debug strings for the 5494 controller session,
+controller PIUs, the LU 6.2 NWS session, and the LU 4 printer. At decompressed
+offsets `0x220F88` and `0x220FC4`, it contains node and attached-printer
+Reply-PSID templates beginning `3C 00 0B 80 00 41 03 8D`. Thus Axis builds
+these as FID3 PIUs on SS-PU address zero. The attached-printer template also
+contains the device status `09 82 04 10 00 00 03 20 01`, with port/station
+still to be patched at runtime. It does **not** contain a fixed 3812 product
+type; that comes from runtime printer configuration.
+
+The Axis node-template builder is at CRIS address `0x40119D5C`, and the
+attached-printer builder starts at `0x40119DAC`. Dispatcher `0x4011A0EA`
+chooses between them. Callers at `0x40113BBE` and `0x40114FEE` recognize a
+Request-PSID and submit the constructed response through `0x40110970`.
+That common sender has a conditional FID3 encapsulation branch at
+`0x40110A10..0x40110AB0`: when its runtime mode flag is set and the FID3
+address is zero, it copies the FID3 PIU into a GDS with key `D8 24`. The
+branch establishes a real controller-session wrapper in a compatible product,
+but the conditions that set the mode flag and the exact outer LU 6.2 RH,
+sequence, and session addresses still need to be traced. The earlier QA
+`D824` PSID trials ended in `UNBIND FE`; this static evidence does not make
+those trials successful.
+
+The Axis templates differ from the IBM Release 3.2 5494 node and printer
+templates in length and fields. They are useful for isolating the framing
+and session-state error, but should not be substituted wholesale for IBM
+printer VPD. The next check is the runtime flag at Axis address `0x40258584`
+and the FID3 wrapper's outer send path, correlated with the V5R4 host's
+`QND5MAIN` controller-session receive path.
