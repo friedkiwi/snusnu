@@ -1121,11 +1121,25 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 
 func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeCircuit, outer piu.FID2, inner printer.LU4PIU) error {
 	if c.device == nil {
-		device, err := printer.NewLU4Device(1, 0x87)
+		device, err := printer.NewLU4Device(1, 0xb7)
 		if err != nil {
 			return err
 		}
 		c.device = device
+	}
+	if outer.RH[1]&0x01 != 0 {
+		grant := piu.FID2{
+			TH: [6]byte{outer.TH[0], outer.TH[1], outer.TH[3], outer.TH[2], 0, 0},
+			RH: [3]byte{0x83, 0x01, 0},
+		}
+		grantBytes, err := grant.Bytes()
+		if err != nil {
+			return err
+		}
+		log.Printf("printer probe LU4 request pacing grant: circuit=%s piu=%x", id, grantBytes)
+		if err := p.sendInformation(id, grantBytes); err != nil {
+			return err
+		}
 	}
 	var responseBytes []byte
 	var err error
@@ -1137,8 +1151,24 @@ func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeC
 			}
 		}
 		scs, complete, err := c.chain.Feed(inner)
-		if err != nil || !complete {
+		if err != nil {
 			return err
+		}
+		if !complete {
+			if outer.RH[2]&0x20 == 0 {
+				return nil
+			}
+			continuation := piu.FID2{
+				TH: [6]byte{outer.TH[0], 0, outer.TH[3], outer.TH[2], outer.TH[4], outer.TH[5]},
+				RH: [3]byte{0x03, 0x91, 0x20},
+				RU: []byte{0, 5, 0xd8, 0x23, 2},
+			}
+			packet, err := continuation.Bytes()
+			if err != nil {
+				return err
+			}
+			log.Printf("printer probe LU4 chain continuation: circuit=%s piu=%x", id, packet)
+			return p.sendInformation(id, packet)
 		}
 		responseBytes, err = c.device.PrepareFMDChain(outer.RU[4:], scs, func(data []byte) error {
 			if err := c.spool.append(p.hub.a.printDir, data); err != nil {
@@ -1171,20 +1201,6 @@ func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeC
 	packet, err := reply.Bytes()
 	if err != nil {
 		return err
-	}
-	if outer.RH[1]&0x01 != 0 {
-		grant := piu.FID2{
-			TH: [6]byte{outer.TH[0], outer.TH[1], outer.TH[3], outer.TH[2], 0, 0},
-			RH: [3]byte{0x83, 0x01, 0},
-		}
-		grantBytes, err := grant.Bytes()
-		if err != nil {
-			return err
-		}
-		log.Printf("printer probe LU4 request pacing grant: circuit=%s piu=%x", id, grantBytes)
-		if err := p.sendInformation(id, grantBytes); err != nil {
-			return err
-		}
 	}
 	log.Printf("printer probe LU4 response: circuit=%s phase=%d piu=%x", id, c.device.Phase(), packet)
 	if err := p.sendInformation(id, packet); err != nil {

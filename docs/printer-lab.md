@@ -1487,3 +1487,39 @@ defines reason `06` as invalid session parameters, but these traces do not
 identify whether the rejected field is within the inner BIND response or the
 surrounding LU6.2 conversation. No SCS data arrived, so the print acceptance
 goal remains open. All logs are in the disposable V5R4 lab directory.
+
+### V5R4 accepted B7/B7 and sent SCS; paused checkpoint
+
+The guest writer job log reported `CPF4533` with device response code `6826`.
+The guest's `DSPMSGD RANGE(CPF4533) DETAIL(*FULL)` defines `6826` as
+"Bind failure." A clean LLC trial then echoed the host's BIND request,
+including `B7 B7` (1408-byte RU values), with no normalizations. That trial
+passed BIND and the guest sent an SCS print stream. The first large `D824`
+record was 1408 bytes, exceeding the old 1024-byte Go parser bound. The
+published 5494 reference permits at most 1024 bytes in its printer BIND
+response, so this V5R4 observation differs from that documented limit. The
+working choice is grounded in this guest's observed behavior, not a claim
+about every 5494 implementation.
+
+The reusable printer parser now admits a 1532-byte inner PIU within the
+1536-byte outer LU6.2 RU. The probe grants pacing for each host `D824`
+record, including partial FID3 chains. With those changes, the host sent
+three large fragments before ending an outer LU6.2 turn while the inner
+FID3 chain was still marked middle. A `D823/02` continuation request at
+that boundary was acknowledged and the host sent four more large fragments.
+A second `D823/02` was also acknowledged, but no more data arrived during
+the observation period. The writer showed `Writing: Y`, `Waiting on message:
+N`; no completed print job or PDF existed at pause. The decisive verbose
+traces are `qa-bind-chain-continue.log` and `router-bind-chain-continue.log`
+in the local lab. The LLC circuit ID is
+`79c7e61b-27cc-46c9-a14a-d57d531e0d16`.
+
+The host was paused at 09:53:56 local time with a successful emulator
+`snapshot --stop`, stored outside Git at
+`/home/friedkiwi/labs/snusnu-printer-v5r4/storage/snapshots/snapshot-2026-11-05T09-53-56-32616734768.tar`.
+The lab's DASD images, QA database, compiled QA probe, router config, and
+verbose logs remain in `/home/friedkiwi/labs/snusnu-printer-v5r4`.
+The QA and router processes were stopped after the snapshot. The local lab
+`RESUME.md` records the exact restart commands and current blocker. The
+remaining acceptance work is completing the IBM i spool over LLC, verifying
+its UI preview and PDF, then repeating the end-to-end spool over AnyNet.

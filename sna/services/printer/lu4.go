@@ -5,6 +5,10 @@ import "errors"
 // ErrLU4 means an encapsulated 5494 LU 4 PIU is malformed or unsupported.
 var ErrLU4 = errors.New("invalid 5494 LU 4 PIU")
 
+// MaxFID3PIUBytes admits the 1408-byte device records negotiated by V5R4.
+// Four bytes remain for the D824 GDS header within a 1536-byte outer RU.
+const MaxFID3PIUBytes = 1532
+
 // LU4PIU is the FID3 PIU carried inside a 5494 LU 6.2 controller session.
 // The enclosing APPC GDS is deliberately outside this type: its private
 // layout is not established by the published 5494 reference.
@@ -29,7 +33,7 @@ const (
 // Station addresses are six bits; the enclosing controller application must
 // correlate the address with an authenticated printer device.
 func ParseLU4PIU(data []byte) (LU4PIU, error) {
-	if len(data) < 5 || len(data) > 1029 || (data[0] != 0x3c && data[0] != 0x3d) ||
+	if len(data) < 5 || len(data) > MaxFID3PIUBytes || (data[0] != 0x3c && data[0] != 0x3d) ||
 		(data[1]&0xc0 != 0x40 && data[1]&0xc0 != 0xc0 && data[1] != 0) ||
 		(data[2]&0x08 != 0 && data[2] != 0x6b && data[2] != 0xeb &&
 			!(data[1] == 0 && (data[2] == 0x0b || data[2] == 0x8b))) || data[4]&^byte(0x20) != 0 {
@@ -49,7 +53,7 @@ func (p LU4PIU) Encode() ([]byte, error) {
 		!(p.Session == LU4PhysicalSession && p.Address == 0)) ||
 		(p.RH[0]&0x08 != 0 && p.RH[0] != 0x6b && p.RH[0] != 0xeb &&
 			!(p.Session == LU4PhysicalSession && (p.RH[0] == 0x0b || p.RH[0] == 0x8b))) ||
-		p.RH[2]&^byte(0x20) != 0 || (p.Response && p.RH[0]&0x83 != 0x83) || len(p.RU) > 1024 {
+		p.RH[2]&^byte(0x20) != 0 || (p.Response && p.RH[0]&0x83 != 0x83) || len(p.RU) > MaxFID3PIUBytes-5 {
 		return nil, ErrLU4
 	}
 	first := byte(0x3c)
@@ -85,7 +89,7 @@ func IsPrinterBind(p LU4PIU) bool {
 func PositiveLU4Response(request LU4PIU, responseRU []byte) (LU4PIU, error) {
 	chain := request.RH[0] & 3
 	if request.Response || (chain != 1 && chain != 3) || request.RH[1]&0xa0 == 0 ||
-		request.RH[1]&0x10 != 0 || len(responseRU) > 1024 {
+		request.RH[1]&0x10 != 0 || len(responseRU) > MaxFID3PIUBytes-5 {
 		return LU4PIU{}, ErrLU4
 	}
 	response := request
@@ -100,11 +104,11 @@ func PositiveLU4Response(request LU4PIU, responseRU []byte) (LU4PIU, error) {
 // CandidatePrinterBindResponseRU negotiates the IBM-defined base 3812 LU 4
 // profile. It is a candidate only: the enclosing LU 6.2 session must have
 // completed its own BIND, and the controller must have announced this device.
-// maxRU is the outer session's encoded maximum (0x85, 0x86, or 0x87).
+// maxRU is the selected encoded maximum, bounded by the outer LU 6.2 session.
 // BIND RU sizes use the SNA a×2^b encoding; the host may offer more than the
-// 5494's supported 1024 bytes, which is negotiated down in the response.
+// responder's supported size, which is negotiated down in the response.
 func CandidatePrinterBindResponseRU(request LU4PIU, maxRU byte) ([]byte, error) {
-	if !IsPrinterBind(request) || len(request.RU) != 26 || maxRU < 0x85 || maxRU > 0x87 {
+	if !IsPrinterBind(request) || len(request.RU) != 26 || !validPrinterBindRUSize(maxRU) || printerBindRUSize(maxRU) > MaxFID3PIUBytes {
 		return nil, ErrLU4
 	}
 	r := request.RU

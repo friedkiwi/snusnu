@@ -82,7 +82,7 @@ func (d *LU4Device) PrepareFMDChain(last, scs []byte, appendSCS func([]byte) err
 }
 
 func NewLU4Device(address, maxRU byte) (*LU4Device, error) {
-	if address == 0 || address > 63 || maxRU < 0x85 || maxRU > 0x87 {
+	if address == 0 || address > 63 || !validPrinterBindRUSize(maxRU) || printerBindRUSize(maxRU) > MaxFID3PIUBytes {
 		return nil, ErrDeviceState
 	}
 	return &LU4Device{address: address, maxRU: maxRU}, nil

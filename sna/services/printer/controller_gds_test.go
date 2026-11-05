@@ -45,3 +45,19 @@ func TestControllerGDSCapturedRequestPSID(t *testing.T) {
 		t.Fatalf("Request PSID positive response: %+v %v", response, err)
 	}
 }
+
+func TestControllerDeviceGDSV5R4PrintRecord(t *testing.T) {
+	// V5R4 sends a 1408-byte D824 record after accepting its B7/B7 BIND.
+	raw := make([]byte, 1399)
+	raw[0] = 0x2b
+	raw[1] = 0xd1
+	p := LU4PIU{Address: 1, Session: LU4PrintSession, RH: [3]byte{0x03, 0x80, 0}, RU: raw}
+	encoded, err := EncodeControllerDeviceGDS(p)
+	if err != nil || len(encoded) != 1408 {
+		t.Fatalf("encode V5R4-sized print record: len=%d err=%v", len(encoded), err)
+	}
+	decoded, err := ParseControllerDeviceGDS(encoded)
+	if err != nil || !bytes.Equal(decoded.RU, raw) {
+		t.Fatalf("decode V5R4-sized print record: len=%d err=%v", len(decoded.RU), err)
+	}
+}

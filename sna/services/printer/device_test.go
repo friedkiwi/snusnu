@@ -54,7 +54,7 @@ func TestLU4DeviceACTLUAndPrinterBind(t *testing.T) {
 }
 
 func TestLU4DeviceV5R4PrinterBind(t *testing.T) {
-	d, err := NewLU4Device(1, 0x87)
+	d, err := NewLU4Device(1, 0xb7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestLU4DeviceV5R4PrinterBind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response[2] != 0xeb || response[9] != 0xb0 || response[15] != 0x87 || response[16] != 0x87 || response[28] != 0 {
+	if response[2] != 0xeb || response[9] != 0xb0 || response[15] != 0xb7 || response[16] != 0xb7 || response[28] != 0 {
 		t.Fatalf("unexpected BIND negotiation: %x", response)
 	}
 	if err := d.MarkSent(response); err != nil || d.Phase() != DeviceBound {
