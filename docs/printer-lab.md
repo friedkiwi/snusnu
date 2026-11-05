@@ -1433,3 +1433,22 @@ lock, held by writer job `002809/QSPLJOB/SVCPRT01`. No competing job held
 a lock on this device at the time of inspection. The guest diagnostics thus
 leave a device-readiness/correlation failure as the strongest remaining
 explanation, without identifying its exact protocol exchange.
+
+### Power-on notification after printer ACTLU
+
+A further clean LLC run used the automatically created `SVCPRT01` and sent a
+second, unsolicited address-01 Reply-PSID immediately after the host paced the
+available-printer ACTLU response. The host acknowledged that notification with
+`8B 80 00 41 03 8D`. Writer job `002822/QSPLJOB/SVCPRT01` started at
+08:43:04 and the form-load inquiry was answered `G`. At 08:45:27 the host sent
+SIGNAL `C9 00 01 00 01`, and `QSYSOPR` posted `CPA3387` again. No inner LU4
+BIND or SCS data arrived. The verbose traces are `qa-postactlu.log` and
+`router-postactlu.log` in the disposable lab directory; the circuit is
+`a5e87ace-cc28-49e2-9145-033831d50ecd`.
+
+This rules out a missing repeat of the architected power-on PSID at the ACTLU
+boundary. The 5494 reference says that a device-on notification also flows on
+the controller conversation. The static firmware evidence currently identifies
+the NMVT sender but has not established that private conversation record or its
+correlation to the host's device session. The next investigation should focus
+on that state transition and the writer's device allocation failure.
