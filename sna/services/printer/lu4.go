@@ -76,7 +76,7 @@ func IsPrinterBind(p LU4PIU) bool {
 		return false
 	}
 	r := p.RU
-	return r[0] == 0x31 && r[1] == 0 && r[2] == 7 && r[3] == 7 && r[14] == 4 && r[15]&0xc0 == 0xc0 && r[23] == 0x80
+	return r[0] == 0x31 && r[1] == 0 && r[2] == 7 && r[3] == 7 && r[14] == 4 && r[15]&0xc0 == 0xc0 && (r[23] == 0 || r[23] == 0x80)
 }
 
 // PositiveLU4Response prepares a response PIU for a complete request. The
@@ -101,26 +101,28 @@ func PositiveLU4Response(request LU4PIU, responseRU []byte) (LU4PIU, error) {
 // profile. It is a candidate only: the enclosing LU 6.2 session must have
 // completed its own BIND, and the controller must have announced this device.
 // maxRU is the outer session's encoded maximum (0x85, 0x86, or 0x87).
+// BIND RU sizes use the SNA a×2^b encoding; the host may offer more than the
+// 5494's supported 1024 bytes, which is negotiated down in the response.
 func CandidatePrinterBindResponseRU(request LU4PIU, maxRU byte) ([]byte, error) {
 	if !IsPrinterBind(request) || len(request.RU) != 26 || maxRU < 0x85 || maxRU > 0x87 {
 		return nil, ErrLU4
 	}
 	r := request.RU
-	if r[4] != 0xf0 || r[5] != 0xb0 || r[6] != 0x10 || r[7] != 0x81 ||
-		r[8]&0x40 != 0 || r[9]&0xc0 != 0 || r[10] < 0x85 || r[10] > 0x87 ||
-		r[11] < 0x85 || r[11] > 0x87 || r[14] != 4 || r[15] != 0xc0 ||
+	if (r[4] != 0xf0 && r[4] != 0xb0) || r[5] != 0xb0 || r[6] != 0x10 || r[7] != 0x81 ||
+		r[8]&0x40 != 0 || r[9]&0xc0 != 0 || !validPrinterBindRUSize(r[10]) ||
+		!validPrinterBindRUSize(r[11]) || r[14] != 4 || r[15] != 0xc0 ||
 		r[16] != 0 || r[17] != 0 || r[18] != 0 || r[19] != 0 || r[20] != 0 ||
-		r[21] != 0 || r[22] != 0 || r[23] != 0x80 || r[24] != 0 || r[25]&^byte(1) != 0 {
+		r[21] != 0 || r[22] != 0 || (r[23] != 0 && r[23] != 0x80) || r[24] != 0 || r[25]&^byte(1) != 0 {
 		return nil, ErrLU4
 	}
 	response := append([]byte(nil), r...)
 	if response[9] == 0 || response[9] > 7 {
 		response[9] = 7
 	}
-	if response[10] > maxRU {
+	if printerBindRUSize(response[10]) > printerBindRUSize(maxRU) {
 		response[10] = maxRU
 	}
-	if response[11] > maxRU {
+	if printerBindRUSize(response[11]) > printerBindRUSize(maxRU) {
 		response[11] = maxRU
 	}
 	if response[12]&0x80 != 0 {
@@ -128,4 +130,13 @@ func CandidatePrinterBindResponseRU(request LU4PIU, maxRU byte) ([]byte, error) 
 	}
 	response[25] = 0 // no printer code download
 	return response, nil
+}
+
+func validPrinterBindRUSize(code byte) bool {
+	size := printerBindRUSize(code)
+	return size >= 256 && size <= 65535
+}
+
+func printerBindRUSize(code byte) int {
+	return int(code>>4) << (code & 0x0f)
 }

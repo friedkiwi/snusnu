@@ -1452,3 +1452,38 @@ the controller conversation. The static firmware evidence currently identifies
 the NMVT sender but has not established that private conversation record or its
 correlation to the host's device session. The next investigation should focus
 on that state transition and the writer's device allocation failure.
+
+### Paced ACTLU reaches the LU4 printer BIND
+
+On 2026-11-05, the QA responder began returning the outer pacing grant
+`83 01 00` for each paced `D824` request before sending the encapsulated
+response. A clean LLC run then reached the first observed address-01 printer
+BIND from the V5R4 writer:
+
+```text
+3D C1 6B 80 00
+31 00 07 07 B0 B0 10 81 00 07 B7 B7 00 00 04 C0
+00 00 00 00 00 00 00 00 00 00
+```
+
+The outer request used `03 91 20`, GDS `D824`, and an LU6.2 pacing bit.
+The router's verbose LLC trace confirms that both the grant and the
+encapsulated response reached the guest; its LLC receive number advanced
+across both frames. The host sent the next outer pacing response.
+
+Three response variants were tried against a queued three-page `QPDSPLIB`
+spool on automatically created `SVCPRT01` (3812 model 1, address 01):
+
+| Trial | Primary FM byte | Code selection | Maximum RU | Result |
+| --- | --- | --- | --- | --- |
+| `qa-pacing-bind.log` | `B0` | `00` | 512 | UNBIND `32 06` |
+| `qa-pacing-bind-delayed.log` | `F0` | `80` | 512 | UNBIND `32 06` |
+| `qa-pacing-bind-1024.log` | `F0` | `80` | 1024 | UNBIND `32 06` |
+| `qa-pacing-bind-echo.log` | `B0` | `00` | 1024 | UNBIND `32 06` |
+
+In each case the host sent UNBIND roughly three seconds after the BIND
+response. The QA responder now acknowledges that UNBIND. IBM's 5494 reference
+defines reason `06` as invalid session parameters, but these traces do not
+identify whether the rejected field is within the inner BIND response or the
+surrounding LU6.2 conversation. No SCS data arrived, so the print acceptance
+goal remains open. All logs are in the disposable V5R4 lab directory.

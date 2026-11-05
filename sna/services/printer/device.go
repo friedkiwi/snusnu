@@ -18,6 +18,7 @@ const (
 	DeviceAwaitBindAck
 	DeviceBound
 	DeviceAwaitDataAck
+	DeviceAwaitUnbindAck
 )
 
 // LU4Device handles the architected ACTLU and printer BIND inside one 5494
@@ -108,6 +109,11 @@ func (d *LU4Device) Prepare(input []byte) ([]byte, error) {
 		ru, err = ACTLUResponseRU(p.RU)
 	case DeviceAwaitBind:
 		ru, err = CandidatePrinterBindResponseRU(p, d.maxRU)
+	case DeviceBound:
+		if p.Session != LU4PrintSession || !p.Expedited || len(p.RU) < 2 || p.RU[0] != 0x32 {
+			return nil, ErrDeviceState
+		}
+		ru = []byte{0x32}
 	default:
 		return nil, ErrDeviceState
 	}
@@ -125,8 +131,10 @@ func (d *LU4Device) Prepare(input []byte) ([]byte, error) {
 	d.pending = encoded
 	if d.phase == DeviceAwaitACTLU {
 		d.phase = DeviceAwaitACTLUAck
-	} else {
+	} else if d.phase == DeviceAwaitBind {
 		d.phase = DeviceAwaitBindAck
+	} else {
+		d.phase = DeviceAwaitUnbindAck
 	}
 	return append([]byte(nil), encoded...), nil
 }
@@ -142,6 +150,8 @@ func (d *LU4Device) MarkSent(response []byte) error {
 		d.phase = DeviceBound
 	case DeviceAwaitDataAck:
 		d.phase = DeviceBound
+	case DeviceAwaitUnbindAck:
+		d.phase = DeviceAwaitBind
 	default:
 		return ErrDeviceState
 	}

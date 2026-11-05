@@ -53,6 +53,38 @@ func TestLU4DeviceACTLUAndPrinterBind(t *testing.T) {
 	}
 }
 
+func TestLU4DeviceV5R4PrinterBind(t *testing.T) {
+	d, err := NewLU4Device(1, 0x87)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actlu, err := d.Prepare([]byte{0x3d, 0x41, 0x6b, 0x80, 0, 0x0d, 1, 1})
+	if err != nil || d.MarkSent(actlu) != nil {
+		t.Fatalf("ACTLU setup: %x %v", actlu, err)
+	}
+	// Captured from the V5R4 writer after its paced ACTLU exchange.
+	bind := []byte{0x3d, 0xc1, 0x6b, 0x80, 0,
+		0x31, 0, 7, 7, 0xb0, 0xb0, 0x10, 0x81, 0, 7, 0xb7, 0xb7, 0, 0, 4, 0xc0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	response, err := d.Prepare(bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response[2] != 0xeb || response[9] != 0xb0 || response[15] != 0x87 || response[16] != 0x87 || response[28] != 0 {
+		t.Fatalf("unexpected BIND negotiation: %x", response)
+	}
+	if err := d.MarkSent(response); err != nil || d.Phase() != DeviceBound {
+		t.Fatalf("BIND send: %v", err)
+	}
+	unbind, err := d.Prepare([]byte{0x3d, 0xc1, 0x63, 0x80, 0, 0x32, 0x06})
+	if err != nil || !bytes.Equal(unbind, []byte{0x3d, 0xc1, 0xe3, 0x80, 0, 0x32}) {
+		t.Fatalf("UNBIND response: %x %v", unbind, err)
+	}
+	if err := d.MarkSent(unbind); err != nil || d.Phase() != DeviceAwaitBind {
+		t.Fatalf("UNBIND send: %v", err)
+	}
+}
+
 func TestLU4DeviceMultiPIUPrintChainWaitsForDurableWrite(t *testing.T) {
 	d, err := NewLU4Device(1, 0x86)
 	if err != nil {

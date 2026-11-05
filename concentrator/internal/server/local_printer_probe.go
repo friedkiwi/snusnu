@@ -1121,7 +1121,7 @@ func (p *localPrinterProbe) managementInformation(id string, c *printerProbeCirc
 
 func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeCircuit, outer piu.FID2, inner printer.LU4PIU) error {
 	if c.device == nil {
-		device, err := printer.NewLU4Device(1, 0x86)
+		device, err := printer.NewLU4Device(1, 0x87)
 		if err != nil {
 			return err
 		}
@@ -1129,7 +1129,7 @@ func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeC
 	}
 	var responseBytes []byte
 	var err error
-	if c.device.Phase() == printer.DeviceBound {
+	if c.device.Phase() == printer.DeviceBound && !(inner.Expedited && len(inner.RU) >= 2 && inner.RU[0] == 0x32) {
 		if c.chain == nil {
 			c.chain, err = printer.NewChainAssembler(printer.MaxJobBytes)
 			if err != nil {
@@ -1171,6 +1171,20 @@ func (p *localPrinterProbe) printerDeviceInformation(id string, c *printerProbeC
 	packet, err := reply.Bytes()
 	if err != nil {
 		return err
+	}
+	if outer.RH[1]&0x01 != 0 {
+		grant := piu.FID2{
+			TH: [6]byte{outer.TH[0], outer.TH[1], outer.TH[3], outer.TH[2], 0, 0},
+			RH: [3]byte{0x83, 0x01, 0},
+		}
+		grantBytes, err := grant.Bytes()
+		if err != nil {
+			return err
+		}
+		log.Printf("printer probe LU4 request pacing grant: circuit=%s piu=%x", id, grantBytes)
+		if err := p.sendInformation(id, grantBytes); err != nil {
+			return err
+		}
 	}
 	log.Printf("printer probe LU4 response: circuit=%s phase=%d piu=%x", id, c.device.Phase(), packet)
 	if err := p.sendInformation(id, packet); err != nil {
